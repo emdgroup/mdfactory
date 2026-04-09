@@ -3,6 +3,14 @@
   <img src="docs/public/mdfactory-logo-v1.0.png" alt="MDFactory logo banner" width="900" />
 </p>
 
+<p align="center">
+  <a href="https://github.com/emdgroup/mdfactory/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/emdgroup/mdfactory/ci.yml?branch=main&style=flat-square&label=CI&labelColor=0f69af&color=ffdcb9" alt="CI" /></a>
+  <a href="https://github.com/emdgroup/mdfactory/actions/workflows/docs.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/emdgroup/mdfactory/docs.yml?branch=main&style=flat-square&label=Docs&labelColor=0f69af&color=ffdcb9" alt="Docs" /></a>
+  <a href="https://github.com/emdgroup/mdfactory/issues/"><img src="https://img.shields.io/github/issues/emdgroup/mdfactory?style=flat-square&label=Issues&labelColor=96d7d2&color=ffdcb9" alt="Issues" /></a>
+  <a href="https://github.com/emdgroup/mdfactory/pulls/"><img src="https://img.shields.io/github/issues-pr/emdgroup/mdfactory?style=flat-square&label=PRs&labelColor=96d7d2&color=ffdcb9" alt="PRs" /></a>
+  <a href="https://github.com/emdgroup/mdfactory/blob/main/LICENSE"><img src="https://shields.io/badge/License-MIT-green.svg?style=flat-square&labelColor=96d7d2&color=ffdcb9" alt="MIT License" /></a>
+</p>
+
 # MDFactory
 
 MDFactory is a high-throughput library for setting up molecular dynamics (MD) simulations. It provides a flexible and efficient framework for creating, parameterizing, and running MD simulations across various systems and engines.
