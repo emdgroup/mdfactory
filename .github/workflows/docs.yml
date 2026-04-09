@@ -47,7 +47,7 @@ jobs:
         working-directory: docs
         env:
           GITHUB_PAGES: true
-          # NEXT_PUBLIC_BASE_PATH: '__root__'
+          NEXT_PUBLIC_BASE_PATH: '/mdfactory'
           NODE_ENV: production
         run: bun run build
 
