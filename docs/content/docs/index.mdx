@@ -6,13 +6,13 @@ description: High-throughput molecular dynamics simulation library
 MDFactory is an open source, end-to-end simulation manager for high-throughput molecular dynamics with robust data management. It handles the full pipeline from molecular structure generation through parametrization, system building, simulation, and analysis — with built-in database integration for tracking results at scale.
 
 <img
-  src="/diagrams/light/architecture/pipeline-overview.png"
+  src={`${process.env.NEXT_PUBLIC_BASE_PATH || ''}/diagrams/light/architecture/pipeline-overview.png`}
   alt="MDFactory pipeline: CSV/YAML input → Structure Generation (RDKit) → Parametrization (OpenFF, CGenFF) → System Build (Mixedbox, Bilayer, LNP) → Simulation (GROMACS, OpenMM) → Analysis, with Database sync to Simulation DB and Analysis DB"
   className="block dark:hidden"
   style={{ width: '100%', maxWidth: '900px', margin: '1.5rem auto' }}
 />
 <img
-  src="/diagrams/dark/architecture/pipeline-overview.png"
+  src={`${process.env.NEXT_PUBLIC_BASE_PATH || ''}/diagrams/dark/architecture/pipeline-overview.png`}
   alt="MDFactory pipeline: CSV/YAML input → Structure Generation (RDKit) → Parametrization (OpenFF, CGenFF) → System Build (Mixedbox, Bilayer, LNP) → Simulation (GROMACS, OpenMM) → Analysis, with Database sync to Simulation DB and Analysis DB"
   className="hidden dark:block"
   style={{ width: '100%', maxWidth: '900px', margin: '1.5rem auto' }}
