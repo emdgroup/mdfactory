@@ -50,25 +50,6 @@ conda activate mdfactory
 pip install -e .[dev]
 ```
 
-## Documentation
-
-We ship an auto-generated documentation site under `docs/` powered by Next.js and Fumadocs. It combines hand-written guides with API pages produced from the Python package using `fumadocs-python`.
-
-1. Install the tooling:
-   ```bash
-   cd docs
-   bun install
-   python3.11 -m pip install -e ..
-   python3.11 -m pip install ./node_modules/fumadocs-python
-   ```
-2. Generate docs + run the dev server (this command automatically rebuilds the API docs on every run):
-   ```bash
-   bun run dev
-   ```
-
-Use `bun run docs:generate` if you only need to refresh the MDX output without running Next.js, and `bun run build` to produce a production bundle in `docs/out` (set `GITHUB_PAGES=true` when you want to simulate the GitHub Pages base path locally).
-
-The docs are published from `docs/out` via the GitHub Actions workflow at `.github/workflows/docs.yml`.
 
 ## Quick Start
 
