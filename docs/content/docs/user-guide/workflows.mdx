@@ -50,6 +50,10 @@ nextflow run workflows/simulate.nf \
   --config_yaml results/systems.yaml
 ```
 
+<Callout type="warn" title="Cluster-specific configuration">
+The shipped `simulate.config` contains SLURM settings (queue name, module loads, GPU/CPU/memory requests) tuned for a specific cluster. Edit this file to match your HPC environment before running. See [Running on HPC Clusters](/docs/user-guide/running-on-hpc) for guidance.
+</Callout>
+
 `simulate.nf` executes this fixed sequence for each hash listed in the summary YAML:
 
 1. Minimization using `em.mdp`

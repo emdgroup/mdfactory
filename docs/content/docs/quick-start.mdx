@@ -99,6 +99,10 @@ nextflow run workflows/simulate.nf \
   --config_yaml output_systems/sample_input.yaml
 ```
 
+<Callout type="warn" title="Cluster-specific configuration">
+The shipped `simulate.config` contains SLURM settings tuned for a specific cluster. Edit this file to match your HPC environment before running. See [Running on HPC Clusters](/docs/user-guide/running-on-hpc) for details.
+</Callout>
+
 </Step>
 </Steps>
 

@@ -146,6 +146,10 @@ nextflow run workflows/simulate.nf \
   --config_yaml tutorial_campaign/mixedbox_chain_length_series_20.yaml
 ```
 
+<Callout type="warn" title="Cluster-specific configuration">
+The shipped `simulate.config` contains SLURM settings tuned for a specific cluster. Edit this file to match your HPC environment before running. See [Running on HPC Clusters](/docs/user-guide/running-on-hpc) for details.
+</Callout>
+
 This executes the fixed sequence implemented in `workflows/simulate.nf`:
 
 1. minimization
