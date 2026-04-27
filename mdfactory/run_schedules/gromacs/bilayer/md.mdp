@@ -2,7 +2,7 @@
 title                   = MD production run membrane system
 ; Run parameters
 integrator              = md                ; leap-frog integrator
-nsteps                  = 500000000          ; 2 * 50000000 = 100 ns
+nsteps                  = 500000000          ; 2 * 500000000 = 1000 ns
 dt                      = 0.002             ; 2 fs
 ; Output control
 nstxout                 = 0                 ; suppress bulky .trr file by setting to 0
