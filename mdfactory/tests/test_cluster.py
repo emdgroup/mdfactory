@@ -506,7 +506,13 @@ class TestDataclasses:
         nt = NodeType(cpus=32, memory_mb=64000)
         assert nt.gpus == 0
         assert nt.gpu_type is None
-        assert nt.features == []
+        assert nt.features == ()
+
+    def test_node_type_features_immutable(self):
+        nt = NodeType(cpus=64, memory_mb=256000, features=("a100", "nvlink"))
+        assert nt.features == ("a100", "nvlink")
+        with pytest.raises(TypeError):
+            nt.features[0] = "other"  # type: ignore[index]
 
     def test_cluster_info_defaults(self):
         ci = ClusterInfo()

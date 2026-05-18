@@ -43,15 +43,15 @@ class NodeType:
         Number of GPUs per node (0 if CPU-only).
     gpu_type : str or None
         GPU model identifier (e.g., ``"a100"``, ``"h100"``), or None.
-    features : list of str
-        SLURM feature/constraint tags on this node type.
+    features : tuple of str
+        SLURM feature/constraint tags on this node type (immutable).
     """
 
     cpus: int
     memory_mb: int
     gpus: int = 0
     gpu_type: str | None = None
-    features: list[str] = field(default_factory=list)
+    features: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -227,7 +227,7 @@ def _parse_memory_mb(mem_str: str) -> int:
         return 0
 
 
-def _parse_features(features_str: str) -> list[str]:
+def _parse_features(features_str: str) -> tuple[str, ...]:
     """Parse SLURM features/constraints string.
 
     Parameters
@@ -237,12 +237,12 @@ def _parse_features(features_str: str) -> list[str]:
 
     Returns
     -------
-    list of str
-        List of feature strings.
+    tuple of str
+        Feature strings (immutable).
     """
     if not features_str or features_str == "(null)":
-        return []
-    return [f.strip() for f in features_str.split(",") if f.strip()]
+        return ()
+    return tuple(f.strip() for f in features_str.split(",") if f.strip())
 
 
 def _parse_sinfo(output: str) -> list[Partition]:
@@ -325,8 +325,8 @@ def _parse_sinfo(output: str) -> list[Partition]:
                 "last_unhealthy_state": "down",
             }
 
-        # Use a hashable representation for deduplication
-        node_key = (cpus, memory_mb, gpus, gpu_type, tuple(features))
+        # Use a hashable representation for deduplication (features is already a tuple)
+        node_key = (cpus, memory_mb, gpus, gpu_type, features)
         partition_data[partition_name]["node_types"].add(node_key)
         partition_data[partition_name]["node_count"] += 1
 
@@ -356,7 +356,7 @@ def _parse_sinfo(output: str) -> list[Partition]:
                 memory_mb=mem,
                 gpus=gpus,
                 gpu_type=gtype,
-                features=list(feats),
+                features=feats,
             )
             for cpus, mem, gpus, gtype, feats in data["node_types"]
         ]
