@@ -63,7 +63,8 @@ class Partition:
     name : str
         Partition name (e.g., ``"gpu"``, ``"cpu"``).
     state : str
-        Partition state (e.g., ``"up"``, ``"down"``).
+        Partition-level state: ``"up"`` if any node is schedulable, otherwise
+        the last observed unhealthy state (e.g., ``"down"``, ``"drained"``).
     max_time : str
         Maximum walltime (SLURM format, e.g., ``"3-00:00:00"``).
     default_time : str
@@ -307,12 +308,13 @@ def _parse_sinfo(output: str) -> list[Partition]:
 
         if partition_name not in partition_data:
             partition_data[partition_name] = {
-                "state": state,
                 "max_time": _parse_time_limit(time_limit),
                 "default_time": _parse_time_limit(time_limit),
                 "node_types": set(),
                 "node_count": 0,
                 "is_default": is_default,
+                "has_healthy_node": False,
+                "last_unhealthy_state": "down",
             }
 
         # Use a hashable representation for deduplication
@@ -324,18 +326,22 @@ def _parse_sinfo(output: str) -> list[Partition]:
         if is_default:
             partition_data[partition_name]["is_default"] = True
 
-        # Use worst state for partition (if any node is down, note it)
-        # Priority: up > drain > down
-        current_state = partition_data[partition_name]["state"]
-        if state.lower() not in ("idle", "mixed", "allocated", "completing"):
-            if current_state.lower() in ("idle", "mixed", "allocated", "completing"):
-                pass  # keep the healthy state as partition state
-            else:
-                partition_data[partition_name]["state"] = state
+        # Track node health: partition is "up" if ANY node is schedulable
+        if state.lower() in ("idle", "mixed", "allocated", "completing", "planned"):
+            partition_data[partition_name]["has_healthy_node"] = True
+        else:
+            partition_data[partition_name]["last_unhealthy_state"] = state
 
     # Build Partition objects
     partitions = []
     for name, data in partition_data.items():
+        # Partition state: "up" if any node is healthy, otherwise report
+        # the last observed unhealthy state
+        if data["has_healthy_node"]:
+            partition_state = "up"
+        else:
+            partition_state = data["last_unhealthy_state"]
+
         node_types = [
             NodeType(
                 cpus=cpus,
@@ -352,7 +358,7 @@ def _parse_sinfo(output: str) -> list[Partition]:
         partitions.append(
             Partition(
                 name=name,
-                state=data["state"],
+                state=partition_state,
                 max_time=data["max_time"],
                 default_time=data["default_time"],
                 node_types=node_types,
@@ -562,14 +568,8 @@ def select_partition(
     candidates: list[Partition] = []
 
     for partition in cluster.partitions:
-        # Skip non-up partitions
-        if partition.state.lower() not in (
-            "up",
-            "idle",
-            "mixed",
-            "allocated",
-            "completing",
-        ):
+        # Skip partitions with no schedulable nodes
+        if partition.state.lower() != "up":
             continue
 
         # Check if any node type meets requirements

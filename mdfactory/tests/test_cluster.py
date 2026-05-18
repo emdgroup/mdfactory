@@ -50,6 +50,19 @@ SINFO_OUTPUT_NO_TYPE_GPU = """\
 gpu node001 64 256000 gpu:4 (null) 1-00:00:00 idle
 """
 
+# First node drained, rest healthy → partition should be "up"
+SINFO_OUTPUT_MIXED_HEALTH = """\
+cpu node001 64 128000 (null) (null) 2-00:00:00 drained
+cpu node002 64 128000 (null) (null) 2-00:00:00 idle
+cpu node003 64 128000 (null) (null) 2-00:00:00 idle
+"""
+
+# All nodes unhealthy → partition should report unhealthy state
+SINFO_OUTPUT_ALL_DOWN = """\
+cpu node001 64 128000 (null) (null) 2-00:00:00 down
+cpu node002 64 128000 (null) (null) 2-00:00:00 drained
+"""
+
 SACCTMGR_ACCOUNTS = """\
 myproject
 shared-account
@@ -182,6 +195,19 @@ class TestParseSinfo:
         nt = partitions[0].node_types[0]
         assert nt.gpus == 4
         assert nt.gpu_type is None
+
+    def test_partition_state_up_when_any_node_healthy(self):
+        """Partition with mixed healthy/unhealthy nodes should be 'up'."""
+        partitions = _parse_sinfo(SINFO_OUTPUT_MIXED_HEALTH)
+        assert len(partitions) == 1
+        assert partitions[0].state == "up"
+
+    def test_partition_state_unhealthy_when_all_nodes_down(self):
+        """Partition with no healthy nodes reports unhealthy state."""
+        partitions = _parse_sinfo(SINFO_OUTPUT_ALL_DOWN)
+        assert len(partitions) == 1
+        assert partitions[0].state != "up"
+        assert partitions[0].state in ("down", "drained")
 
     def test_empty_output(self):
         partitions = _parse_sinfo("")
@@ -394,6 +420,13 @@ class TestSelectPartition:
         result = select_partition(cluster, needs_gpu=True, min_cpus=90)
         assert result is not None
         assert result.name == "gpu"
+
+    def test_skips_down_partitions(self):
+        """Partitions where all nodes are down are not selectable."""
+        partitions = _parse_sinfo(SINFO_OUTPUT_ALL_DOWN)
+        cluster = ClusterInfo(partitions=partitions)
+        result = select_partition(cluster)
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
