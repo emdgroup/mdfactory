@@ -285,6 +285,7 @@ class TestDiscoverCluster:
                     SINFO_OUTPUT_MIXED,  # sinfo call
                     SACCTMGR_ACCOUNTS,  # sacctmgr accounts
                     SACCTMGR_QOS,  # sacctmgr qos
+                    "myproject",  # sacctmgr default account
                 ],
             ),
         ):
@@ -295,6 +296,28 @@ class TestDiscoverCluster:
         assert len(result.partitions) == 3
         assert len(result.accounts) == 3
         assert len(result.qos_policies) == 3
+        assert result.default_account == "myproject"
+
+    def test_default_account_falls_back_to_first(self):
+        """When default account query fails, fall back to first account."""
+        with (
+            patch(
+                "mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"
+            ),
+            patch(
+                "mdfactory.performance.cluster._run_command",
+                side_effect=[
+                    SINFO_OUTPUT_MIXED,  # sinfo call
+                    SACCTMGR_ACCOUNTS,  # sacctmgr accounts
+                    SACCTMGR_QOS,  # sacctmgr qos
+                    None,  # sacctmgr default account fails
+                ],
+            ),
+        ):
+            result = discover_cluster()
+
+        assert result is not None
+        # Falls back to first alphabetical account
         assert result.default_account == "default-account"
 
     def test_graceful_without_sacctmgr(self):
@@ -309,6 +332,7 @@ class TestDiscoverCluster:
                     SINFO_OUTPUT_MIXED,  # sinfo succeeds
                     None,  # sacctmgr accounts fails
                     None,  # sacctmgr qos fails
+                    None,  # sacctmgr default account fails
                 ],
             ),
         ):
@@ -332,6 +356,7 @@ class TestDiscoverCluster:
                     SINFO_OUTPUT_SINGLE_PARTITION,
                     None,
                     None,
+                    None,
                 ],
             ) as mock_cmd,
         ):
@@ -339,8 +364,8 @@ class TestDiscoverCluster:
             result2 = discover_cluster()
 
         assert result1 is result2
-        # _run_command should only be called once (3 calls total for 1 discover)
-        assert mock_cmd.call_count == 3
+        # _run_command called 4 times for 1 discover (sinfo, accounts, qos, default_account)
+        assert mock_cmd.call_count == 4
 
     def test_returns_none_when_sinfo_fails(self):
         """If sinfo exists but returns error, return None."""

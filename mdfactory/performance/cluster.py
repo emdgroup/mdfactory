@@ -484,6 +484,34 @@ def _discover_qos() -> list[str] | None:
     return _parse_qos(output)
 
 
+def _discover_default_account() -> str | None:
+    """Query sacctmgr for the current user's default SLURM account.
+
+    Returns
+    -------
+    str or None
+        The user's default account, or None if unavailable.
+    """
+    user = os.environ.get("USER", os.environ.get("LOGNAME", ""))
+    if not user:
+        return None
+    output = _run_command(
+        [
+            "sacctmgr",
+            "show",
+            "user",
+            user,
+            "format=DefaultAccount",
+            "--noheader",
+            "--parsable2",
+        ]
+    )
+    if output is None:
+        return None
+    account = output.strip().splitlines()[0].strip() if output.strip() else None
+    return account if account else None
+
+
 @functools.lru_cache(maxsize=1)
 def discover_cluster() -> ClusterInfo | None:
     """Query SLURM and return structured cluster information.
@@ -520,7 +548,10 @@ def discover_cluster() -> ClusterInfo | None:
     accounts = _discover_accounts() or []
     qos_policies = _discover_qos() or []
 
-    default_account = accounts[0] if accounts else None
+    # Query the real SLURM default account; fall back to first available
+    default_account = _discover_default_account()
+    if default_account is None and accounts:
+        default_account = accounts[0]
 
     return ClusterInfo(
         partitions=partitions,
