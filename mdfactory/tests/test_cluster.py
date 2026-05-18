@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +17,7 @@ from mdfactory.performance.cluster import (
     _parse_gres,
     _parse_qos,
     _parse_sinfo,
+    _run_command,
     discover_cluster,
     select_partition,
 )
@@ -520,3 +522,48 @@ class TestDataclasses:
         assert ci.accounts == []
         assert ci.qos_policies == []
         assert ci.default_account is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: _run_command edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestRunCommand:
+    """Test _run_command timeout and error handling."""
+
+    def test_returns_none_on_timeout(self):
+        with patch(
+            "mdfactory.performance.cluster.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["sinfo"], timeout=30),
+        ):
+            result = _run_command(["sinfo", "--version"])
+        assert result is None
+
+    def test_returns_none_on_file_not_found(self):
+        with patch(
+            "mdfactory.performance.cluster.subprocess.run",
+            side_effect=FileNotFoundError("No such file"),
+        ):
+            result = _run_command(["nonexistent_binary"])
+        assert result is None
+
+    def test_returns_none_on_nonzero_exit(self):
+        with patch(
+            "mdfactory.performance.cluster.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["sinfo"], returncode=1, stdout="", stderr="error"
+            ),
+        ):
+            result = _run_command(["sinfo", "--bad-flag"])
+        assert result is None
+
+    def test_returns_stdout_on_success(self):
+        with patch(
+            "mdfactory.performance.cluster.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["echo"], returncode=0, stdout="hello\n", stderr=""
+            ),
+        ):
+            result = _run_command(["echo", "hello"])
+        assert result == "hello"
