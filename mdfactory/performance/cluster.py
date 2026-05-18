@@ -68,7 +68,8 @@ class Partition:
     max_time : str
         Maximum walltime (SLURM format, e.g., ``"3-00:00:00"``).
     default_time : str
-        Default walltime if none specified.
+        Default walltime assigned when user does not specify one.
+        Populated from sinfo ``%L``; equals ``max_time`` on legacy output.
     node_types : list of NodeType
         Distinct hardware configurations available in this partition.
     total_nodes : int
@@ -248,9 +249,13 @@ def _parse_sinfo(output: str) -> list[Partition]:
     """Parse sinfo output into Partition objects.
 
     Expects output from:
-        sinfo -N --noheader -o "%P %n %c %m %G %f %l %T"
+        sinfo -N --noheader -o "%P %n %c %m %G %f %l %L %T"
 
-    Fields: Partition, NodeName, CPUs, Memory(MB), GRES, Features, TimeLimit, State
+    Fields: Partition, NodeName, CPUs, Memory(MB), GRES, Features,
+            MaxTimeLimit, DefaultTimeLimit, State
+
+    Also supports the legacy 8-field format (without %L) for backward
+    compatibility — in that case ``default_time`` equals ``max_time``.
 
     Parameters
     ----------
@@ -271,17 +276,28 @@ def _parse_sinfo(output: str) -> list[Partition]:
             continue
 
         parts = line.split()
-        if len(parts) < 8:
+        if len(parts) >= 9:
+            # 9-field format: %P %n %c %m %G %f %l %L %T
+            partition_name = parts[0]
+            cpus_str = parts[2]
+            mem_str = parts[3]
+            gres_str = parts[4]
+            features_str = parts[5]
+            max_time = parts[6]
+            default_time = parts[7]
+            state = parts[8]
+        elif len(parts) == 8:
+            # Legacy 8-field format (no %L): default_time = max_time
+            partition_name = parts[0]
+            cpus_str = parts[2]
+            mem_str = parts[3]
+            gres_str = parts[4]
+            features_str = parts[5]
+            max_time = parts[6]
+            default_time = parts[6]
+            state = parts[7]
+        else:
             continue
-
-        partition_name = parts[0]
-        # node_name = parts[1]  # not stored but could be useful for debugging
-        cpus_str = parts[2]
-        mem_str = parts[3]
-        gres_str = parts[4]
-        features_str = parts[5]
-        time_limit = parts[6]
-        state = parts[7]
 
         # Handle default partition marker (trailing asterisk)
         is_default = partition_name.endswith("*")
@@ -298,18 +314,10 @@ def _parse_sinfo(output: str) -> list[Partition]:
         gpus, gpu_type = _parse_gres(gres_str)
         features = _parse_features(features_str)
 
-        node_type = NodeType(
-            cpus=cpus,
-            memory_mb=memory_mb,
-            gpus=gpus,
-            gpu_type=gpu_type,
-            features=features,
-        )
-
         if partition_name not in partition_data:
             partition_data[partition_name] = {
-                "max_time": _parse_time_limit(time_limit),
-                "default_time": _parse_time_limit(time_limit),
+                "max_time": _parse_time_limit(max_time),
+                "default_time": _parse_time_limit(default_time),
                 "node_types": set(),
                 "node_count": 0,
                 "is_default": is_default,
@@ -427,7 +435,7 @@ def _discover_partitions() -> list[Partition] | None:
         Parsed partitions, or None if sinfo is unavailable.
     """
     output = _run_command(
-        ["sinfo", "-N", "--noheader", "-o", "%P %n %c %m %G %f %l %T"]
+        ["sinfo", "-N", "--noheader", "-o", "%P %n %c %m %G %f %l %L %T"]
     )
     if output is None:
         return None

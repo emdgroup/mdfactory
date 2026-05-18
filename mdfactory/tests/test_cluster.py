@@ -25,42 +25,49 @@ from mdfactory.performance.cluster import (
 # Fixtures: realistic sinfo / sacctmgr output
 # ---------------------------------------------------------------------------
 
+# 9-field format: Partition Node CPUs Mem GRES Features MaxTime DefTime State
 SINFO_OUTPUT_MIXED = """\
-cpu* node001 128 512000 (null) epyc9555,avx512 3-00:00:00 idle
-cpu* node002 128 512000 (null) epyc9555,avx512 3-00:00:00 mixed
-cpu* node003 128 512000 (null) epyc9555,avx512 3-00:00:00 allocated
-gpu node010 64 256000 gpu:a100:4 a100,nvlink 1-00:00:00 idle
-gpu node011 64 256000 gpu:a100:4 a100,nvlink 1-00:00:00 idle
-gpu node012 96 512000 gpu:h100:8 h100,nvlink 1-00:00:00 mixed
-bigmem node020 256 2048000 (null) bigmem,epyc 7-00:00:00 idle
+cpu* node001 128 512000 (null) epyc9555,avx512 3-00:00:00 1-00:00:00 idle
+cpu* node002 128 512000 (null) epyc9555,avx512 3-00:00:00 1-00:00:00 mixed
+cpu* node003 128 512000 (null) epyc9555,avx512 3-00:00:00 1-00:00:00 allocated
+gpu node010 64 256000 gpu:a100:4 a100,nvlink 1-00:00:00 4:00:00 idle
+gpu node011 64 256000 gpu:a100:4 a100,nvlink 1-00:00:00 4:00:00 idle
+gpu node012 96 512000 gpu:h100:8 h100,nvlink 1-00:00:00 4:00:00 mixed
+bigmem node020 256 2048000 (null) bigmem,epyc 7-00:00:00 1-00:00:00 idle
 """
 
 SINFO_OUTPUT_SINGLE_PARTITION = """\
-compute node001 64 128000 (null) (null) 2-00:00:00 idle
-compute node002 64 128000 (null) (null) 2-00:00:00 idle
+compute node001 64 128000 (null) (null) 2-00:00:00 1-00:00:00 idle
+compute node002 64 128000 (null) (null) 2-00:00:00 1-00:00:00 idle
 """
 
 SINFO_OUTPUT_GPU_ONLY = """\
-gpu-short node001 32 64000 gpu:v100:2 v100 4:00:00 idle
-gpu-short node002 32 64000 gpu:v100:2 v100 4:00:00 idle
-gpu-long node003 64 128000 gpu:a100:4 a100 2-00:00:00 idle
+gpu-short node001 32 64000 gpu:v100:2 v100 4:00:00 2:00:00 idle
+gpu-short node002 32 64000 gpu:v100:2 v100 4:00:00 2:00:00 idle
+gpu-long node003 64 128000 gpu:a100:4 a100 2-00:00:00 4:00:00 idle
 """
 
 SINFO_OUTPUT_NO_TYPE_GPU = """\
-gpu node001 64 256000 gpu:4 (null) 1-00:00:00 idle
+gpu node001 64 256000 gpu:4 (null) 1-00:00:00 4:00:00 idle
 """
 
 # First node drained, rest healthy → partition should be "up"
 SINFO_OUTPUT_MIXED_HEALTH = """\
-cpu node001 64 128000 (null) (null) 2-00:00:00 drained
-cpu node002 64 128000 (null) (null) 2-00:00:00 idle
-cpu node003 64 128000 (null) (null) 2-00:00:00 idle
+cpu node001 64 128000 (null) (null) 2-00:00:00 1-00:00:00 drained
+cpu node002 64 128000 (null) (null) 2-00:00:00 1-00:00:00 idle
+cpu node003 64 128000 (null) (null) 2-00:00:00 1-00:00:00 idle
 """
 
 # All nodes unhealthy → partition should report unhealthy state
 SINFO_OUTPUT_ALL_DOWN = """\
-cpu node001 64 128000 (null) (null) 2-00:00:00 down
-cpu node002 64 128000 (null) (null) 2-00:00:00 drained
+cpu node001 64 128000 (null) (null) 2-00:00:00 1-00:00:00 down
+cpu node002 64 128000 (null) (null) 2-00:00:00 1-00:00:00 drained
+"""
+
+# Legacy 8-field format (no %L default time) — backward compatibility
+SINFO_OUTPUT_LEGACY_8FIELD = """\
+compute node001 64 128000 (null) (null) 2-00:00:00 idle
+compute node002 64 128000 (null) (null) 2-00:00:00 idle
 """
 
 SACCTMGR_ACCOUNTS = """\
@@ -195,6 +202,24 @@ class TestParseSinfo:
         nt = partitions[0].node_types[0]
         assert nt.gpus == 4
         assert nt.gpu_type is None
+
+    def test_default_time_parsed_separately(self):
+        partitions = _parse_sinfo(SINFO_OUTPUT_MIXED)
+        cpu_part = next(p for p in partitions if p.name == "cpu")
+        assert cpu_part.max_time == "3-00:00:00"
+        assert cpu_part.default_time == "1-00:00:00"
+
+        gpu_part = next(p for p in partitions if p.name == "gpu")
+        assert gpu_part.max_time == "1-00:00:00"
+        assert gpu_part.default_time == "4:00:00"
+
+    def test_legacy_8field_format(self):
+        """Parser handles legacy 8-field sinfo output (no %L)."""
+        partitions = _parse_sinfo(SINFO_OUTPUT_LEGACY_8FIELD)
+        assert len(partitions) == 1
+        assert partitions[0].name == "compute"
+        # default_time falls back to max_time
+        assert partitions[0].default_time == partitions[0].max_time
 
     def test_partition_state_up_when_any_node_healthy(self):
         """Partition with mixed healthy/unhealthy nodes should be 'up'."""
