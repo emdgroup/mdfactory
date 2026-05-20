@@ -1261,8 +1261,7 @@ def analysis_run(
             )
         except RuntimeError as e:
             raise ValueError(
-                f"SLURM autodiscovery failed: {e}\n"
-                "Please specify --account explicitly."
+                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
             ) from e
     else:
         slurm_cfg = SlurmConfig(
@@ -1582,8 +1581,7 @@ def analysis_artifacts_run(
             )
         except RuntimeError as e:
             raise ValueError(
-                f"SLURM autodiscovery failed: {e}\n"
-                "Please specify --account explicitly."
+                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
             ) from e
     else:
         slurm_cfg = SlurmConfig(

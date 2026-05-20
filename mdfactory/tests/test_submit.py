@@ -515,9 +515,7 @@ class TestSlurmConfigFromCluster:
             max_time="2-00:00:00",
             default_time="1:00:00",
             node_types=[
-                cluster_mod.NodeType(
-                    cpus=32, memory_mb=128 * 1024, gpus=4, gpu_type="a100"
-                )
+                cluster_mod.NodeType(cpus=32, memory_mb=128 * 1024, gpus=4, gpu_type="a100")
             ],
             total_nodes=20,
             is_default=False,
