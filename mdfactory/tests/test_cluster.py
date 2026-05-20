@@ -22,7 +22,6 @@ from mdfactory.performance.cluster import (
     select_partition,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures: realistic sinfo / sacctmgr output
 # ---------------------------------------------------------------------------
@@ -303,9 +302,7 @@ class TestDiscoverCluster:
 
     def test_returns_cluster_info_with_sinfo(self):
         with (
-            patch(
-                "mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"
-            ),
+            patch("mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"),
             patch(
                 "mdfactory.performance.cluster._run_command",
                 side_effect=[
@@ -328,9 +325,7 @@ class TestDiscoverCluster:
     def test_default_account_falls_back_to_first(self):
         """When default account query fails, fall back to first account."""
         with (
-            patch(
-                "mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"
-            ),
+            patch("mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"),
             patch(
                 "mdfactory.performance.cluster._run_command",
                 side_effect=[
@@ -350,9 +345,7 @@ class TestDiscoverCluster:
     def test_graceful_without_sacctmgr(self):
         """When sacctmgr fails, still return partitions."""
         with (
-            patch(
-                "mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"
-            ),
+            patch("mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"),
             patch(
                 "mdfactory.performance.cluster._run_command",
                 side_effect=[
@@ -374,9 +367,7 @@ class TestDiscoverCluster:
     def test_caching(self):
         """Second call returns cached result without re-querying."""
         with (
-            patch(
-                "mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"
-            ),
+            patch("mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"),
             patch(
                 "mdfactory.performance.cluster._run_command",
                 side_effect=[
@@ -397,9 +388,7 @@ class TestDiscoverCluster:
     def test_returns_none_when_sinfo_fails(self):
         """If sinfo exists but returns error, return None."""
         with (
-            patch(
-                "mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"
-            ),
+            patch("mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"),
             patch(
                 "mdfactory.performance.cluster._run_command",
                 return_value=None,  # sinfo call fails

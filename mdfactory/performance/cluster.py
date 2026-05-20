@@ -165,8 +165,8 @@ def _parse_gres(gres_str: str) -> tuple[int, str | None]:
         return 0, None
 
     # Handle multiple GRES entries separated by commas
-    for entry in gres_str.split(","):
-        entry = entry.strip()
+    for raw_entry in gres_str.split(","):
+        entry = raw_entry.strip()
         if not entry.startswith("gpu"):
             continue
         parts = entry.split(":")
@@ -270,8 +270,8 @@ def _parse_sinfo(output: str) -> list[Partition]:
     # Collect data per partition
     partition_data: dict[str, dict] = {}
 
-    for line in output.splitlines():
-        line = line.strip()
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
         if not line:
             continue
 
@@ -415,8 +415,8 @@ def _parse_qos(output: str) -> list[str]:
         QOS policy names, sorted.
     """
     qos_names = set()
-    for line in output.splitlines():
-        line = line.strip()
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
         if not line:
             continue
         # Format: Name|MaxWall|MaxTRES
@@ -434,9 +434,7 @@ def _discover_partitions() -> list[Partition] | None:
     list of Partition or None
         Parsed partitions, or None if sinfo is unavailable.
     """
-    output = _run_command(
-        ["sinfo", "-N", "--noheader", "-o", "%P %n %c %m %G %f %l %L %T"]
-    )
+    output = _run_command(["sinfo", "-N", "--noheader", "-o", "%P %n %c %m %G %f %l %L %T"])
     if output is None:
         return None
     return _parse_sinfo(output)
