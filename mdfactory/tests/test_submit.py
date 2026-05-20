@@ -494,7 +494,7 @@ class TestSlurmConfigFromCluster:
         import pytest
 
         with pytest.raises(RuntimeError, match="No suitable partition found"):
-            submit_mod.SlurmConfig.from_cluster(min_cpus=32)
+            submit_mod.SlurmConfig.from_cluster(cpus_per_task=32)
 
     def test_from_cluster_selects_gpu_partition(self, monkeypatch):
         """Test that needs_gpu=True selects GPU partition."""
