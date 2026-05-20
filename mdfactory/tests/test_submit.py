@@ -385,3 +385,153 @@ def test_submit_analyses_slurm_forwards_analysis_kwargs(monkeypatch, tmp_path):
 
     assert len(submitted_kwargs) == 1
     assert submitted_kwargs[0]["analysis_kwargs"] == {"start_ns": 50.0, "stride": 2}
+
+
+# --- SlurmConfig.from_cluster tests ---
+
+
+class TestSlurmConfigFromCluster:
+    """Tests for SlurmConfig.from_cluster() autodiscovery method."""
+
+    def test_from_cluster_success(self, monkeypatch):
+        """Test successful autodiscovery creates correct config."""
+        from mdfactory.performance import cluster as cluster_mod
+
+        # Create mock cluster info
+        mock_partition = cluster_mod.Partition(
+            name="compute",
+            state="up",
+            max_time="3-00:00:00",
+            default_time="1:00:00",
+            node_types=[
+                cluster_mod.NodeType(cpus=32, memory_mb=128 * 1024, gpus=0),
+            ],
+            total_nodes=10,
+            is_default=True,
+        )
+        mock_cluster = cluster_mod.ClusterInfo(
+            partitions=[mock_partition],
+            accounts=["myaccount", "otheraccount"],
+            qos_policies=["normal", "high"],
+            default_account="myaccount",
+        )
+
+        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: mock_cluster)
+
+        config = submit_mod.SlurmConfig.from_cluster(
+            time="4h",
+            cpus_per_task=8,
+            mem_gb=16,
+        )
+
+        assert config.account == "myaccount"
+        assert config.partition == "compute"
+        assert config.time == "4h"
+        assert config.cpus_per_task == 8
+        assert config.mem_gb == 16
+
+    def test_from_cluster_no_slurm_raises(self, monkeypatch):
+        """Test that missing SLURM raises RuntimeError."""
+        from mdfactory.performance import cluster as cluster_mod
+
+        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: None)
+
+        import pytest
+
+        with pytest.raises(RuntimeError, match="not running on a SLURM cluster"):
+            submit_mod.SlurmConfig.from_cluster()
+
+    def test_from_cluster_no_account_raises(self, monkeypatch):
+        """Test that missing default account raises RuntimeError."""
+        from mdfactory.performance import cluster as cluster_mod
+
+        mock_partition = cluster_mod.Partition(
+            name="compute",
+            state="up",
+            max_time="1-00:00:00",
+            default_time="1:00:00",
+            node_types=[cluster_mod.NodeType(cpus=16, memory_mb=64 * 1024)],
+            total_nodes=5,
+            is_default=True,
+        )
+        mock_cluster = cluster_mod.ClusterInfo(
+            partitions=[mock_partition],
+            accounts=[],
+            qos_policies=[],
+            default_account=None,
+        )
+
+        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: mock_cluster)
+
+        import pytest
+
+        with pytest.raises(RuntimeError, match="no default account found"):
+            submit_mod.SlurmConfig.from_cluster()
+
+    def test_from_cluster_no_suitable_partition_raises(self, monkeypatch):
+        """Test that no matching partition raises RuntimeError."""
+        from mdfactory.performance import cluster as cluster_mod
+
+        # Partition with only 4 CPUs - won't match request for 32 CPUs
+        mock_partition = cluster_mod.Partition(
+            name="tiny",
+            state="up",
+            max_time="1:00:00",
+            default_time="0:30:00",
+            node_types=[cluster_mod.NodeType(cpus=4, memory_mb=8 * 1024)],
+            total_nodes=2,
+            is_default=True,
+        )
+        mock_cluster = cluster_mod.ClusterInfo(
+            partitions=[mock_partition],
+            accounts=["myaccount"],
+            qos_policies=[],
+            default_account="myaccount",
+        )
+
+        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: mock_cluster)
+
+        import pytest
+
+        with pytest.raises(RuntimeError, match="No suitable partition found"):
+            submit_mod.SlurmConfig.from_cluster(min_cpus=32)
+
+    def test_from_cluster_selects_gpu_partition(self, monkeypatch):
+        """Test that needs_gpu=True selects GPU partition."""
+        from mdfactory.performance import cluster as cluster_mod
+
+        cpu_partition = cluster_mod.Partition(
+            name="cpu",
+            state="up",
+            max_time="7-00:00:00",
+            default_time="1:00:00",
+            node_types=[cluster_mod.NodeType(cpus=64, memory_mb=256 * 1024, gpus=0)],
+            total_nodes=100,
+            is_default=True,
+        )
+        gpu_partition = cluster_mod.Partition(
+            name="gpu",
+            state="up",
+            max_time="2-00:00:00",
+            default_time="1:00:00",
+            node_types=[
+                cluster_mod.NodeType(
+                    cpus=32, memory_mb=128 * 1024, gpus=4, gpu_type="a100"
+                )
+            ],
+            total_nodes=20,
+            is_default=False,
+        )
+        mock_cluster = cluster_mod.ClusterInfo(
+            partitions=[cpu_partition, gpu_partition],
+            accounts=["myaccount"],
+            qos_policies=[],
+            default_account="myaccount",
+        )
+
+        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: mock_cluster)
+
+        config = submit_mod.SlurmConfig.from_cluster(needs_gpu=True)
+
+        assert config.partition == "gpu"
+        assert config.account == "myaccount"
