@@ -1,0 +1,25 @@
+simulation_type: proteinbox
+engine: gromacs
+parametrization: pdb2gmx
+parametrization_config:
+  type: pdb2gmx
+  forcefield: charmm36m
+  water_model: tip3p
+  ignh: true
+
+system:
+  protein:
+    resname: LYZ
+    count: 1
+    pdb_path: ./1aki.pdb
+    disulfide_bonds:
+      - [6, 127]
+      - [30, 115]
+      - [64, 80]
+      - [76, 94]
+    protonation_states:
+      HIS15: HIE
+  box_padding: 12.0
+  ionization:
+    neutralize: true
+    concentration: 0.15

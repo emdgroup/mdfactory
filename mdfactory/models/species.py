@@ -202,6 +202,8 @@ class LipidSpecies(SingleMoleculeSpecies):
 class ProteinSpecies(Species):
     """Represent a protein species identified by a PDB structure file."""
 
+    count: Optional[int] = Field(1, description="Number of protein copies (always 1).")
+    fraction: Optional[float] = Field(1.0, description="Fraction (always 1.0 for protein).")
     pdb_path: Path = Field(..., description="Path to the input PDB file.")
     disulfide_bonds: list[tuple[int, int]] = Field(
         default_factory=list,
@@ -211,13 +213,6 @@ class ProteinSpecies(Species):
         default_factory=dict,
         description="Residue-specific protonation states, e.g. {'HIS15': 'HIE', 'GLU35': 'GLH'}.",
     )
-
-    @model_validator(mode="after")
-    def set_default_count(self) -> "ProteinSpecies":
-        if self.count is None and self.fraction is None:
-            self.count = 1
-            self.fraction = 1.0
-        return self
 
     @property
     def charge(self) -> int:
