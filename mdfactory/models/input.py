@@ -80,6 +80,10 @@ class BuildInput(BaseModel):
         elif self.simulation_type == "mixedbox":
             system_specific["target_density"] = self.system.target_density
             system_specific["ionization"] = self.system.ionization.model_dump()
+        elif self.simulation_type == "proteinbox":
+            system_specific["box_padding"] = self.system.box_padding
+            system_specific["ionization"] = self.system.ionization.model_dump()
+            system_specific["pdb_path"] = str(self.system.protein.pdb_path)
 
         return {
             "hash": self.hash,

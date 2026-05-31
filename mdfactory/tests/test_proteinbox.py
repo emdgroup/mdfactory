@@ -16,6 +16,7 @@ from mdfactory.models.parametrization import (
 )
 from mdfactory.models.species import ProteinSpecies
 from mdfactory.setup.protein import (
+    _apply_protonation_states,
     _sum_charges_from_itp,
     extract_charge_from_topology,
     update_topology_molecules,
@@ -191,3 +192,42 @@ class TestTopologyParsing:
         assert "10" in content
         assert "CL" in content
         assert "18" in content
+
+    def test_apply_protonation_states(self, tmp_path):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(textwrap.dedent("""\
+            ATOM      1  N   HIS A  15       1.000   2.000   3.000  1.00  0.00
+            ATOM      2  CA  HIS A  15       1.500   2.500   3.500  1.00  0.00
+            ATOM      3  N   ALA A  16       2.000   3.000   4.000  1.00  0.00
+            ATOM      4  N   GLU A  35       3.000   4.000   5.000  1.00  0.00
+        """))
+        result = _apply_protonation_states(
+            pdb, {"HIS15": "HIE", "GLU35": "GLH"}, tmp_path
+        )
+        content = result.read_text()
+        # HIS at resid 15 should be renamed to HIE
+        assert "HIE" in content
+        # GLU at resid 35 should be renamed to GLH
+        assert "GLH" in content
+        # ALA at resid 16 should be unchanged
+        assert "ALA" in content
+
+
+class TestMetadata:
+    def test_proteinbox_metadata(self, tmp_path):
+        pdb = tmp_path / "test.pdb"
+        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+        data = {
+            "simulation_type": "proteinbox",
+            "parametrization": "pdb2gmx",
+            "system": {
+                "protein": {"resname": "LYZ", "count": 1, "pdb_path": str(pdb)},
+                "box_padding": 12.0,
+            },
+        }
+        inp = BuildInput(**data)
+        meta = inp.metadata
+        assert meta["simulation_type"] == "proteinbox"
+        assert meta["total_count"] == 1
+        assert "box_padding" in meta["system_specific"]
+        assert meta["system_specific"]["box_padding"] == 12.0

@@ -4,6 +4,7 @@
 
 import os
 from functools import partial
+from pathlib import Path
 
 import MDAnalysis as mda
 import numpy as np
@@ -687,6 +688,8 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge):
 @validate_call
 def build_proteinbox(inp: BuildInput):
     """Build a protein-in-waterbox system: clean, parametrize, solvate, ionize, relax."""
+    import shutil
+
     from loguru import logger
 
     from .models.composition import ProteinBoxComposition
@@ -694,7 +697,6 @@ def build_proteinbox(inp: BuildInput):
     from .setup.protein import (
         check_gmx_available,
         clean_pdb,
-        extract_charge_from_topology,
         run_pdb2gmx,
         update_topology_molecules,
         validate_with_grompp,
@@ -760,8 +762,6 @@ def build_proteinbox(inp: BuildInput):
     n_water_final = len(u_ionized.select_atoms("water").residues)
 
     # 7. Update topology [ molecules ] section
-    import shutil
-
     topology_dest = Path("topology.top")
     shutil.copy(params.topology_file, topology_dest)
     shutil.copy(params.position_restraint_file, Path("posre.itp"))

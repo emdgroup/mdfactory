@@ -389,3 +389,18 @@ class ProteinBoxComposition(BaseModel):
     ionization: IonizationConfig = Field(
         default_factory=IonizationConfig, description="Configuration for ionization."
     )
+
+    @property
+    def species(self) -> list[ProteinSpecies]:
+        """Return protein as a single-element species list for metadata compatibility."""
+        return [self.protein]
+
+    @property
+    def total_count(self) -> int:
+        """Return 1 (one protein) for metadata compatibility."""
+        return 1
+
+    @property
+    def charge(self) -> int:
+        """Protein charge is not pre-computable; return 0 as placeholder."""
+        return 0

@@ -11,6 +11,70 @@ from loguru import logger
 from ..models.parametrization import GromacsProteinParameterSet, Pdb2gmxConfig
 
 
+def _apply_protonation_states(
+    pdb_path: Path, protonation_states: dict[str, str], output_dir: Path
+) -> Path:
+    """Apply protonation state overrides by renaming residues in the PDB.
+
+    pdb2gmx selects protonation states based on residue names (e.g. HIS -> HID/HIE/HIP
+    for CHARMM, ASP -> ASPP for protonated aspartate). This function renames matching
+    residues in the PDB so pdb2gmx applies the correct parameters without interactive
+    prompts.
+
+    Parameters
+    ----------
+    pdb_path : Path
+        Input PDB file (absolute path).
+    protonation_states : dict[str, str]
+        Mapping of "RESNAME<resid>" to target residue name, e.g.
+        {"HIS15": "HID", "GLU35": "GLH"}.
+    output_dir : Path
+        Directory for the modified PDB.
+
+    Returns
+    -------
+    Path
+        Path to the modified PDB file.
+
+    """
+    import re
+
+    output_pdb = output_dir / "protonation_adjusted.pdb"
+
+    # Parse overrides: "HIS15" -> (original_resname_prefix="HIS", resid=15, new_name="HID")
+    overrides = []
+    for key, new_name in protonation_states.items():
+        match = re.match(r"([A-Za-z]+)(\d+)", key)
+        if not match:
+            raise ValueError(
+                f"Invalid protonation state key '{key}'. "
+                "Expected format: RESNAME<resid>, e.g. 'HIS15'."
+            )
+        resname_prefix = match.group(1).upper()
+        resid = int(match.group(2))
+        overrides.append((resname_prefix, resid, new_name.upper()))
+
+    with open(pdb_path) as f_in, open(output_pdb, "w") as f_out:
+        for line in f_in:
+            if line.startswith(("ATOM", "HETATM")) and len(line) >= 26:
+                current_resname = line[17:20].strip()
+                try:
+                    current_resid = int(line[22:26].strip())
+                except ValueError:
+                    f_out.write(line)
+                    continue
+
+                for prefix, target_resid, new_name in overrides:
+                    if current_resname.startswith(prefix) and current_resid == target_resid:
+                        padded = f"{new_name:<3s}"
+                        line = line[:17] + padded + line[20:]
+                        break
+            f_out.write(line)
+
+    logger.info(f"Protonation states applied: {protonation_states}")
+    return output_pdb
+
+
 def check_gmx_available() -> Path:
     """Verify that the GROMACS gmx binary is available on PATH.
 
@@ -97,6 +161,10 @@ def run_pdb2gmx(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resolve all paths to absolute to avoid cwd confusion with subprocess
+    pdb_path = pdb_path.resolve()
+    output_dir = output_dir.resolve()
+
     structure_file = output_dir / "processed.gro"
     topology_file = output_dir / "topol.top"
     posre_file = output_dir / "posre.itp"
@@ -119,6 +187,12 @@ def run_pdb2gmx(
 
     if disulfide_bonds:
         cmd.append("-ss")
+
+    # Apply protonation state overrides by renaming residues in the PDB
+    # before pdb2gmx processes it (standard approach for CHARMM/AMBER FFs)
+    if protonation_states:
+        pdb_path = _apply_protonation_states(pdb_path, protonation_states, output_dir)
+        cmd[cmd.index("-f") + 1] = str(pdb_path)
 
     logger.info(f"Running pdb2gmx: {' '.join(cmd)}")
 
