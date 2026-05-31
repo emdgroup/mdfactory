@@ -17,10 +17,20 @@ from mdfactory.models.parametrization import (
 from mdfactory.models.species import ProteinSpecies
 from mdfactory.setup.protein import (
     _apply_protonation_states,
+    _build_disulfide_prompt_input,
     _sum_charges_from_itp,
+    check_forcefield_available,
     extract_charge_from_topology,
+    run_pdb2gmx,
     update_topology_molecules,
 )
+
+
+def _pdb_atom(serial, atom_name, resname, resid, x, y, z):
+    return (
+        f"ATOM  {serial:5d} {atom_name:<4s} {resname:>3s} A{resid:4d}    "
+        f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00\n"
+    )
 
 
 class TestProteinSpecies:
@@ -98,6 +108,20 @@ class TestPdb2gmxConfig:
         config = Pdb2gmxConfig()
         with pytest.raises(Exception):
             config.forcefield = "other"
+
+
+class TestForceFieldCheck:
+    def test_available_forcefield_passes(self):
+        check_forcefield_available("charmm27")
+
+    def test_unavailable_forcefield_raises(self):
+        with pytest.raises(ValueError, match="not found"):
+            check_forcefield_available("nonexistent_ff_xyz")
+
+    def test_error_lists_available_forcefields(self):
+        with pytest.raises(ValueError, match="charmm27") as exc_info:
+            check_forcefield_available("nonexistent_ff_xyz")
+        assert "Available force fields" in str(exc_info.value)
 
 
 class TestBuildInputProteinbox:
@@ -211,6 +235,92 @@ class TestTopologyParsing:
         assert "GLH" in content
         # ALA at resid 16 should be unchanged
         assert "ALA" in content
+
+    def test_apply_protonation_states_translates_charmm_histidine_alias(self, tmp_path):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(_pdb_atom(1, "N", "HIS", 15, 1.0, 2.0, 3.0))
+        result = _apply_protonation_states(
+            pdb, {"HIS15": "HIE"}, tmp_path, forcefield="charmm36m"
+        )
+        assert "HSE" in result.read_text()
+
+    def test_apply_protonation_states_rejects_four_character_names(self, tmp_path):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(_pdb_atom(1, "N", "GLU", 35, 1.0, 2.0, 3.0))
+        with pytest.raises(ValueError, match="cannot be written to PDB"):
+            _apply_protonation_states(pdb, {"GLU35": "GLUP"}, tmp_path)
+
+    def test_build_disulfide_prompt_input_answers_exact_requested_pairs(self, tmp_path):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(
+            "".join(
+                [
+                    _pdb_atom(1, "SG", "CYS", 1, 0.0, 0.0, 0.0),
+                    _pdb_atom(2, "SG", "CYS", 4, 2.0, 0.0, 0.0),
+                    _pdb_atom(3, "SG", "CYS", 2, 10.0, 0.0, 0.0),
+                    _pdb_atom(4, "SG", "CYS", 3, 12.0, 0.0, 0.0),
+                ]
+            )
+        )
+        assert _build_disulfide_prompt_input(pdb, [(2, 3)]) == "n\ny\n"
+
+    def test_build_disulfide_prompt_input_rejects_missing_pair(self, tmp_path):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(
+            "".join(
+                [
+                    _pdb_atom(1, "SG", "CYS", 6, 0.0, 0.0, 0.0),
+                    _pdb_atom(2, "SG", "CYS", 127, 8.0, 0.0, 0.0),
+                ]
+            )
+        )
+        with pytest.raises(ValueError, match="not detected as close CYS SG pairs"):
+            _build_disulfide_prompt_input(pdb, [(6, 127)])
+
+    def test_run_pdb2gmx_passes_disulfide_answers_to_subprocess(self, tmp_path, monkeypatch):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(
+            "".join(
+                [
+                    _pdb_atom(1, "SG", "CYS", 1, 0.0, 0.0, 0.0),
+                    _pdb_atom(2, "SG", "CYS", 4, 2.0, 0.0, 0.0),
+                    _pdb_atom(3, "SG", "CYS", 2, 10.0, 0.0, 0.0),
+                    _pdb_atom(4, "SG", "CYS", 3, 12.0, 0.0, 0.0),
+                ]
+            )
+        )
+        calls = {}
+
+        def fake_run(cmd, cwd, text, input, capture_output, timeout):
+            calls["cmd"] = cmd
+            calls["cwd"] = cwd
+            calls["input"] = input
+            output_dir = Path(cwd)
+            (output_dir / "processed.gro").write_text("mock gro\n")
+            (output_dir / "topol.top").write_text("[ atoms ]\n")
+            (output_dir / "posre.itp").write_text("mock posre\n")
+
+            class Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return Result()
+
+        monkeypatch.setattr("mdfactory.setup.protein.subprocess.run", fake_run)
+        monkeypatch.setattr("mdfactory.setup.protein.check_forcefield_available", lambda ff: None)
+
+        run_pdb2gmx(
+            pdb_path=pdb,
+            config=Pdb2gmxConfig(forcefield="amber99sb-ildn", water_model="tip3p"),
+            disulfide_bonds=[(2, 3)],
+            protonation_states={},
+            output_dir=tmp_path / "pdb2gmx_output",
+        )
+
+        assert "-ss" in calls["cmd"]
+        assert calls["input"] == "n\ny\n"
+        assert calls["cwd"] == str((tmp_path / "pdb2gmx_output").resolve())
 
 
 class TestMetadata:

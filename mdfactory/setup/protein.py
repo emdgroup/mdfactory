@@ -2,6 +2,7 @@
 # ABOUTME: Wraps PDBFixer for cleaning and gmx pdb2gmx for topology generation
 """Protein preparation utilities for the proteinbox simulation type."""
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -10,16 +11,115 @@ from loguru import logger
 
 from ..models.parametrization import GromacsProteinParameterSet, Pdb2gmxConfig
 
+_DISULFIDE_CUTOFF_ANGSTROM = 2.2
+
+
+def _resolve_protonation_residue_name(residue_name: str, forcefield: str | None) -> str:
+    """Return the residue name to write into the PDB for a protonation override."""
+    residue_name = residue_name.upper()
+    if forcefield and forcefield.lower().startswith("charmm"):
+        residue_name = {
+            "HID": "HSD",
+            "HIE": "HSE",
+            "HIP": "HSP",
+        }.get(residue_name, residue_name)
+
+    if len(residue_name) != 3:
+        raise ValueError(
+            f"Protonation residue name '{residue_name}' cannot be written to PDB "
+            "without shifting columns. Use a 3-character residue name supported by "
+            "the selected force field."
+        )
+    return residue_name
+
+
+def _distance(coords_a: tuple[float, float, float], coords_b: tuple[float, float, float]) -> float:
+    return sum((a - b) ** 2 for a, b in zip(coords_a, coords_b, strict=True)) ** 0.5
+
+
+def _read_cysteine_sg_atoms(pdb_path: Path) -> dict[int, tuple[float, float, float]]:
+    """Read cysteine SG atom coordinates keyed by residue id."""
+    atoms: dict[int, tuple[float, float, float]] = {}
+    duplicate_resids = set()
+
+    with open(pdb_path) as f:
+        for line in f:
+            if not line.startswith(("ATOM", "HETATM")) or len(line) < 54:
+                continue
+
+            atom_name = line[12:16].strip()
+            resname = line[17:20].strip()
+            if atom_name != "SG" or resname not in {"CYS", "CYM", "CYX"}:
+                continue
+
+            resid = int(line[22:26].strip())
+            coords = (
+                float(line[30:38].strip()),
+                float(line[38:46].strip()),
+                float(line[46:54].strip()),
+            )
+            if resid in atoms:
+                duplicate_resids.add(resid)
+            atoms[resid] = coords
+
+    if duplicate_resids:
+        raise ValueError(
+            "Disulfide bond overrides use residue ids only and cannot disambiguate "
+            f"duplicate cysteine residue ids: {sorted(duplicate_resids)}."
+        )
+    return atoms
+
+
+def _build_disulfide_prompt_input(
+    pdb_path: Path,
+    disulfide_bonds: list[tuple[int, int]],
+    cutoff_angstrom: float = _DISULFIDE_CUTOFF_ANGSTROM,
+) -> str:
+    """Build deterministic yes/no input for pdb2gmx disulfide prompts."""
+    requested = {tuple(sorted(pair)) for pair in disulfide_bonds}
+    for pair in requested:
+        if pair[0] == pair[1]:
+            raise ValueError(f"Invalid disulfide bond with identical residues: {pair}")
+
+    sg_atoms = _read_cysteine_sg_atoms(pdb_path)
+    missing_resids = sorted({resid for pair in requested for resid in pair if resid not in sg_atoms})
+    if missing_resids:
+        raise ValueError(
+            f"Requested disulfide residues are not cysteine SG atoms in {pdb_path}: "
+            f"{missing_resids}"
+        )
+
+    candidate_pairs = []
+    resids = sorted(sg_atoms)
+    for i, resid_a in enumerate(resids):
+        for resid_b in resids[i + 1 :]:
+            if _distance(sg_atoms[resid_a], sg_atoms[resid_b]) <= cutoff_angstrom:
+                candidate_pairs.append((resid_a, resid_b))
+
+    missing_pairs = sorted(requested - set(candidate_pairs))
+    if missing_pairs:
+        raise ValueError(
+            "Requested disulfide bonds were not detected as close CYS SG pairs "
+            f"within {cutoff_angstrom:.1f} A in {pdb_path}: {missing_pairs}"
+        )
+
+    answers = ["y" if pair in requested else "n" for pair in candidate_pairs]
+    logger.info(f"pdb2gmx disulfide candidates: {candidate_pairs}; requested: {sorted(requested)}")
+    return "\n".join(answers) + "\n"
+
 
 def _apply_protonation_states(
-    pdb_path: Path, protonation_states: dict[str, str], output_dir: Path
+    pdb_path: Path,
+    protonation_states: dict[str, str],
+    output_dir: Path,
+    forcefield: str | None = None,
 ) -> Path:
     """Apply protonation state overrides by renaming residues in the PDB.
 
-    pdb2gmx selects protonation states based on residue names (e.g. HIS -> HID/HIE/HIP
-    for CHARMM, ASP -> ASPP for protonated aspartate). This function renames matching
-    residues in the PDB so pdb2gmx applies the correct parameters without interactive
-    prompts.
+    pdb2gmx selects protonation states based on residue names. This function renames
+    matching residues in the PDB so pdb2gmx applies the requested 3-character residue
+    names without interactive prompts. Common AMBER histidine names are translated to
+    CHARMM names when a CHARMM force field is selected.
 
     Parameters
     ----------
@@ -30,6 +130,8 @@ def _apply_protonation_states(
         {"HIS15": "HID", "GLU35": "GLH"}.
     output_dir : Path
         Directory for the modified PDB.
+    forcefield : str | None
+        Selected pdb2gmx force field, used for force-field-specific aliases.
 
     Returns
     -------
@@ -44,7 +146,7 @@ def _apply_protonation_states(
     # Parse overrides: "HIS15" -> (original_resname_prefix="HIS", resid=15, new_name="HID")
     overrides = []
     for key, new_name in protonation_states.items():
-        match = re.match(r"([A-Za-z]+)(\d+)", key)
+        match = re.fullmatch(r"([A-Za-z]+)(\d+)", key)
         if not match:
             raise ValueError(
                 f"Invalid protonation state key '{key}'. "
@@ -52,7 +154,9 @@ def _apply_protonation_states(
             )
         resname_prefix = match.group(1).upper()
         resid = int(match.group(2))
-        overrides.append((resname_prefix, resid, new_name.upper()))
+        overrides.append(
+            (resname_prefix, resid, _resolve_protonation_residue_name(new_name, forcefield))
+        )
 
     with open(pdb_path) as f_in, open(output_pdb, "w") as f_out:
         for line in f_in:
@@ -96,6 +200,71 @@ def check_gmx_available() -> Path:
             "Ensure GROMACS is installed and 'module load gromacs' has been run."
         )
     return Path(gmx_path)
+
+
+def check_forcefield_available(forcefield: str) -> None:
+    """Verify that the requested force field is findable by GROMACS.
+
+    Searches the GROMACS share directory, GMXLIB paths, and the current
+    working directory for a directory named ``{forcefield}.ff``.
+
+    Parameters
+    ----------
+    forcefield : str
+        Force field name as passed to ``gmx pdb2gmx -ff``.
+
+    Raises
+    ------
+    ValueError
+        If the force field directory is not found, listing available options.
+
+    """
+    ff_dirname = f"{forcefield}.ff"
+    search_paths: list[Path] = []
+
+    # GROMACS data prefix from the binary
+    result = subprocess.run(
+        ["gmx", "--version"],
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    for line in result.stdout.splitlines():
+        if "Data prefix" in line:
+            data_prefix = Path(line.split(":", 1)[1].strip())
+            top_dir = data_prefix / "share" / "gromacs" / "top"
+            if top_dir.is_dir():
+                search_paths.append(top_dir)
+            break
+
+    # GMXLIB environment variable (colon-separated paths)
+    gmxlib = os.environ.get("GMXLIB", "")
+    for p in gmxlib.split(":"):
+        if p and Path(p).is_dir():
+            search_paths.append(Path(p))
+
+    # Current working directory
+    search_paths.append(Path.cwd())
+
+    # Check if the force field exists in any search path
+    for search_dir in search_paths:
+        if (search_dir / ff_dirname).is_dir():
+            return
+
+    # Not found — collect available force fields for the error message
+    available = set()
+    for search_dir in search_paths:
+        if search_dir.is_dir():
+            for entry in search_dir.iterdir():
+                if entry.is_dir() and entry.name.endswith(".ff"):
+                    available.add(entry.stem)
+
+    raise ValueError(
+        f"Force field '{forcefield}' not found. "
+        f"Searched: {[str(p) for p in search_paths]}.\n"
+        f"Available force fields: {sorted(available)}.\n"
+        "Install the force field to a search path or set GMXLIB."
+    )
 
 
 def clean_pdb(pdb_path: Path, output_path: Path) -> Path:
@@ -159,6 +328,8 @@ def run_pdb2gmx(
         Paths to generated topology, structure, and position restraint files.
 
     """
+    check_forcefield_available(config.forcefield)
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Resolve all paths to absolute to avoid cwd confusion with subprocess
@@ -185,14 +356,18 @@ def run_pdb2gmx(
     if config.merge_all:
         cmd.extend(["-merge", "all"])
 
-    if disulfide_bonds:
-        cmd.append("-ss")
-
     # Apply protonation state overrides by renaming residues in the PDB
     # before pdb2gmx processes it (standard approach for CHARMM/AMBER FFs)
     if protonation_states:
-        pdb_path = _apply_protonation_states(pdb_path, protonation_states, output_dir)
+        pdb_path = _apply_protonation_states(
+            pdb_path, protonation_states, output_dir, forcefield=config.forcefield
+        )
         cmd[cmd.index("-f") + 1] = str(pdb_path)
+
+    pdb2gmx_input = ""
+    if disulfide_bonds:
+        cmd.append("-ss")
+        pdb2gmx_input = _build_disulfide_prompt_input(pdb_path, disulfide_bonds)
 
     logger.info(f"Running pdb2gmx: {' '.join(cmd)}")
 
@@ -200,7 +375,7 @@ def run_pdb2gmx(
         cmd,
         cwd=str(output_dir),
         text=True,
-        input="",
+        input=pdb2gmx_input,
         capture_output=True,
         timeout=120,
     )
@@ -379,9 +554,12 @@ def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) 
         timeout=60,
     )
 
-    # Clean up the check tpr
+    # Clean up grompp artifacts
     if tpr_out.is_file():
         tpr_out.unlink()
+    mdout_path = cwd / "mdout.mdp"
+    if mdout_path.is_file():
+        mdout_path.unlink()
 
     if result.returncode != 0:
         raise RuntimeError(

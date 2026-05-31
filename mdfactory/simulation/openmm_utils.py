@@ -744,12 +744,10 @@ def relax_with_protein_restraints(
     box_vectors = state.getPeriodicBoxVectors()
     simulation.topology.setPeriodicBoxVectors(box_vectors)
 
-    app.PDBFile.writeFile(
-        simulation.topology, positions, open("relaxed_system.pdb", "w"), keepIds=True
-    )
-    app.PDBxFile.writeFile(
-        simulation.topology, positions, open("relaxed_system.mmcif", "w"), keepIds=True
-    )
+    with open("relaxed_system.pdb", "w") as f:
+        app.PDBFile.writeFile(simulation.topology, positions, f, keepIds=True)
+    with open("relaxed_system.mmcif", "w") as f:
+        app.PDBxFile.writeFile(simulation.topology, positions, f, keepIds=True)
 
     u_tmp = mda.Universe(app.PDBxFile("relaxed_system.mmcif"))
     ret = mda.Merge(u.atoms)

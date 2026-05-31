@@ -768,16 +768,19 @@ def build_proteinbox(inp: BuildInput):
     update_topology_molecules(topology_dest, n_water_final, num_na, num_cl)
 
     # 8. Write coordinates for OpenMM relaxation
-    u_ionized.atoms.write("system_pre_relax.pdb")
+    pre_relax_structure = Path("system_pre_relax.pdb").resolve()
+    u_ionized.atoms.write(str(pre_relax_structure))
 
     # 9. OpenMM relaxation with protein position restraints
     protein_atoms = u_ionized.select_atoms("protein and not name H*")
     protein_indices = protein_atoms.indices.tolist()
+    topology_dest = topology_dest.resolve()
+    position_restraint_file = Path("posre.itp").resolve()
 
     with working_directory("relaxation", create=True, cleanup=True) as wd:
-        shutil.copy("system_pre_relax.pdb", wd / "system.pdb")
+        shutil.copy(pre_relax_structure, wd / "system.pdb")
         shutil.copy(topology_dest, wd / "topology.top")
-        shutil.copy("posre.itp", wd / "posre.itp")
+        shutil.copy(position_restraint_file, wd / "posre.itp")
 
         # Copy forcefield directory if referenced by topology
         # pdb2gmx topologies use #include from the GROMACS data dir, so OpenMM
