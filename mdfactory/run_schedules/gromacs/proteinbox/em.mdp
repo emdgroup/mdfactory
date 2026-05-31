@@ -1,0 +1,20 @@
+; Energy minimization parameters for protein systems (CHARMM36m)
+integrator  = steep
+emtol       = 1000.0
+emstep      = 0.01
+nsteps      = 50000
+
+; Neighbor searching
+nstlist         = 1
+cutoff-scheme   = Verlet
+ns_type         = grid
+pbc             = xyz
+
+; Electrostatics and VdW (CHARMM36m settings)
+coulombtype     = PME
+rcoulomb        = 1.2
+rvdw            = 1.2
+vdwtype         = cutoff
+vdw-modifier    = Force-switch
+rvdw-switch     = 1.0
+DispCorr        = no
