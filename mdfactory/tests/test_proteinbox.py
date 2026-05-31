@@ -334,6 +334,9 @@ class TestTopologyParsing:
             return Result()
 
         monkeypatch.setattr("mdfactory.setup.protein.subprocess.run", fake_run)
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.check_gmx_available", lambda: Path("/mock/gmx")
+        )
         monkeypatch.setattr("mdfactory.setup.protein.check_forcefield_available", lambda ff: None)
         monkeypatch.setattr(
             "mdfactory.setup.protein.get_gromacs_env",
@@ -349,6 +352,7 @@ class TestTopologyParsing:
         )
 
         assert "-ss" in calls["cmd"]
+        assert calls["cmd"][:2] == ["/mock/gmx", "pdb2gmx"]
         assert calls["input"] == "n\ny\n"
         assert calls["cwd"] == str((tmp_path / "pdb2gmx_output").resolve())
         assert calls["env"] == {"GMXLIB": "/mock/forcefields"}
