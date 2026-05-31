@@ -291,7 +291,7 @@ class TestTopologyParsing:
         )
         calls = {}
 
-        def fake_run(cmd, cwd, text, input, capture_output, timeout):
+        def fake_run(cmd, cwd, text, input, capture_output, timeout, env=None):
             calls["cmd"] = cmd
             calls["cwd"] = cwd
             calls["input"] = input

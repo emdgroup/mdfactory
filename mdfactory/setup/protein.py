@@ -2,16 +2,38 @@
 # ABOUTME: Wraps PDBFixer for cleaning and gmx pdb2gmx for topology generation
 """Protein preparation utilities for the proteinbox simulation type."""
 
+import io
 import os
 import shutil
 import subprocess
+import tarfile
 from pathlib import Path
+from urllib.request import urlopen
 
 from loguru import logger
 
 from ..models.parametrization import GromacsProteinParameterSet, Pdb2gmxConfig
+from ..settings import get_data_dir
 
 _DISULFIDE_CUTOFF_ANGSTROM = 2.2
+
+FORCEFIELD_REGISTRY: dict[str, dict[str, str]] = {
+    "charmm36m": {
+        "url": "http://mackerell.umaryland.edu/download.php?filename=CHARMM_ff_params_files/charmm36-feb2026_cgenff-5.0.ff.tgz",
+        "dirname": "charmm36-feb2026_cgenff-5.0.ff",
+        "description": "CHARMM36m protein + CGenFF 5.0 (Feb 2026)",
+    },
+    "charmm36m-ljpme": {
+        "url": "http://mackerell.umaryland.edu/download.php?filename=CHARMM_ff_params_files/charmm36-feb2026_ljpme_cgenff-5.0.ff.tgz",
+        "dirname": "charmm36-feb2026_ljpme_cgenff-5.0.ff",
+        "description": "CHARMM36m + CGenFF 5.0, LJ-PME variant (Feb 2026)",
+    },
+}
+
+
+def get_forcefield_dir() -> Path:
+    """Return the directory where downloaded force fields are stored."""
+    return get_data_dir() / "forcefields"
 
 
 def _resolve_protonation_residue_name(residue_name: str, forcefield: str | None) -> str:
@@ -202,27 +224,69 @@ def check_gmx_available() -> Path:
     return Path(gmx_path)
 
 
-def check_forcefield_available(forcefield: str) -> None:
-    """Verify that the requested force field is findable by GROMACS.
-
-    Searches the GROMACS share directory, GMXLIB paths, and the current
-    working directory for a directory named ``{forcefield}.ff``.
+def download_forcefield(name: str) -> Path:
+    """Download a force field from the registry to the local data directory.
 
     Parameters
     ----------
-    forcefield : str
-        Force field name as passed to ``gmx pdb2gmx -ff``.
+    name : str
+        Registry key (e.g. "charmm36m").
+
+    Returns
+    -------
+    Path
+        Path to the extracted force field directory.
 
     Raises
     ------
     ValueError
-        If the force field directory is not found, listing available options.
+        If the name is not in the registry.
 
     """
-    ff_dirname = f"{forcefield}.ff"
+    if name not in FORCEFIELD_REGISTRY:
+        raise ValueError(
+            f"Force field '{name}' is not in the download registry. "
+            f"Available: {sorted(FORCEFIELD_REGISTRY.keys())}."
+        )
+
+    entry = FORCEFIELD_REGISTRY[name]
+    ff_dir = get_forcefield_dir()
+    ff_dir.mkdir(parents=True, exist_ok=True)
+
+    target = ff_dir / entry["dirname"]
+    if target.is_dir():
+        logger.info(f"Force field '{name}' already present at {target}")
+        return target
+
+    logger.info(f"Downloading force field '{name}' from {entry['url']}...")
+    response = urlopen(entry["url"], timeout=120)  # noqa: S310
+    data = io.BytesIO(response.read())
+
+    with tarfile.open(fileobj=data, mode="r:gz") as tar:
+        tar.extractall(path=ff_dir, filter="data")
+
+    if not target.is_dir():
+        raise RuntimeError(
+            f"Download succeeded but expected directory '{entry['dirname']}' "
+            f"not found in {ff_dir}. Tarball may have unexpected structure."
+        )
+
+    logger.info(f"Force field '{name}' installed to {target}")
+    return target
+
+
+def download_all_forcefields() -> list[Path]:
+    """Download all force fields in the registry. Idempotent."""
+    paths = []
+    for name in FORCEFIELD_REGISTRY:
+        paths.append(download_forcefield(name))
+    return paths
+
+
+def _get_gmx_search_paths() -> list[Path]:
+    """Return the directories GROMACS searches for force fields."""
     search_paths: list[Path] = []
 
-    # GROMACS data prefix from the binary
     result = subprocess.run(
         ["gmx", "--version"],
         text=True,
@@ -237,32 +301,79 @@ def check_forcefield_available(forcefield: str) -> None:
                 search_paths.append(top_dir)
             break
 
-    # GMXLIB environment variable (colon-separated paths)
     gmxlib = os.environ.get("GMXLIB", "")
     for p in gmxlib.split(":"):
         if p and Path(p).is_dir():
             search_paths.append(Path(p))
 
-    # Current working directory
-    search_paths.append(Path.cwd())
+    ff_dir = get_forcefield_dir()
+    if ff_dir.is_dir():
+        search_paths.append(ff_dir)
 
-    # Check if the force field exists in any search path
+    search_paths.append(Path.cwd())
+    return search_paths
+
+
+def resolve_forcefield(forcefield: str) -> str:
+    """Resolve a friendly force field name to the actual directory stem.
+
+    If the name is a registry key (e.g. "charmm36m"), returns the actual
+    directory name (e.g. "charmm36-feb2026_cgenff-5.0"). Otherwise returns
+    the name unchanged (for built-in FFs like "charmm27").
+
+    """
+    if forcefield in FORCEFIELD_REGISTRY:
+        return FORCEFIELD_REGISTRY[forcefield]["dirname"].removesuffix(".ff")
+    return forcefield
+
+
+def check_forcefield_available(forcefield: str) -> None:
+    """Verify that the requested force field is findable by GROMACS.
+
+    If the force field is in the download registry but not installed,
+    downloads it automatically.
+
+    Parameters
+    ----------
+    forcefield : str
+        Force field name as passed to ``gmx pdb2gmx -ff``, or a registry
+        key (e.g. "charmm36m").
+
+    Raises
+    ------
+    ValueError
+        If the force field is not found and not in the registry.
+
+    """
+    # Resolve friendly name to actual dirname
+    resolved = resolve_forcefield(forcefield)
+    ff_dirname = f"{resolved}.ff"
+
+    search_paths = _get_gmx_search_paths()
+
     for search_dir in search_paths:
         if (search_dir / ff_dirname).is_dir():
             return
 
-    # Not found — collect available force fields for the error message
+    # Not found — try downloading from registry
+    if forcefield in FORCEFIELD_REGISTRY:
+        download_forcefield(forcefield)
+        return
+
+    # Not in registry either — error with available options
     available = set()
     for search_dir in search_paths:
         if search_dir.is_dir():
             for entry in search_dir.iterdir():
                 if entry.is_dir() and entry.name.endswith(".ff"):
                     available.add(entry.stem)
+    available.update(FORCEFIELD_REGISTRY.keys())
 
     raise ValueError(
         f"Force field '{forcefield}' not found. "
         f"Searched: {[str(p) for p in search_paths]}.\n"
         f"Available force fields: {sorted(available)}.\n"
+        f"Downloadable: {sorted(FORCEFIELD_REGISTRY.keys())}.\n"
         "Install the force field to a search path or set GMXLIB."
     )
 
@@ -329,6 +440,7 @@ def run_pdb2gmx(
 
     """
     check_forcefield_available(config.forcefield)
+    resolved_ff = resolve_forcefield(config.forcefield)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -346,7 +458,7 @@ def run_pdb2gmx(
         "-o", str(structure_file),
         "-p", str(topology_file),
         "-i", str(posre_file),
-        "-ff", config.forcefield,
+        "-ff", resolved_ff,
         "-water", config.water_model,
     ]
 
@@ -371,6 +483,13 @@ def run_pdb2gmx(
 
     logger.info(f"Running pdb2gmx: {' '.join(cmd)}")
 
+    # Ensure GMXLIB includes our forcefield download directory
+    env = os.environ.copy()
+    ff_dir = get_forcefield_dir()
+    if ff_dir.is_dir():
+        existing_gmxlib = env.get("GMXLIB", "")
+        env["GMXLIB"] = f"{ff_dir}:{existing_gmxlib}" if existing_gmxlib else str(ff_dir)
+
     result = subprocess.run(
         cmd,
         cwd=str(output_dir),
@@ -378,6 +497,7 @@ def run_pdb2gmx(
         input=pdb2gmx_input,
         capture_output=True,
         timeout=120,
+        env=env,
     )
 
     if result.returncode != 0:
@@ -435,9 +555,10 @@ def extract_charge_from_topology(top_path: Path) -> int:
             stripped = line.strip()
 
             if stripped.startswith("#include"):
-                # Follow includes for itp files in the same directory
+                # Follow includes only for local itp files (protein chains,
+                # position restraints), not force field library files
                 include_path = stripped.split('"')[1] if '"' in stripped else None
-                if include_path and not include_path.endswith(".ff/"):
+                if include_path and ".ff/" not in include_path:
                     itp_path = top_path.parent / include_path
                     if itp_path.is_file():
                         total_charge += _sum_charges_from_itp(itp_path)
