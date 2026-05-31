@@ -45,6 +45,10 @@ class Settings:
             "cgenff": {
                 "SILCSBIODIR": "",
             },
+            "gromacs": {
+                "GMX_PATH": "",
+                "FORCEFIELD_DIR": str(data_dir / "forcefields"),
+            },
             "storage": {
                 "PARAMETERS": str(data_dir / "parameters"),
             },
@@ -81,6 +85,7 @@ class Settings:
     # Keep DEFAULT_CONFIG as class attribute for backward compat in tests
     DEFAULT_CONFIG = {
         "cgenff": {"SILCSBIODIR": ""},
+        "gromacs": {"GMX_PATH": "", "FORCEFIELD_DIR": ""},
         "storage": {"PARAMETERS": ""},
         "database": {"TYPE": "sqlite"},
         "databases": {
@@ -117,6 +122,12 @@ class Settings:
         self._load_config()
         if "cgenff" in self.config:
             os.environ.setdefault("SILCSBIODIR", str(self.cgenff_dir))
+        if "gromacs" in self.config:
+            gmxlib_dir = str(self.gromacs_forcefield_dir)
+            if gmxlib_dir:
+                existing = os.environ.get("GMXLIB", "")
+                if gmxlib_dir not in existing:
+                    os.environ["GMXLIB"] = f"{gmxlib_dir}:{existing}" if existing else gmxlib_dir
 
     def _load_config(self):
         """Load configuration from defaults, then user config, then env overrides."""
@@ -170,6 +181,24 @@ class Settings:
     def cgenff_dir(self) -> Path:
         """Return the CGenFF directory (SILCSBIODIR)."""
         return Path(self.config["cgenff"].get("SILCSBIODIR", "")).resolve()
+
+    # --- GROMACS properties ---
+
+    @property
+    def gromacs_gmx_path(self) -> Path | None:
+        """Return the configured gmx binary path, or None to use PATH lookup."""
+        raw = self.config["gromacs"].get("GMX_PATH", "")
+        if not raw:
+            return None
+        return Path(self._resolve_local_path(raw))
+
+    @property
+    def gromacs_forcefield_dir(self) -> Path:
+        """Return the directory where downloaded force fields are stored."""
+        raw = self.config["gromacs"].get("FORCEFIELD_DIR", "")
+        if raw:
+            return Path(self._resolve_local_path(raw))
+        return get_data_dir() / "forcefields"
 
     # --- Storage properties ---
 

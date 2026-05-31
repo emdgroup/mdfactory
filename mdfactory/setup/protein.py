@@ -13,7 +13,6 @@ from urllib.request import urlopen
 from loguru import logger
 
 from ..models.parametrization import GromacsProteinParameterSet, Pdb2gmxConfig
-from ..settings import get_data_dir
 
 _DISULFIDE_CUTOFF_ANGSTROM = 2.2
 
@@ -33,7 +32,9 @@ FORCEFIELD_REGISTRY: dict[str, dict[str, str]] = {
 
 def get_forcefield_dir() -> Path:
     """Return the directory where downloaded force fields are stored."""
-    return get_data_dir() / "forcefields"
+    from ..settings import settings  # noqa: PLC0415
+
+    return settings.gromacs_forcefield_dir
 
 
 def _resolve_protonation_residue_name(residue_name: str, forcefield: str | None) -> str:
@@ -202,7 +203,9 @@ def _apply_protonation_states(
 
 
 def check_gmx_available() -> Path:
-    """Verify that the GROMACS gmx binary is available on PATH.
+    """Verify that the GROMACS gmx binary is available.
+
+    Checks the configured path from settings first, then falls back to PATH.
 
     Returns
     -------
@@ -212,14 +215,26 @@ def check_gmx_available() -> Path:
     Raises
     ------
     RuntimeError
-        If gmx is not found on PATH.
+        If gmx is not found.
 
     """
+    from ..settings import settings  # noqa: PLC0415
+
+    configured = settings.gromacs_gmx_path
+    if configured is not None:
+        if configured.is_file():
+            return configured
+        raise RuntimeError(
+            f"Configured GROMACS path '{configured}' does not exist. "
+            "Check [gromacs] GMX_PATH in your mdfactory config."
+        )
+
     gmx_path = shutil.which("gmx")
     if gmx_path is None:
         raise RuntimeError(
             "GROMACS 'gmx' binary not found on PATH. "
-            "Ensure GROMACS is installed and 'module load gromacs' has been run."
+            "Either set [gromacs] GMX_PATH in mdfactory config, "
+            "or ensure 'gmx' is on PATH (e.g. 'module load gromacs')."
         )
     return Path(gmx_path)
 
@@ -287,8 +302,9 @@ def _get_gmx_search_paths() -> list[Path]:
     """Return the directories GROMACS searches for force fields."""
     search_paths: list[Path] = []
 
+    gmx_bin = str(check_gmx_available())
     result = subprocess.run(
-        ["gmx", "--version"],
+        [gmx_bin, "--version"],
         text=True,
         capture_output=True,
         timeout=10,
@@ -439,6 +455,7 @@ def run_pdb2gmx(
         Paths to generated topology, structure, and position restraint files.
 
     """
+    gmx_bin = str(check_gmx_available())
     check_forcefield_available(config.forcefield)
     resolved_ff = resolve_forcefield(config.forcefield)
 
@@ -453,7 +470,7 @@ def run_pdb2gmx(
     posre_file = output_dir / "posre.itp"
 
     cmd = [
-        "gmx", "pdb2gmx",
+        gmx_bin, "pdb2gmx",
         "-f", str(pdb_path),
         "-o", str(structure_file),
         "-p", str(topology_file),
@@ -656,15 +673,22 @@ def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) 
         If grompp reports errors.
 
     """
+    gmx_bin = str(check_gmx_available())
     tpr_out = cwd / "check.tpr"
     cmd = [
-        "gmx", "grompp",
+        gmx_bin, "grompp",
         "-f", str(mdp),
         "-c", str(structure),
         "-p", str(topology),
         "-o", str(tpr_out),
         "-maxwarn", "0",
     ]
+
+    env = os.environ.copy()
+    ff_dir = get_forcefield_dir()
+    if ff_dir.is_dir():
+        existing_gmxlib = env.get("GMXLIB", "")
+        env["GMXLIB"] = f"{ff_dir}:{existing_gmxlib}" if existing_gmxlib else str(ff_dir)
 
     result = subprocess.run(
         cmd,
@@ -673,6 +697,7 @@ def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) 
         input="",
         capture_output=True,
         timeout=60,
+        env=env,
     )
 
     # Clean up grompp artifacts
