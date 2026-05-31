@@ -1,5 +1,5 @@
 # ABOUTME: Core build pipeline for constructing MD simulation systems
-# ABOUTME: Dispatches to mixedbox, bilayer, and LNP build routines
+# ABOUTME: Dispatches to mixedbox, bilayer, LNP, and proteinbox build routines
 """Core build pipeline for constructing MD simulation systems."""
 
 import os
@@ -682,3 +682,134 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge):
     na_spec = SingleMoleculeSpecies(count=num_na, smiles="[Na+]", resname="NA")
     cl_spec = SingleMoleculeSpecies(count=num_cl, smiles="[Cl-]", resname="CL")
     return u_ionized, [na_spec, cl_spec]
+
+
+@validate_call
+def build_proteinbox(inp: BuildInput):
+    """Build a protein-in-waterbox system: clean, parametrize, solvate, ionize, relax."""
+    from loguru import logger
+
+    from .models.composition import ProteinBoxComposition
+    from .models.parametrization import Pdb2gmxConfig
+    from .setup.protein import (
+        check_gmx_available,
+        clean_pdb,
+        extract_charge_from_topology,
+        run_pdb2gmx,
+        update_topology_molecules,
+        validate_with_grompp,
+    )
+
+    if not isinstance(inp.system, ProteinBoxComposition):
+        raise TypeError("System must specify a ProteinBoxComposition.")
+
+    if not isinstance(inp.parametrization_config, Pdb2gmxConfig):
+        raise TypeError("Parametrization config must be Pdb2gmxConfig for proteinbox.")
+
+    # 1. Verify GROMACS is available
+    gmx_path = check_gmx_available()
+    logger.info(f"Using GROMACS: {gmx_path}")
+
+    protein = inp.system.protein
+    config = inp.parametrization_config
+
+    # 2. Clean PDB
+    pdb_input = protein.pdb_path
+    if not pdb_input.is_absolute():
+        pdb_input = pdb_input.resolve()
+
+    cleaned_pdb = Path("cleaned.pdb")
+    clean_pdb(pdb_input, cleaned_pdb)
+
+    # 3. Run pdb2gmx
+    pdb2gmx_dir = Path("pdb2gmx_output")
+    params = run_pdb2gmx(
+        pdb_path=cleaned_pdb,
+        config=config,
+        disulfide_bonds=protein.disulfide_bonds,
+        protonation_states=protein.protonation_states,
+        output_dir=pdb2gmx_dir,
+    )
+    logger.info(f"pdb2gmx output: {params.structure_file}")
+
+    # 4. Center protein in cubic box
+    u = mda.Universe(str(params.structure_file))
+    extent = u.atoms.positions.max(axis=0) - u.atoms.positions.min(axis=0)
+    box_size = extent.max() + 2 * inp.system.box_padding
+    u.dimensions = [box_size, box_size, box_size, 90, 90, 90]
+    center = np.array([box_size / 2, box_size / 2, box_size / 2])
+    u.atoms.translate(-u.atoms.center_of_geometry() + center)
+    logger.info(f"Protein centered in cubic box: {box_size:.1f} A")
+
+    # 5. Solvate (reuse existing solvation)
+    u_solvated = solvate(u, prune_in_z=False)
+    u_solvated.dimensions = u.dimensions
+    n_water = len(u_solvated.select_atoms("water").residues)
+    logger.info(f"Solvation added {n_water} water molecules.")
+
+    if n_water == 0:
+        raise ValueError("Solvation did not add any water molecules.")
+
+    # 6. Ionize (reuse existing ionization)
+    protein_charge = params.total_charge
+    u_ionized, ion_species = ionize_solvated_system(
+        inp.system.ionization, u_solvated, protein_charge
+    )
+    num_na = ion_species[0].count if len(ion_species) > 0 else 0
+    num_cl = ion_species[1].count if len(ion_species) > 1 else 0
+    n_water_final = len(u_ionized.select_atoms("water").residues)
+
+    # 7. Update topology [ molecules ] section
+    import shutil
+
+    topology_dest = Path("topology.top")
+    shutil.copy(params.topology_file, topology_dest)
+    shutil.copy(params.position_restraint_file, Path("posre.itp"))
+    update_topology_molecules(topology_dest, n_water_final, num_na, num_cl)
+
+    # 8. Write coordinates for OpenMM relaxation
+    u_ionized.atoms.write("system_pre_relax.pdb")
+
+    # 9. OpenMM relaxation with protein position restraints
+    protein_atoms = u_ionized.select_atoms("protein and not name H*")
+    protein_indices = protein_atoms.indices.tolist()
+
+    with working_directory("relaxation", create=True, cleanup=True) as wd:
+        shutil.copy("system_pre_relax.pdb", wd / "system.pdb")
+        shutil.copy(topology_dest, wd / "topology.top")
+        shutil.copy("posre.itp", wd / "posre.itp")
+
+        # Copy forcefield directory if referenced by topology
+        # pdb2gmx topologies use #include from the GROMACS data dir, so OpenMM
+        # needs the GromacsTopFile to resolve them via GMXLIB or local copies
+        from .simulation.openmm_utils import relax_with_protein_restraints
+
+        u_relaxed = relax_with_protein_restraints(
+            u_ionized,
+            wd / "system.pdb",
+            wd / "topology.top",
+            protein_indices=protein_indices,
+            steps=10000,
+        )
+
+    logger.info("OpenMM relaxation complete.")
+
+    # 10. Write final output
+    u_relaxed.atoms.write("system.pdb")
+    logger.info("Final system written to system.pdb")
+
+    # 11. Validate with grompp (if em.mdp is available)
+    manager = RunScheduleManager()
+    manager.copy_run_files_with_check(
+        engine=inp.engine, system_type="proteinbox", target_folder=os.getcwd(), force_copy=True
+    )
+    logger.info("Run schedule files copied.")
+
+    em_mdp = Path("em.mdp")
+    if em_mdp.is_file():
+        try:
+            validate_with_grompp(topology_dest, Path("system.pdb"), em_mdp, Path.cwd())
+        except RuntimeError as e:
+            logger.warning(f"grompp validation failed (non-fatal): {e}")
+
+    logger.info("Proteinbox build complete.")

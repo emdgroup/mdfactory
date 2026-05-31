@@ -5,7 +5,7 @@
 from pathlib import Path
 from typing import Any
 
-from .build import build_bilayer, build_lnp, build_mixedbox
+from .build import build_bilayer, build_lnp, build_mixedbox, build_proteinbox
 from .models.input import BuildInput
 from .utils.utilities import load_yaml_file
 
@@ -13,6 +13,7 @@ DISPATCH_BUILD = {
     "mixedbox": build_mixedbox,
     "bilayer": build_bilayer,
     "lnp": build_lnp,
+    "proteinbox": build_proteinbox,
 }
 
 
