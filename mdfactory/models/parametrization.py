@@ -59,15 +59,9 @@ class Pdb2gmxConfig(BaseModel):
     forcefield: str = Field(
         "charmm36m", description="Force field name as recognized by gmx pdb2gmx."
     )
-    water_model: str = Field(
-        "tip3p", description="Water model name as recognized by gmx pdb2gmx."
-    )
-    ignh: bool = Field(
-        True, description="Ignore hydrogens in input PDB (regenerate with pdb2gmx)."
-    )
-    merge_all: bool = Field(
-        False, description="Merge all chains into a single moleculetype."
-    )
+    water_model: str = Field("tip3p", description="Water model name as recognized by gmx pdb2gmx.")
+    ignh: bool = Field(True, description="Ignore hydrogens in input PDB (regenerate with pdb2gmx).")
+    merge_all: bool = Field(False, description="Merge all chains into a single moleculetype.")
 
 
 ParametrizationConfig = Annotated[

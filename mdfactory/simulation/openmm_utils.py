@@ -1,5 +1,5 @@
 # ABOUTME: OpenMM simulation utilities for box compression, equilibration, and relaxation
-# ABOUTME: Provides volume convergence monitoring, density-targeted compression, and protein restraints
+# ABOUTME: Provides convergence checks, density-targeted compression, and protein restraints
 """OpenMM simulation utilities for box compression and equilibration."""
 
 import sys
@@ -675,9 +675,7 @@ def relax_with_protein_restraints(
     """
     print("Loading GROMACS files for protein relaxation...")
     gro = app.PDBFile(str(pdb))
-    top_file = app.GromacsTopFile(
-        str(top), periodicBoxVectors=gro.topology.getPeriodicBoxVectors()
-    )
+    top_file = app.GromacsTopFile(str(top), periodicBoxVectors=gro.topology.getPeriodicBoxVectors())
 
     print("Creating OpenMM system...")
     system = top_file.createSystem(
@@ -687,9 +685,7 @@ def relax_with_protein_restraints(
     )
 
     # Position restraints on protein atoms
-    restraint_force = mm.CustomExternalForce(
-        "k*((x-x0)^2+(y-y0)^2+(z-z0)^2)"
-    )
+    restraint_force = mm.CustomExternalForce("k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
     restraint_force.addGlobalParameter(
         "k", restraint_k * unit.kilojoules_per_mole / unit.nanometer**2
     )

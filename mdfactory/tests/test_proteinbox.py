@@ -10,17 +10,13 @@ import yaml
 
 from mdfactory.models.composition import ProteinBoxComposition
 from mdfactory.models.input import BuildInput
-from mdfactory.models.parametrization import (
-    GromacsProteinParameterSet,
-    Pdb2gmxConfig,
-)
+from mdfactory.models.parametrization import Pdb2gmxConfig
 from mdfactory.models.species import ProteinSpecies
 from mdfactory.setup.protein import (
     _apply_protonation_states,
     _build_disulfide_prompt_input,
     _sum_charges_from_itp,
     check_forcefield_available,
-    extract_charge_from_topology,
     run_pdb2gmx,
     update_topology_molecules,
 )
@@ -205,7 +201,8 @@ system:
 class TestTopologyParsing:
     def test_sum_charges_from_itp(self, tmp_path):
         itp = tmp_path / "protein.itp"
-        itp.write_text(textwrap.dedent("""\
+        itp.write_text(
+            textwrap.dedent("""\
             [ moleculetype ]
             Protein   3
 
@@ -218,13 +215,15 @@ class TestTopologyParsing:
 
             [ bonds ]
             1 2
-        """))
+        """)
+        )
         charge = _sum_charges_from_itp(itp)
         assert abs(charge - (-0.090)) < 1e-6
 
     def test_update_topology_molecules(self, tmp_path):
         top = tmp_path / "topol.top"
-        top.write_text(textwrap.dedent("""\
+        top.write_text(
+            textwrap.dedent("""\
             #include "charmm36m.ff/forcefield.itp"
             #include "protein.itp"
 
@@ -233,7 +232,8 @@ class TestTopologyParsing:
 
             [ molecules ]
             Protein_chain_A  1
-        """))
+        """)
+        )
         update_topology_molecules(top, n_water=5000, num_na=10, num_cl=18)
         content = top.read_text()
         assert "SOL" in content
@@ -245,15 +245,15 @@ class TestTopologyParsing:
 
     def test_apply_protonation_states(self, tmp_path):
         pdb = tmp_path / "input.pdb"
-        pdb.write_text(textwrap.dedent("""\
+        pdb.write_text(
+            textwrap.dedent("""\
             ATOM      1  N   HIS A  15       1.000   2.000   3.000  1.00  0.00
             ATOM      2  CA  HIS A  15       1.500   2.500   3.500  1.00  0.00
             ATOM      3  N   ALA A  16       2.000   3.000   4.000  1.00  0.00
             ATOM      4  N   GLU A  35       3.000   4.000   5.000  1.00  0.00
-        """))
-        result = _apply_protonation_states(
-            pdb, {"HIS15": "HIE", "GLU35": "GLH"}, tmp_path
+        """)
         )
+        result = _apply_protonation_states(pdb, {"HIS15": "HIE", "GLU35": "GLH"}, tmp_path)
         content = result.read_text()
         # HIS at resid 15 should be renamed to HIE
         assert "HIE" in content
@@ -265,9 +265,7 @@ class TestTopologyParsing:
     def test_apply_protonation_states_translates_charmm_histidine_alias(self, tmp_path):
         pdb = tmp_path / "input.pdb"
         pdb.write_text(_pdb_atom(1, "N", "HIS", 15, 1.0, 2.0, 3.0))
-        result = _apply_protonation_states(
-            pdb, {"HIS15": "HIE"}, tmp_path, forcefield="charmm36m"
-        )
+        result = _apply_protonation_states(pdb, {"HIS15": "HIE"}, tmp_path, forcefield="charmm36m")
         assert "HSE" in result.read_text()
 
     def test_apply_protonation_states_rejects_four_character_names(self, tmp_path):
@@ -317,11 +315,12 @@ class TestTopologyParsing:
         )
         calls = {}
 
-        def fake_run(cmd, cwd, text, input, capture_output, timeout, env=None):
+        def fake_run(cmd, cwd, text, input, capture_output, timeout, env=None, check=None):
             calls["cmd"] = cmd
             calls["cwd"] = cwd
             calls["input"] = input
             calls["env"] = env
+            calls["check"] = check
             output_dir = Path(cwd)
             (output_dir / "processed.gro").write_text("mock gro\n")
             (output_dir / "topol.top").write_text("[ atoms ]\n")
@@ -353,6 +352,7 @@ class TestTopologyParsing:
         assert calls["input"] == "n\ny\n"
         assert calls["cwd"] == str((tmp_path / "pdb2gmx_output").resolve())
         assert calls["env"] == {"GMXLIB": "/mock/forcefields"}
+        assert calls["check"] is False
 
 
 class TestMetadata:

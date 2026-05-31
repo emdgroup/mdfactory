@@ -111,7 +111,9 @@ def _build_disulfide_prompt_input(
             raise ValueError(f"Invalid disulfide bond with identical residues: {pair}")
 
     sg_atoms = _read_cysteine_sg_atoms(pdb_path)
-    missing_resids = sorted({resid for pair in requested for resid in pair if resid not in sg_atoms})
+    missing_resids = sorted(
+        {resid for pair in requested for resid in pair if resid not in sg_atoms}
+    )
     if missing_resids:
         raise ValueError(
             f"Requested disulfide residues are not cysteine SG atoms in {pdb_path}: "
@@ -189,20 +191,21 @@ def _apply_protonation_states(
 
     with open(pdb_path) as f_in, open(output_pdb, "w") as f_out:
         for line in f_in:
-            if line.startswith(("ATOM", "HETATM")) and len(line) >= 26:
-                current_resname = line[17:20].strip()
+            output_line = line
+            if output_line.startswith(("ATOM", "HETATM")) and len(output_line) >= 26:
+                current_resname = output_line[17:20].strip()
                 try:
-                    current_resid = int(line[22:26].strip())
+                    current_resid = int(output_line[22:26].strip())
                 except ValueError:
-                    f_out.write(line)
+                    f_out.write(output_line)
                     continue
 
                 for prefix, target_resid, new_name in overrides:
                     if current_resname.startswith(prefix) and current_resid == target_resid:
                         padded = f"{new_name:<3s}"
-                        line = line[:17] + padded + line[20:]
+                        output_line = output_line[:17] + padded + output_line[20:]
                         break
-            f_out.write(line)
+            f_out.write(output_line)
 
     logger.info(f"Protonation states applied: {protonation_states}")
     return output_pdb
@@ -314,6 +317,7 @@ def _get_gmx_search_paths() -> list[Path]:
         text=True,
         capture_output=True,
         timeout=10,
+        check=False,
     )
     for line in result.stdout.splitlines():
         if "Data prefix" in line:
@@ -463,13 +467,20 @@ def run_pdb2gmx(
     posre_file = output_dir / "posre.itp"
 
     cmd = [
-        gmx_bin, "pdb2gmx",
-        "-f", str(pdb_path),
-        "-o", str(structure_file),
-        "-p", str(topology_file),
-        "-i", str(posre_file),
-        "-ff", resolved_ff,
-        "-water", config.water_model,
+        gmx_bin,
+        "pdb2gmx",
+        "-f",
+        str(pdb_path),
+        "-o",
+        str(structure_file),
+        "-p",
+        str(topology_file),
+        "-i",
+        str(posre_file),
+        "-ff",
+        resolved_ff,
+        "-water",
+        config.water_model,
     ]
 
     if config.ignh:
@@ -501,6 +512,7 @@ def run_pdb2gmx(
         capture_output=True,
         timeout=120,
         env=get_gromacs_env(),
+        check=False,
     )
 
     if result.returncode != 0:
@@ -634,9 +646,7 @@ def update_topology_molecules(
         if num_cl > 0:
             f.write(f"{'CL':<20s} {num_cl}\n")
 
-    logger.info(
-        f"Topology updated: {n_water} water, {num_na} Na+, {num_cl} Cl-"
-    )
+    logger.info(f"Topology updated: {n_water} water, {num_na} Na+, {num_cl} Cl-")
 
 
 def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) -> None:
@@ -662,12 +672,18 @@ def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) 
     gmx_bin = str(check_gmx_available())
     tpr_out = cwd / "check.tpr"
     cmd = [
-        gmx_bin, "grompp",
-        "-f", str(mdp),
-        "-c", str(structure),
-        "-p", str(topology),
-        "-o", str(tpr_out),
-        "-maxwarn", "0",
+        gmx_bin,
+        "grompp",
+        "-f",
+        str(mdp),
+        "-c",
+        str(structure),
+        "-p",
+        str(topology),
+        "-o",
+        str(tpr_out),
+        "-maxwarn",
+        "0",
     ]
 
     result = subprocess.run(
@@ -678,6 +694,7 @@ def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) 
         capture_output=True,
         timeout=60,
         env=get_gromacs_env(),
+        check=False,
     )
 
     # Clean up grompp artifacts

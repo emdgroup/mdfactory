@@ -14,7 +14,12 @@ from .composition import (
     MixedBoxComposition,
     ProteinBoxComposition,
 )
-from .parametrization import CgenffConfig, Pdb2gmxConfig, ParametrizationConfig, SmirnoffConfig
+from .parametrization import (
+    CgenffConfig,
+    ParametrizationConfig,
+    Pdb2gmxConfig,
+    SmirnoffConfig,
+)
 
 # Map system_type to the corresponding model class
 # TODO: StrEnum?
