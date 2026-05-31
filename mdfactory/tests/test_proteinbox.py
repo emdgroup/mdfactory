@@ -111,17 +111,43 @@ class TestPdb2gmxConfig:
 
 
 class TestForceFieldCheck:
-    def test_available_forcefield_passes(self):
+    def test_available_forcefield_passes(self, tmp_path, monkeypatch):
+        (tmp_path / "charmm27.ff").mkdir()
+        monkeypatch.setattr(
+            "mdfactory.setup.protein._get_gmx_search_paths",
+            lambda: [tmp_path],
+        )
         check_forcefield_available("charmm27")
 
-    def test_unavailable_forcefield_raises(self):
+    def test_unavailable_forcefield_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "mdfactory.setup.protein._get_gmx_search_paths",
+            lambda: [tmp_path],
+        )
         with pytest.raises(ValueError, match="not found"):
             check_forcefield_available("nonexistent_ff_xyz")
 
-    def test_error_lists_available_forcefields(self):
+    def test_error_lists_available_forcefields(self, tmp_path, monkeypatch):
+        (tmp_path / "charmm27.ff").mkdir()
+        monkeypatch.setattr(
+            "mdfactory.setup.protein._get_gmx_search_paths",
+            lambda: [tmp_path],
+        )
         with pytest.raises(ValueError, match="charmm27") as exc_info:
             check_forcefield_available("nonexistent_ff_xyz")
         assert "Available force fields" in str(exc_info.value)
+
+    def test_registered_forcefield_check_does_not_download(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "mdfactory.setup.protein._get_gmx_search_paths",
+            lambda: [tmp_path],
+        )
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.download_forcefield",
+            lambda name: pytest.fail("check_forcefield_available should not download"),
+        )
+        with pytest.raises(ValueError, match="Downloadable"):
+            check_forcefield_available("charmm36m")
 
 
 class TestBuildInputProteinbox:
@@ -295,6 +321,7 @@ class TestTopologyParsing:
             calls["cmd"] = cmd
             calls["cwd"] = cwd
             calls["input"] = input
+            calls["env"] = env
             output_dir = Path(cwd)
             (output_dir / "processed.gro").write_text("mock gro\n")
             (output_dir / "topol.top").write_text("[ atoms ]\n")
@@ -309,6 +336,10 @@ class TestTopologyParsing:
 
         monkeypatch.setattr("mdfactory.setup.protein.subprocess.run", fake_run)
         monkeypatch.setattr("mdfactory.setup.protein.check_forcefield_available", lambda ff: None)
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.get_gromacs_env",
+            lambda: {"GMXLIB": "/mock/forcefields"},
+        )
 
         run_pdb2gmx(
             pdb_path=pdb,
@@ -321,6 +352,7 @@ class TestTopologyParsing:
         assert "-ss" in calls["cmd"]
         assert calls["input"] == "n\ny\n"
         assert calls["cwd"] == str((tmp_path / "pdb2gmx_output").resolve())
+        assert calls["env"] == {"GMXLIB": "/mock/forcefields"}
 
 
 class TestMetadata:

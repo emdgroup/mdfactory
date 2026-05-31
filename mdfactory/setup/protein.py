@@ -3,7 +3,6 @@
 """Protein preparation utilities for the proteinbox simulation type."""
 
 import io
-import os
 import shutil
 import subprocess
 import tarfile
@@ -35,6 +34,13 @@ def get_forcefield_dir() -> Path:
     from ..settings import settings  # noqa: PLC0415
 
     return settings.gromacs_forcefield_dir
+
+
+def get_gromacs_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return an environment with configured GROMACS force fields on GMXLIB."""
+    from ..settings import settings  # noqa: PLC0415
+
+    return settings.gromacs_env(base_env)
 
 
 def _resolve_protonation_residue_name(residue_name: str, forcefield: str | None) -> str:
@@ -317,14 +323,10 @@ def _get_gmx_search_paths() -> list[Path]:
                 search_paths.append(top_dir)
             break
 
-    gmxlib = os.environ.get("GMXLIB", "")
+    gmxlib = get_gromacs_env().get("GMXLIB", "")
     for p in gmxlib.split(":"):
         if p and Path(p).is_dir():
             search_paths.append(Path(p))
-
-    ff_dir = get_forcefield_dir()
-    if ff_dir.is_dir():
-        search_paths.append(ff_dir)
 
     search_paths.append(Path.cwd())
     return search_paths
@@ -345,9 +347,6 @@ def resolve_forcefield(forcefield: str) -> str:
 
 def check_forcefield_available(forcefield: str) -> None:
     """Verify that the requested force field is findable by GROMACS.
-
-    If the force field is in the download registry but not installed,
-    downloads it automatically.
 
     Parameters
     ----------
@@ -371,26 +370,20 @@ def check_forcefield_available(forcefield: str) -> None:
         if (search_dir / ff_dirname).is_dir():
             return
 
-    # Not found — try downloading from registry
-    if forcefield in FORCEFIELD_REGISTRY:
-        download_forcefield(forcefield)
-        return
-
-    # Not in registry either — error with available options
     available = set()
     for search_dir in search_paths:
         if search_dir.is_dir():
             for entry in search_dir.iterdir():
                 if entry.is_dir() and entry.name.endswith(".ff"):
                     available.add(entry.stem)
-    available.update(FORCEFIELD_REGISTRY.keys())
 
     raise ValueError(
         f"Force field '{forcefield}' not found. "
         f"Searched: {[str(p) for p in search_paths]}.\n"
         f"Available force fields: {sorted(available)}.\n"
         f"Downloadable: {sorted(FORCEFIELD_REGISTRY.keys())}.\n"
-        "Install the force field to a search path or set GMXLIB."
+        "Install the force field to a search path, set [gromacs] FORCEFIELD_DIR, "
+        "or download registered force fields with `mdfactory config init`."
     )
 
 
@@ -500,13 +493,6 @@ def run_pdb2gmx(
 
     logger.info(f"Running pdb2gmx: {' '.join(cmd)}")
 
-    # Ensure GMXLIB includes our forcefield download directory
-    env = os.environ.copy()
-    ff_dir = get_forcefield_dir()
-    if ff_dir.is_dir():
-        existing_gmxlib = env.get("GMXLIB", "")
-        env["GMXLIB"] = f"{ff_dir}:{existing_gmxlib}" if existing_gmxlib else str(ff_dir)
-
     result = subprocess.run(
         cmd,
         cwd=str(output_dir),
@@ -514,7 +500,7 @@ def run_pdb2gmx(
         input=pdb2gmx_input,
         capture_output=True,
         timeout=120,
-        env=env,
+        env=get_gromacs_env(),
     )
 
     if result.returncode != 0:
@@ -684,12 +670,6 @@ def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) 
         "-maxwarn", "0",
     ]
 
-    env = os.environ.copy()
-    ff_dir = get_forcefield_dir()
-    if ff_dir.is_dir():
-        existing_gmxlib = env.get("GMXLIB", "")
-        env["GMXLIB"] = f"{ff_dir}:{existing_gmxlib}" if existing_gmxlib else str(ff_dir)
-
     result = subprocess.run(
         cmd,
         cwd=str(cwd),
@@ -697,7 +677,7 @@ def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) 
         input="",
         capture_output=True,
         timeout=60,
-        env=env,
+        env=get_gromacs_env(),
     )
 
     # Clean up grompp artifacts

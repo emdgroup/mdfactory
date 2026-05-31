@@ -123,11 +123,9 @@ class Settings:
         if "cgenff" in self.config:
             os.environ.setdefault("SILCSBIODIR", str(self.cgenff_dir))
         if "gromacs" in self.config:
-            gmxlib_dir = str(self.gromacs_forcefield_dir)
-            if gmxlib_dir:
-                existing = os.environ.get("GMXLIB", "")
-                if gmxlib_dir not in existing:
-                    os.environ["GMXLIB"] = f"{gmxlib_dir}:{existing}" if existing else gmxlib_dir
+            env = self.gromacs_env(os.environ)
+            if "GMXLIB" in env:
+                os.environ["GMXLIB"] = env["GMXLIB"]
 
     def _load_config(self):
         """Load configuration from defaults, then user config, then env overrides."""
@@ -169,6 +167,7 @@ class Settings:
         get_config_dir().mkdir(parents=True, exist_ok=True)
         get_data_dir().mkdir(parents=True, exist_ok=True)
         self.parameter_store.mkdir(parents=True, exist_ok=True)
+        self.gromacs_forcefield_dir.mkdir(parents=True, exist_ok=True)
 
     # --- CGenFF properties ---
 
@@ -199,6 +198,19 @@ class Settings:
         if raw:
             return Path(self._resolve_local_path(raw))
         return get_data_dir() / "forcefields"
+
+    def gromacs_env(self, base_env: dict[str, str] | None = None) -> dict[str, str]:
+        """Return an environment with configured GROMACS force fields on GMXLIB."""
+        env = dict(os.environ if base_env is None else base_env)
+        forcefield_dir = str(self.gromacs_forcefield_dir)
+        if not forcefield_dir:
+            return env
+
+        paths = [p for p in env.get("GMXLIB", "").split(":") if p]
+        if forcefield_dir not in paths:
+            paths.insert(0, forcefield_dir)
+        env["GMXLIB"] = ":".join(paths)
+        return env
 
     # --- Storage properties ---
 
