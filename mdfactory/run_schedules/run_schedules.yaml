@@ -36,3 +36,16 @@
     num_gpus: 1
     num_cores: 8
     walltime: 24:00:00
+
+- engine: gromacs
+  system_type: proteinbox
+  version: 1.0
+  run_files:
+    - em.mdp
+    - nvt.mdp
+    - npt.mdp
+    - md.mdp
+  settings:
+    num_gpus: 1
+    num_cores: 8
+    walltime: 24:00:00
