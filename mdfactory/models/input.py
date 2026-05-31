@@ -8,8 +8,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from .composition import BilayerComposition, LNPComposition, MixedBoxComposition
-from .parametrization import CgenffConfig, ParametrizationConfig, SmirnoffConfig
+from .composition import (
+    BilayerComposition,
+    LNPComposition,
+    MixedBoxComposition,
+    ProteinBoxComposition,
+)
+from .parametrization import CgenffConfig, Pdb2gmxConfig, ParametrizationConfig, SmirnoffConfig
 
 # Map system_type to the corresponding model class
 # TODO: StrEnum?
@@ -17,15 +22,16 @@ type_mapping = {
     "mixedbox": MixedBoxComposition,
     "bilayer": BilayerComposition,
     "lnp": LNPComposition,
+    "proteinbox": ProteinBoxComposition,
 }
 
 
 class BuildInput(BaseModel):
     """Represent a complete simulation build specification with composition and parametrization."""
 
-    simulation_type: Literal["mixedbox", "bilayer", "lnp"]
-    system: MixedBoxComposition | BilayerComposition | LNPComposition
-    parametrization: Literal["cgenff", "smirnoff"] = Field(
+    simulation_type: Literal["mixedbox", "bilayer", "lnp", "proteinbox"]
+    system: MixedBoxComposition | BilayerComposition | LNPComposition | ProteinBoxComposition
+    parametrization: Literal["cgenff", "smirnoff", "pdb2gmx"] = Field(
         "cgenff", description="Parametrization to use."
     )
     parametrization_config: ParametrizationConfig | None = Field(
@@ -162,4 +168,6 @@ class BuildInput(BaseModel):
                 object.__setattr__(self, "parametrization_config", SmirnoffConfig())
             elif self.parametrization == "cgenff":
                 object.__setattr__(self, "parametrization_config", CgenffConfig())
+            elif self.parametrization == "pdb2gmx":
+                object.__setattr__(self, "parametrization_config", Pdb2gmxConfig())
         return self

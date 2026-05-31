@@ -1,13 +1,13 @@
-# ABOUTME: Pydantic models for system composition (mixedbox, bilayer, LNP)
+# ABOUTME: Pydantic models for system composition (mixedbox, bilayer, LNP, proteinbox)
 # ABOUTME: Defines species counts, ionization, and composition validation
-"""Pydantic models for system composition (mixedbox, bilayer, LNP)."""
+"""Pydantic models for system composition (mixedbox, bilayer, LNP, proteinbox)."""
 
 from typing import Optional
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .species import LipidSpecies, SingleMoleculeSpecies, Species
+from .species import LipidSpecies, ProteinSpecies, SingleMoleculeSpecies, Species
 
 
 def distribute_counts(fractions: list[float], total: int) -> list[int]:
@@ -375,3 +375,17 @@ class LNPComposition(BaseModel):
             else:
                 species_map[key] = spec.model_copy()
         return list(species_map.values())
+
+
+class ProteinBoxComposition(BaseModel):
+    """Define a protein-in-waterbox system: one protein centered in a cubic box with ions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    protein: ProteinSpecies
+    box_padding: float = Field(
+        10.0, description="Minimum distance from protein to box edge in Angstroms.", ge=0.0
+    )
+    ionization: IonizationConfig = Field(
+        default_factory=IonizationConfig, description="Configuration for ionization."
+    )

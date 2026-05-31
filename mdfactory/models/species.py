@@ -1,11 +1,12 @@
-# ABOUTME: Pydantic models for molecular species (small molecules and lipids)
+# ABOUTME: Pydantic models for molecular species (small molecules, lipids, proteins)
 # ABOUTME: Provides SMILES-based identity, charge, and molecular object properties
-"""Pydantic models for molecular species (small molecules and lipids)."""
+"""Pydantic models for molecular species (small molecules, lipids, proteins)."""
 
 import hashlib
 import io
 import warnings
 from functools import cached_property
+from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field, model_validator
@@ -196,3 +197,30 @@ class LipidSpecies(SingleMoleculeSpecies):
     #         u, tail_atom_ids=self.tail_atoms, head_atom_ids=self.head_atoms, z_axis=[1, 0, 0]
     #     )
     #     return u
+
+
+class ProteinSpecies(Species):
+    """Represent a protein species identified by a PDB structure file."""
+
+    pdb_path: Path = Field(..., description="Path to the input PDB file.")
+    disulfide_bonds: list[tuple[int, int]] = Field(
+        default_factory=list,
+        description="Pairs of residue IDs forming disulfide bonds, e.g. [(6, 127), (30, 115)].",
+    )
+    protonation_states: dict[str, str] = Field(
+        default_factory=dict,
+        description="Residue-specific protonation states, e.g. {'HIS15': 'HIE', 'GLU35': 'GLH'}.",
+    )
+
+    @model_validator(mode="after")
+    def set_default_count(self) -> "ProteinSpecies":
+        if self.count is None and self.fraction is None:
+            self.count = 1
+            self.fraction = 1.0
+        return self
+
+    @property
+    def charge(self) -> int:
+        raise NotImplementedError(
+            "Protein charge is determined by pdb2gmx topology output, not pre-computable."
+        )

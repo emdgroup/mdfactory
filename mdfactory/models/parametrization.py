@@ -50,8 +50,30 @@ class CgenffConfig(BaseModel):
     # CGenFF uses SILCSBIODIR from config.ini, no additional settings needed
 
 
+class Pdb2gmxConfig(BaseModel):
+    """Configuration for pdb2gmx protein parametrization."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: Literal["pdb2gmx"] = Field("pdb2gmx", description="Config type discriminator.")
+    forcefield: str = Field(
+        "charmm36m", description="Force field name as recognized by gmx pdb2gmx."
+    )
+    water_model: str = Field(
+        "tip3p", description="Water model name as recognized by gmx pdb2gmx."
+    )
+    ignh: bool = Field(
+        True, description="Ignore hydrogens in input PDB (regenerate with pdb2gmx)."
+    )
+    merge_all: bool = Field(
+        False, description="Merge all chains into a single moleculetype."
+    )
+
+
 ParametrizationConfig = Annotated[
-    Annotated[SmirnoffConfig, Tag("smirnoff")] | Annotated[CgenffConfig, Tag("cgenff")],
+    Annotated[SmirnoffConfig, Tag("smirnoff")]
+    | Annotated[CgenffConfig, Tag("cgenff")]
+    | Annotated[Pdb2gmxConfig, Tag("pdb2gmx")],
     Discriminator("type"),
 ]
 
@@ -91,3 +113,16 @@ class GromacsSingleMoleculeParameterSet(BaseModel):
             raise ValueError("Invalid parameter_data_type for GromacsSingleMoleculeParameterSet.")
         data = json.loads(data_row["parameter_data"])
         return cls(**data)
+
+
+class GromacsProteinParameterSet(BaseModel):
+    """Store GROMACS topology output from pdb2gmx for a protein system."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    topology_file: Path
+    structure_file: Path
+    position_restraint_file: Path
+    forcefield: str
+    water_model: str
+    total_charge: int
