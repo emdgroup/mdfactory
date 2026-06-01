@@ -39,19 +39,20 @@ class NodeType:
         Number of CPU cores per node.
     memory_mb : int
         Memory in megabytes per node.
-    gpus : int
-        Number of GPUs per node (0 if CPU-only).
-    gpu_type : str or None
-        GPU model identifier (e.g., ``"a100"``, ``"h100"``), or None.
+    gpu_specs : tuple of (int, str)
+        GPU specifications as (count, type) tuples. Empty if CPU-only.
+        Multiple entries represent different GPU types on the same node.
     features : tuple of str
         SLURM feature/constraint tags on this node type (immutable).
+    count : int
+        Number of nodes with this exact configuration.
     """
 
     cpus: int
     memory_mb: int
-    gpus: int = 0
-    gpu_type: str | None = None
+    gpu_specs: tuple[tuple[int, str], ...] = field(default_factory=tuple)
     features: tuple[str, ...] = field(default_factory=tuple)
+    count: int = 1
 
 
 @dataclass(frozen=True)
@@ -139,53 +140,61 @@ def _run_command(cmd: list[str], *, timeout: int = 30) -> str | None:
         return None
 
 
-def _parse_gres(gres_str: str) -> tuple[int, str | None]:
-    """Parse SLURM GRES string to extract GPU count and type.
+def _parse_gres(gres_str: str) -> list[tuple[int, str | None]]:
+    """Parse SLURM GRES string to extract GPU count and type for all GPU entries.
 
     Parameters
     ----------
     gres_str : str
         GRES field from sinfo (e.g., ``"gpu:a100:4"``, ``"gpu:2"``, ``"(null)"``).
+        May contain multiple GPU entries separated by commas.
 
     Returns
     -------
-    tuple of (int, str or None)
-        (gpu_count, gpu_type). Returns (0, None) when no GPUs.
+    list of tuple (int, str or None)
+        List of (gpu_count, gpu_type) for each GPU entry. Empty list when no GPUs.
 
     Examples
     --------
     >>> _parse_gres("gpu:a100:4")
-    (4, 'a100')
-    >>> _parse_gres("gpu:2")
-    (2, None)
+    [(4, 'a100')]
+    >>> _parse_gres("gpu:b200:8(S:0-1),gpu:1g.23gb:7(S:1)")
+    [(8, 'b200'), (7, '1g.23gb')]
     >>> _parse_gres("(null)")
-    (0, None)
+    []
     """
     if not gres_str or gres_str == "(null)":
-        return 0, None
+        return []
+
+    gpu_entries = []
 
     # Handle multiple GRES entries separated by commas
     for raw_entry in gres_str.split(","):
         entry = raw_entry.strip()
         if not entry.startswith("gpu"):
             continue
+
+        # Strip socket binding suffix like "(S:0-1)" or "(IDX:0-3)"
+        if "(" in entry:
+            entry = entry.split("(")[0]
+
         parts = entry.split(":")
         if len(parts) == 3:
             # gpu:type:count
             _, gpu_type, count_str = parts
-            return int(count_str), gpu_type
+            gpu_entries.append((int(count_str), gpu_type))
         elif len(parts) == 2:
             # gpu:count (no type specified)
             _, count_str = parts
             # Check if second part is a number or a type
             try:
                 count = int(count_str)
-                return count, None
+                gpu_entries.append((count, None))
             except ValueError:
                 # gpu:type with implicit count of 1
-                return 1, count_str
+                gpu_entries.append((1, count_str))
 
-    return 0, None
+    return gpu_entries
 
 
 def _parse_time_limit(time_str: str) -> str:
@@ -311,34 +320,56 @@ def _parse_sinfo(output: str) -> list[Partition]:
             continue
 
         memory_mb = _parse_memory_mb(mem_str)
-        gpus, gpu_type = _parse_gres(gres_str)
+        gpu_entries = _parse_gres(gres_str)
         features = _parse_features(features_str)
 
         if partition_name not in partition_data:
             partition_data[partition_name] = {
                 "max_time": _parse_time_limit(max_time),
                 "default_time": _parse_time_limit(default_time),
-                "node_types": set(),
+                "node_types": {},  # Maps node_key -> count
                 "node_count": 0,
                 "is_default": is_default,
                 "has_healthy_node": False,
                 "last_unhealthy_state": "down",
             }
 
-        # Use a hashable representation for deduplication (features is already a tuple)
-        node_key = (cpus, memory_mb, gpus, gpu_type, features)
-        partition_data[partition_name]["node_types"].add(node_key)
-        partition_data[partition_name]["node_count"] += 1
-
         # Track if any line marks this as default
         if is_default:
             partition_data[partition_name]["is_default"] = True
 
-        # Track node health: partition is "up" if ANY node is schedulable
-        if state.lower() in ("idle", "mixed", "allocated", "completing", "planned"):
+        # Determine if node is operational (can schedule jobs or report accurate config)
+        # Exclude only truly broken/invalid nodes: down, drained, inval, fail, maint, unknown
+        state_lower = state.lower()
+        is_broken = any(
+            broken in state_lower
+            for broken in ("down", "drained", "inval", "fail", "maint", "unknown")
+        )
+        is_operational = not is_broken
+
+        # Partition is "up" if ANY operational node exists
+        if is_operational:
             partition_data[partition_name]["has_healthy_node"] = True
         else:
             partition_data[partition_name]["last_unhealthy_state"] = state
+
+        # Count all nodes (including allocated, reserved, etc.) for stable totals
+        partition_data[partition_name]["node_count"] += 1
+
+        # Only collect node specs from operational nodes
+        # (broken nodes may report incorrect/stale hardware configs)
+        if is_operational:
+            # Convert GPU entries to a sorted tuple for consistent hashing
+            # Sort by type name for deterministic ordering
+            gpu_specs = tuple(sorted(gpu_entries, key=lambda x: x[1] or ""))
+
+            # Use a hashable representation for deduplication
+            node_key = (cpus, memory_mb, gpu_specs, features)
+
+            # Track count of nodes with this exact configuration
+            if node_key not in partition_data[partition_name]["node_types"]:
+                partition_data[partition_name]["node_types"][node_key] = 0
+            partition_data[partition_name]["node_types"][node_key] += 1
 
     # Build Partition objects
     partitions = []
@@ -354,14 +385,14 @@ def _parse_sinfo(output: str) -> list[Partition]:
             NodeType(
                 cpus=cpus,
                 memory_mb=mem,
-                gpus=gpus,
-                gpu_type=gtype,
+                gpu_specs=gpu_specs,
                 features=feats,
+                count=count,
             )
-            for cpus, mem, gpus, gtype, feats in data["node_types"]
+            for (cpus, mem, gpu_specs, feats), count in data["node_types"].items()
         ]
-        # Sort node types by CPU count for deterministic ordering
-        node_types.sort(key=lambda n: (n.cpus, n.memory_mb, n.gpus))
+        # Sort node types by CPU count, memory, then GPU specs for deterministic ordering
+        node_types.sort(key=lambda n: (n.cpus, n.memory_mb, n.gpu_specs))
 
         partitions.append(
             Partition(
@@ -616,7 +647,9 @@ def select_partition(
                 continue
             if node.memory_mb < min_mem_mb:
                 continue
-            if needs_gpu and node.gpus == 0:
+            # Check if node has any GPUs
+            has_gpu = len(node.gpu_specs) > 0
+            if needs_gpu and not has_gpu:
                 continue
             has_qualifying_node = True
             break

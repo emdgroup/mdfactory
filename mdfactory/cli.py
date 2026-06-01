@@ -1187,8 +1187,6 @@ def analysis_run(
     if source is None:
         raise ValueError("Provide SOURCE as a simulation directory or build summary YAML.")
 
-    if slurm and account is None:
-        raise ValueError("--account is required when using --slurm.")
     if analysis_workers is not None and analysis_workers < 1:
         raise ValueError("--analysis-workers must be >= 1.")
 
@@ -1233,16 +1231,49 @@ def analysis_run(
         print(result_df)
         return
 
-    slurm_cfg = SlurmConfig(
-        account=account or "",
-        partition=partition,
-        time=time,
-        cpus_per_task=cpus,
-        mem_gb=mem_gb,
-        qos=qos,
-        constraint=constraint,
-        job_name_prefix=job_name_prefix,
-    )
+    # Use autodiscovery if account not provided
+    if account is None:
+        try:
+            slurm_cfg = SlurmConfig.from_cluster(
+                needs_gpu=False,
+                time=time,
+                cpus_per_task=cpus,
+                mem_gb=mem_gb,
+                qos=qos,
+                constraint=constraint,
+                job_name_prefix=job_name_prefix,
+            )
+            # Override partition if user specified one explicitly
+            if partition != "cpu":  # user changed from default
+                slurm_cfg = SlurmConfig(
+                    account=slurm_cfg.account,
+                    partition=partition,
+                    time=time,
+                    cpus_per_task=cpus,
+                    mem_gb=mem_gb,
+                    qos=qos,
+                    constraint=constraint,
+                    job_name_prefix=job_name_prefix,
+                )
+            logger.info(
+                f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
+                f"partition={slurm_cfg.partition}"
+            )
+        except RuntimeError as e:
+            raise ValueError(
+                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
+            ) from e
+    else:
+        slurm_cfg = SlurmConfig(
+            account=account,
+            partition=partition,
+            time=time,
+            cpus_per_task=cpus,
+            mem_gb=mem_gb,
+            qos=qos,
+            constraint=constraint,
+            job_name_prefix=job_name_prefix,
+        )
     if log_dir is None:
         log_dir = determine_log_dir(sim_paths)
     result_df = submit_analyses_slurm(
@@ -1520,19 +1551,50 @@ def analysis_artifacts_run(
         print(summary)
         return
 
+    # Use autodiscovery if account not provided
     if account is None:
-        raise ValueError("--account is required when using --slurm.")
+        try:
+            slurm_cfg = SlurmConfig.from_cluster(
+                needs_gpu=False,
+                time=time,
+                cpus_per_task=cpus,
+                mem_gb=mem_gb,
+                qos=qos,
+                constraint=constraint,
+                job_name_prefix=job_name_prefix,
+            )
+            # Override partition if user specified one explicitly
+            if partition != "cpu":  # user changed from default
+                slurm_cfg = SlurmConfig(
+                    account=slurm_cfg.account,
+                    partition=partition,
+                    time=time,
+                    cpus_per_task=cpus,
+                    mem_gb=mem_gb,
+                    qos=qos,
+                    constraint=constraint,
+                    job_name_prefix=job_name_prefix,
+                )
+            logger.info(
+                f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
+                f"partition={slurm_cfg.partition}"
+            )
+        except RuntimeError as e:
+            raise ValueError(
+                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
+            ) from e
+    else:
+        slurm_cfg = SlurmConfig(
+            account=account,
+            partition=partition,
+            time=time,
+            cpus_per_task=cpus,
+            mem_gb=mem_gb,
+            qos=qos,
+            constraint=constraint,
+            job_name_prefix=job_name_prefix,
+        )
 
-    slurm_cfg = SlurmConfig(
-        account=account,
-        partition=partition,
-        time=time,
-        cpus_per_task=cpus,
-        mem_gb=mem_gb,
-        qos=qos,
-        constraint=constraint,
-        job_name_prefix=job_name_prefix,
-    )
     if log_dir is None:
         log_dir = determine_log_dir(sim_paths)
     result_df = submit_artifacts_slurm(
@@ -1748,6 +1810,112 @@ def config_edit():
 
     editor = os.environ.get("EDITOR", "vi")
     subprocess.run([editor, str(config_path)], check=False)
+
+
+@config_app.command(name="cluster")
+def config_cluster(
+    json_output: Annotated[bool, Parameter("--json", help="Output in JSON format.")] = False,
+):
+    """Show discovered SLURM cluster information.
+
+    Queries the local SLURM scheduler and displays available partitions,
+    accounts, and QOS policies. Useful for verifying autodiscovery works
+    and understanding cluster resources before submitting jobs.
+
+    On non-SLURM machines, prints a helpful message instead of failing.
+    """
+    import json as json_module
+
+    from mdfactory.performance.cluster import discover_cluster
+
+    cluster = discover_cluster()
+
+    if cluster is None:
+        if json_output:
+            print(json_module.dumps({"error": "SLURM not available", "cluster": None}))
+        else:
+            print("SLURM cluster not detected.")
+            print()
+            print("This machine does not appear to be a SLURM cluster node,")
+            print("or SLURM commands (sinfo, sacctmgr) are not in PATH.")
+            print()
+            print("To use SLURM submission, run this command on a cluster login node.")
+        return
+
+    if json_output:
+        # Build JSON-serializable structure
+        data = {
+            "default_account": cluster.default_account,
+            "accounts": cluster.accounts,
+            "qos_policies": cluster.qos_policies,
+            "partitions": [
+                {
+                    "name": p.name,
+                    "state": p.state,
+                    "is_default": p.is_default,
+                    "max_time": p.max_time,
+                    "default_time": p.default_time,
+                    "total_nodes": p.total_nodes,
+                    "node_types": [
+                        {
+                            "cpus": nt.cpus,
+                            "memory_mb": nt.memory_mb,
+                            "gpu_specs": [
+                                {"count": count, "type": gtype} for count, gtype in nt.gpu_specs
+                            ],
+                            "features": list(nt.features),
+                            "count": nt.count,
+                        }
+                        for nt in p.node_types
+                    ],
+                }
+                for p in cluster.partitions
+            ],
+        }
+        print(json_module.dumps(data, indent=2))
+        return
+
+    # Human-readable output
+    print("SLURM Cluster Information")
+    print("=" * 50)
+    print()
+
+    # Account info
+    print(f"Default Account: {cluster.default_account or '(none)'}")
+    if cluster.accounts:
+        print(f"Available Accounts: {', '.join(cluster.accounts)}")
+    print()
+
+    # QOS info
+    if cluster.qos_policies:
+        print(f"QOS Policies: {', '.join(cluster.qos_policies)}")
+        print()
+
+    # Partition info
+    print("Partitions:")
+    print("-" * 50)
+    for partition in cluster.partitions:
+        default_marker = " (default)" if partition.is_default else ""
+        state_marker = f" [{partition.state}]" if partition.state != "up" else ""
+        print(f"\n  {partition.name}{default_marker}{state_marker}")
+        print(f"    Nodes: {partition.total_nodes}")
+        print(f"    Max Time: {partition.max_time}")
+        if partition.default_time != partition.max_time:
+            print(f"    Default Time: {partition.default_time}")
+
+        # Summarize node types
+        for nt in partition.node_types:
+            gpu_info = ""
+            if nt.gpu_specs:
+                # Format multiple GPU types like "7x b200, 7x 1g.23gb"
+                gpu_parts = [f"{count}x {gtype}" for count, gtype in nt.gpu_specs]
+                gpu_info = f", {', '.join(gpu_parts)}"
+            mem_gb = nt.memory_mb // 1024
+            features_str = ""
+            if nt.features:
+                features_str = f" [{', '.join(nt.features)}]"
+            count_str = f" ({nt.count} node{'s' if nt.count != 1 else ''})"
+            print(f"      - {nt.cpus} CPUs, {mem_gb} GB{gpu_info}{features_str}{count_str}")
 
 
 def main():
