@@ -40,7 +40,7 @@ class TestConfigClusterCommand:
             max_time="7-00:00:00",
             default_time="1:00:00",
             node_types=[
-                cluster_mod.NodeType(cpus=64, memory_mb=256 * 1024, gpus=0),
+                cluster_mod.NodeType(cpus=64, memory_mb=256 * 1024, gpu_specs=(), count=100),
             ],
             total_nodes=100,
             is_default=True,
@@ -51,7 +51,9 @@ class TestConfigClusterCommand:
             max_time="2-00:00:00",
             default_time="1:00:00",
             node_types=[
-                cluster_mod.NodeType(cpus=32, memory_mb=128 * 1024, gpus=4, gpu_type="a100"),
+                cluster_mod.NodeType(
+                    cpus=32, memory_mb=128 * 1024, gpu_specs=((4, "a100"),), count=20
+                ),
             ],
             total_nodes=20,
             is_default=False,
@@ -88,8 +90,9 @@ class TestConfigClusterCommand:
                 cluster_mod.NodeType(
                     cpus=64,
                     memory_mb=256 * 1024,
-                    gpus=0,
+                    gpu_specs=(),
                     features=("avx512", "intel"),
+                    count=100,
                 ),
             ],
             total_nodes=100,
@@ -123,8 +126,9 @@ class TestConfigClusterCommand:
         nt = part["node_types"][0]
         assert nt["cpus"] == 64
         assert nt["memory_mb"] == 256 * 1024
-        assert nt["gpus"] == 0
+        assert nt["gpu_specs"] == []  # No GPUs
         assert nt["features"] == ["avx512", "intel"]
+        assert nt["count"] == 100
 
     def test_config_cluster_down_partition(self, monkeypatch, capsys):
         """Test display of partition with down state."""
@@ -133,7 +137,7 @@ class TestConfigClusterCommand:
             state="drained",
             max_time="1:00:00",
             default_time="0:30:00",
-            node_types=[cluster_mod.NodeType(cpus=16, memory_mb=32 * 1024)],
+            node_types=[cluster_mod.NodeType(cpus=16, memory_mb=32 * 1024, count=5)],
             total_nodes=5,
             is_default=False,
         )

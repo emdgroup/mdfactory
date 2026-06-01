@@ -1860,9 +1860,11 @@ def config_cluster(
                         {
                             "cpus": nt.cpus,
                             "memory_mb": nt.memory_mb,
-                            "gpus": nt.gpus,
-                            "gpu_type": nt.gpu_type,
+                            "gpu_specs": [
+                                {"count": count, "type": gtype} for count, gtype in nt.gpu_specs
+                            ],
                             "features": list(nt.features),
+                            "count": nt.count,
                         }
                         for nt in p.node_types
                     ],
@@ -1904,14 +1906,16 @@ def config_cluster(
         # Summarize node types
         for nt in partition.node_types:
             gpu_info = ""
-            if nt.gpus > 0:
-                gpu_type_str = nt.gpu_type or "GPU"
-                gpu_info = f", {nt.gpus}x {gpu_type_str}"
+            if nt.gpu_specs:
+                # Format multiple GPU types like "7x b200, 7x 1g.23gb"
+                gpu_parts = [f"{count}x {gtype}" for count, gtype in nt.gpu_specs]
+                gpu_info = f", {', '.join(gpu_parts)}"
             mem_gb = nt.memory_mb // 1024
             features_str = ""
             if nt.features:
                 features_str = f" [{', '.join(nt.features)}]"
-            print(f"      - {nt.cpus} CPUs, {mem_gb} GB{gpu_info}{features_str}")
+            count_str = f" ({nt.count} node{'s' if nt.count != 1 else ''})"
+            print(f"      - {nt.cpus} CPUs, {mem_gb} GB{gpu_info}{features_str}{count_str}")
 
 
 def main():

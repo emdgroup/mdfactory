@@ -93,25 +93,37 @@ class TestParseGres:
     """Test GPU GRES string parsing."""
 
     def test_gpu_with_type_and_count(self):
-        assert _parse_gres("gpu:a100:4") == (4, "a100")
+        assert _parse_gres("gpu:a100:4") == [(4, "a100")]
 
     def test_gpu_with_count_only(self):
-        assert _parse_gres("gpu:2") == (2, None)
+        assert _parse_gres("gpu:2") == [(2, None)]
 
     def test_gpu_with_type_only(self):
-        assert _parse_gres("gpu:h100") == (1, "h100")
+        assert _parse_gres("gpu:h100") == [(1, "h100")]
 
     def test_null_gres(self):
-        assert _parse_gres("(null)") == (0, None)
+        assert _parse_gres("(null)") == []
 
     def test_empty_string(self):
-        assert _parse_gres("") == (0, None)
+        assert _parse_gres("") == []
 
     def test_multi_gres_with_gpu(self):
-        assert _parse_gres("mps:shared,gpu:a100:4") == (4, "a100")
+        assert _parse_gres("mps:shared,gpu:a100:4") == [(4, "a100")]
 
     def test_non_gpu_gres(self):
-        assert _parse_gres("mps:shared") == (0, None)
+        assert _parse_gres("mps:shared") == []
+
+    def test_multiple_gpu_types(self):
+        """Test multiple GPU entries (e.g., MIG slices)."""
+        result = _parse_gres("gpu:b200:7,gpu:1g.23gb:7")
+        assert len(result) == 2
+        assert (7, "1g.23gb") in result
+        assert (7, "b200") in result
+
+    def test_socket_binding_stripped(self):
+        """Test that socket binding suffixes are removed."""
+        assert _parse_gres("gpu:l40s:4(S:0-1)") == [(4, "l40s")]
+        assert _parse_gres("gpu:b200:8(S:0-1),gpu:1g.23gb:7(S:1)") == [(8, "b200"), (7, "1g.23gb")]
 
 
 # ---------------------------------------------------------------------------
@@ -155,9 +167,9 @@ class TestParseSinfo:
         nt = cpu_part.node_types[0]
         assert nt.cpus == 128
         assert nt.memory_mb == 512000
-        assert nt.gpus == 0
-        assert nt.gpu_type is None
+        assert nt.gpu_specs == ()  # No GPUs
         assert "epyc9555" in nt.features
+        assert nt.count == 3  # 3 nodes with this config
 
     def test_gpu_partition_multiple_node_types(self):
         partitions = _parse_sinfo(SINFO_OUTPUT_MIXED)
@@ -166,13 +178,15 @@ class TestParseSinfo:
         # 2 distinct node types: a100 (64 core) and h100 (96 core)
         assert len(gpu_part.node_types) == 2
 
-        a100_node = next(n for n in gpu_part.node_types if n.gpu_type == "a100")
+        a100_node = next(n for n in gpu_part.node_types if (4, "a100") in n.gpu_specs)
         assert a100_node.cpus == 64
-        assert a100_node.gpus == 4
+        assert a100_node.gpu_specs == ((4, "a100"),)
+        assert a100_node.count == 2  # 2 a100 nodes
 
-        h100_node = next(n for n in gpu_part.node_types if n.gpu_type == "h100")
+        h100_node = next(n for n in gpu_part.node_types if (8, "h100") in n.gpu_specs)
         assert h100_node.cpus == 96
-        assert h100_node.gpus == 8
+        assert h100_node.gpu_specs == ((8, "h100"),)
+        assert h100_node.count == 1  # 1 h100 node
 
     def test_total_node_count(self):
         partitions = _parse_sinfo(SINFO_OUTPUT_MIXED)
@@ -201,8 +215,7 @@ class TestParseSinfo:
         partitions = _parse_sinfo(SINFO_OUTPUT_NO_TYPE_GPU)
         assert len(partitions) == 1
         nt = partitions[0].node_types[0]
-        assert nt.gpus == 4
-        assert nt.gpu_type is None
+        assert nt.gpu_specs == ((4, None),)  # 4 GPUs, no type specified
 
     def test_default_time_parsed_separately(self):
         partitions = _parse_sinfo(SINFO_OUTPUT_MIXED)
@@ -479,7 +492,7 @@ class TestDataclasses:
     """Test dataclass construction and immutability."""
 
     def test_node_type_frozen(self):
-        nt = NodeType(cpus=64, memory_mb=256000, gpus=4, gpu_type="a100")
+        nt = NodeType(cpus=64, memory_mb=256000, gpu_specs=((4, "a100"),), count=1)
         with pytest.raises(AttributeError):
             nt.cpus = 128  # type: ignore[misc]
 
@@ -495,12 +508,14 @@ class TestDataclasses:
 
     def test_node_type_defaults(self):
         nt = NodeType(cpus=32, memory_mb=64000)
-        assert nt.gpus == 0
-        assert nt.gpu_type is None
+        assert nt.gpu_specs == ()  # No GPUs by default
         assert nt.features == ()
+        assert nt.count == 1  # Default count
 
     def test_node_type_features_immutable(self):
-        nt = NodeType(cpus=64, memory_mb=256000, features=("a100", "nvlink"))
+        nt = NodeType(
+            cpus=64, memory_mb=256000, gpu_specs=((4, "a100"),), features=("a100", "nvlink")
+        )
         assert nt.features == ("a100", "nvlink")
         with pytest.raises(TypeError):
             nt.features[0] = "other"  # type: ignore[index]
