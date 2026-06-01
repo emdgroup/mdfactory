@@ -34,6 +34,8 @@ class SlurmConfig:
     def from_cluster(
         cls,
         *,
+        account: str | None = None,
+        partition: str | None = None,
         needs_gpu: bool = False,
         time: str = "2h",
         cpus_per_task: int = 4,
@@ -42,15 +44,21 @@ class SlurmConfig:
         constraint: str | None = None,
         job_name_prefix: str = "mdfactory-analysis",
     ) -> "SlurmConfig":
-        """Create SlurmConfig from autodiscovered cluster info.
+        """Create SlurmConfig from config file or autodiscovered cluster info.
+
+        Precedence: explicit parameters > config file > autodiscovery
 
         Uses lazy import of ``mdfactory.performance.cluster`` to avoid
         hard dependency on SLURM commands at import time.
 
         Parameters
         ----------
+        account : str or None
+            SLURM account. If None, uses config or autodiscovery.
+        partition : str or None
+            SLURM partition. If None, uses config or autodiscovers based on needs_gpu.
         needs_gpu : bool
-            If True, select a GPU-enabled partition.
+            If True and partition not specified, autodiscover GPU partition.
         time : str
             Job time limit (default: "2h").
         cpus_per_task : int
@@ -58,7 +66,7 @@ class SlurmConfig:
         mem_gb : int
             Memory per task in GB (default: 8).
         qos : str or None
-            Quality of service. If None, uses first available from cluster.
+            Quality of service. If None, uses config or SLURM default.
         constraint : str or None
             SLURM constraint string.
         job_name_prefix : str
@@ -67,52 +75,69 @@ class SlurmConfig:
         Returns
         -------
         SlurmConfig
-            Configured instance with autodiscovered account and partition.
+            Configured instance.
 
         Raises
         ------
         RuntimeError
-            If SLURM is not available or no suitable partition found.
+            If SLURM is not available or required values cannot be determined.
         """
         from mdfactory.performance.cluster import discover_cluster, select_partition
+        from mdfactory.settings import settings
 
+        # Try autodiscovery (needed for fallback)
         cluster = discover_cluster()
-        if cluster is None:
-            raise RuntimeError(
-                "SLURM autodiscovery failed: not running on a SLURM cluster "
-                "or SLURM commands (sinfo) are not available."
-            )
 
-        # Select appropriate partition
-        partition = select_partition(
-            cluster,
-            needs_gpu=needs_gpu,
-            min_cpus=cpus_per_task,
-            min_mem_gb=mem_gb,
-        )
-        if partition is None:
-            raise RuntimeError(
-                f"No suitable partition found for requirements: "
-                f"needs_gpu={needs_gpu}, min_cpus={cpus_per_task}, min_mem_gb={mem_gb}"
-            )
+        # Determine account: explicit > config > autodiscovery
+        resolved_account = account
+        if resolved_account is None:
+            resolved_account = settings.slurm_account
+        if resolved_account is None:
+            if cluster is None:
+                raise RuntimeError(
+                    "SLURM autodiscovery failed and no account configured. "
+                    "Set [slurm] account in config.ini or pass account= explicitly."
+                )
+            resolved_account = cluster.default_account
+            if resolved_account is None:
+                raise RuntimeError(
+                    "No SLURM account available. "
+                    "Set [slurm] account in config.ini or pass account= explicitly."
+                )
 
-        # Get account (required)
-        account = cluster.default_account
-        if account is None:
-            raise RuntimeError(
-                "SLURM autodiscovery failed: no default account found. "
-                "Please specify --account explicitly."
-            )
+        # Determine partition: explicit > config > autodiscovery
+        resolved_partition = partition
+        if resolved_partition is None:
+            resolved_partition = settings.slurm_partition
 
-        # Use first QOS if available and not explicitly set
+        # Fall back to autodiscovery if no config value
+        if resolved_partition is None:
+            if cluster is None:
+                raise RuntimeError(
+                    "SLURM autodiscovery failed and no partition configured. "
+                    "Set [slurm] partition in config.ini or pass partition= explicitly."
+                )
+            selected = select_partition(
+                cluster,
+                needs_gpu=needs_gpu,
+                min_cpus=cpus_per_task,
+                min_mem_gb=mem_gb,
+            )
+            if selected is None:
+                raise RuntimeError(
+                    f"No suitable partition found for requirements: "
+                    f"needs_gpu={needs_gpu}, cpus={cpus_per_task}, mem={mem_gb}GB"
+                )
+            resolved_partition = selected.name
+
+        # Determine QOS: explicit > config > skip (let SLURM use default)
         resolved_qos = qos
-        if resolved_qos is None and cluster.qos_policies:
-            # Don't auto-select QOS; let SLURM use partition default
-            pass
+        if resolved_qos is None:
+            resolved_qos = settings.slurm_qos
 
         return cls(
-            account=account,
-            partition=partition.name,
+            account=resolved_account,
+            partition=resolved_partition,
             time=time,
             cpus_per_task=cpus_per_task,
             mem_gb=mem_gb,

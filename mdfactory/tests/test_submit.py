@@ -438,7 +438,9 @@ class TestSlurmConfigFromCluster:
 
         import pytest
 
-        with pytest.raises(RuntimeError, match="not running on a SLURM cluster"):
+        with pytest.raises(
+            RuntimeError, match="SLURM autodiscovery failed and no account configured"
+        ):
             submit_mod.SlurmConfig.from_cluster()
 
     def test_from_cluster_no_account_raises(self, monkeypatch):
@@ -465,7 +467,7 @@ class TestSlurmConfigFromCluster:
 
         import pytest
 
-        with pytest.raises(RuntimeError, match="no default account found"):
+        with pytest.raises(RuntimeError, match="No SLURM account available"):
             submit_mod.SlurmConfig.from_cluster()
 
     def test_from_cluster_no_suitable_partition_raises(self, monkeypatch):
@@ -537,3 +539,100 @@ class TestSlurmConfigFromCluster:
 
         assert config.partition == "gpu"
         assert config.account == "myaccount"
+
+    def test_from_cluster_uses_config_account(self, monkeypatch):
+        """Test that config account takes precedence over autodiscovery."""
+        from mdfactory.performance import cluster as cluster_mod
+        from mdfactory.settings import Settings
+
+        mock_partition = cluster_mod.Partition(
+            name="compute",
+            state="up",
+            max_time="3-00:00:00",
+            default_time="1:00:00",
+            node_types=[
+                cluster_mod.NodeType(cpus=32, memory_mb=128 * 1024, gpu_specs=(), count=10),
+            ],
+            total_nodes=10,
+            is_default=True,
+        )
+        mock_cluster = cluster_mod.ClusterInfo(
+            partitions=[mock_partition],
+            accounts=["autodiscovered-account"],
+            qos_policies=[],
+            default_account="autodiscovered-account",
+        )
+
+        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: mock_cluster)
+        monkeypatch.setattr(Settings, "slurm_account", property(lambda self: "config-account"))
+
+        config = submit_mod.SlurmConfig.from_cluster()
+
+        # Should use config account, not autodiscovered
+        assert config.account == "config-account"
+
+    def test_from_cluster_uses_config_partition(self, monkeypatch):
+        """Test that config partition takes precedence over autodiscovery."""
+        from mdfactory.performance import cluster as cluster_mod
+        from mdfactory.settings import Settings
+
+        mock_partition = cluster_mod.Partition(
+            name="autodiscovered-partition",
+            state="up",
+            max_time="3-00:00:00",
+            default_time="1:00:00",
+            node_types=[
+                cluster_mod.NodeType(cpus=32, memory_mb=128 * 1024, gpu_specs=(), count=10),
+            ],
+            total_nodes=10,
+            is_default=True,
+        )
+        mock_cluster = cluster_mod.ClusterInfo(
+            partitions=[mock_partition],
+            accounts=["myaccount"],
+            qos_policies=[],
+            default_account="myaccount",
+        )
+
+        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: mock_cluster)
+        monkeypatch.setattr(Settings, "slurm_partition", property(lambda self: "config-partition"))
+
+        config = submit_mod.SlurmConfig.from_cluster(needs_gpu=False)
+
+        # Should use config partition, not autodiscovered
+        assert config.partition == "config-partition"
+
+    def test_from_cluster_explicit_overrides_config(self, monkeypatch):
+        """Test that explicit parameters override config values."""
+        from mdfactory.performance import cluster as cluster_mod
+        from mdfactory.settings import Settings
+
+        mock_partition = cluster_mod.Partition(
+            name="any-partition",
+            state="up",
+            max_time="3-00:00:00",
+            default_time="1:00:00",
+            node_types=[
+                cluster_mod.NodeType(cpus=32, memory_mb=128 * 1024, gpu_specs=(), count=10),
+            ],
+            total_nodes=10,
+            is_default=True,
+        )
+        mock_cluster = cluster_mod.ClusterInfo(
+            partitions=[mock_partition],
+            accounts=["myaccount"],
+            qos_policies=[],
+            default_account="myaccount",
+        )
+
+        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: mock_cluster)
+        monkeypatch.setattr(Settings, "slurm_account", property(lambda self: "config-account"))
+        monkeypatch.setattr(Settings, "slurm_partition", property(lambda self: "config-partition"))
+
+        config = submit_mod.SlurmConfig.from_cluster(
+            account="explicit-account", partition="explicit-partition"
+        )
+
+        # Should use explicit values
+        assert config.account == "explicit-account"
+        assert config.partition == "explicit-partition"
