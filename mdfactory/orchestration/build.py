@@ -186,6 +186,37 @@ def _wait_with_progress(
     )
     task_id = progress.add_task("builds", total=total, succeeded=0, failed=0, running=0)
 
+    def _get_block_status() -> str:
+        """Query Parsl for SLURM block (job) statuses."""
+        try:
+            dfk = parsl.dfk()
+            counts: dict[str, int] = {}
+            for executor in dfk.executors.values():
+                if not hasattr(executor, "status"):
+                    continue
+                block_statuses = executor.status()
+                for _block_id, job_status in block_statuses.items():
+                    state = str(job_status.state.name).lower()
+                    counts[state] = counts.get(state, 0) + 1
+            if not counts:
+                return ""
+            parts = []
+            if counts.get("running", 0):
+                parts.append(f"[green]{counts['running']} running[/]")
+            if counts.get("pending", 0):
+                parts.append(f"[yellow]{counts['pending']} pending[/]")
+            if counts.get("completed", 0):
+                parts.append(f"[dim]{counts['completed']} completed[/]")
+            if counts.get("failed", 0):
+                parts.append(f"[red]{counts['failed']} failed[/]")
+            # Catch-all for other states
+            for state, count in counts.items():
+                if state not in ("running", "pending", "completed", "failed"):
+                    parts.append(f"[dim]{count} {state}[/]")
+            return " · ".join(parts)
+        except Exception:
+            return ""
+
     def _render():
         done_count = succeeded + failed
         running = sum(1 for i, f in enumerate(futures) if results[i] is None and _is_running(f))
@@ -196,8 +227,11 @@ def _wait_with_progress(
             failed=failed,
             running=running,
         )
-        # Combine progress bar + activity log
+        # Combine progress bar + SLURM status + activity log
         parts = [progress]
+        block_info = _get_block_status()
+        if block_info:
+            parts.append(Text.from_markup(f"  SLURM jobs: {block_info}"))
         if activity:
             parts.append(Text(""))  # blank line
             for line in activity[-max_activity:]:
