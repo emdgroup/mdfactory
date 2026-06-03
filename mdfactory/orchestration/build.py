@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -76,8 +77,54 @@ def build_systems(
 
     # Poll futures with live status reporting
     results = _wait_with_progress(futures, hashes=input_hashes)
-    parsl.clear()
+    _shutdown_parsl()
     return results
+
+
+def _shutdown_parsl():
+    """Shut down Parsl and cancel any remaining SLURM jobs."""
+    try:
+        dfk = parsl.dfk()
+        # Collect SLURM job IDs before cleanup
+        job_ids = _get_slurm_job_ids(dfk)
+        parsl.clear()
+        # Explicitly scancel anything still alive
+        if job_ids:
+            _scancel_jobs(job_ids)
+    except Exception as exc:
+        logger.debug(f"Parsl shutdown error (non-fatal): {exc}")
+
+
+def _get_slurm_job_ids(dfk) -> list[str]:
+    """Extract active SLURM job IDs from the Parsl DataFlowKernel."""
+    job_ids = []
+    try:
+        for executor in dfk.executors.values():
+            if hasattr(executor, "provider") and hasattr(executor.provider, "resources"):
+                for _block_id, resource in executor.provider.resources.items():
+                    job_id = resource.get("remote_job_id") or resource.get("job_id")
+                    if job_id:
+                        job_ids.append(str(job_id))
+    except Exception:
+        pass
+    return job_ids
+
+
+def _scancel_jobs(job_ids: list[str]):
+    """Run scancel on the given SLURM job IDs."""
+    if not job_ids:
+        return
+    try:
+        cmd = ["scancel"] + job_ids
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+        if result.returncode == 0:
+            logger.info(f"Cancelled SLURM jobs: {', '.join(job_ids)}")
+        else:
+            logger.debug(f"scancel stderr: {result.stderr.strip()}")
+    except FileNotFoundError:
+        logger.debug("scancel not found (not on SLURM cluster)")
+    except Exception as exc:
+        logger.debug(f"scancel failed: {exc}")
 
 
 def _wait_with_progress(
@@ -122,7 +169,7 @@ def _wait_with_progress(
     succeeded = 0
     failed = 0
     # Activity log (last N events)
-    max_activity = 8
+    max_activity = 12
     activity: list[Text] = []
 
     # Progress bar
@@ -183,16 +230,17 @@ def _wait_with_progress(
                             line.append("  done", style="dim")
                             activity.append(line)
                         except Exception as exc:
+                            error_msg = str(exc)
                             results[i] = {
                                 "hash": display_hashes[i],
                                 "status": "failed",
-                                "error": str(exc),
+                                "error": error_msg,
                             }
                             failed += 1
                             line = Text()
                             line.append("  ✗ ", style="bold red")
                             line.append(display_hashes[i][:12], style="cyan")
-                            line.append(f"  {str(exc)[:50]}", style="red")
+                            line.append(f"  {error_msg}", style="red")
                             activity.append(line)
                         done_count += 1
 
@@ -204,10 +252,8 @@ def _wait_with_progress(
                 time.sleep(poll_interval)
 
     except KeyboardInterrupt:
-        console.print(
-            "\n[bold yellow]Interrupted — shutting down Parsl (cancelling SLURM jobs)...[/]"
-        )
-        parsl.clear()
+        console.print("\n[bold yellow]Interrupted — cancelling SLURM jobs...[/]")
+        _shutdown_parsl()
         raise
 
     return [r for r in results if r is not None]
