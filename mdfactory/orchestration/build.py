@@ -231,7 +231,7 @@ def _wait_with_progress(
         parts = [progress]
         block_info = _get_block_status()
         if block_info:
-            parts.append(Text.from_markup(f"  SLURM jobs: {block_info}"))
+            parts.append(Text.from_markup(f"  🖥  SLURM: {block_info}"))
         if activity:
             parts.append(Text(""))  # blank line
             for line in activity[-max_activity:]:
