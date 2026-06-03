@@ -43,6 +43,9 @@ foundry = [
 submitit = [
     "submitit>=1.5.1",
 ]
+parsl = [
+    "parsl>=2024.1.1",
+]
 dev = [
     "bump-my-version",
     "hatch",
@@ -97,6 +100,7 @@ openmm = "*"
 
 [tool.pixi.pypi-dependencies]
 mdfactory = { path = ".", editable = true }
+parsl = ">=2024.1.1"
 
 [tool.pixi.tasks]
 test = "pytest -k 'not build' mdfactory"
@@ -209,3 +213,4 @@ addopts = "-m 'not foundry_live and not slow' -v --cov mdfactory --cov-report xm
 
 [tool.coverage.run]
 omit = ["mdfactory/tests/*"]
+

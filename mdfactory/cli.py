@@ -33,7 +33,7 @@ from .prepare import df_to_build_input_models
 from .utils.data_manager import check_run_exists
 from .utils.push import push_systems
 from .utils.utilities import working_directory
-from .workflows import run_build_from_file
+from .workflows import run_build_from_dict, run_build_from_file
 
 app = App(name="MDFactory", version=__version__)
 
@@ -113,21 +113,196 @@ def df_models_from_input_csv(input):
 
 
 @app.command(name="build", group="Build")
-def build_system(input: Path, output: Path = Path(".")):
-    """Build MD system from YAML input file.
+def build_system(
+    input: Path,
+    output: Path = Path("."),
+    config: Annotated[
+        Path | None, Parameter(help="Executor config YAML for parallel Parsl builds.")
+    ] = None,
+    dry_run: Annotated[
+        bool, Parameter(help="Print what would be built without executing.")
+    ] = False,
+):
+    """Build MD system(s) from YAML, CSV, or summary input.
+
+    Supports three input modes:
+
+    - Single YAML: builds one system locally (original behavior)
+    - CSV file: builds systems from each row (parallel with --config, sequential without)
+    - Summary YAML: dispatches builds for previously prepared systems
 
     Parameters
     ----------
     input : Path
-        Path to the YAML file specifying the `BuildInput`
+        Path to input file (YAML for single build, CSV for batch, summary YAML for prepared).
     output : Path, optional
-        Output directory, by default Path(".")
+        Output directory, by default Path(".").
+    config : Path, optional
+        Path to executor configuration YAML for parallel Parsl builds.
+    dry_run : bool, optional
+        Print what would be built without executing.
 
     """
     input = input.resolve()
-    logger.info(f"Building system from YAML file {input} and output directory: {output}.")
-    with working_directory(output, create=True):
-        run_build_from_file(input)
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+
+    suffix = input.suffix.lower()
+
+    if suffix == ".csv":
+        _build_from_csv(input, output, config=config, dry_run=dry_run)
+    elif suffix in (".yaml", ".yml"):
+        _build_from_yaml(input, output, config=config, dry_run=dry_run)
+    else:
+        logger.error(f"Unsupported input file format: {suffix}. Use .csv, .yaml, or .yml.")
+        sys.exit(1)
+
+
+def _build_from_csv(
+    input: Path,
+    output: Path,
+    *,
+    config: Path | None = None,
+    dry_run: bool = False,
+):
+    """Handle CSV input for the build command."""
+    df, models, errors = df_models_from_input_csv(input)
+    if errors:
+        logger.error("Errors building models from CSV:")
+        for k, v in errors.items():
+            logger.error(f"  Row {k}: {v}")
+        sys.exit(1)
+
+    # Create per-hash directories and write YAML files
+    for model in models:
+        build_dir = output / model.hash
+        build_dir.mkdir(parents=True, exist_ok=True)
+        yml_path = build_dir / f"{model.hash}.yaml"
+        if not yml_path.exists():
+            with open(yml_path, "w") as f:
+                yaml.safe_dump(model.model_dump(), f)
+
+    if dry_run:
+        from mdfactory.orchestration import ExecutorConfig, build_systems_dry_run
+
+        executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
+        build_systems_dry_run(models, executor_config, output_dir=output)
+        return
+
+    if config is not None:
+        # Parallel builds via Parsl
+        from mdfactory.orchestration import ExecutorConfig, build_systems
+
+        executor_config = ExecutorConfig.from_yaml(config)
+        results = build_systems(models, executor_config, output_dir=output)
+        _report_build_results(results)
+    else:
+        # Sequential local builds
+        logger.info(f"Building {len(models)} system(s) sequentially.")
+        for model in models:
+            build_dir = output / model.hash
+            logger.info(f"Building {model.hash} ({model.simulation_type})...")
+            with working_directory(build_dir, create=True):
+                run_build_from_dict(model)
+
+
+def _build_from_yaml(
+    input: Path,
+    output: Path,
+    *,
+    config: Path | None = None,
+    dry_run: bool = False,
+):
+    """Handle YAML input for the build command."""
+    with open(input) as f:
+        data = yaml.safe_load(f)
+
+    if isinstance(data, dict) and "system_directory" in data:
+        # Summary YAML -- dispatch builds for prepared systems
+        _build_from_summary_yaml(data, output, config=config, dry_run=dry_run)
+    else:
+        # Single build YAML
+        if dry_run:
+            from mdfactory.orchestration import ExecutorConfig, build_systems_dry_run
+
+            executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
+            from mdfactory.models.input import BuildInput
+
+            model = BuildInput(**data)
+            build_systems_dry_run([model], executor_config, output_dir=output)
+            return
+
+        if config is not None:
+            from mdfactory.models.input import BuildInput
+            from mdfactory.orchestration import ExecutorConfig, build_systems
+
+            executor_config = ExecutorConfig.from_yaml(config)
+            model = BuildInput(**data)
+            results = build_systems([model], executor_config, output_dir=output)
+            _report_build_results(results)
+        else:
+            logger.info(f"Building system from YAML file {input} and output directory: {output}.")
+            with working_directory(output, create=True):
+                run_build_from_file(input)
+
+
+def _build_from_summary_yaml(
+    data: dict,
+    output: Path,
+    *,
+    config: Path | None = None,
+    dry_run: bool = False,
+):
+    """Handle summary YAML (from prepare-build) for the build command."""
+    dirs = data.get("system_directory", [])
+    hashes = data.get("hash", [])
+
+    if not dirs:
+        logger.error("Summary YAML contains no system_directory entries.")
+        sys.exit(1)
+
+    from mdfactory.models.input import BuildInput
+
+    models = []
+    for sim_dir, sim_hash in zip(dirs, hashes):
+        yml_path = Path(sim_dir) / f"{sim_hash}.yaml"
+        if not yml_path.exists():
+            logger.error(f"Build YAML not found: {yml_path}")
+            sys.exit(1)
+        with open(yml_path) as f:
+            model_data = yaml.safe_load(f)
+        models.append(BuildInput(**model_data))
+
+    if dry_run:
+        from mdfactory.orchestration import ExecutorConfig, build_systems_dry_run
+
+        executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
+        build_systems_dry_run(models, executor_config, output_dir=output)
+        return
+
+    if config is not None:
+        from mdfactory.orchestration import ExecutorConfig, build_systems
+
+        executor_config = ExecutorConfig.from_yaml(config)
+        results = build_systems(models, executor_config, output_dir=output)
+        _report_build_results(results)
+    else:
+        # Sequential local builds
+        logger.info(f"Building {len(models)} prepared system(s) sequentially.")
+        for model, sim_dir in zip(models, dirs):
+            logger.info(f"Building {model.hash} ({model.simulation_type})...")
+            with working_directory(Path(sim_dir), create=True):
+                run_build_from_dict(model)
+
+
+def _report_build_results(results: list[dict]):
+    """Report build results to the user."""
+    succeeded = sum(1 for r in results if r.get("status") == "success")
+    failed = sum(1 for r in results if r.get("status") == "failed")
+    logger.info(f"Build complete: {succeeded} succeeded, {failed} failed.")
+    for r in results:
+        if r.get("status") == "failed":
+            logger.error(f"  {r.get('hash', 'unknown')}: {r.get('error', 'unknown error')}")
 
 
 @app.command(name="clean")

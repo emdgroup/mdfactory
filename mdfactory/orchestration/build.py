@@ -1,0 +1,265 @@
+# ABOUTME: Build orchestration dispatch via Parsl
+# ABOUTME: Submits parallel builds and provides dry-run preview
+"""Build orchestration via Parsl."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import parsl
+from loguru import logger
+
+from mdfactory.models.input import BuildInput
+
+from .apps import get_build_app
+
+if TYPE_CHECKING:
+    from .config import ExecutorConfig
+
+
+def build_systems(
+    build_inputs: list,
+    config: "ExecutorConfig",
+    *,
+    output_dir: Path | None = None,
+    wait: bool = True,
+) -> list:
+    """Submit parallel builds via Parsl.
+
+    Parameters
+    ----------
+    build_inputs : list
+        List of BuildInput models or dicts.
+    config : ExecutorConfig
+        Executor configuration for Parsl.
+    output_dir : Path, optional
+        Base output directory for builds. Defaults to current directory.
+    wait : bool, optional
+        Whether to wait for all futures to complete. Default True.
+
+    Returns
+    -------
+    list
+        If wait=True, list of result dicts. If wait=False, list of AppFutures.
+
+    """
+    output_dir = Path(output_dir) if output_dir else Path.cwd()
+
+    # Build parsl config and load
+    parsl_config = config.to_parsl_config()
+    parsl.load(parsl_config)
+
+    build_app = get_build_app()
+
+    # Prepare inputs and submit
+    futures = []
+    input_hashes = []
+    for inp in build_inputs:
+        if isinstance(inp, BuildInput):
+            input_dict = inp.model_dump()
+            input_dict["_build_dir"] = str(output_dir / inp.hash)
+            input_hashes.append(inp.hash)
+        elif isinstance(inp, dict):
+            model = BuildInput(**inp)
+            input_dict = inp.copy()
+            input_dict["_build_dir"] = str(output_dir / model.hash)
+            input_hashes.append(model.hash)
+        else:
+            raise TypeError(f"Expected BuildInput or dict, got {type(inp)}")
+        futures.append(build_app(input_dict))
+
+    logger.info(f"Submitted {len(futures)} build(s) to Parsl")
+
+    if not wait:
+        return futures
+
+    # Poll futures with live status reporting
+    results = _wait_with_progress(futures, hashes=input_hashes)
+    parsl.clear()
+    return results
+
+
+def _wait_with_progress(
+    futures: list,
+    *,
+    hashes: list[str] | None = None,
+    poll_interval: float = 2.0,
+) -> list[dict]:
+    """Wait for futures with a live terminal progress display.
+
+    Shows a progress bar with summary counts and a scrolling activity log
+    of recent completions/failures. Scales to any number of builds.
+
+    Parameters
+    ----------
+    futures : list
+        List of Parsl AppFutures.
+    hashes : list[str], optional
+        Known hashes for each build (displayed in activity log).
+    poll_interval : float
+        Seconds between status polls.
+
+    Returns
+    -------
+    list[dict]
+        Result dicts for each future.
+
+    """
+    import time
+
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
+    from rich.text import Text
+
+    total = len(futures)
+    results: list[dict | None] = [None] * total
+    display_hashes = hashes or [f"build-{i}" for i in range(total)]
+    console = Console()
+
+    # Track counts
+    succeeded = 0
+    failed = 0
+    # Activity log (last N events)
+    max_activity = 8
+    activity: list[Text] = []
+
+    # Progress bar
+    progress = Progress(
+        TextColumn("🔨 [bold]Parsl Builds[/]"),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TextColumn("·"),
+        TextColumn("[green]{task.fields[succeeded]} ✓[/]"),
+        TextColumn("[red]{task.fields[failed]} ✗[/]"),
+        TextColumn("[yellow]{task.fields[running]} ●[/]"),
+        console=console,
+        transient=False,
+    )
+    task_id = progress.add_task("builds", total=total, succeeded=0, failed=0, running=0)
+
+    def _render():
+        done_count = succeeded + failed
+        running = sum(1 for i, f in enumerate(futures) if results[i] is None and _is_running(f))
+        progress.update(
+            task_id,
+            completed=done_count,
+            succeeded=succeeded,
+            failed=failed,
+            running=running,
+        )
+        # Combine progress bar + activity log
+        parts = [progress]
+        if activity:
+            parts.append(Text(""))  # blank line
+            for line in activity[-max_activity:]:
+                parts.append(line)
+        return Group(*parts)
+
+    def _is_running(future) -> bool:
+        try:
+            status = future.task_status()
+            return status in ("launched", "running", "running_ended")
+        except Exception:
+            return False
+
+    try:
+        with Live(_render(), console=console, refresh_per_second=2) as live:
+            while True:
+                done_count = 0
+                for i, future in enumerate(futures):
+                    if results[i] is not None:
+                        done_count += 1
+                        continue
+                    if future.done():
+                        try:
+                            result = future.result()
+                            results[i] = result
+                            succeeded += 1
+                            line = Text()
+                            line.append("  ✓ ", style="bold green")
+                            line.append(display_hashes[i][:12], style="cyan")
+                            line.append("  done", style="dim")
+                            activity.append(line)
+                        except Exception as exc:
+                            results[i] = {
+                                "hash": display_hashes[i],
+                                "status": "failed",
+                                "error": str(exc),
+                            }
+                            failed += 1
+                            line = Text()
+                            line.append("  ✗ ", style="bold red")
+                            line.append(display_hashes[i][:12], style="cyan")
+                            line.append(f"  {str(exc)[:50]}", style="red")
+                            activity.append(line)
+                        done_count += 1
+
+                live.update(_render())
+
+                if done_count == total:
+                    break
+
+                time.sleep(poll_interval)
+
+    except KeyboardInterrupt:
+        console.print(
+            "\n[bold yellow]Interrupted — shutting down Parsl (cancelling SLURM jobs)...[/]"
+        )
+        parsl.clear()
+        raise
+
+    return [r for r in results if r is not None]
+
+
+def build_systems_dry_run(
+    build_inputs: list,
+    config: "ExecutorConfig",
+    *,
+    output_dir: Path | None = None,
+) -> list[dict]:
+    """Print what would be built without submitting to Parsl.
+
+    Parameters
+    ----------
+    build_inputs : list
+        List of BuildInput models or dicts.
+    config : ExecutorConfig
+        Executor configuration (used for display, Parsl not loaded).
+    output_dir : Path, optional
+        Base output directory for builds. Defaults to current directory.
+
+    Returns
+    -------
+    list[dict]
+        List of dicts describing each planned build.
+
+    """
+    output_dir = Path(output_dir) if output_dir else Path.cwd()
+
+    descriptions = []
+    for inp in build_inputs:
+        if isinstance(inp, BuildInput):
+            model = inp
+        elif isinstance(inp, dict):
+            model = BuildInput(**inp)
+        else:
+            raise TypeError(f"Expected BuildInput or dict, got {type(inp)}")
+
+        desc = {
+            "hash": model.hash,
+            "simulation_type": model.simulation_type,
+            "parametrization": model.parametrization,
+            "engine": model.engine,
+            "output_directory": str(output_dir / model.hash),
+        }
+        descriptions.append(desc)
+        logger.info(
+            f"[dry-run] {model.hash} | {model.simulation_type} | "
+            f"{model.parametrization} | {model.engine} -> {output_dir / model.hash}"
+        )
+
+    logger.info(f"[dry-run] {len(descriptions)} system(s) would be built")
+    logger.info(f"[dry-run] Provider: {config.provider}")
+    return descriptions
