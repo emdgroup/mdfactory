@@ -173,24 +173,48 @@ def _build_from_csv(
             logger.error(f"  Row {k}: {v}")
         sys.exit(1)
 
-    if config is not None or dry_run:
-        # Parallel builds via Parsl (or dry-run preview)
+    if dry_run:
         from mdfactory.orchestration import ExecutorConfig, build_systems
 
         executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
-        results = build_systems(models, executor_config, output_dir=output, dry_run=dry_run)
-        if not dry_run:
-            _report_build_results(results)
-    else:
-        # Sequential local builds — create per-hash directories
-        for model in models:
-            build_dir = output / model.hash
-            build_dir.mkdir(parents=True, exist_ok=True)
-            yml_path = build_dir / f"{model.hash}.yaml"
-            if not yml_path.exists():
-                with open(yml_path, "w") as f:
-                    yaml.safe_dump(model.model_dump(), f)
+        build_systems(models, executor_config, output_dir=output, dry_run=True)
+        return
 
+    # Create per-hash directories, write per-system YAMLs, and generate summary
+    dirs = []
+    for model in models:
+        build_dir = output / model.hash
+        build_dir.mkdir(parents=True, exist_ok=True)
+        yml_path = build_dir / f"{model.hash}.yaml"
+        if not yml_path.exists():
+            with open(yml_path, "w") as f:
+                yaml.safe_dump(model.model_dump(), f)
+        dirs.append(str(build_dir.resolve()))
+
+    # Write summary YAML (same format as prepare-build)
+    summary_path = output / f"{input.stem}.yaml"
+    summary = {
+        "n_systems": len(models),
+        "input": str(input),
+        "output": str(output),
+        "hash": [m.hash for m in models],
+        "simulation_type": [m.simulation_type for m in models],
+        "system_directory": dirs,
+        "date": datetime.now(),
+    }
+    with open(summary_path, "w") as f:
+        yaml.safe_dump(summary, f)
+    logger.info(f"Summary YAML written to {summary_path}")
+
+    if config is not None:
+        # Parallel builds via Parsl
+        from mdfactory.orchestration import ExecutorConfig, build_systems
+
+        executor_config = ExecutorConfig.from_yaml(config)
+        results = build_systems(models, executor_config, output_dir=output)
+        _report_build_results(results)
+    else:
+        # Sequential local builds
         logger.info(f"Building {len(models)} system(s) sequentially.")
         for model in models:
             build_dir = output / model.hash

@@ -61,6 +61,21 @@ class TestBuildCommandCSV:
         mock_build.assert_called_once()
         assert mock_build.call_args[1]["dry_run"] is True
 
+    def test_csv_dry_run_no_filesystem_side_effects(self, sample_csv, tmp_path, monkeypatch):
+        """CSV dry-run does not create directories or summary YAML."""
+        from mdfactory.cli import _build_from_csv
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        with patch("mdfactory.orchestration.build_systems") as mock_build:
+            mock_build.return_value = []
+            _build_from_csv(sample_csv, output_dir, dry_run=True)
+
+        # No summary YAML or hash directories should be created in output
+        assert not (output_dir / "input.yaml").exists()
+        assert len(list(output_dir.iterdir())) == 0
+
     def test_csv_sequential_builds_locally(self, sample_csv, tmp_path, monkeypatch):
         """CSV input without --config builds sequentially."""
         from mdfactory.cli import _build_from_csv
@@ -69,6 +84,24 @@ class TestBuildCommandCSV:
             _build_from_csv(sample_csv, tmp_path, config=None, dry_run=False)
 
         mock_build.assert_called_once()
+
+    def test_csv_generates_summary_yaml(self, sample_csv, tmp_path, monkeypatch):
+        """CSV build generates a summary YAML matching prepare-build format."""
+        from mdfactory.cli import _build_from_csv
+
+        with patch("mdfactory.cli.run_build_from_dict"):
+            _build_from_csv(sample_csv, tmp_path, config=None, dry_run=False)
+
+        summary_path = tmp_path / "input.yaml"
+        assert summary_path.exists()
+        with open(summary_path) as f:
+            summary = yaml.safe_load(f)
+        assert summary["n_systems"] == 1
+        assert str(sample_csv) == summary["input"]
+        assert len(summary["hash"]) == 1
+        assert len(summary["system_directory"]) == 1
+        assert "date" in summary
+        assert "simulation_type" in summary
 
     def test_csv_with_config_uses_parsl(self, sample_csv, sample_config, tmp_path, monkeypatch):
         """CSV input with --config dispatches via build_systems."""
