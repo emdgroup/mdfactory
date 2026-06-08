@@ -173,31 +173,24 @@ def _build_from_csv(
             logger.error(f"  Row {k}: {v}")
         sys.exit(1)
 
-    if dry_run:
-        from mdfactory.orchestration import ExecutorConfig, build_systems_dry_run
-
-        executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
-        build_systems_dry_run(models, executor_config, output_dir=output)
-        return
-
-    # Create per-hash directories and write YAML files
-    for model in models:
-        build_dir = output / model.hash
-        build_dir.mkdir(parents=True, exist_ok=True)
-        yml_path = build_dir / f"{model.hash}.yaml"
-        if not yml_path.exists():
-            with open(yml_path, "w") as f:
-                yaml.safe_dump(model.model_dump(), f)
-
-    if config is not None:
-        # Parallel builds via Parsl
+    if config is not None or dry_run:
+        # Parallel builds via Parsl (or dry-run preview)
         from mdfactory.orchestration import ExecutorConfig, build_systems
 
-        executor_config = ExecutorConfig.from_yaml(config)
-        results = build_systems(models, executor_config, output_dir=output)
-        _report_build_results(results)
+        executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
+        results = build_systems(models, executor_config, output_dir=output, dry_run=dry_run)
+        if not dry_run:
+            _report_build_results(results)
     else:
-        # Sequential local builds
+        # Sequential local builds — create per-hash directories
+        for model in models:
+            build_dir = output / model.hash
+            build_dir.mkdir(parents=True, exist_ok=True)
+            yml_path = build_dir / f"{model.hash}.yaml"
+            if not yml_path.exists():
+                with open(yml_path, "w") as f:
+                    yaml.safe_dump(model.model_dump(), f)
+
         logger.info(f"Building {len(models)} system(s) sequentially.")
         for model in models:
             build_dir = output / model.hash
@@ -226,28 +219,18 @@ def _build_from_yaml(
         _build_from_summary_yaml(data, output, config=config, dry_run=dry_run)
     else:
         # Single build YAML
-        if dry_run:
-            from mdfactory.orchestration import ExecutorConfig, build_systems_dry_run
+        from mdfactory.models.input import BuildInput
 
-            executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
-            from mdfactory.models.input import BuildInput
+        model = BuildInput(**data)
 
-            model = BuildInput(**data)
-            build_systems_dry_run([model], executor_config, output_dir=output)
-            return
-
-        if config is not None:
-            from mdfactory.models.input import BuildInput
+        if config is not None or dry_run:
             from mdfactory.orchestration import ExecutorConfig, build_systems
 
-            executor_config = ExecutorConfig.from_yaml(config)
-            model = BuildInput(**data)
-            results = build_systems([model], executor_config, output_dir=output)
-            _report_build_results(results)
+            executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
+            results = build_systems([model], executor_config, output_dir=output, dry_run=dry_run)
+            if not dry_run:
+                _report_build_results(results)
         else:
-            from mdfactory.models.input import BuildInput
-
-            model = BuildInput(**data)
             build_dir = output / model.hash
             logger.info(f"Building {model.hash} ({model.simulation_type}) -> {build_dir}")
             with working_directory(build_dir, create=True):
@@ -288,19 +271,13 @@ def _build_from_summary_yaml(
             model_data = yaml.safe_load(f)
         models.append(BuildInput(**model_data))
 
-    if dry_run:
-        from mdfactory.orchestration import ExecutorConfig, build_systems_dry_run
-
-        executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
-        build_systems_dry_run(models, executor_config, output_dir=output)
-        return
-
-    if config is not None:
+    if config is not None or dry_run:
         from mdfactory.orchestration import ExecutorConfig, build_systems
 
-        executor_config = ExecutorConfig.from_yaml(config)
-        results = build_systems(models, executor_config, output_dir=output)
-        _report_build_results(results)
+        executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
+        results = build_systems(models, executor_config, output_dir=output, dry_run=dry_run)
+        if not dry_run:
+            _report_build_results(results)
     else:
         # Sequential local builds
         logger.info(f"Building {len(models)} prepared system(s) sequentially.")

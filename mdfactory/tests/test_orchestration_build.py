@@ -36,19 +36,20 @@ class FakeBuildInput:
 
 
 def test_build_systems_dry_run(monkeypatch, tmp_path):
-    """build_systems_dry_run describes planned builds without loading Parsl."""
+    """build_systems with dry_run=True describes planned builds without loading Parsl."""
     import mdfactory.orchestration.build as build_mod
-    from mdfactory.orchestration.build import build_systems_dry_run
+    from mdfactory.orchestration.build import build_systems
 
     mock_model = FakeBuildInput(
         hash="ABC123", simulation_type="bilayer", parametrization="smirnoff"
     )
     monkeypatch.setattr(build_mod, "BuildInput", FakeBuildInput)
 
-    results = build_systems_dry_run(
+    results = build_systems(
         [mock_model],
         ExecutorConfig(),
         output_dir=tmp_path,
+        dry_run=True,
     )
 
     assert len(results) == 1
@@ -58,14 +59,14 @@ def test_build_systems_dry_run(monkeypatch, tmp_path):
 
 
 def test_build_systems_dry_run_multiple(monkeypatch, tmp_path):
-    """build_systems_dry_run handles multiple inputs."""
+    """build_systems with dry_run=True handles multiple inputs."""
     import mdfactory.orchestration.build as build_mod
-    from mdfactory.orchestration.build import build_systems_dry_run
+    from mdfactory.orchestration.build import build_systems
 
     models = [FakeBuildInput(hash=f"HASH{i}") for i in range(3)]
     monkeypatch.setattr(build_mod, "BuildInput", FakeBuildInput)
 
-    results = build_systems_dry_run(models, ExecutorConfig(), output_dir=tmp_path)
+    results = build_systems(models, ExecutorConfig(), output_dir=tmp_path, dry_run=True)
     assert len(results) == 3
     assert [r["hash"] for r in results] == ["HASH0", "HASH1", "HASH2"]
 
@@ -151,11 +152,11 @@ def test_build_systems_no_wait(monkeypatch, tmp_path):
 
 
 def test_build_systems_dry_run_invalid_input_type(tmp_path):
-    """build_systems_dry_run raises TypeError for invalid input."""
-    from mdfactory.orchestration.build import build_systems_dry_run
+    """build_systems with dry_run=True raises TypeError for invalid input."""
+    from mdfactory.orchestration.build import build_systems
 
     with pytest.raises(TypeError, match="Expected BuildInput or dict"):
-        build_systems_dry_run([42], ExecutorConfig(), output_dir=tmp_path)
+        build_systems([42], ExecutorConfig(), output_dir=tmp_path, dry_run=True)
 
 
 # --- Finding 5: Tests for _build_system_impl ---
@@ -316,8 +317,8 @@ def test_keyboard_interrupt_triggers_shutdown(monkeypatch, tmp_path):
 
 
 def test_build_systems_dry_run_with_dict_input(monkeypatch, tmp_path):
-    """build_systems_dry_run handles dict input correctly."""
-    from mdfactory.orchestration.build import build_systems_dry_run
+    """build_systems with dry_run=True handles dict input correctly."""
+    from mdfactory.orchestration.build import build_systems
 
     input_dict = {
         "simulation_type": "mixedbox",
@@ -326,7 +327,7 @@ def test_build_systems_dry_run_with_dict_input(monkeypatch, tmp_path):
         "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
     }
 
-    results = build_systems_dry_run([input_dict], ExecutorConfig(), output_dir=tmp_path)
+    results = build_systems([input_dict], ExecutorConfig(), output_dir=tmp_path, dry_run=True)
 
     assert len(results) == 1
     assert results[0]["simulation_type"] == "mixedbox"

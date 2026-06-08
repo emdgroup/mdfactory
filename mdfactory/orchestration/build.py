@@ -24,8 +24,9 @@ def build_systems(
     *,
     output_dir: Path | None = None,
     wait: bool = True,
+    dry_run: bool = False,
 ) -> list:
-    """Submit parallel builds via Parsl.
+    """Submit parallel builds via Parsl (or preview with dry_run).
 
     Parameters
     ----------
@@ -39,13 +40,54 @@ def build_systems(
         Whether to wait for all futures to complete. Default True.
         If False, returns raw AppFutures and the caller is responsible
         for calling ``parsl.clear()`` after all futures complete.
+    dry_run : bool, optional
+        If True, log what would be built and return descriptions without
+        loading Parsl or submitting any work. Default False.
 
     Returns
     -------
     list
-        If wait=True, list of result dicts. If wait=False, list of AppFutures.
+        If dry_run=True, list of description dicts.
+        If wait=True, list of result dicts.
+        If wait=False, list of AppFutures.
 
     """
+    output_dir = Path(output_dir) if output_dir else Path.cwd()
+
+    # Resolve all inputs upfront
+    resolved: list[tuple[BuildInput, dict]] = []
+    for inp in build_inputs:
+        if isinstance(inp, BuildInput):
+            model = inp
+            input_dict = inp.model_dump()
+        elif isinstance(inp, dict):
+            model = BuildInput(**inp)
+            input_dict = inp.copy()
+        else:
+            raise TypeError(f"Expected BuildInput or dict, got {type(inp)}")
+        input_dict["_build_dir"] = str(output_dir / model.hash)
+        resolved.append((model, input_dict))
+
+    # Dry-run: log plan and return without loading Parsl
+    if dry_run:
+        descriptions = []
+        for model, _ in resolved:
+            desc = {
+                "hash": model.hash,
+                "simulation_type": model.simulation_type,
+                "parametrization": model.parametrization,
+                "engine": model.engine,
+                "output_directory": str(output_dir / model.hash),
+            }
+            descriptions.append(desc)
+            logger.info(
+                f"[dry-run] {model.hash} | {model.simulation_type} | "
+                f"{model.parametrization} | {model.engine} -> {output_dir / model.hash}"
+            )
+        logger.info(f"[dry-run] {len(descriptions)} system(s) would be built")
+        logger.info(f"[dry-run] Provider: {config.provider}")
+        return descriptions
+
     try:
         import parsl  # type: ignore[import-not-found]
     except ImportError as exc:
@@ -53,8 +95,6 @@ def build_systems(
             "parsl is required for build orchestration. "
             "Install with `pip install 'mdfactory[parsl]'`."
         ) from exc
-
-    output_dir = Path(output_dir) if output_dir else Path.cwd()
 
     # Build parsl config and load
     parsl_config = config.to_parsl_config()
@@ -64,21 +104,11 @@ def build_systems(
     try:
         build_app = get_build_app()
 
-        # Prepare inputs and submit
+        # Submit all builds
         futures = []
         input_hashes = []
-        for inp in build_inputs:
-            if isinstance(inp, BuildInput):
-                input_dict = inp.model_dump()
-                input_dict["_build_dir"] = str(output_dir / inp.hash)
-                input_hashes.append(inp.hash)
-            elif isinstance(inp, dict):
-                model = BuildInput(**inp)
-                input_dict = inp.copy()
-                input_dict["_build_dir"] = str(output_dir / model.hash)
-                input_hashes.append(model.hash)
-            else:
-                raise TypeError(f"Expected BuildInput or dict, got {type(inp)}")
+        for model, input_dict in resolved:
+            input_hashes.append(model.hash)
             futures.append(build_app(input_dict))
 
         logger.info(f"Submitted {len(futures)} build(s) to Parsl")
@@ -323,55 +353,3 @@ def _wait_with_progress(
         raise
 
     return [r for r in results if r is not None]
-
-
-def build_systems_dry_run(
-    build_inputs: list,
-    config: "ExecutorConfig",
-    *,
-    output_dir: Path | None = None,
-) -> list[dict]:
-    """Print what would be built without submitting to Parsl.
-
-    Parameters
-    ----------
-    build_inputs : list
-        List of BuildInput models or dicts.
-    config : ExecutorConfig
-        Executor configuration (used for display, Parsl not loaded).
-    output_dir : Path, optional
-        Base output directory for builds. Defaults to current directory.
-
-    Returns
-    -------
-    list[dict]
-        List of dicts describing each planned build.
-
-    """
-    output_dir = Path(output_dir) if output_dir else Path.cwd()
-
-    descriptions = []
-    for inp in build_inputs:
-        if isinstance(inp, BuildInput):
-            model = inp
-        elif isinstance(inp, dict):
-            model = BuildInput(**inp)
-        else:
-            raise TypeError(f"Expected BuildInput or dict, got {type(inp)}")
-
-        desc = {
-            "hash": model.hash,
-            "simulation_type": model.simulation_type,
-            "parametrization": model.parametrization,
-            "engine": model.engine,
-            "output_directory": str(output_dir / model.hash),
-        }
-        descriptions.append(desc)
-        logger.info(
-            f"[dry-run] {model.hash} | {model.simulation_type} | "
-            f"{model.parametrization} | {model.engine} -> {output_dir / model.hash}"
-        )
-
-    logger.info(f"[dry-run] {len(descriptions)} system(s) would be built")
-    logger.info(f"[dry-run] Provider: {config.provider}")
-    return descriptions

@@ -51,14 +51,15 @@ class TestBuildCommandCSV:
     """Tests for CSV input dispatch path."""
 
     def test_csv_dry_run(self, sample_csv, tmp_path, monkeypatch):
-        """CSV input with --dry-run calls build_systems_dry_run."""
+        """CSV input with --dry-run calls build_systems with dry_run=True."""
         from mdfactory.cli import _build_from_csv
 
-        with patch("mdfactory.orchestration.build_systems_dry_run") as mock_dry_run:
-            mock_dry_run.return_value = [{"hash": "X", "simulation_type": "mixedbox"}]
+        with patch("mdfactory.orchestration.build_systems") as mock_build:
+            mock_build.return_value = [{"hash": "X", "simulation_type": "mixedbox"}]
             _build_from_csv(sample_csv, tmp_path, dry_run=True)
 
-        mock_dry_run.assert_called_once()
+        mock_build.assert_called_once()
+        assert mock_build.call_args[1]["dry_run"] is True
 
     def test_csv_sequential_builds_locally(self, sample_csv, tmp_path, monkeypatch):
         """CSV input without --config builds sequentially."""
@@ -97,14 +98,15 @@ class TestBuildCommandYAML:
         assert call_args[0][0] == sample_yaml
 
     def test_yaml_dry_run(self, sample_yaml, tmp_path, monkeypatch):
-        """Single YAML with --dry-run calls build_systems_dry_run."""
+        """Single YAML with --dry-run calls build_systems with dry_run=True."""
         from mdfactory.cli import _build_from_yaml
 
-        with patch("mdfactory.orchestration.build_systems_dry_run") as mock_dry_run:
-            mock_dry_run.return_value = [{"hash": "X", "simulation_type": "mixedbox"}]
+        with patch("mdfactory.orchestration.build_systems") as mock_build:
+            mock_build.return_value = [{"hash": "X", "simulation_type": "mixedbox"}]
             _build_from_yaml(sample_yaml, tmp_path, dry_run=True)
 
-        mock_dry_run.assert_called_once()
+        mock_build.assert_called_once()
+        assert mock_build.call_args[1]["dry_run"] is True
 
     def test_yaml_with_config_uses_parsl(self, sample_yaml, sample_config, tmp_path, monkeypatch):
         """Single YAML with --config dispatches via build_systems."""
@@ -145,7 +147,7 @@ class TestBuildCommandSummaryYAML:
             _build_from_summary_yaml(data, tmp_path)
 
     def test_summary_yaml_dry_run(self, tmp_path):
-        """Summary YAML with --dry-run calls build_systems_dry_run."""
+        """Summary YAML with --dry-run calls build_systems with dry_run=True."""
         from mdfactory.cli import _build_from_summary_yaml
 
         hash_val = "TESTHASH123"
@@ -160,11 +162,12 @@ class TestBuildCommandSummaryYAML:
         (build_dir / f"{hash_val}.yaml").write_text(yaml.safe_dump(yaml_data))
         data = {"system_directory": [str(build_dir)], "hash": [hash_val]}
 
-        with patch("mdfactory.orchestration.build_systems_dry_run") as mock_dry_run:
-            mock_dry_run.return_value = [{"hash": hash_val}]
+        with patch("mdfactory.orchestration.build_systems") as mock_build:
+            mock_build.return_value = [{"hash": hash_val}]
             _build_from_summary_yaml(data, tmp_path, dry_run=True)
 
-        mock_dry_run.assert_called_once()
+        mock_build.assert_called_once()
+        assert mock_build.call_args[1]["dry_run"] is True
 
     def test_summary_yaml_sequential(self, tmp_path):
         """Summary YAML without --config builds sequentially."""
