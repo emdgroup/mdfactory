@@ -148,6 +148,11 @@ def _scancel_jobs(job_ids: list[str]):
             logger.debug(f"scancel stderr: {result.stderr.strip()}")
     except FileNotFoundError:
         logger.debug("scancel not found (not on SLURM cluster)")
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            f"scancel timed out after 10 s — SLURM jobs {', '.join(job_ids)} may still "
+            f"be running. Run `scancel {' '.join(job_ids)}` manually."
+        )
     except Exception as exc:
         logger.debug(f"scancel failed: {exc}")
 
@@ -314,7 +319,7 @@ def _wait_with_progress(
 
     except KeyboardInterrupt:
         console.print("\n[bold yellow]Interrupted — cancelling SLURM jobs...[/]")
-        _shutdown_parsl()
+        # Don't call _shutdown_parsl() here — build_systems' finally block owns cleanup
         raise
 
     return [r for r in results if r is not None]

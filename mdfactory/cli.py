@@ -173,6 +173,13 @@ def _build_from_csv(
             logger.error(f"  Row {k}: {v}")
         sys.exit(1)
 
+    if dry_run:
+        from mdfactory.orchestration import ExecutorConfig, build_systems_dry_run
+
+        executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
+        build_systems_dry_run(models, executor_config, output_dir=output)
+        return
+
     # Create per-hash directories and write YAML files
     for model in models:
         build_dir = output / model.hash
@@ -181,13 +188,6 @@ def _build_from_csv(
         if not yml_path.exists():
             with open(yml_path, "w") as f:
                 yaml.safe_dump(model.model_dump(), f)
-
-    if dry_run:
-        from mdfactory.orchestration import ExecutorConfig, build_systems_dry_run
-
-        executor_config = ExecutorConfig.from_yaml(config) if config else ExecutorConfig()
-        build_systems_dry_run(models, executor_config, output_dir=output)
-        return
 
     if config is not None:
         # Parallel builds via Parsl
@@ -217,7 +217,11 @@ def _build_from_yaml(
     with open(input) as f:
         data = yaml.safe_load(f)
 
-    if isinstance(data, dict) and "system_directory" in data:
+    if not isinstance(data, dict):
+        logger.error(f"Invalid YAML input file (empty or not a mapping): {input}")
+        sys.exit(1)
+
+    if "system_directory" in data:
         # Summary YAML -- dispatch builds for prepared systems
         _build_from_summary_yaml(data, output, config=config, dry_run=dry_run)
     else:
@@ -263,6 +267,13 @@ def _build_from_summary_yaml(
 
     if not dirs:
         logger.error("Summary YAML contains no system_directory entries.")
+        sys.exit(1)
+
+    if len(dirs) != len(hashes):
+        logger.error(
+            f"Summary YAML is malformed: system_directory has {len(dirs)} entries "
+            f"but hash has {len(hashes)}."
+        )
         sys.exit(1)
 
     from mdfactory.models.input import BuildInput

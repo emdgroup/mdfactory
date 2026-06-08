@@ -308,8 +308,7 @@ def test_keyboard_interrupt_triggers_shutdown(monkeypatch, tmp_path):
     with pytest.raises(KeyboardInterrupt):
         build_mod.build_systems([mock_model], cfg, output_dir=tmp_path)
 
-    # parsl.clear should have been called (via _shutdown_parsl in KeyboardInterrupt handler
-    # AND in the finally block)
+    # parsl.clear should have been called via _shutdown_parsl in the finally block
     assert parsl_mod.clear.called
 
 
@@ -371,3 +370,52 @@ def test_build_systems_with_dict_input(monkeypatch, tmp_path):
     assert len(captured_args) == 1
     assert "_build_dir" in captured_args[0]
     assert results[0]["status"] == "success"
+
+
+# --- Finding 9: Multi-iteration polling test ---
+
+
+def test_wait_with_progress_multi_iteration(monkeypatch):
+    """_wait_with_progress exercises multi-iteration polling when future is not immediately done."""
+    from mdfactory.orchestration.build import _wait_with_progress
+
+    mock_future = MagicMock()
+    mock_future.done.side_effect = [False, False, True]
+    mock_future.result.return_value = {"hash": "POLL1", "status": "success", "directory": "/tmp"}
+    mock_future.task_status.return_value = "running"
+
+    results = _wait_with_progress([mock_future], hashes=["POLL1"], poll_interval=0.01)
+
+    assert len(results) == 1
+    assert results[0]["status"] == "success"
+    # done() should have been called at least twice (False then True)
+    assert mock_future.done.call_count >= 2
+
+
+# --- Finding 10: Assert non-cleanup in no_wait ---
+
+
+def test_build_systems_no_wait_does_not_clear(monkeypatch, tmp_path):
+    """build_systems with wait=False does NOT call parsl.clear()."""
+    import parsl
+
+    mock_app_fn = MagicMock()
+    mock_future = MagicMock()
+    mock_app_fn.return_value = mock_future
+
+    import mdfactory.orchestration.build as build_mod
+
+    monkeypatch.setattr(build_mod, "get_build_app", lambda: mock_app_fn)
+    monkeypatch.setattr(parsl, "load", MagicMock())
+    mock_clear = MagicMock()
+    monkeypatch.setattr(parsl, "clear", mock_clear)
+
+    mock_model = FakeBuildInput(hash="NW2")
+    monkeypatch.setattr(build_mod, "BuildInput", FakeBuildInput)
+    monkeypatch.setattr(ExecutorConfig, "to_parsl_config", lambda self: MagicMock())
+
+    cfg = ExecutorConfig()
+    futures = build_mod.build_systems([mock_model], cfg, output_dir=tmp_path, wait=False)
+
+    assert futures == [mock_future]
+    mock_clear.assert_not_called()

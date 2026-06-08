@@ -136,6 +136,79 @@ class TestBuildCommandSummaryYAML:
         with pytest.raises(SystemExit):
             _build_from_summary_yaml(data, tmp_path)
 
+    def test_summary_yaml_mismatched_lengths_exits(self, tmp_path):
+        """Summary YAML with mismatched list lengths causes exit."""
+        from mdfactory.cli import _build_from_summary_yaml
+
+        data = {"system_directory": [str(tmp_path), str(tmp_path)], "hash": ["A"]}
+        with pytest.raises(SystemExit):
+            _build_from_summary_yaml(data, tmp_path)
+
+    def test_summary_yaml_dry_run(self, tmp_path):
+        """Summary YAML with --dry-run calls build_systems_dry_run."""
+        from mdfactory.cli import _build_from_summary_yaml
+
+        hash_val = "TESTHASH123"
+        build_dir = tmp_path / hash_val
+        build_dir.mkdir()
+        yaml_data = {
+            "simulation_type": "mixedbox",
+            "parametrization": "cgenff",
+            "engine": "gromacs",
+            "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
+        }
+        (build_dir / f"{hash_val}.yaml").write_text(yaml.safe_dump(yaml_data))
+        data = {"system_directory": [str(build_dir)], "hash": [hash_val]}
+
+        with patch("mdfactory.orchestration.build_systems_dry_run") as mock_dry_run:
+            mock_dry_run.return_value = [{"hash": hash_val}]
+            _build_from_summary_yaml(data, tmp_path, dry_run=True)
+
+        mock_dry_run.assert_called_once()
+
+    def test_summary_yaml_sequential(self, tmp_path):
+        """Summary YAML without --config builds sequentially."""
+        from mdfactory.cli import _build_from_summary_yaml
+
+        hash_val = "SEQHASH456"
+        build_dir = tmp_path / hash_val
+        build_dir.mkdir()
+        yaml_data = {
+            "simulation_type": "mixedbox",
+            "parametrization": "cgenff",
+            "engine": "gromacs",
+            "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
+        }
+        (build_dir / f"{hash_val}.yaml").write_text(yaml.safe_dump(yaml_data))
+        data = {"system_directory": [str(build_dir)], "hash": [hash_val]}
+
+        with patch("mdfactory.cli.run_build_from_dict") as mock_build:
+            _build_from_summary_yaml(data, tmp_path, config=None, dry_run=False)
+
+        mock_build.assert_called_once()
+
+    def test_summary_yaml_parallel(self, tmp_path, sample_config):
+        """Summary YAML with --config dispatches via build_systems."""
+        from mdfactory.cli import _build_from_summary_yaml
+
+        hash_val = "PARHASH789"
+        build_dir = tmp_path / hash_val
+        build_dir.mkdir()
+        yaml_data = {
+            "simulation_type": "mixedbox",
+            "parametrization": "cgenff",
+            "engine": "gromacs",
+            "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
+        }
+        (build_dir / f"{hash_val}.yaml").write_text(yaml.safe_dump(yaml_data))
+        data = {"system_directory": [str(build_dir)], "hash": [hash_val]}
+
+        with patch("mdfactory.orchestration.build_systems") as mock_build:
+            mock_build.return_value = [{"hash": hash_val, "status": "success"}]
+            _build_from_summary_yaml(data, tmp_path, config=sample_config, dry_run=False)
+
+        mock_build.assert_called_once()
+
 
 class TestBuildCommandErrors:
     """Tests for error handling in build command."""
@@ -148,3 +221,45 @@ class TestBuildCommandErrors:
         txt_file.write_text("hello")
         with pytest.raises(SystemExit):
             build_system(txt_file, output=tmp_path)
+
+    def test_malformed_csv_exits(self, tmp_path):
+        """CSV with missing required columns causes sys.exit."""
+        from mdfactory.cli import _build_from_csv
+
+        # Missing simulation_type column
+        csv_content = "system.species.SOL.smiles,system.species.SOL.count\nO,100\n"
+        csv_path = tmp_path / "bad.csv"
+        csv_path.write_text(csv_content)
+        with pytest.raises(SystemExit):
+            _build_from_csv(csv_path, tmp_path, config=None, dry_run=False)
+
+    def test_empty_yaml_exits(self, tmp_path):
+        """Empty YAML file causes sys.exit with clear message."""
+        from mdfactory.cli import _build_from_yaml
+
+        empty_yaml = tmp_path / "empty.yaml"
+        empty_yaml.write_text("")
+        with pytest.raises(SystemExit):
+            _build_from_yaml(empty_yaml, tmp_path)
+
+
+class TestBuildCommandRouting:
+    """Tests for build_system() top-level routing logic."""
+
+    def test_csv_routes_to_csv_handler(self, sample_csv, tmp_path):
+        """build_system() with .csv file routes to CSV handler."""
+        from mdfactory.cli import build_system
+
+        with patch("mdfactory.cli.run_build_from_dict") as mock_build:
+            build_system(sample_csv, output=tmp_path)
+
+        mock_build.assert_called_once()
+
+    def test_yaml_routes_to_yaml_handler(self, sample_yaml, tmp_path):
+        """build_system() with .yaml file routes to YAML handler."""
+        from mdfactory.cli import build_system
+
+        with patch("mdfactory.cli.run_build_from_file") as mock_build:
+            build_system(sample_yaml, output=tmp_path)
+
+        mock_build.assert_called_once()

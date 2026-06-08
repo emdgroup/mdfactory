@@ -107,6 +107,10 @@ class ExecutorConfig(BaseModel):
         """
         with open(path) as f:
             data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Executor config YAML is empty or invalid (expected a mapping): {path}"
+            )
         provider = data.get("provider", "local")
         if provider == "slurm":
             return SlurmExecutorConfig(**data)
