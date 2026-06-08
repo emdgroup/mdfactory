@@ -5,6 +5,8 @@
 import pytest
 import yaml
 
+pytest.importorskip("parsl", reason="parsl not installed")
+
 from mdfactory.orchestration.config import ExecutorConfig, SlurmExecutorConfig
 
 

@@ -8,7 +8,6 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import parsl
 from loguru import logger
 
 from mdfactory.models.input import BuildInput
@@ -38,6 +37,8 @@ def build_systems(
         Base output directory for builds. Defaults to current directory.
     wait : bool, optional
         Whether to wait for all futures to complete. Default True.
+        If False, returns raw AppFutures and the caller is responsible
+        for calling ``parsl.clear()`` after all futures complete.
 
     Returns
     -------
@@ -45,54 +46,78 @@ def build_systems(
         If wait=True, list of result dicts. If wait=False, list of AppFutures.
 
     """
+    try:
+        import parsl  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ImportError(
+            "parsl is required for build orchestration. "
+            "Install with `pip install 'mdfactory[parsl]'`."
+        ) from exc
+
     output_dir = Path(output_dir) if output_dir else Path.cwd()
 
     # Build parsl config and load
     parsl_config = config.to_parsl_config()
     parsl.load(parsl_config)
 
-    build_app = get_build_app()
+    cleanup_needed = True
+    try:
+        build_app = get_build_app()
 
-    # Prepare inputs and submit
-    futures = []
-    input_hashes = []
-    for inp in build_inputs:
-        if isinstance(inp, BuildInput):
-            input_dict = inp.model_dump()
-            input_dict["_build_dir"] = str(output_dir / inp.hash)
-            input_hashes.append(inp.hash)
-        elif isinstance(inp, dict):
-            model = BuildInput(**inp)
-            input_dict = inp.copy()
-            input_dict["_build_dir"] = str(output_dir / model.hash)
-            input_hashes.append(model.hash)
-        else:
-            raise TypeError(f"Expected BuildInput or dict, got {type(inp)}")
-        futures.append(build_app(input_dict))
+        # Prepare inputs and submit
+        futures = []
+        input_hashes = []
+        for inp in build_inputs:
+            if isinstance(inp, BuildInput):
+                input_dict = inp.model_dump()
+                input_dict["_build_dir"] = str(output_dir / inp.hash)
+                input_hashes.append(inp.hash)
+            elif isinstance(inp, dict):
+                model = BuildInput(**inp)
+                input_dict = inp.copy()
+                input_dict["_build_dir"] = str(output_dir / model.hash)
+                input_hashes.append(model.hash)
+            else:
+                raise TypeError(f"Expected BuildInput or dict, got {type(inp)}")
+            futures.append(build_app(input_dict))
 
-    logger.info(f"Submitted {len(futures)} build(s) to Parsl")
+        logger.info(f"Submitted {len(futures)} build(s) to Parsl")
 
-    if not wait:
-        return futures
+        if not wait:
+            logger.warning("Returning raw futures — caller must call parsl.clear() when done.")
+            cleanup_needed = False
+            return futures
 
-    # Poll futures with live status reporting
-    results = _wait_with_progress(futures, hashes=input_hashes)
-    _shutdown_parsl()
-    return results
+        # Poll futures with live status reporting
+        results = _wait_with_progress(futures, hashes=input_hashes)
+        return results
+    finally:
+        if cleanup_needed:
+            _shutdown_parsl()
 
 
 def _shutdown_parsl():
     """Shut down Parsl and cancel any remaining SLURM jobs."""
     try:
+        import parsl  # type: ignore[import-not-found]
+    except ImportError:
+        return
+
+    job_ids = []
+    try:
         dfk = parsl.dfk()
-        # Collect SLURM job IDs before cleanup
         job_ids = _get_slurm_job_ids(dfk)
-        parsl.clear()
-        # Explicitly scancel anything still alive
-        if job_ids:
-            _scancel_jobs(job_ids)
     except Exception as exc:
-        logger.debug(f"Parsl shutdown error (non-fatal): {exc}")
+        logger.debug(f"Could not query Parsl DFK for SLURM jobs: {exc}")
+
+    try:
+        parsl.clear()
+    except Exception as exc:
+        logger.warning(f"Parsl shutdown failed — DFK may still be loaded: {exc}")
+
+    # Always attempt scancel if we found job IDs
+    if job_ids:
+        _scancel_jobs(job_ids)
 
 
 def _get_slurm_job_ids(dfk) -> list[str]:
@@ -105,8 +130,8 @@ def _get_slurm_job_ids(dfk) -> list[str]:
                     job_id = resource.get("remote_job_id") or resource.get("job_id")
                     if job_id:
                         job_ids.append(str(job_id))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug(f"Could not enumerate SLURM jobs for explicit scancel: {exc}")
     return job_ids
 
 
@@ -189,6 +214,8 @@ def _wait_with_progress(
     def _get_block_status() -> str:
         """Query Parsl for SLURM block (job) statuses."""
         try:
+            import parsl  # type: ignore[import-not-found]
+
             dfk = parsl.dfk()
             counts: dict[str, int] = {}
             for executor in dfk.executors.values():

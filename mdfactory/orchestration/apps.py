@@ -2,8 +2,6 @@
 # ABOUTME: Wraps run_build_from_dict as a @python_app with runtime decoration
 """Parsl application definitions for build orchestration."""
 
-from parsl import python_app
-
 
 def _build_system_impl(build_input_dict: dict) -> dict:
     """Run a single system build inside a Parsl worker.
@@ -54,5 +52,17 @@ def get_build_app():
     callable
         A Parsl ``@python_app`` wrapping the build implementation.
 
+    Raises
+    ------
+    ImportError
+        If parsl is not installed.
+
     """
+    try:
+        from parsl import python_app  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ImportError(
+            "parsl is required for build orchestration. "
+            "Install with `pip install 'mdfactory[parsl]'`."
+        ) from exc
     return python_app(_build_system_impl)

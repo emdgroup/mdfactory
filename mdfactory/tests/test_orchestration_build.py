@@ -2,11 +2,13 @@
 # ABOUTME: Validates Parsl submission, dry-run output, and error handling
 """Tests for orchestration build dispatch."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mdfactory.orchestration.config import ExecutorConfig
+parsl = pytest.importorskip("parsl", reason="parsl not installed")
+
+from mdfactory.orchestration.config import ExecutorConfig  # noqa: E402
 
 
 class FakeBuildInput:
@@ -70,6 +72,8 @@ def test_build_systems_dry_run_multiple(monkeypatch, tmp_path):
 
 def test_build_systems_submits_correct_count(monkeypatch, tmp_path):
     """build_systems submits one Parsl task per input."""
+    import parsl
+
     mock_app_fn = MagicMock()
     mock_future = MagicMock()
     mock_future.result.return_value = {"hash": "H1", "status": "success", "directory": "/tmp/H1"}
@@ -78,8 +82,9 @@ def test_build_systems_submits_correct_count(monkeypatch, tmp_path):
     import mdfactory.orchestration.build as build_mod
 
     monkeypatch.setattr(build_mod, "get_build_app", lambda: mock_app_fn)
-    monkeypatch.setattr(build_mod.parsl, "load", MagicMock())
-    monkeypatch.setattr(build_mod.parsl, "clear", MagicMock())
+    monkeypatch.setattr(parsl, "load", MagicMock())
+    monkeypatch.setattr(parsl, "clear", MagicMock())
+    monkeypatch.setattr(parsl, "dfk", MagicMock(side_effect=RuntimeError("No DFK")))
 
     mock_model = FakeBuildInput(hash="H1")
     monkeypatch.setattr(build_mod, "BuildInput", FakeBuildInput)
@@ -96,6 +101,8 @@ def test_build_systems_submits_correct_count(monkeypatch, tmp_path):
 
 def test_build_systems_handles_failed_future(monkeypatch, tmp_path):
     """build_systems captures exceptions from failed futures."""
+    import parsl
+
     mock_app_fn = MagicMock()
     mock_future = MagicMock()
     mock_future.result.side_effect = RuntimeError("CUDA OOM")
@@ -104,8 +111,9 @@ def test_build_systems_handles_failed_future(monkeypatch, tmp_path):
     import mdfactory.orchestration.build as build_mod
 
     monkeypatch.setattr(build_mod, "get_build_app", lambda: mock_app_fn)
-    monkeypatch.setattr(build_mod.parsl, "load", MagicMock())
-    monkeypatch.setattr(build_mod.parsl, "clear", MagicMock())
+    monkeypatch.setattr(parsl, "load", MagicMock())
+    monkeypatch.setattr(parsl, "clear", MagicMock())
+    monkeypatch.setattr(parsl, "dfk", MagicMock(side_effect=RuntimeError("No DFK")))
 
     mock_model = FakeBuildInput(hash="FAIL1", simulation_type="bilayer")
     monkeypatch.setattr(build_mod, "BuildInput", FakeBuildInput)
@@ -121,6 +129,8 @@ def test_build_systems_handles_failed_future(monkeypatch, tmp_path):
 
 def test_build_systems_no_wait(monkeypatch, tmp_path):
     """build_systems with wait=False returns futures directly."""
+    import parsl
+
     mock_app_fn = MagicMock()
     mock_future = MagicMock()
     mock_app_fn.return_value = mock_future
@@ -128,7 +138,7 @@ def test_build_systems_no_wait(monkeypatch, tmp_path):
     import mdfactory.orchestration.build as build_mod
 
     monkeypatch.setattr(build_mod, "get_build_app", lambda: mock_app_fn)
-    monkeypatch.setattr(build_mod.parsl, "load", MagicMock())
+    monkeypatch.setattr(parsl, "load", MagicMock())
 
     mock_model = FakeBuildInput(hash="NW1")
     monkeypatch.setattr(build_mod, "BuildInput", FakeBuildInput)
@@ -146,3 +156,218 @@ def test_build_systems_dry_run_invalid_input_type(tmp_path):
 
     with pytest.raises(TypeError, match="Expected BuildInput or dict"):
         build_systems_dry_run([42], ExecutorConfig(), output_dir=tmp_path)
+
+
+# --- Finding 5: Tests for _build_system_impl ---
+
+
+def test_build_system_impl_strips_internal_keys_and_chdirs(monkeypatch, tmp_path):
+    """_build_system_impl strips _-prefixed keys and chdirs to build_dir."""
+    from mdfactory.orchestration.apps import _build_system_impl
+
+    build_dir = tmp_path / "OUT"
+    captured_model = {}
+
+    def mock_run_build(model):
+        import os
+
+        captured_model["hash"] = model.hash
+        captured_model["cwd"] = os.getcwd()
+
+    monkeypatch.setattr("mdfactory.workflows.run_build_from_dict", mock_run_build)
+
+    # Provide minimal valid BuildInput fields plus internal keys
+    input_dict = {
+        "simulation_type": "mixedbox",
+        "parametrization": "cgenff",
+        "engine": "gromacs",
+        "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
+        "_build_dir": str(build_dir),
+        "_internal_flag": "should_be_stripped",
+    }
+    result = _build_system_impl(input_dict)
+
+    assert result["status"] == "success"
+    assert result["directory"] == str(build_dir.resolve())
+    assert build_dir.exists()
+    # Verify we chdir'd to build_dir during execution
+    assert captured_model["cwd"] == str(build_dir)
+
+
+def test_build_system_impl_restores_cwd_on_failure(monkeypatch, tmp_path):
+    """_build_system_impl restores original cwd even if build fails."""
+    import os
+
+    from mdfactory.orchestration.apps import _build_system_impl
+
+    build_dir = tmp_path / "FAIL"
+    original_cwd = os.getcwd()
+
+    def mock_run_build_fail(model):
+        raise RuntimeError("Build exploded")
+
+    monkeypatch.setattr("mdfactory.workflows.run_build_from_dict", mock_run_build_fail)
+
+    input_dict = {
+        "simulation_type": "mixedbox",
+        "parametrization": "cgenff",
+        "engine": "gromacs",
+        "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
+        "_build_dir": str(build_dir),
+    }
+    with pytest.raises(RuntimeError, match="Build exploded"):
+        _build_system_impl(input_dict)
+
+    # cwd should be restored
+    assert os.getcwd() == original_cwd
+
+
+# --- Finding 9: Tests for SLURM cleanup functions ---
+
+
+def test_shutdown_parsl_calls_clear_and_scancel(monkeypatch):
+    """_shutdown_parsl calls parsl.clear() and scancels SLURM jobs."""
+    import parsl as parsl_mod
+
+    from mdfactory.orchestration.build import _shutdown_parsl
+
+    mock_dfk = MagicMock()
+    mock_executor = MagicMock()
+    mock_executor.provider.resources = {"block-1": {"remote_job_id": "12345"}}
+    mock_dfk.executors = {"htex": mock_executor}
+
+    monkeypatch.setattr(parsl_mod, "dfk", MagicMock(return_value=mock_dfk))
+    monkeypatch.setattr(parsl_mod, "clear", MagicMock())
+
+    with patch("subprocess.run") as mock_subprocess:
+        mock_subprocess.return_value = MagicMock(returncode=0)
+        _shutdown_parsl()
+
+    parsl_mod.clear.assert_called_once()
+    mock_subprocess.assert_called_once()
+    assert "12345" in mock_subprocess.call_args[0][0]
+
+
+def test_shutdown_parsl_attempts_scancel_even_if_clear_fails(monkeypatch):
+    """_shutdown_parsl runs scancel even when parsl.clear() raises."""
+    import parsl as parsl_mod
+
+    from mdfactory.orchestration.build import _shutdown_parsl
+
+    mock_dfk = MagicMock()
+    mock_executor = MagicMock()
+    mock_executor.provider.resources = {"block-1": {"remote_job_id": "99999"}}
+    mock_dfk.executors = {"htex": mock_executor}
+
+    monkeypatch.setattr(parsl_mod, "dfk", MagicMock(return_value=mock_dfk))
+    monkeypatch.setattr(parsl_mod, "clear", MagicMock(side_effect=RuntimeError("timeout")))
+
+    with patch("subprocess.run") as mock_subprocess:
+        mock_subprocess.return_value = MagicMock(returncode=0)
+        _shutdown_parsl()
+
+    # scancel should still be called despite clear() failing
+    mock_subprocess.assert_called_once()
+    assert "99999" in mock_subprocess.call_args[0][0]
+
+
+def test_get_slurm_job_ids_handles_missing_resources(monkeypatch):
+    """_get_slurm_job_ids handles executors without resources attribute."""
+    from mdfactory.orchestration.build import _get_slurm_job_ids
+
+    mock_dfk = MagicMock()
+    mock_executor = MagicMock(spec=[])  # no attributes
+    mock_dfk.executors = {"htex": mock_executor}
+
+    result = _get_slurm_job_ids(mock_dfk)
+    assert result == []
+
+
+def test_keyboard_interrupt_triggers_shutdown(monkeypatch, tmp_path):
+    """KeyboardInterrupt during _wait_with_progress triggers _shutdown_parsl."""
+    import parsl as parsl_mod
+
+    import mdfactory.orchestration.build as build_mod
+
+    mock_app_fn = MagicMock()
+    # Future that raises KeyboardInterrupt when polled
+    mock_future = MagicMock()
+    mock_future.done.side_effect = KeyboardInterrupt()
+    mock_app_fn.return_value = mock_future
+
+    monkeypatch.setattr(build_mod, "get_build_app", lambda: mock_app_fn)
+    monkeypatch.setattr(parsl_mod, "load", MagicMock())
+    monkeypatch.setattr(parsl_mod, "clear", MagicMock())
+    monkeypatch.setattr(parsl_mod, "dfk", MagicMock(side_effect=RuntimeError("No DFK")))
+
+    mock_model = FakeBuildInput(hash="INT1")
+    monkeypatch.setattr(build_mod, "BuildInput", FakeBuildInput)
+    monkeypatch.setattr(ExecutorConfig, "to_parsl_config", lambda self: MagicMock())
+
+    cfg = ExecutorConfig()
+    with pytest.raises(KeyboardInterrupt):
+        build_mod.build_systems([mock_model], cfg, output_dir=tmp_path)
+
+    # parsl.clear should have been called (via _shutdown_parsl in KeyboardInterrupt handler
+    # AND in the finally block)
+    assert parsl_mod.clear.called
+
+
+# --- Finding 10: Tests for dict input path ---
+
+
+def test_build_systems_dry_run_with_dict_input(monkeypatch, tmp_path):
+    """build_systems_dry_run handles dict input correctly."""
+    from mdfactory.orchestration.build import build_systems_dry_run
+
+    input_dict = {
+        "simulation_type": "mixedbox",
+        "parametrization": "cgenff",
+        "engine": "gromacs",
+        "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
+    }
+
+    results = build_systems_dry_run([input_dict], ExecutorConfig(), output_dir=tmp_path)
+
+    assert len(results) == 1
+    assert results[0]["simulation_type"] == "mixedbox"
+    assert results[0]["parametrization"] == "cgenff"
+    assert results[0]["hash"]  # hash should be computed
+
+
+def test_build_systems_with_dict_input(monkeypatch, tmp_path):
+    """build_systems handles dict input and injects _build_dir."""
+    import parsl as parsl_mod
+
+    import mdfactory.orchestration.build as build_mod
+
+    captured_args = []
+    mock_app_fn = MagicMock()
+    mock_future = MagicMock()
+    mock_future.result.return_value = {"hash": "X", "status": "success", "directory": "/tmp/X"}
+
+    def capture_app_call(input_dict):
+        captured_args.append(input_dict)
+        return mock_future
+
+    mock_app_fn.side_effect = capture_app_call
+
+    monkeypatch.setattr(build_mod, "get_build_app", lambda: mock_app_fn)
+    monkeypatch.setattr(parsl_mod, "load", MagicMock())
+    monkeypatch.setattr(parsl_mod, "clear", MagicMock())
+    monkeypatch.setattr(parsl_mod, "dfk", MagicMock(side_effect=RuntimeError("No DFK")))
+    monkeypatch.setattr(ExecutorConfig, "to_parsl_config", lambda self: MagicMock())
+
+    input_dict = {
+        "simulation_type": "mixedbox",
+        "parametrization": "cgenff",
+        "engine": "gromacs",
+        "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
+    }
+
+    cfg = ExecutorConfig()
+    results = build_mod.build_systems([input_dict], cfg, output_dir=tmp_path)
+
+    assert len(captured_args) == 1
+    assert "_build_dir" in captured_args[0]
+    assert results[0]["status"] == "success"

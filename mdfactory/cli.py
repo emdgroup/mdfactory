@@ -241,8 +241,12 @@ def _build_from_yaml(
             results = build_systems([model], executor_config, output_dir=output)
             _report_build_results(results)
         else:
-            logger.info(f"Building system from YAML file {input} and output directory: {output}.")
-            with working_directory(output, create=True):
+            from mdfactory.models.input import BuildInput
+
+            model = BuildInput(**data)
+            build_dir = output / model.hash
+            logger.info(f"Building {model.hash} ({model.simulation_type}) -> {build_dir}")
+            with working_directory(build_dir, create=True):
                 run_build_from_file(input)
 
 

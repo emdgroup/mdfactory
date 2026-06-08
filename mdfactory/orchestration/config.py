@@ -5,13 +5,37 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-import parsl
 import yaml
-from parsl.executors import HighThroughputExecutor
-from parsl.providers import LocalProvider, SlurmProvider
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    import parsl
+
+
+def _import_parsl():
+    """Import parsl with a clear error message if not installed.
+
+    Returns
+    -------
+    module
+        The parsl module.
+
+    Raises
+    ------
+    ImportError
+        If parsl is not installed.
+
+    """
+    try:
+        import parsl  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ImportError(
+            "parsl is required for build orchestration. "
+            "Install with `pip install 'mdfactory[parsl]'`."
+        ) from exc
+    return parsl
 
 
 class ExecutorConfig(BaseModel):
@@ -38,7 +62,7 @@ class ExecutorConfig(BaseModel):
     max_workers_per_node: int = 1
     max_blocks: int = 1
 
-    def to_parsl_config(self) -> parsl.Config:
+    def to_parsl_config(self) -> "parsl.Config":
         """Build a Parsl Config with HighThroughputExecutor + LocalProvider.
 
         Returns
@@ -47,6 +71,10 @@ class ExecutorConfig(BaseModel):
             Configured Parsl Config object.
 
         """
+        parsl = _import_parsl()
+        from parsl.executors import HighThroughputExecutor
+        from parsl.providers import LocalProvider
+
         provider = LocalProvider(
             worker_init=self.worker_init,
             min_blocks=0,
@@ -149,7 +177,7 @@ class SlurmExecutorConfig(ExecutorConfig):
     max_blocks: int = 1
     scheduler_options: str = ""
 
-    def to_parsl_config(self) -> parsl.Config:
+    def to_parsl_config(self) -> "parsl.Config":
         """Build a Parsl Config with HighThroughputExecutor + SlurmProvider.
 
         Returns
@@ -158,6 +186,10 @@ class SlurmExecutorConfig(ExecutorConfig):
             Configured Parsl Config object.
 
         """
+        parsl = _import_parsl()
+        from parsl.executors import HighThroughputExecutor
+        from parsl.providers import SlurmProvider
+
         # Build scheduler_options from structured fields + raw extras
         opts = []
         if self.gres:

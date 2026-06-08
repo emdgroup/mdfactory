@@ -7223,7 +7223,7 @@ packages:
 - pypi: ./
   name: mdfactory
   version: 0.1.0
-  sha256: 18de6b3b8cf9142a6aa9068a5ece95bf5e6836a1761b4bdf5699f8ced3e8d109
+  sha256: 93b4b57f5ba28fbf3f493c44623d0ca6a4fd42618369c890a1912389aee16a80
   requires_dist:
   - cyclopts
   - loguru
