@@ -492,18 +492,24 @@ class TestDataclasses:
     """Test dataclass construction and immutability."""
 
     def test_node_type_frozen(self):
+        from pydantic import ValidationError
+
         nt = NodeType(cpus=64, memory_mb=256000, gpu_specs=((4, "a100"),), count=1)
-        with pytest.raises(AttributeError):
+        with pytest.raises(ValidationError):
             nt.cpus = 128  # type: ignore[misc]
 
     def test_partition_frozen(self):
+        from pydantic import ValidationError
+
         p = Partition(name="test", state="up", max_time="1-00:00:00", default_time="1:00:00")
-        with pytest.raises(AttributeError):
+        with pytest.raises(ValidationError):
             p.name = "other"  # type: ignore[misc]
 
     def test_cluster_info_frozen(self):
+        from pydantic import ValidationError
+
         ci = ClusterInfo()
-        with pytest.raises(AttributeError):
+        with pytest.raises(ValidationError):
             ci.default_account = "hack"  # type: ignore[misc]
 
     def test_node_type_defaults(self):

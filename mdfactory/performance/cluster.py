@@ -26,11 +26,11 @@ import functools
 import os
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
-@dataclass(frozen=True)
-class NodeType:
+class NodeType(BaseModel):
     """Hardware specification of a node type within a partition.
 
     Parameters
@@ -39,24 +39,26 @@ class NodeType:
         Number of CPU cores per node.
     memory_mb : int
         Memory in megabytes per node.
-    gpu_specs : tuple of (int, str)
+    gpu_specs : tuple of (int, str | None)
         GPU specifications as (count, type) tuples. Empty if CPU-only.
         Multiple entries represent different GPU types on the same node.
+        Type can be None if SLURM reports GPU count without type info.
     features : tuple of str
         SLURM feature/constraint tags on this node type (immutable).
     count : int
         Number of nodes with this exact configuration.
     """
 
+    model_config = ConfigDict(frozen=True)
+
     cpus: int
     memory_mb: int
-    gpu_specs: tuple[tuple[int, str], ...] = field(default_factory=tuple)
-    features: tuple[str, ...] = field(default_factory=tuple)
+    gpu_specs: tuple[tuple[int, str | None], ...] = Field(default_factory=tuple)
+    features: tuple[str, ...] = Field(default_factory=tuple)
     count: int = 1
 
 
-@dataclass(frozen=True)
-class Partition:
+class Partition(BaseModel):
     """A SLURM partition with its node types and limits.
 
     Parameters
@@ -79,17 +81,18 @@ class Partition:
         Whether this is the cluster's default partition.
     """
 
+    model_config = ConfigDict(frozen=True)
+
     name: str
     state: str
     max_time: str
     default_time: str
-    node_types: list[NodeType] = field(default_factory=list)
+    node_types: list[NodeType] = Field(default_factory=list)
     total_nodes: int = 0
     is_default: bool = False
 
 
-@dataclass(frozen=True)
-class ClusterInfo:
+class ClusterInfo(BaseModel):
     """Structured representation of a SLURM cluster's resources.
 
     Parameters
@@ -104,9 +107,11 @@ class ClusterInfo:
         The user's default account, if determinable.
     """
 
-    partitions: list[Partition] = field(default_factory=list)
-    accounts: list[str] = field(default_factory=list)
-    qos_policies: list[str] = field(default_factory=list)
+    model_config = ConfigDict(frozen=True)
+
+    partitions: list[Partition] = Field(default_factory=list)
+    accounts: list[str] = Field(default_factory=list)
+    qos_policies: list[str] = Field(default_factory=list)
     default_account: str | None = None
 
 
