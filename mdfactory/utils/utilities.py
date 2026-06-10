@@ -1,16 +1,117 @@
 # ABOUTME: General-purpose utility functions for mdfactory
 # ABOUTME: Provides working directory management, YAML loading, and file locking
+# ABOUTME: Includes subprocess execution wrapper with graceful failure modes
 """General-purpose utility functions for mdfactory."""
 
 import contextlib
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict
 
 import yaml
+
+
+def run_command(
+    cmd: list[str],
+    *,
+    timeout: int | None = None,
+    capture_output: bool = True,
+    check: bool = False,
+    text: bool = True,
+    graceful: bool = False,
+    **kwargs,
+) -> subprocess.CompletedProcess | str | None:
+    """Run a shell command with flexible error handling.
+
+    Provides a unified interface for subprocess execution with common
+    patterns: graceful failure for optional commands, strict checking
+    for critical operations, and timeout support.
+
+    Parameters
+    ----------
+    cmd : list of str
+        Command and arguments to execute.
+    timeout : int or None
+        Timeout in seconds. None for no timeout (default).
+    capture_output : bool
+        Capture stdout/stderr. Default True.
+    check : bool
+        Raise CalledProcessError on non-zero exit. Default False.
+        Ignored when graceful=True.
+    text : bool
+        Return output as text (str) rather than bytes. Default True.
+    graceful : bool
+        Return None on any failure (timeout, non-zero exit, OSError)
+        instead of raising. Default False. When True, overrides check=True.
+    **kwargs
+        Additional arguments passed to subprocess.run (e.g., cwd, env,
+        stdout, stderr, stdin).
+
+    Returns
+    -------
+    subprocess.CompletedProcess, str, or None
+        - If graceful=True: Returns stdout string on success, None on any failure.
+        - If capture_output=True and not graceful: Returns stripped stdout string.
+        - Otherwise: Returns CompletedProcess object.
+
+    Raises
+    ------
+    subprocess.CalledProcessError
+        If check=True and command exits with non-zero status.
+    subprocess.TimeoutExpired
+        If timeout is exceeded and graceful=False.
+    FileNotFoundError
+        If command binary not found and graceful=False.
+    OSError
+        On other OS-level failures and graceful=False.
+
+    Examples
+    --------
+    >>> # Graceful failure for optional commands
+    >>> output = run_command(["sinfo", "--version"], timeout=30, graceful=True)
+    >>> if output is None:
+    ...     print("SLURM not available")
+
+    >>> # Strict checking for critical operations
+    >>> run_command(["vmd", "-e", "script.tcl"], check=True)
+
+    >>> # Manual error handling
+    >>> result = run_command(["fdt", "config"], capture_output=False)
+    >>> if result.returncode != 0:
+    ...     print("Validation failed")
+    """
+    if graceful:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=capture_output,
+                text=text,
+                timeout=timeout,
+                check=False,  # Handle manually in graceful mode
+                **kwargs,
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.strip() if capture_output and text else result.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+    else:
+        result = subprocess.run(
+            cmd,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            check=check,
+            **kwargs,
+        )
+        # If caller wants just stdout (most common case)
+        if capture_output and text and not check:
+            return result.stdout.strip()
+        return result
 
 
 @contextlib.contextmanager

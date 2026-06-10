@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -17,7 +16,6 @@ from mdfactory.performance.cluster import (
     _parse_gres,
     _parse_qos,
     _parse_sinfo,
-    _run_command,
     discover_cluster,
     select_partition,
 )
@@ -314,16 +312,18 @@ class TestDiscoverCluster:
         assert result is None
 
     def test_returns_cluster_info_with_sinfo(self):
+        """Test full integration when SLURM commands return data."""
+        partitions = _parse_sinfo(SINFO_OUTPUT_MIXED)
+        accounts = _parse_accounts(SACCTMGR_ACCOUNTS)
+        qos = _parse_qos(SACCTMGR_QOS)
+
         with (
             patch("mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"),
+            patch("mdfactory.performance.cluster._discover_partitions", return_value=partitions),
+            patch("mdfactory.performance.cluster._discover_accounts", return_value=accounts),
+            patch("mdfactory.performance.cluster._discover_qos", return_value=qos),
             patch(
-                "mdfactory.performance.cluster._run_command",
-                side_effect=[
-                    SINFO_OUTPUT_MIXED,  # sinfo call
-                    SACCTMGR_ACCOUNTS,  # sacctmgr accounts
-                    SACCTMGR_QOS,  # sacctmgr qos
-                    "myproject",  # sacctmgr default account
-                ],
+                "mdfactory.performance.cluster._discover_default_account", return_value="myproject"
             ),
         ):
             result = discover_cluster()
@@ -337,17 +337,16 @@ class TestDiscoverCluster:
 
     def test_default_account_falls_back_to_first(self):
         """When default account query fails, fall back to first account."""
+        partitions = _parse_sinfo(SINFO_OUTPUT_MIXED)
+        accounts = _parse_accounts(SACCTMGR_ACCOUNTS)
+        qos = _parse_qos(SACCTMGR_QOS)
+
         with (
             patch("mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"),
-            patch(
-                "mdfactory.performance.cluster._run_command",
-                side_effect=[
-                    SINFO_OUTPUT_MIXED,  # sinfo call
-                    SACCTMGR_ACCOUNTS,  # sacctmgr accounts
-                    SACCTMGR_QOS,  # sacctmgr qos
-                    None,  # sacctmgr default account fails
-                ],
-            ),
+            patch("mdfactory.performance.cluster._discover_partitions", return_value=partitions),
+            patch("mdfactory.performance.cluster._discover_accounts", return_value=accounts),
+            patch("mdfactory.performance.cluster._discover_qos", return_value=qos),
+            patch("mdfactory.performance.cluster._discover_default_account", return_value=None),
         ):
             result = discover_cluster()
 
@@ -357,17 +356,14 @@ class TestDiscoverCluster:
 
     def test_graceful_without_sacctmgr(self):
         """When sacctmgr fails, still return partitions."""
+        partitions = _parse_sinfo(SINFO_OUTPUT_MIXED)
+
         with (
             patch("mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"),
-            patch(
-                "mdfactory.performance.cluster._run_command",
-                side_effect=[
-                    SINFO_OUTPUT_MIXED,  # sinfo succeeds
-                    None,  # sacctmgr accounts fails
-                    None,  # sacctmgr qos fails
-                    None,  # sacctmgr default account fails
-                ],
-            ),
+            patch("mdfactory.performance.cluster._discover_partitions", return_value=partitions),
+            patch("mdfactory.performance.cluster._discover_accounts", return_value=None),
+            patch("mdfactory.performance.cluster._discover_qos", return_value=None),
+            patch("mdfactory.performance.cluster._discover_default_account", return_value=None),
         ):
             result = discover_cluster()
 
@@ -379,33 +375,29 @@ class TestDiscoverCluster:
 
     def test_caching(self):
         """Second call returns cached result without re-querying."""
+        partitions = _parse_sinfo(SINFO_OUTPUT_SINGLE_PARTITION)
+
         with (
             patch("mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"),
             patch(
-                "mdfactory.performance.cluster._run_command",
-                side_effect=[
-                    SINFO_OUTPUT_SINGLE_PARTITION,
-                    None,
-                    None,
-                    None,
-                ],
-            ) as mock_cmd,
+                "mdfactory.performance.cluster._discover_partitions", return_value=partitions
+            ) as mock_partitions,
+            patch("mdfactory.performance.cluster._discover_accounts", return_value=None),
+            patch("mdfactory.performance.cluster._discover_qos", return_value=None),
+            patch("mdfactory.performance.cluster._discover_default_account", return_value=None),
         ):
             result1 = discover_cluster()
             result2 = discover_cluster()
 
         assert result1 is result2
-        # _run_command called 4 times for 1 discover (sinfo, accounts, qos, default_account)
-        assert mock_cmd.call_count == 4
+        # _discover_partitions called only once due to caching
+        assert mock_partitions.call_count == 1
 
     def test_returns_none_when_sinfo_fails(self):
         """If sinfo exists but returns error, return None."""
         with (
             patch("mdfactory.performance.cluster.shutil.which", return_value="/usr/bin/sinfo"),
-            patch(
-                "mdfactory.performance.cluster._run_command",
-                return_value=None,  # sinfo call fails
-            ),
+            patch("mdfactory.performance.cluster._discover_partitions", return_value=None),
         ):
             result = discover_cluster()
         assert result is None
@@ -532,48 +524,3 @@ class TestDataclasses:
         assert ci.accounts == []
         assert ci.qos_policies == []
         assert ci.default_account is None
-
-
-# ---------------------------------------------------------------------------
-# Tests: _run_command edge cases
-# ---------------------------------------------------------------------------
-
-
-class TestRunCommand:
-    """Test _run_command timeout and error handling."""
-
-    def test_returns_none_on_timeout(self):
-        with patch(
-            "mdfactory.performance.cluster.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd=["sinfo"], timeout=30),
-        ):
-            result = _run_command(["sinfo", "--version"])
-        assert result is None
-
-    def test_returns_none_on_file_not_found(self):
-        with patch(
-            "mdfactory.performance.cluster.subprocess.run",
-            side_effect=FileNotFoundError("No such file"),
-        ):
-            result = _run_command(["nonexistent_binary"])
-        assert result is None
-
-    def test_returns_none_on_nonzero_exit(self):
-        with patch(
-            "mdfactory.performance.cluster.subprocess.run",
-            return_value=subprocess.CompletedProcess(
-                args=["sinfo"], returncode=1, stdout="", stderr="error"
-            ),
-        ):
-            result = _run_command(["sinfo", "--bad-flag"])
-        assert result is None
-
-    def test_returns_stdout_on_success(self):
-        with patch(
-            "mdfactory.performance.cluster.subprocess.run",
-            return_value=subprocess.CompletedProcess(
-                args=["echo"], returncode=0, stdout="hello\n", stderr=""
-            ),
-        ):
-            result = _run_command(["echo", "hello"])
-        assert result == "hello"

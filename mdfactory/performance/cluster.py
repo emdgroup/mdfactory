@@ -25,9 +25,10 @@ from __future__ import annotations
 import functools
 import os
 import shutil
-import subprocess
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from mdfactory.utils.utilities import run_command
 
 
 class NodeType(BaseModel):
@@ -113,36 +114,6 @@ class ClusterInfo(BaseModel):
     accounts: list[str] = Field(default_factory=list)
     qos_policies: list[str] = Field(default_factory=list)
     default_account: str | None = None
-
-
-def _run_command(cmd: list[str], *, timeout: int = 30) -> str | None:
-    """Run a shell command and return stdout, or None on failure.
-
-    Parameters
-    ----------
-    cmd : list of str
-        Command and arguments.
-    timeout : int
-        Timeout in seconds.
-
-    Returns
-    -------
-    str or None
-        Stripped stdout on success, None on any failure.
-    """
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        if result.returncode != 0:
-            return None
-        return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return None
 
 
 def _parse_gres(gres_str: str) -> list[tuple[int, str | None]]:
@@ -470,7 +441,11 @@ def _discover_partitions() -> list[Partition] | None:
     list of Partition or None
         Parsed partitions, or None if sinfo is unavailable.
     """
-    output = _run_command(["sinfo", "-N", "--noheader", "-o", "%P %n %c %m %G %f %l %L %T"])
+    output = run_command(
+        ["sinfo", "-N", "--noheader", "-o", "%P %n %c %m %G %f %l %L %T"],
+        timeout=30,
+        graceful=True,
+    )
     if output is None:
         return None
     return _parse_sinfo(output)
@@ -487,7 +462,7 @@ def _discover_accounts() -> list[str] | None:
     user = os.environ.get("USER", os.environ.get("LOGNAME", ""))
     if not user:
         return None
-    output = _run_command(
+    output = run_command(
         [
             "sacctmgr",
             "show",
@@ -496,7 +471,9 @@ def _discover_accounts() -> list[str] | None:
             "format=Account",
             "--noheader",
             "--parsable2",
-        ]
+        ],
+        timeout=30,
+        graceful=True,
     )
     if output is None:
         return None
@@ -511,7 +488,7 @@ def _discover_qos() -> list[str] | None:
     list of str or None
         QOS names, or None if sacctmgr is unavailable.
     """
-    output = _run_command(
+    output = run_command(
         [
             "sacctmgr",
             "show",
@@ -519,7 +496,9 @@ def _discover_qos() -> list[str] | None:
             "format=Name,MaxWall,MaxTRES",
             "--noheader",
             "--parsable2",
-        ]
+        ],
+        timeout=30,
+        graceful=True,
     )
     if output is None:
         return None
@@ -537,7 +516,7 @@ def _discover_default_account() -> str | None:
     user = os.environ.get("USER", os.environ.get("LOGNAME", ""))
     if not user:
         return None
-    output = _run_command(
+    output = run_command(
         [
             "sacctmgr",
             "show",
@@ -546,7 +525,9 @@ def _discover_default_account() -> str | None:
             "format=DefaultAccount",
             "--noheader",
             "--parsable2",
-        ]
+        ],
+        timeout=30,
+        graceful=True,
     )
     if output is None:
         return None
