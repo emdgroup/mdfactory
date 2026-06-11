@@ -238,7 +238,7 @@ def _make_cluster(
 class TestBaseSlurmConfigFromCluster:
     """Tests run without a real SLURM cluster (discover_cluster mocked)."""
 
-    def test_autodiscovery_populates_account_and_partition(self, monkeypatch):
+    def test_autodiscovery_populates_account_and_partition(self, monkeypatch, no_slurm_settings):
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
         cfg = SlurmConfig.from_cluster()
         assert cfg.account == "myaccount"
@@ -262,7 +262,7 @@ class TestBaseSlurmConfigFromCluster:
         with pytest.raises(RuntimeError, match="No suitable partition found"):
             SlurmConfig.from_cluster(min_cpus=32)
 
-    def test_needs_gpu_selects_gpu_partition(self, monkeypatch):
+    def test_needs_gpu_selects_gpu_partition(self, monkeypatch, no_slurm_settings):
         cluster = _make_cluster(
             partitions=[_make_cpu_partition(), _make_gpu_partition()]
         )
