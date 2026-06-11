@@ -72,8 +72,9 @@ class Settings:
             },
             "slurm": {
                 "ACCOUNT": "",
-                "PARTITION": "",
-                "QOS": "",
+                "PARTITION_CPU": "",
+                "PARTITION_GPU": "",
+                "DEFAULT_QOS": "",
             },
         }
 
@@ -103,8 +104,9 @@ class Settings:
         },
         "slurm": {
             "ACCOUNT": "",
-            "PARTITION": "",
-            "QOS": "",
+            "PARTITION_CPU": "",
+            "PARTITION_GPU": "",
+            "DEFAULT_QOS": "",
         },
     }
 
@@ -331,15 +333,32 @@ class Settings:
         return val if val else None
 
     @property
-    def slurm_partition(self) -> str | None:
-        """Return configured SLURM partition, or None if not set."""
-        val = self.config.get("slurm", "PARTITION", fallback="").strip()
+    def slurm_partition_cpu(self) -> str | None:
+        """Return configured CPU partition name, or None if not set.
+
+        Maps to ``[slurm] PARTITION_CPU`` in config.ini.
+        Used by ``BaseSlurmConfig.from_cluster()`` when ``needs_gpu=False``.
+        """
+        val = self.config.get("slurm", "PARTITION_CPU", fallback="").strip()
+        return val if val else None
+
+    @property
+    def slurm_partition_gpu(self) -> str | None:
+        """Return configured GPU partition name, or None if not set.
+
+        Maps to ``[slurm] PARTITION_GPU`` in config.ini.
+        Used by ``BaseSlurmConfig.from_cluster()`` when ``needs_gpu=True``.
+        """
+        val = self.config.get("slurm", "PARTITION_GPU", fallback="").strip()
         return val if val else None
 
     @property
     def slurm_qos(self) -> str | None:
-        """Return configured SLURM QOS, or None if not set."""
-        val = self.config.get("slurm", "QOS", fallback="").strip()
+        """Return configured SLURM default QOS, or None if not set.
+
+        Maps to ``[slurm] DEFAULT_QOS`` in config.ini.
+        """
+        val = self.config.get("slurm", "DEFAULT_QOS", fallback="").strip()
         return val if val else None
 
 
