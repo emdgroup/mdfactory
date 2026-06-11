@@ -16,7 +16,6 @@ from mdfactory.performance.slurm_config import (
     normalize_slurm_time,
 )
 
-
 # ---------------------------------------------------------------------------
 # normalize_slurm_time
 # ---------------------------------------------------------------------------
@@ -189,9 +188,7 @@ def _make_cpu_partition(name: str = "compute", cpus: int = 32) -> cluster_mod.Pa
         state="up",
         max_time="3-00:00:00",
         default_time="1:00:00",
-        node_types=[
-            cluster_mod.NodeType(cpus=cpus, memory_mb=128 * 1024, gpu_specs=(), count=10)
-        ],
+        node_types=[cluster_mod.NodeType(cpus=cpus, memory_mb=128 * 1024, gpu_specs=(), count=10)],
         total_nodes=10,
         is_default=True,
     )
@@ -263,9 +260,7 @@ class TestBaseSlurmConfigFromCluster:
             SlurmConfig.from_cluster(min_cpus=32)
 
     def test_needs_gpu_selects_gpu_partition(self, monkeypatch, no_slurm_settings):
-        cluster = _make_cluster(
-            partitions=[_make_cpu_partition(), _make_gpu_partition()]
-        )
+        cluster = _make_cluster(partitions=[_make_cpu_partition(), _make_gpu_partition()])
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: cluster)
         cfg = SlurmConfig.from_cluster(needs_gpu=True)
         assert cfg.partition == "gpu"
@@ -276,9 +271,7 @@ class TestBaseSlurmConfigFromCluster:
         from mdfactory.settings import Settings
 
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
-        monkeypatch.setattr(
-            Settings, "slurm_account", property(lambda self: "config-account")
-        )
+        monkeypatch.setattr(Settings, "slurm_account", property(lambda self: "config-account"))
         cfg = SlurmConfig.from_cluster()
         assert cfg.account == "config-account"
 
@@ -286,22 +279,16 @@ class TestBaseSlurmConfigFromCluster:
         from mdfactory.settings import Settings
 
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
-        monkeypatch.setattr(
-            Settings, "slurm_partition_cpu", property(lambda self: "config-cpu")
-        )
+        monkeypatch.setattr(Settings, "slurm_partition_cpu", property(lambda self: "config-cpu"))
         cfg = SlurmConfig.from_cluster(needs_gpu=False)
         assert cfg.partition == "config-cpu"
 
     def test_config_gpu_partition_overrides_autodiscovery(self, monkeypatch):
         from mdfactory.settings import Settings
 
-        cluster = _make_cluster(
-            partitions=[_make_cpu_partition(), _make_gpu_partition()]
-        )
+        cluster = _make_cluster(partitions=[_make_cpu_partition(), _make_gpu_partition()])
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: cluster)
-        monkeypatch.setattr(
-            Settings, "slurm_partition_gpu", property(lambda self: "config-gpu")
-        )
+        monkeypatch.setattr(Settings, "slurm_partition_gpu", property(lambda self: "config-gpu"))
         cfg = SlurmConfig.from_cluster(needs_gpu=True)
         assert cfg.partition == "config-gpu"
 
@@ -309,9 +296,7 @@ class TestBaseSlurmConfigFromCluster:
         from mdfactory.settings import Settings
 
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
-        monkeypatch.setattr(
-            Settings, "slurm_qos", property(lambda self: "high")
-        )
+        monkeypatch.setattr(Settings, "slurm_qos", property(lambda self: "high"))
         cfg = SlurmConfig.from_cluster()
         assert cfg.qos == "high"
 
@@ -321,9 +306,7 @@ class TestBaseSlurmConfigFromCluster:
         from mdfactory.settings import Settings
 
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
-        monkeypatch.setattr(
-            Settings, "slurm_account", property(lambda self: "config-account")
-        )
+        monkeypatch.setattr(Settings, "slurm_account", property(lambda self: "config-account"))
         cfg = SlurmConfig.from_cluster(account="explicit-account")
         assert cfg.account == "explicit-account"
 
@@ -341,9 +324,7 @@ class TestBaseSlurmConfigFromCluster:
         from mdfactory.settings import Settings
 
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
-        monkeypatch.setattr(
-            Settings, "slurm_qos", property(lambda self: "high")
-        )
+        monkeypatch.setattr(Settings, "slurm_qos", property(lambda self: "high"))
         cfg = SlurmConfig.from_cluster(qos="debug")
         assert cfg.qos == "debug"
 

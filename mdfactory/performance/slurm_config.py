@@ -197,9 +197,7 @@ class BaseSlurmConfig(BaseModel):
         resolved_partition: str | None = extra_fields.pop("partition", None)
         if resolved_partition is None:
             resolved_partition = (
-                settings.slurm_partition_gpu
-                if needs_gpu
-                else settings.slurm_partition_cpu
+                settings.slurm_partition_gpu if needs_gpu else settings.slurm_partition_cpu
             )
         if resolved_partition is None:
             if cluster is None:

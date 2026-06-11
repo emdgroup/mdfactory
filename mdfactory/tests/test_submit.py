@@ -597,7 +597,9 @@ class TestSlurmConfigFromCluster:
         )
 
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: mock_cluster)
-        monkeypatch.setattr(Settings, "slurm_partition_cpu", property(lambda self: "config-partition"))
+        monkeypatch.setattr(
+            Settings, "slurm_partition_cpu", property(lambda self: "config-partition")
+        )
 
         config = submit_mod.SlurmConfig.from_cluster(needs_gpu=False)
 
@@ -629,7 +631,9 @@ class TestSlurmConfigFromCluster:
 
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: mock_cluster)
         monkeypatch.setattr(Settings, "slurm_account", property(lambda self: "config-account"))
-        monkeypatch.setattr(Settings, "slurm_partition_cpu", property(lambda self: "config-partition"))
+        monkeypatch.setattr(
+            Settings, "slurm_partition_cpu", property(lambda self: "config-partition")
+        )
 
         config = submit_mod.SlurmConfig.from_cluster(
             account="explicit-account", partition="explicit-partition"
