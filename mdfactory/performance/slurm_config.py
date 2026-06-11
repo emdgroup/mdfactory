@@ -29,7 +29,7 @@ normalize_slurm_time
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -88,10 +88,11 @@ def normalize_slurm_time(value: str) -> str:
 class BaseSlurmConfig(BaseModel):
     """SLURM resource specification shared by all submission backends.
 
-    Owns the four cross-cutting SLURM fields and the single authoritative
-    ``from_cluster()`` factory method.  Subclasses add backend-specific
-    fields (e.g. ``cpus_per_task`` for submitit, ``cpus_per_node`` for Parsl)
-    and inherit ``from_cluster()`` without writing any additional code.
+    Base class owning the four cross-cutting SLURM fields and the single
+    authoritative ``from_cluster()`` factory method.  Subclasses add
+    backend-specific fields (e.g. ``cpus_per_task`` for submitit,
+    ``cpus_per_node`` for Parsl) and inherit ``from_cluster()`` without
+    writing any additional code.
 
     Parameters
     ----------
@@ -126,7 +127,7 @@ class BaseSlurmConfig(BaseModel):
         min_cpus: int = 1,
         min_mem_gb: int = 1,
         **extra_fields: Any,
-    ) -> "BaseSlurmConfig":
+    ) -> Self:
         """Create an instance with SLURM fields auto-populated from the cluster.
 
         Three-tier precedence (highest wins):
@@ -294,7 +295,7 @@ class SlurmConfig(BaseSlurmConfig):
         return normalize_slurm_time(v)
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "SlurmConfig":
+    def from_yaml(cls, path: Path | str) -> "SlurmConfig":
         """Load a ``SlurmConfig`` from a YAML file.
 
         Parameters

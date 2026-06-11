@@ -12,6 +12,7 @@ slurm_config
     ``SlurmConfig`` is the submitit backend configuration.
 """
 
+from mdfactory.performance import cluster
 from mdfactory.performance.slurm_config import BaseSlurmConfig, SlurmConfig
 
-__all__ = ["BaseSlurmConfig", "SlurmConfig"]
+__all__ = ["cluster", "BaseSlurmConfig", "SlurmConfig"]
