@@ -158,6 +158,27 @@ class TestSlurmConfigFromYaml:
 
 
 # ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_slurm_settings(monkeypatch):
+    """Return None for all [slurm] settings — simulates an unconfigured machine.
+
+    Without this fixture, tests that expect autodiscovery to be the sole source
+    of truth would behave differently on machines that have ACCOUNT / PARTITION_CPU
+    set in their config.ini.
+    """
+    from mdfactory.settings import Settings
+
+    monkeypatch.setattr(Settings, "slurm_account", property(lambda self: None))
+    monkeypatch.setattr(Settings, "slurm_partition_cpu", property(lambda self: None))
+    monkeypatch.setattr(Settings, "slurm_partition_gpu", property(lambda self: None))
+    monkeypatch.setattr(Settings, "slurm_qos", property(lambda self: None))
+
+
+# ---------------------------------------------------------------------------
 # Helpers to build mock cluster objects
 # ---------------------------------------------------------------------------
 
@@ -223,18 +244,18 @@ class TestBaseSlurmConfigFromCluster:
         assert cfg.account == "myaccount"
         assert cfg.partition == "compute"
 
-    def test_no_slurm_raises(self, monkeypatch):
+    def test_no_slurm_raises(self, monkeypatch, no_slurm_settings):
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: None)
         with pytest.raises(RuntimeError, match="SLURM autodiscovery failed and no account"):
             SlurmConfig.from_cluster()
 
-    def test_no_default_account_raises(self, monkeypatch):
+    def test_no_default_account_raises(self, monkeypatch, no_slurm_settings):
         cluster = _make_cluster(default_account=None)
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: cluster)
         with pytest.raises(RuntimeError, match="No SLURM account available"):
             SlurmConfig.from_cluster()
 
-    def test_no_suitable_partition_raises(self, monkeypatch):
+    def test_no_suitable_partition_raises(self, monkeypatch, no_slurm_settings):
         # Tiny partition: 4 CPUs — won't satisfy min_cpus=32
         cluster = _make_cluster(partitions=[_make_cpu_partition(cpus=4)])
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: cluster)
