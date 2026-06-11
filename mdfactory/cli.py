@@ -1153,7 +1153,7 @@ def analysis_run(
     skip_existing: bool = True,
     slurm: bool = False,
     account: str | None = None,
-    partition: str = "cpu",
+    partition: str | None = None,
     time: str = "2h",
     cpus: int = 4,
     mem_gb: int = 8,
@@ -1236,25 +1236,16 @@ def analysis_run(
         try:
             slurm_cfg = SlurmConfig.from_cluster(
                 needs_gpu=False,
+                min_cpus=cpus,
+                min_mem_gb=mem_gb,
                 time=time,
                 cpus_per_task=cpus,
                 mem_gb=mem_gb,
                 qos=qos,
                 constraint=constraint,
                 job_name_prefix=job_name_prefix,
+                **({"partition": partition} if partition is not None else {}),
             )
-            # Override partition if user specified one explicitly
-            if partition != "cpu":  # user changed from default
-                slurm_cfg = SlurmConfig(
-                    account=slurm_cfg.account,
-                    partition=partition,
-                    time=time,
-                    cpus_per_task=cpus,
-                    mem_gb=mem_gb,
-                    qos=qos,
-                    constraint=constraint,
-                    job_name_prefix=job_name_prefix,
-                )
             logger.info(
                 f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
                 f"partition={slurm_cfg.partition}"
@@ -1266,7 +1257,7 @@ def analysis_run(
     else:
         slurm_cfg = SlurmConfig(
             account=account,
-            partition=partition,
+            partition=partition or "cpu",
             time=time,
             cpus_per_task=cpus,
             mem_gb=mem_gb,
@@ -1504,7 +1495,7 @@ def analysis_artifacts_run(
     skip_existing: bool = True,
     slurm: bool = False,
     account: str | None = None,
-    partition: str = "cpu",
+    partition: str | None = None,
     time: str = "2h",
     cpus: int = 4,
     mem_gb: int = 8,
@@ -1556,25 +1547,16 @@ def analysis_artifacts_run(
         try:
             slurm_cfg = SlurmConfig.from_cluster(
                 needs_gpu=False,
+                min_cpus=cpus,
+                min_mem_gb=mem_gb,
                 time=time,
                 cpus_per_task=cpus,
                 mem_gb=mem_gb,
                 qos=qos,
                 constraint=constraint,
                 job_name_prefix=job_name_prefix,
+                **({"partition": partition} if partition is not None else {}),
             )
-            # Override partition if user specified one explicitly
-            if partition != "cpu":  # user changed from default
-                slurm_cfg = SlurmConfig(
-                    account=slurm_cfg.account,
-                    partition=partition,
-                    time=time,
-                    cpus_per_task=cpus,
-                    mem_gb=mem_gb,
-                    qos=qos,
-                    constraint=constraint,
-                    job_name_prefix=job_name_prefix,
-                )
             logger.info(
                 f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
                 f"partition={slurm_cfg.partition}"
@@ -1586,7 +1568,7 @@ def analysis_artifacts_run(
     else:
         slurm_cfg = SlurmConfig(
             account=account,
-            partition=partition,
+            partition=partition or "cpu",
             time=time,
             cpus_per_task=cpus,
             mem_gb=mem_gb,
