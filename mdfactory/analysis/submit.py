@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import os
 import shutil
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -16,158 +15,15 @@ import pandas as pd
 from mdfactory.analysis.artifacts import ARTIFACT_REGISTRY
 from mdfactory.analysis.simulation import ANALYSIS_REGISTRY, Simulation
 
-
-@dataclass(frozen=True)
-class SlurmConfig:
-    """Configuration for submitit/SLURM execution."""
-
-    account: str
-    partition: str = "cpu"
-    time: str = "2h"
-    cpus_per_task: int = 4
-    mem_gb: int = 8
-    qos: str | None = None
-    constraint: str | None = None
-    job_name_prefix: str = "mdfactory-analysis"
-
-    @classmethod
-    def from_cluster(
-        cls,
-        *,
-        account: str | None = None,
-        partition: str | None = None,
-        needs_gpu: bool = False,
-        time: str = "2h",
-        cpus_per_task: int = 4,
-        mem_gb: int = 8,
-        qos: str | None = None,
-        constraint: str | None = None,
-        job_name_prefix: str = "mdfactory-analysis",
-    ) -> "SlurmConfig":
-        """Create SlurmConfig from config file or autodiscovered cluster info.
-
-        Precedence: explicit parameters > config file > autodiscovery
-
-        Uses lazy import of ``mdfactory.performance.cluster`` to avoid
-        hard dependency on SLURM commands at import time.
-
-        Parameters
-        ----------
-        account : str or None
-            SLURM account. If None, uses config or autodiscovery.
-        partition : str or None
-            SLURM partition. If None, uses config or autodiscovers based on needs_gpu.
-        needs_gpu : bool
-            If True and partition not specified, autodiscover GPU partition.
-        time : str
-            Job time limit (default: "2h").
-        cpus_per_task : int
-            CPUs per task (default: 4).
-        mem_gb : int
-            Memory per task in GB (default: 8).
-        qos : str or None
-            Quality of service. If None, uses config or SLURM default.
-        constraint : str or None
-            SLURM constraint string.
-        job_name_prefix : str
-            Prefix for SLURM job names.
-
-        Returns
-        -------
-        SlurmConfig
-            Configured instance.
-
-        Raises
-        ------
-        RuntimeError
-            If SLURM is not available or required values cannot be determined.
-        """
-        from mdfactory.performance.cluster import discover_cluster, select_partition
-        from mdfactory.settings import settings
-
-        # Try autodiscovery (needed for fallback)
-        cluster = discover_cluster()
-
-        # Determine account: explicit > config > autodiscovery
-        resolved_account = account
-        if resolved_account is None:
-            resolved_account = settings.slurm_account
-        if resolved_account is None:
-            if cluster is None:
-                raise RuntimeError(
-                    "SLURM autodiscovery failed and no account configured. "
-                    "Set [slurm] account in config.ini or pass account= explicitly."
-                )
-            resolved_account = cluster.default_account
-            if resolved_account is None:
-                raise RuntimeError(
-                    "No SLURM account available. "
-                    "Set [slurm] account in config.ini or pass account= explicitly."
-                )
-
-        # Determine partition: explicit > config > autodiscovery
-        resolved_partition = partition
-        if resolved_partition is None:
-            resolved_partition = settings.slurm_partition
-
-        # Fall back to autodiscovery if no config value
-        if resolved_partition is None:
-            if cluster is None:
-                raise RuntimeError(
-                    "SLURM autodiscovery failed and no partition configured. "
-                    "Set [slurm] partition in config.ini or pass partition= explicitly."
-                )
-            selected = select_partition(
-                cluster,
-                needs_gpu=needs_gpu,
-                min_cpus=cpus_per_task,
-                min_mem_gb=mem_gb,
-            )
-            if selected is None:
-                raise RuntimeError(
-                    f"No suitable partition found for requirements: "
-                    f"needs_gpu={needs_gpu}, cpus={cpus_per_task}, mem={mem_gb}GB"
-                )
-            resolved_partition = selected.name
-
-        # Determine QOS: explicit > config > skip (let SLURM use default)
-        resolved_qos = qos
-        if resolved_qos is None:
-            resolved_qos = settings.slurm_qos
-
-        return cls(
-            account=resolved_account,
-            partition=resolved_partition,
-            time=time,
-            cpus_per_task=cpus_per_task,
-            mem_gb=mem_gb,
-            qos=resolved_qos,
-            constraint=constraint,
-            job_name_prefix=job_name_prefix,
-        )
-
-
-def normalize_slurm_time(value: str) -> str:
-    """Normalize SLURM time strings to accepted formats."""
-    raw = value.strip()
-    if ":" in raw:
-        return raw
-    lowered = raw.lower()
-    if lowered.endswith("d"):
-        days = int(lowered[:-1])
-        return f"{days}-00:00:00"
-    if lowered.endswith("h"):
-        hours = int(lowered[:-1])
-        return f"{hours:02d}:00:00"
-    if lowered.endswith("m"):
-        minutes = int(lowered[:-1])
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours:02d}:{minutes:02d}:00"
-    if lowered.isdigit():
-        minutes = int(lowered)
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours:02d}:{minutes:02d}:00"
-    return raw
+# SlurmConfig and normalize_slurm_time live in the performance package so that
+# every SLURM-facing backend (submitit, Parsl, Nextflow) can share them.
+# Re-exported here for backward compatibility:
+#   from mdfactory.analysis.submit import SlurmConfig        # still works
+#   from mdfactory.analysis.submit import normalize_slurm_time  # still works
+from mdfactory.performance.slurm_config import (  # noqa: F401  (re-export)
+    SlurmConfig,
+    normalize_slurm_time,
+)
 
 
 def resolve_simulation_paths(
