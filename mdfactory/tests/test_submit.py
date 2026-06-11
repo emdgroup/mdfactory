@@ -23,6 +23,8 @@ def test_resolve_simulation_paths_from_yaml(tmp_path):
 
 
 def test_normalize_slurm_time():
+    # normalize_slurm_time is re-exported from mdfactory.analysis.submit for
+    # backward compatibility — the canonical version lives in performance.slurm_config.
     assert submit_mod.normalize_slurm_time("2h") == "02:00:00"
     assert submit_mod.normalize_slurm_time("30m") == "00:30:00"
     assert submit_mod.normalize_slurm_time("90") == "01:30:00"
@@ -426,7 +428,7 @@ class TestSlurmConfigFromCluster:
 
         assert config.account == "myaccount"
         assert config.partition == "compute"
-        assert config.time == "4h"
+        assert config.time == "04:00:00"
         assert config.cpus_per_task == 8
         assert config.mem_gb == 16
 
@@ -496,7 +498,7 @@ class TestSlurmConfigFromCluster:
         import pytest
 
         with pytest.raises(RuntimeError, match="No suitable partition found"):
-            submit_mod.SlurmConfig.from_cluster(cpus_per_task=32)
+            submit_mod.SlurmConfig.from_cluster(min_cpus=32)
 
     def test_from_cluster_selects_gpu_partition(self, monkeypatch):
         """Test that needs_gpu=True selects GPU partition."""
@@ -595,7 +597,7 @@ class TestSlurmConfigFromCluster:
         )
 
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: mock_cluster)
-        monkeypatch.setattr(Settings, "slurm_partition", property(lambda self: "config-partition"))
+        monkeypatch.setattr(Settings, "slurm_partition_cpu", property(lambda self: "config-partition"))
 
         config = submit_mod.SlurmConfig.from_cluster(needs_gpu=False)
 
@@ -627,7 +629,7 @@ class TestSlurmConfigFromCluster:
 
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: mock_cluster)
         monkeypatch.setattr(Settings, "slurm_account", property(lambda self: "config-account"))
-        monkeypatch.setattr(Settings, "slurm_partition", property(lambda self: "config-partition"))
+        monkeypatch.setattr(Settings, "slurm_partition_cpu", property(lambda self: "config-partition"))
 
         config = submit_mod.SlurmConfig.from_cluster(
             account="explicit-account", partition="explicit-partition"
