@@ -14,6 +14,7 @@ from mdfactory.performance.cluster import (
     Partition,
     _parse_accounts,
     _parse_gres,
+    _parse_memory_mb,
     _parse_qos,
     _parse_sinfo,
     discover_cluster,
@@ -256,6 +257,10 @@ class TestParseSinfo:
         # Should still parse valid lines
         assert len(partitions) == 1
 
+    def test_memory_trailing_plus_stripped(self):
+        """SLURM reports '128000+' when memory varies across nodes in a partition."""
+        assert _parse_memory_mb("128000+") == 128000
+
 
 # ---------------------------------------------------------------------------
 # Tests: account / QOS parsing
@@ -473,6 +478,16 @@ class TestSelectPartition:
         cluster = ClusterInfo(partitions=partitions)
         result = select_partition(cluster)
         assert result is None
+
+    def test_node_count_tiebreak(self):
+        """When multiple partitions qualify, prefer the one with more nodes."""
+        # SINFO_OUTPUT_GPU_ONLY: gpu-short (2 nodes) vs gpu-long (1 node), neither default.
+        # sort key (not is_default, -total_nodes, name) should pick gpu-short.
+        partitions = _parse_sinfo(SINFO_OUTPUT_GPU_ONLY)
+        cluster = ClusterInfo(partitions=partitions)
+        result = select_partition(cluster, needs_gpu=True)
+        assert result is not None
+        assert result.name == "gpu-short"
 
 
 # ---------------------------------------------------------------------------

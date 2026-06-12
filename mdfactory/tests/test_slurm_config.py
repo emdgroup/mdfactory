@@ -259,6 +259,18 @@ class TestBaseSlurmConfigFromCluster:
         with pytest.raises(RuntimeError, match="No suitable partition found"):
             SlurmConfig.from_cluster(min_cpus=32)
 
+    def test_autodiscovery_fails_no_partition_in_config_raises(
+        self, monkeypatch, no_slurm_settings
+    ):
+        """cluster=None with account supplied but no partition in config raises RuntimeError."""
+        from mdfactory.settings import Settings
+
+        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: None)
+        # Provide account so resolution reaches the partition step
+        monkeypatch.setattr(Settings, "slurm_account", property(lambda self: "myaccount"))
+        with pytest.raises(RuntimeError, match="no partition configured"):
+            SlurmConfig.from_cluster()
+
     def test_needs_gpu_selects_gpu_partition(self, monkeypatch, no_slurm_settings):
         cluster = _make_cluster(partitions=[_make_cpu_partition(), _make_gpu_partition()])
         monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: cluster)
