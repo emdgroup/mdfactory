@@ -315,11 +315,11 @@ def _parse_sinfo(output: str) -> list[Partition]:
             partition_data[partition_name]["is_default"] = True
 
         # Determine if node is operational (can schedule jobs or report accurate config)
-        # Exclude only truly broken/invalid nodes: down, drained, inval, fail, maint, unknown
+        # Exclude broken/invalid nodes: down, drained, inval, fail, maint, unknown, error
         state_lower = state.lower()
         is_broken = any(
             broken in state_lower
-            for broken in ("down", "drained", "inval", "fail", "maint", "unknown")
+            for broken in ("down", "drained", "inval", "fail", "maint", "unknown", "error")
         )
         is_operational = not is_broken
 
