@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import os
 import shutil
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -16,42 +15,15 @@ import pandas as pd
 from mdfactory.analysis.artifacts import ARTIFACT_REGISTRY
 from mdfactory.analysis.simulation import ANALYSIS_REGISTRY, Simulation
 
-
-@dataclass(frozen=True)
-class SlurmConfig:
-    """Configuration for submitit/SLURM execution."""
-
-    account: str
-    partition: str = "cpu"
-    time: str = "2h"
-    cpus_per_task: int = 4
-    mem_gb: int = 8
-    qos: str | None = None
-    constraint: str | None = None
-    job_name_prefix: str = "mdfactory-analysis"
-
-
-def normalize_slurm_time(value: str) -> str:
-    """Normalize SLURM time strings to accepted formats."""
-    raw = value.strip()
-    if ":" in raw:
-        return raw
-    lowered = raw.lower()
-    if lowered.endswith("d"):
-        days = int(lowered[:-1])
-        return f"{days}-00:00:00"
-    if lowered.endswith("h"):
-        hours = int(lowered[:-1])
-        return f"{hours:02d}:00:00"
-    if lowered.endswith("m"):
-        minutes = int(lowered[:-1])
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours:02d}:{minutes:02d}:00"
-    if lowered.isdigit():
-        minutes = int(lowered)
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours:02d}:{minutes:02d}:00"
-    return raw
+# SlurmConfig and normalize_slurm_time live in the performance package so that
+# every SLURM-facing backend (submitit, Parsl, Nextflow) can share them.
+# Re-exported here for backward compatibility:
+#   from mdfactory.analysis.submit import SlurmConfig        # still works
+#   from mdfactory.analysis.submit import normalize_slurm_time  # still works
+from mdfactory.performance.slurm_config import (  # noqa: F401  (re-export)
+    SlurmConfig,
+    normalize_slurm_time,
+)
 
 
 def resolve_simulation_paths(
