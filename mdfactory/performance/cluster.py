@@ -163,7 +163,10 @@ def _parse_gres(gres_str: str) -> list[tuple[int, str | None]]:
         if len(parts) == 3:
             # gpu:type:count
             _, gpu_type, count_str = parts
-            gpu_entries.append((int(count_str), gpu_type))
+            try:
+                gpu_entries.append((int(count_str), gpu_type))
+            except ValueError:
+                continue  # skip malformed GRES entry
         elif len(parts) == 2:
             # gpu:count (no type specified)
             _, count_str = parts
