@@ -1890,7 +1890,7 @@ def config_cluster(
             gpu_info = ""
             if nt.gpu_specs:
                 # Format multiple GPU types like "7x b200, 7x 1g.23gb"
-                gpu_parts = [f"{count}x {gtype}" for count, gtype in nt.gpu_specs]
+                gpu_parts = [f"{count}x {gtype or 'unknown'}" for count, gtype in nt.gpu_specs]
                 gpu_info = f", {', '.join(gpu_parts)}"
             mem_gb = nt.memory_mb // 1024
             features_str = ""
