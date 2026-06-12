@@ -22,13 +22,17 @@ Examples
 
 from __future__ import annotations
 
-import functools
 import os
 import shutil
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from mdfactory.utils.utilities import run_command
+
+# Sentinel for selective caching in discover_cluster(): only confirmed sinfo-absent
+# and successful ClusterInfo results are cached; transient failures fall through.
+_CLUSTER_CACHE_SENTINEL = object()
+_cluster_cache: "ClusterInfo | None | object" = _CLUSTER_CACHE_SENTINEL
 
 
 class NodeType(BaseModel):
@@ -535,7 +539,6 @@ def _discover_default_account() -> str | None:
     return account if account else None
 
 
-@functools.lru_cache(maxsize=1)
 def discover_cluster() -> ClusterInfo | None:
     """Query SLURM and return structured cluster information.
 
@@ -543,8 +546,10 @@ def discover_cluster() -> ClusterInfo | None:
     accounts, and QOS policies. Returns None gracefully when SLURM commands
     are not available (e.g., running on a laptop).
 
-    Results are cached for the session (cluster topology doesn't change
-    mid-session). Call ``discover_cluster.cache_clear()`` to force re-query.
+    Successful results and confirmed sinfo-absent are cached for the session
+    (cluster topology doesn't change mid-run). Transient failures (sinfo
+    present but exiting non-zero) are not cached so the next call retries.
+    Call ``discover_cluster.cache_clear()`` to force a full re-query.
 
     Returns
     -------
@@ -558,13 +563,19 @@ def discover_cluster() -> ClusterInfo | None:
     ...     for p in cluster.partitions:
     ...         print(f"{p.name}: {p.total_nodes} nodes")
     """
+    global _cluster_cache
+    if _cluster_cache is not _CLUSTER_CACHE_SENTINEL:
+        return _cluster_cache  # type: ignore[return-value]
+
     # sinfo is the minimum requirement — if it's not available, we're not
-    # on a SLURM cluster
+    # on a SLURM cluster. This is a stable fact; cache it.
     if shutil.which("sinfo") is None:
+        _cluster_cache = None
         return None
 
     partitions = _discover_partitions()
     if partitions is None:
+        # Transient failure (sinfo exited non-zero) — don't cache, allow retry.
         return None
 
     # Accounts and QOS are best-effort (sacctmgr may be restricted)
@@ -576,12 +587,22 @@ def discover_cluster() -> ClusterInfo | None:
     if default_account is None and accounts:
         default_account = accounts[0]
 
-    return ClusterInfo(
+    result = ClusterInfo(
         partitions=partitions,
         accounts=accounts,
         qos_policies=qos_policies,
         default_account=default_account,
     )
+    _cluster_cache = result
+    return result
+
+
+def _clear_cluster_cache() -> None:
+    global _cluster_cache
+    _cluster_cache = _CLUSTER_CACHE_SENTINEL
+
+
+discover_cluster.cache_clear = _clear_cluster_cache  # type: ignore[attr-defined]
 
 
 def select_partition(
