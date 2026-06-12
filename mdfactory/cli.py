@@ -112,12 +112,62 @@ def df_models_from_input_csv(input):
     return df, models, errors
 
 
+def _resolve_slurm_flag(slurm: str | None) -> Path | None:
+    """Resolve the ``--slurm`` CLI flag to an executor config YAML path.
+
+    Parameters
+    ----------
+    slurm : str or None
+        Raw value from the ``--slurm`` flag.  ``"tui"`` launches the
+        interactive wizard (which writes a temporary YAML).  Any other
+        non-None value is treated as a file path.
+
+    Returns
+    -------
+    Path or None
+        Path to executor config YAML, or None if no SLURM config requested.
+    """
+    if slurm is None:
+        return None
+
+    if slurm.strip().lower() == "tui":
+        from mdfactory.orchestration.tui import UserCancelledError, configure_slurm_interactive
+
+        try:
+            config = configure_slurm_interactive()
+        except UserCancelledError:
+            logger.info("SLURM configuration cancelled.")
+            sys.exit(0)
+
+        # Write to a temporary YAML so the existing from_yaml flow works
+        import tempfile
+
+        import yaml as _yaml
+
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", prefix="mdfactory_slurm_", delete=False
+        )
+        _yaml.dump(config.model_dump(exclude_none=True), tmp, default_flow_style=False)
+        tmp.close()
+        logger.info(f"Using SLURM config from interactive wizard ({tmp.name})")
+        return Path(tmp.name)
+
+    path = Path(slurm)
+    if not path.exists():
+        logger.error(f"SLURM config file not found: {path}")
+        sys.exit(1)
+    return path
+
+
 @app.command(name="build", group="Build")
 def build_system(
     input: Path,
     output: Path = Path("."),
-    config: Annotated[
-        Path | None, Parameter(help="Executor config YAML for parallel Parsl builds.")
+    slurm: Annotated[
+        str | None,
+        Parameter(
+            help=("SLURM executor config: path to YAML file, or 'tui' for interactive setup.")
+        ),
     ] = None,
     dry_run: Annotated[
         bool, Parameter(help="Print what would be built without executing.")
@@ -128,7 +178,7 @@ def build_system(
     Supports three input modes:
 
     - Single YAML: builds one system locally (original behavior)
-    - CSV file: builds systems from each row (parallel with --config, sequential without)
+    - CSV file: builds systems from each row (parallel with --slurm, sequential without)
     - Summary YAML: dispatches builds for previously prepared systems
 
     Parameters
@@ -137,8 +187,9 @@ def build_system(
         Path to input file (YAML for single build, CSV for batch, summary YAML for prepared).
     output : Path, optional
         Output directory, by default Path(".").
-    config : Path, optional
-        Path to executor configuration YAML for parallel Parsl builds.
+    slurm : str, optional
+        Path to SLURM executor config YAML, or ``"tui"`` to launch the
+        interactive configuration wizard.
     dry_run : bool, optional
         Print what would be built without executing.
 
@@ -146,6 +197,10 @@ def build_system(
     input = input.resolve()
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+
+    # Resolve --slurm flag: "tui" launches the interactive wizard,
+    # anything else is treated as a path to a YAML config file.
+    config: Path | None = _resolve_slurm_flag(slurm)
 
     suffix = input.suffix.lower()
 
@@ -1983,6 +2038,25 @@ def config_edit():
 
     editor = os.environ.get("EDITOR", "vi")
     subprocess.run([editor, str(config_path)], check=False)
+
+
+@config_app.command(name="slurm")
+def config_slurm():
+    """Interactive wizard to configure a SLURM executor and save to YAML.
+
+    Queries the local SLURM scheduler for available accounts, partitions,
+    and hardware, then walks through resource selection interactively.
+    The result is saved to a YAML file that can be reused with
+    ``mdfactory build --slurm <file>``.
+
+    On non-SLURM machines, falls back to manual text entry.
+    """
+    from mdfactory.orchestration.tui import UserCancelledError, configure_and_save_slurm
+
+    try:
+        configure_and_save_slurm()
+    except UserCancelledError:
+        logger.info("SLURM configuration cancelled.")
 
 
 @config_app.command(name="cluster")

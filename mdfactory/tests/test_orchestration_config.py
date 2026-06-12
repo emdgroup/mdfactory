@@ -30,8 +30,8 @@ def test_slurm_executor_config_defaults():
     cfg = SlurmExecutorConfig(account="my_account")
     assert cfg.provider == "slurm"
     assert cfg.account == "my_account"
-    assert cfg.partition == "gpu"
-    assert cfg.walltime == "2:00:00"
+    assert cfg.partition == "cpu"
+    assert cfg.walltime == "02:00:00"
     assert cfg.nodes == 1
     assert cfg.cpus_per_node == 12
     assert cfg.gres is None
