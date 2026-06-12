@@ -29,10 +29,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from mdfactory.utils.utilities import run_command
 
-# Sentinel for selective caching in discover_cluster(): only confirmed sinfo-absent
-# and successful ClusterInfo results are cached; transient failures fall through.
+# Single-element list used as a mutable cache cell (avoids 'global', ruff PLW0603).
+# _CLUSTER_CACHE_SENTINEL = not yet queried; None = sinfo absent; ClusterInfo = success.
+# Transient sinfo failures are not cached so the next call retries.
 _CLUSTER_CACHE_SENTINEL = object()
-_cluster_cache: "ClusterInfo | None | object" = _CLUSTER_CACHE_SENTINEL
+_cluster_cache: list = [_CLUSTER_CACHE_SENTINEL]
 
 
 class NodeType(BaseModel):
@@ -563,14 +564,13 @@ def discover_cluster() -> ClusterInfo | None:
     ...     for p in cluster.partitions:
     ...         print(f"{p.name}: {p.total_nodes} nodes")
     """
-    global _cluster_cache
-    if _cluster_cache is not _CLUSTER_CACHE_SENTINEL:
-        return _cluster_cache  # type: ignore[return-value]
+    if _cluster_cache[0] is not _CLUSTER_CACHE_SENTINEL:
+        return _cluster_cache[0]  # type: ignore[return-value]
 
     # sinfo is the minimum requirement — if it's not available, we're not
     # on a SLURM cluster. This is a stable fact; cache it.
     if shutil.which("sinfo") is None:
-        _cluster_cache = None
+        _cluster_cache[0] = None
         return None
 
     partitions = _discover_partitions()
@@ -593,13 +593,12 @@ def discover_cluster() -> ClusterInfo | None:
         qos_policies=qos_policies,
         default_account=default_account,
     )
-    _cluster_cache = result
+    _cluster_cache[0] = result
     return result
 
 
 def _clear_cluster_cache() -> None:
-    global _cluster_cache
-    _cluster_cache = _CLUSTER_CACHE_SENTINEL
+    _cluster_cache[0] = _CLUSTER_CACHE_SENTINEL
 
 
 discover_cluster.cache_clear = _clear_cluster_cache  # type: ignore[attr-defined]
