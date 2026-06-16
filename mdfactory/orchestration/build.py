@@ -13,6 +13,7 @@ from loguru import logger
 from mdfactory.models.input import BuildInput
 
 from .apps import get_build_app
+from .config import _import_parsl
 
 if TYPE_CHECKING:
     from .config import ExecutorConfig
@@ -88,13 +89,18 @@ def build_systems(
         logger.info(f"[dry-run] Provider: {config.provider}")
         return descriptions
 
+    parsl = _import_parsl()
+
+    # Guard against already-active DataFlowKernel
     try:
-        import parsl  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise ImportError(
-            "parsl is required for build orchestration. "
-            "Install with `pip install 'mdfactory[parsl]'`."
-        ) from exc
+        parsl.dfk()
+    except Exception:
+        pass  # No active DFK, good
+    else:
+        raise RuntimeError(
+            "A Parsl DataFlowKernel is already active. "
+            "Call parsl.clear() before starting a new build session."
+        )
 
     # Build parsl config and load
     parsl_config = config.to_parsl_config()

@@ -230,69 +230,15 @@ class SlurmExecutorConfig(ExecutorConfig):
             If SLURM is unavailable *and* the required ``account`` or
             ``partition`` value cannot be resolved from config.
         """
-        from mdfactory.performance.cluster import discover_cluster, select_partition
-        from mdfactory.settings import settings
+        from mdfactory.performance.slurm_config import resolve_slurm_fields
 
-        cluster = discover_cluster()
-
-        # --- account: explicit kwarg > config.ini > autodiscovery ---
-        resolved_account: str | None = extra_fields.pop("account", None)
-        if resolved_account is None:
-            resolved_account = settings.slurm_account
-        if resolved_account is None:
-            if cluster is None:
-                raise RuntimeError(
-                    "SLURM autodiscovery failed and no account configured. "
-                    "Set [slurm] ACCOUNT in config.ini or pass account= explicitly."
-                )
-            resolved_account = cluster.default_account
-            if resolved_account is None:
-                raise RuntimeError(
-                    "No SLURM account available. "
-                    "Set [slurm] ACCOUNT in config.ini or pass account= explicitly."
-                )
-
-        # --- partition: explicit kwarg > config.ini (cpu/gpu) > autodiscovery ---
-        resolved_partition: str | None = extra_fields.pop("partition", None)
-        if resolved_partition is None:
-            resolved_partition = (
-                settings.slurm_partition_gpu if needs_gpu else settings.slurm_partition_cpu
-            )
-        if resolved_partition is None:
-            if cluster is None:
-                raise RuntimeError(
-                    "SLURM autodiscovery failed and no partition configured. "
-                    "Set [slurm] PARTITION_CPU or PARTITION_GPU in config.ini "
-                    "or pass partition= explicitly."
-                )
-            selected = select_partition(
-                cluster,
-                needs_gpu=needs_gpu,
-                min_cpus=min_cpus,
-                min_mem_gb=min_mem_gb,
-            )
-            if selected is None:
-                raise RuntimeError(
-                    f"No suitable partition found for requirements: "
-                    f"needs_gpu={needs_gpu}, cpus={min_cpus}, mem={min_mem_gb}GB"
-                )
-            resolved_partition = selected.name
-
-        # --- qos: explicit kwarg > config.ini ---
-        resolved_qos: str | None = extra_fields.pop("qos", None)
-        if resolved_qos is None:
-            resolved_qos = settings.slurm_qos
-
-        # --- constraint: explicit kwarg only ---
-        resolved_constraint: str | None = extra_fields.pop("constraint", None)
-
-        return cls(
-            account=resolved_account,
-            partition=resolved_partition,
-            qos=resolved_qos,
-            constraint=resolved_constraint,
+        fields = resolve_slurm_fields(
+            needs_gpu=needs_gpu,
+            min_cpus=min_cpus,
+            min_mem_gb=min_mem_gb,
             **extra_fields,
         )
+        return cls(**fields)
 
     def to_parsl_config(self) -> "parsl.Config":
         """Build a Parsl Config with HighThroughputExecutor + SlurmProvider.
