@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 if TYPE_CHECKING:
     import parsl
@@ -53,6 +53,11 @@ class ExecutorConfig(BaseModel):
         Maximum number of parallel tasks per compute node.
     max_blocks : int
         Maximum number of execution blocks (for local: process groups).
+    run_dir : Path
+        Directory where Parsl writes its ``runinfo`` logs and database.
+        Defaults to ``~/.parsl/mdfactory`` so logs land in a predictable,
+        controllable location instead of scattering ``runinfo/`` into the
+        current working directory (typically the login-node home on HPC).
 
     """
 
@@ -61,6 +66,18 @@ class ExecutorConfig(BaseModel):
     working_directory: Path | None = None
     max_workers_per_node: int = 1
     max_blocks: int = 1
+    run_dir: Path = Field(default_factory=lambda: Path("~/.parsl/mdfactory").expanduser())
+
+    @field_validator("run_dir", mode="before")
+    @classmethod
+    def _expand_run_dir(cls, v: Any) -> Any:
+        """Expand ``~`` in user-supplied run_dir values."""
+        return Path(v).expanduser() if v is not None else v
+
+    @field_serializer("run_dir", "working_directory")
+    def _serialize_paths(self, v: Path | None) -> str | None:
+        """Serialize Path fields as plain strings for YAML compatibility."""
+        return str(v) if v is not None else None
 
     def to_parsl_config(self) -> "parsl.Config":
         """Build a Parsl Config with HighThroughputExecutor + LocalProvider.
@@ -88,7 +105,7 @@ class ExecutorConfig(BaseModel):
             max_workers_per_node=self.max_workers_per_node,
             working_dir=str(self.working_directory) if self.working_directory else None,
         )
-        return parsl.Config(executors=[executor])
+        return parsl.Config(executors=[executor], run_dir=str(self.run_dir))
 
     @classmethod
     def from_yaml(cls, path: Path) -> "ExecutorConfig | SlurmExecutorConfig":
@@ -134,7 +151,11 @@ class SlurmExecutorConfig(ExecutorConfig):
     nodes : int
         Number of nodes per SLURM job (``--nodes``).
     cpus_per_node : int
-        CPUs per node (``--cpus-per-task`` equivalent).
+        CPUs requested per node. Wired to Parsl ``SlurmProvider(cores_per_node=...)``,
+        which Parsl uses to size the worker pool (roughly ``--ntasks`` /
+        cores-per-node) — it is **not** the sbatch ``--cpus-per-task`` flag. For
+        MPI+OpenMP workloads (e.g. GROMACS), OpenMP threads-per-rank must be set
+        separately via ``scheduler_options`` / ``worker_init``.
     gres : str or None
         Generic resource specification (``--gres``), e.g. ``"gpu:l40s:1"``.
     mem : str or None
@@ -286,4 +307,4 @@ class SlurmExecutorConfig(ExecutorConfig):
             max_workers_per_node=self.max_workers_per_node,
             working_dir=str(self.working_directory) if self.working_directory else None,
         )
-        return parsl.Config(executors=[executor])
+        return parsl.Config(executors=[executor], run_dir=str(self.run_dir))

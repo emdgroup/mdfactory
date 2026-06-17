@@ -240,7 +240,7 @@ def _wait_with_progress(
 
     # Progress bar
     progress = Progress(
-        TextColumn("🔨 [bold]Parsl Builds[/]"),
+        TextColumn("⚒ [bold]Parsl Builds[/]"),
         BarColumn(bar_width=40),
         MofNCompleteColumn(),
         TextColumn("·"),
@@ -299,7 +299,7 @@ def _wait_with_progress(
         parts = [progress]
         block_info = _get_block_status()
         if block_info:
-            parts.append(Text.from_markup(f"  🖥  SLURM: {block_info}"))
+            parts.append(Text.from_markup(f"  ▸ SLURM: {block_info}"))
         if activity:
             parts.append(Text(""))  # blank line
             for line in activity[-max_activity:]:

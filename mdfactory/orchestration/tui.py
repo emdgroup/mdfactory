@@ -13,11 +13,42 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import questionary
 import yaml
+from rich.console import Console
 
 from mdfactory.orchestration.config import SlurmExecutorConfig
 from mdfactory.performance.cluster import ClusterInfo, Partition, discover_cluster
+
+console = Console()
+
+
+def _import_questionary():
+    """Import questionary with a clear error message if not installed.
+
+    ``questionary`` ships in the ``[parsl]`` optional extra. Importing it
+    lazily (rather than at module level) means ``import mdfactory.orchestration``
+    succeeds for users who never touch the TUI, matching the lazy-import
+    pattern used for ``parsl`` and ``rich``.
+
+    Returns
+    -------
+    module
+        The questionary module.
+
+    Raises
+    ------
+    ImportError
+        If questionary is not installed.
+
+    """
+    try:
+        import questionary
+    except ImportError as exc:
+        raise ImportError(
+            "questionary is required for the SLURM TUI. "
+            "Install with: pip install 'mdfactory[parsl]'"
+        ) from exc
+    return questionary
 
 
 def _default_worker_init() -> str:
@@ -198,6 +229,7 @@ def _select_with_custom(
     UserCancelledError
         If the user cancels.
     """
+    questionary = _import_questionary()
     _CUSTOM = "Custom…"
     all_choices = [*choices, _CUSTOM]
     selected = _require(
@@ -235,6 +267,7 @@ def _configure_with_cluster(cluster: ClusterInfo) -> SlurmExecutorConfig:
     UserCancelledError
         If the user cancels any prompt.
     """
+    questionary = _import_questionary()
     # --- Account ---
     if cluster.accounts:
         account = _require(
@@ -254,7 +287,7 @@ def _configure_with_cluster(cluster: ClusterInfo) -> SlurmExecutorConfig:
     # --- Partition ---
     up_partitions = [p for p in cluster.partitions if p.state == "up"]
     if not up_partitions:
-        print("⚠ No partitions in 'up' state — showing all partitions.")
+        console.print("⚠ No partitions in 'up' state — showing all partitions.")
         up_partitions = list(cluster.partitions)
 
     if not up_partitions:
@@ -281,14 +314,16 @@ def _configure_with_cluster(cluster: ClusterInfo) -> SlurmExecutorConfig:
     partition = next(p for p in up_partitions if p.name == partition_name)
 
     # --- Display node types ---
-    print(f"\n  Partition '{partition_name}' node types:")
+    console.print(f"\n  Partition '{partition_name}' node types:")
     for nt in partition.node_types:
         gpu_info = ""
         if nt.gpu_specs:
             gpu_parts = [f"{c}×{t}" if t else f"{c}×gpu" for c, t in nt.gpu_specs]
             gpu_info = f", GPUs: {', '.join(gpu_parts)}"
-        print(f"    {nt.count} nodes — {nt.cpus} CPUs, {nt.memory_mb // 1024} GB RAM{gpu_info}")
-    print()
+        console.print(
+            f"    {nt.count} nodes — {nt.cpus} CPUs, {nt.memory_mb // 1024} GB RAM{gpu_info}"
+        )
+    console.print()
 
     # --- Walltime ---
     walltime = _select_with_custom(
@@ -396,6 +431,7 @@ def _configure_manual() -> SlurmExecutorConfig:
     UserCancelledError
         If the user cancels any prompt.
     """
+    questionary = _import_questionary()
     account = _require(questionary.text("SLURM account:").ask(), "account")
     partition = _require(questionary.text("SLURM partition:", default="gpu").ask(), "partition")
     walltime = _require(questionary.text("Walltime (--time):", default="2:00:00").ask(), "walltime")
@@ -473,17 +509,18 @@ def configure_slurm_interactive() -> SlurmExecutorConfig:
     UserCancelledError
         If the user cancels any prompt (Ctrl-C / Ctrl-D).
     """
-    print("Querying SLURM cluster...")
+    questionary = _import_questionary()
+    console.print("Querying SLURM cluster...")
     cluster = discover_cluster()
 
     if cluster is not None:
-        print(
+        console.print(
             f"✓ Cluster discovered: {len(cluster.partitions)} partitions, "
             f"{len(cluster.accounts)} accounts\n"
         )
         return _configure_with_cluster(cluster)
 
-    print("⚠ SLURM not detected (sinfo unavailable). Falling back to manual entry.\n")
+    console.print("⚠ SLURM not detected (sinfo unavailable). Falling back to manual entry.\n")
     proceed = questionary.confirm("Enter SLURM configuration manually?", default=True).ask()
     if not proceed:
         raise UserCancelledError("User declined manual SLURM configuration.")
@@ -507,7 +544,7 @@ def save_slurm_config_yaml(config: SlurmExecutorConfig, path: Path) -> None:
     with open(path, "w") as fh:
         yaml.dump(data, fh, default_flow_style=False, sort_keys=False)
 
-    print(f"✓ SLURM config written to {path}")
+    console.print(f"✓ SLURM config written to {path}")
 
 
 def configure_and_save_slurm() -> SlurmExecutorConfig:
@@ -525,10 +562,11 @@ def configure_and_save_slurm() -> SlurmExecutorConfig:
     UserCancelledError
         If the user cancels any prompt.
     """
+    questionary = _import_questionary()
     try:
         config = configure_slurm_interactive()
     except UserCancelledError:
-        print("Configuration cancelled.")
+        console.print("Configuration cancelled.")
         raise
 
     save_path = _require(

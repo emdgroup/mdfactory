@@ -68,8 +68,9 @@ class TestConfigureManualFallback:
     """When discover_cluster returns None, wizard uses manual entry."""
 
     @patch("mdfactory.orchestration.tui.discover_cluster", return_value=None)
-    @patch("mdfactory.orchestration.tui.questionary")
-    def test_configure_manual_fallback(self, mock_q, _discover):
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_configure_manual_fallback(self, mock_iq, _discover):
+        mock_q = mock_iq.return_value
         # confirm → proceed with manual config
         mock_q.confirm.return_value.ask.return_value = True
         # text prompts in order: account, partition, walltime, cpus,
@@ -99,8 +100,9 @@ class TestConfigureWithCluster:
     """When cluster is discovered, wizard uses select menus."""
 
     @patch("mdfactory.orchestration.tui.discover_cluster")
-    @patch("mdfactory.orchestration.tui.questionary")
-    def test_configure_with_cluster(self, mock_q, mock_discover):
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_configure_with_cluster(self, mock_iq, mock_discover):
+        mock_q = mock_iq.return_value
         mock_discover.return_value = _make_cluster()
 
         # select prompts: account, partition, walltime, cpus, mem, max_blocks
@@ -133,8 +135,9 @@ class TestUserCancellation:
     """If a questionary prompt returns None, UserCancelledError is raised."""
 
     @patch("mdfactory.orchestration.tui.discover_cluster", return_value=None)
-    @patch("mdfactory.orchestration.tui.questionary")
-    def test_user_cancellation(self, mock_q, _discover):
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_user_cancellation(self, mock_iq, _discover):
+        mock_q = mock_iq.return_value
         # confirm manual? → None (cancelled)
         mock_q.confirm.return_value.ask.return_value = None
 
