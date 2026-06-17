@@ -125,6 +125,68 @@ def build_systems(
         return _wait_with_progress(futures, hashes=input_hashes, label="Parsl Builds")
 
 
+def _describe_failure(exc: BaseException) -> tuple[str, str]:
+    """Extract ``(failure_type, error_detail)`` from a future's exception.
+
+    Parsl surfaces worker errors differently across versions: modern Parsl
+    re-raises the *original* exception (via ``RemoteExceptionWrapper.reraise()``),
+    while older versions wrapped it and exposed the underlying error on
+    ``.e_value``. Unwrap defensively so callers always see the *underlying*
+    error type — letting future retry logic distinguish, e.g., a GROMACS crash
+    (``CalledProcessError``) from an infrastructure failure (OOM / preemption).
+
+    Parameters
+    ----------
+    exc : BaseException
+        The exception raised by ``future.result()``.
+
+    Returns
+    -------
+    tuple[str, str]
+        ``(failure_type, error_detail)`` — the underlying exception's class
+        name and its string representation.
+
+    """
+    underlying = getattr(exc, "e_value", None) or exc
+    return type(underlying).__name__, str(underlying)
+
+
+def _collect_results(results: list, hashes: list[str]) -> list[dict]:
+    """Return all captured results, raising if any slot is still uncaptured.
+
+    The polling loop only exits once every future has been recorded, so a
+    ``None`` slot here signals an internal bug rather than a normal outcome.
+    Failing explicitly is safer than silently returning a shorter list than
+    the caller submitted (which would corrupt any ``len()``-based bookkeeping).
+
+    Parameters
+    ----------
+    results : list
+        Per-future result slots; ``None`` marks an uncaptured future.
+    hashes : list[str]
+        Display hashes aligned with ``results``, used for the error message.
+
+    Returns
+    -------
+    list[dict]
+        The complete list of result dicts.
+
+    Raises
+    ------
+    RuntimeError
+        If one or more result slots were never captured.
+
+    """
+    missing = [hashes[i] for i, r in enumerate(results) if r is None]
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} build result(s) were never captured "
+            f"({', '.join(h[:12] for h in missing)}); the polling loop exited "
+            "prematurely. This is an internal error."
+        )
+    return list(results)
+
+
 def _wait_with_progress(
     futures: list,
     *,
@@ -268,17 +330,19 @@ def _wait_with_progress(
                             line.append("  done", style="dim")
                             activity.append(line)
                         except Exception as exc:
-                            error_msg = str(exc)
+                            failure_type, error_detail = _describe_failure(exc)
                             results[i] = {
                                 "hash": display_hashes[i],
                                 "status": "failed",
-                                "error": error_msg,
+                                "error": error_detail,
+                                "failure_type": failure_type,
+                                "error_detail": error_detail,
                             }
                             failed += 1
                             line = Text()
                             line.append("  ✗ ", style="bold red")
                             line.append(display_hashes[i][:12], style="cyan")
-                            line.append(f"  {error_msg}", style="red")
+                            line.append(f"  {error_detail}", style="red")
                             activity.append(line)
                         done_count += 1
 
@@ -294,4 +358,4 @@ def _wait_with_progress(
         # Don't call _shutdown_parsl() here — build_systems' finally block owns cleanup
         raise
 
-    return [r for r in results if r is not None]
+    return _collect_results(results, display_hashes)

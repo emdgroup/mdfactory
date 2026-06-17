@@ -126,6 +126,9 @@ def test_build_systems_handles_failed_future(monkeypatch, tmp_path):
     assert len(results) == 1
     assert results[0]["status"] == "failed"
     assert "CUDA OOM" in results[0]["error"]
+    # Finding 10: failure metadata is surfaced for future retry logic.
+    assert results[0]["failure_type"] == "RuntimeError"
+    assert results[0]["error_detail"] == "CUDA OOM"
 
 
 def test_build_systems_no_wait(monkeypatch, tmp_path):
@@ -420,3 +423,52 @@ def test_build_systems_no_wait_does_not_clear(monkeypatch, tmp_path):
 
     assert futures == [mock_future]
     mock_clear.assert_not_called()
+
+
+# --- Finding 10: failure description helper ---
+
+
+def test_describe_failure_plain_exception():
+    """_describe_failure returns the exception type name and message."""
+    from mdfactory.orchestration.build import _describe_failure
+
+    failure_type, detail = _describe_failure(RuntimeError("boom"))
+    assert failure_type == "RuntimeError"
+    assert detail == "boom"
+
+
+def test_describe_failure_unwraps_legacy_e_value():
+    """_describe_failure unwraps a legacy Parsl wrapper exposing .e_value."""
+    from mdfactory.orchestration.build import _describe_failure
+
+    class FakeAppFailure(Exception):
+        """Mimic an older Parsl wrapper carrying the underlying error."""
+
+        def __init__(self, e_value):
+            super().__init__("wrapped")
+            self.e_value = e_value
+
+    underlying = ValueError("real GROMACS crash")
+    failure_type, detail = _describe_failure(FakeAppFailure(underlying))
+    assert failure_type == "ValueError"
+    assert detail == "real GROMACS crash"
+
+
+# --- Finding 12: completeness guard ---
+
+
+def test_collect_results_returns_complete_list():
+    """_collect_results returns all results when every slot is captured."""
+    from mdfactory.orchestration.build import _collect_results
+
+    results = [{"hash": "A"}, {"hash": "B"}]
+    assert _collect_results(results, ["A", "B"]) == results
+
+
+def test_collect_results_raises_on_uncaptured_slot():
+    """_collect_results raises rather than silently dropping a None slot."""
+    from mdfactory.orchestration.build import _collect_results
+
+    results = [{"hash": "A"}, None]
+    with pytest.raises(RuntimeError, match="never captured"):
+        _collect_results(results, ["AAAA", "BBBB"])
