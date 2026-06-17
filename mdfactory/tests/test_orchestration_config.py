@@ -134,6 +134,30 @@ def test_constraint_in_scheduler_options():
     assert "#SBATCH --constraint=a100" in provider.scheduler_options
 
 
+def test_slurm_executor_config_inherits_base_slurm_config():
+    """SlurmExecutorConfig unifies with the shared BaseSlurmConfig hierarchy.
+
+    Guards against re-introducing a divergent third copy of the SLURM fields
+    (issue #20): account/partition/qos/constraint and from_cluster() must come
+    from BaseSlurmConfig, not be redeclared here.
+    """
+    from mdfactory.performance.slurm_config import BaseSlurmConfig
+
+    assert issubclass(SlurmExecutorConfig, BaseSlurmConfig)
+    # from_cluster is inherited, not reimplemented.
+    assert SlurmExecutorConfig.from_cluster.__func__ is BaseSlurmConfig.from_cluster.__func__
+    # The shared SLURM fields are not redeclared on the subclass itself.
+    own_fields = set(vars(SlurmExecutorConfig).get("__annotations__", {}))
+    assert not ({"account", "qos", "constraint"} & own_fields)
+
+
+def test_slurm_executor_config_is_mutable():
+    """Despite BaseSlurmConfig being frozen, the executor config stays mutable."""
+    cfg = SlurmExecutorConfig(account="acc")
+    cfg.partition = "gpu"  # must not raise (frozen=False)
+    assert cfg.partition == "gpu"
+
+
 def test_raw_scheduler_options_appended():
     """Raw scheduler_options are appended after structured fields."""
     cfg = SlurmExecutorConfig(account="acc", gres="gpu:1", scheduler_options="#SBATCH --exclusive")

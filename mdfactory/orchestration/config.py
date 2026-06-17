@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+
+from mdfactory.performance.slurm_config import BaseSlurmConfig
 
 if TYPE_CHECKING:
     import parsl
@@ -143,11 +145,24 @@ class ExecutorConfig(BaseModel):
         return cls(**data)
 
 
-class SlurmExecutorConfig(ExecutorConfig):
+class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
     """SLURM executor configuration for Parsl workflows.
+
+    Inherits the four cross-cutting SLURM fields (``account``, ``partition``,
+    ``qos``, ``constraint``) and the authoritative ``from_cluster()`` factory
+    from :class:`~mdfactory.performance.slurm_config.BaseSlurmConfig`, and the
+    Parsl executor fields (``run_dir``, ``available_accelerators``, …) from
+    :class:`ExecutorConfig`. Only Parsl/SLURM-job-specific fields are declared
+    here.
 
     Field names mirror sbatch flags where possible. The only Parsl-specific
     field is ``max_workers_per_node`` (number of parallel tasks per node).
+
+    Notes
+    -----
+    ``BaseSlurmConfig`` is frozen (immutable), but executor configs are mutated
+    in places (e.g. the TUI wizard), so this subclass explicitly sets
+    ``frozen=False`` to match :class:`ExecutorConfig`'s mutable behaviour.
 
     Parameters
     ----------
@@ -204,16 +219,17 @@ class SlurmExecutorConfig(ExecutorConfig):
 
     """
 
+    model_config = ConfigDict(frozen=False)
+
     provider: Literal["slurm"] = "slurm"
-    account: str
-    partition: str = "cpu"
+    # account, partition, qos, constraint inherited from BaseSlurmConfig.
+    # from_cluster() inherited from BaseSlurmConfig — extra fields below are
+    # forwarded to the constructor via resolve_slurm_fields().
     walltime: str = Field(default="2h", validate_default=True)
     nodes: int = 1
     cpus_per_node: int = 12
     gres: str | None = None
     mem: str | None = None
-    qos: str | None = None
-    constraint: str | None = None
     scheduler_options: str = ""
     launch_options: str = ""
 
@@ -224,59 +240,6 @@ class SlurmExecutorConfig(ExecutorConfig):
         from mdfactory.performance.slurm_config import normalize_slurm_time
 
         return normalize_slurm_time(v)
-
-    @classmethod
-    def from_cluster(
-        cls,
-        *,
-        needs_gpu: bool = False,
-        min_cpus: int = 1,
-        min_mem_gb: int = 1,
-        **extra_fields: Any,
-    ) -> "SlurmExecutorConfig":
-        """Create an instance with SLURM fields auto-populated from the cluster.
-
-        Three-tier precedence (highest wins):
-
-        1. Explicit keyword arguments passed by the caller.
-        2. ``[slurm]`` section in ``config.ini`` — read via
-           ``mdfactory.settings.settings``.
-        3. Live ``sinfo`` / ``sacctmgr`` autodiscovery via
-           ``mdfactory.performance.cluster``.
-
-        Parameters
-        ----------
-        needs_gpu : bool
-            Select a GPU-capable partition when ``True``.
-        min_cpus : int
-            Minimum CPUs per node required (passed to ``select_partition()``).
-        min_mem_gb : int
-            Minimum memory per node in GB (passed to ``select_partition()``).
-        **extra_fields
-            Additional fields forwarded to the constructor.  Base SLURM
-            fields (``account``, ``partition``, ``qos``, ``constraint``)
-            may be passed here to override autodiscovery.
-
-        Returns
-        -------
-        SlurmExecutorConfig
-            A fully initialised instance.
-
-        Raises
-        ------
-        RuntimeError
-            If SLURM is unavailable *and* the required ``account`` or
-            ``partition`` value cannot be resolved from config.
-        """
-        from mdfactory.performance.slurm_config import resolve_slurm_fields
-
-        fields = resolve_slurm_fields(
-            needs_gpu=needs_gpu,
-            min_cpus=min_cpus,
-            min_mem_gb=min_mem_gb,
-            **extra_fields,
-        )
-        return cls(**fields)
 
     def to_parsl_config(self) -> "parsl.Config":
         """Build a Parsl Config with HighThroughputExecutor + SlurmProvider.
