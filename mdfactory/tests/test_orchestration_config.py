@@ -144,6 +144,77 @@ def test_raw_scheduler_options_appended():
     assert "#SBATCH --exclusive" in provider.scheduler_options
 
 
+def test_run_dir_default_and_expanduser():
+    """run_dir defaults under the home dir and expands ``~`` in supplied values."""
+    cfg = ExecutorConfig()
+    assert str(cfg.run_dir).endswith("/.parsl/mdfactory")
+    assert "~" not in str(cfg.run_dir)
+
+    cfg2 = ExecutorConfig(run_dir="~/scratch/parsl")
+    assert "~" not in str(cfg2.run_dir)
+    assert str(cfg2.run_dir).endswith("/scratch/parsl")
+
+    # run_dir flows into the Parsl Config
+    assert str(cfg.run_dir) == cfg.to_parsl_config().run_dir
+
+
+def test_paths_serialize_as_strings():
+    """run_dir / working_directory serialize as plain strings for YAML."""
+    cfg = ExecutorConfig(working_directory="/tmp/work")
+    dumped = cfg.model_dump()
+    assert isinstance(dumped["run_dir"], str)
+    assert isinstance(dumped["working_directory"], str)
+    # Round-trips through yaml without RepresenterError
+    yaml.safe_dump(dumped)
+
+
+def test_available_accelerators_wired_local():
+    """available_accelerators is forwarded to the local HighThroughputExecutor."""
+    cfg = ExecutorConfig(max_workers_per_node=2, available_accelerators=2)
+    executor = cfg.to_parsl_config().executors[0]
+    # Parsl normalises an int count into a list of device IDs.
+    assert executor.available_accelerators == ["0", "1"]
+
+
+def test_available_accelerators_wired_slurm():
+    """available_accelerators is forwarded to the SLURM HighThroughputExecutor."""
+    cfg = SlurmExecutorConfig(account="acc", available_accelerators=["0", "1"])
+    executor = cfg.to_parsl_config().executors[0]
+    assert executor.available_accelerators == ["0", "1"]
+
+
+def test_launch_options_sets_srun_launcher():
+    """launch_options wires a SrunLauncher with the given overrides."""
+    from parsl.launchers import SrunLauncher
+
+    cfg = SlurmExecutorConfig(
+        account="acc",
+        launch_options="--cpu-bind=cores --distribution=block:block",
+    )
+    provider = cfg.to_parsl_config().executors[0].provider
+    assert isinstance(provider.launcher, SrunLauncher)
+    assert provider.launcher.overrides == "--cpu-bind=cores --distribution=block:block"
+
+
+def test_no_launch_options_keeps_default_launcher():
+    """Without launch_options, Parsl's default launcher is left untouched."""
+    from parsl.launchers import SrunLauncher
+
+    cfg = SlurmExecutorConfig(account="acc")
+    provider = cfg.to_parsl_config().executors[0].provider
+    assert not isinstance(provider.launcher, SrunLauncher)
+
+
+def test_launch_options_roundtrip_yaml(tmp_path):
+    """launch_options survives a YAML round-trip."""
+    original = SlurmExecutorConfig(account="acc", launch_options="--cpu-bind=cores")
+    cfg_path = tmp_path / "launch.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(original.model_dump(), f)
+    loaded = ExecutorConfig.from_yaml(cfg_path)
+    assert loaded.launch_options == "--cpu-bind=cores"
+
+
 def test_config_yaml_roundtrip(tmp_path):
     """Config can be written to YAML and loaded back identically."""
     original = SlurmExecutorConfig(

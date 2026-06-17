@@ -53,6 +53,13 @@ class ExecutorConfig(BaseModel):
         Maximum number of parallel tasks per compute node.
     max_blocks : int
         Maximum number of execution blocks (for local: process groups).
+    available_accelerators : int or list[str]
+        GPU pinning for Parsl workers. An integer count (or explicit list of
+        device IDs) makes Parsl assign each worker a distinct accelerator and
+        set ``CUDA_VISIBLE_DEVICES`` accordingly. Defaults to ``0`` (no pinning,
+        all workers share the node's uncontrolled GPU context). Set this when
+        running ``max_workers_per_node > 1`` on GPU nodes to avoid silent
+        wrong-GPU contention.
     run_dir : Path
         Directory where Parsl writes its ``runinfo`` logs and database.
         Defaults to ``~/.parsl/mdfactory`` so logs land in a predictable,
@@ -66,6 +73,7 @@ class ExecutorConfig(BaseModel):
     working_directory: Path | None = None
     max_workers_per_node: int = 1
     max_blocks: int = 1
+    available_accelerators: int | list[str] = 0
     run_dir: Path = Field(default_factory=lambda: Path("~/.parsl/mdfactory").expanduser())
 
     @field_validator("run_dir", mode="before")
@@ -103,6 +111,7 @@ class ExecutorConfig(BaseModel):
             label="local",
             provider=provider,
             max_workers_per_node=self.max_workers_per_node,
+            available_accelerators=self.available_accelerators,
             working_dir=str(self.working_directory) if self.working_directory else None,
         )
         return parsl.Config(executors=[executor], run_dir=str(self.run_dir))
@@ -168,7 +177,14 @@ class SlurmExecutorConfig(ExecutorConfig):
         Maximum number of simultaneous SLURM jobs. Each block is one
         SLURM job; set this to control how many run in parallel.
     scheduler_options : str
-        Additional raw ``#SBATCH`` lines for anything not covered above.
+        Additional raw ``#SBATCH`` lines for anything not covered above
+        (allocation-level flags injected into the job script).
+    launch_options : str
+        Extra ``srun`` flags forwarded to Parsl's ``SrunLauncher(overrides=...)``
+        for task-placement / binding control (e.g.
+        ``"--cpu-bind=cores --distribution=block:block"`` for NUMA-local CPU
+        binding in MPI+OpenMP workers). Empty string leaves Parsl's default
+        launcher untouched.
 
     Examples
     --------
@@ -199,6 +215,7 @@ class SlurmExecutorConfig(ExecutorConfig):
     qos: str | None = None
     constraint: str | None = None
     scheduler_options: str = ""
+    launch_options: str = ""
 
     @field_validator("walltime", mode="before")
     @classmethod
@@ -288,6 +305,14 @@ class SlurmExecutorConfig(ExecutorConfig):
             opts.append(self.scheduler_options)
         scheduler_options = "\n".join(opts)
 
+        # Only override Parsl's default launcher when srun-level flags are given,
+        # so NUMA/task-placement binding is opt-in (relevant for MPI+OpenMP work).
+        provider_kwargs: dict[str, Any] = {}
+        if self.launch_options:
+            from parsl.launchers import SrunLauncher
+
+            provider_kwargs["launcher"] = SrunLauncher(overrides=self.launch_options)
+
         provider = SlurmProvider(
             account=self.account,
             partition=self.partition,
@@ -300,11 +325,13 @@ class SlurmExecutorConfig(ExecutorConfig):
             init_blocks=1,
             max_blocks=self.max_blocks,
             parallelism=1,
+            **provider_kwargs,
         )
         executor = HighThroughputExecutor(
             label="slurm",
             provider=provider,
             max_workers_per_node=self.max_workers_per_node,
+            available_accelerators=self.available_accelerators,
             working_dir=str(self.working_directory) if self.working_directory else None,
         )
         return parsl.Config(executors=[executor], run_dir=str(self.run_dir))

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,10 +12,24 @@ from loguru import logger
 from mdfactory.models.input import BuildInput
 
 from .apps import get_build_app
-from .config import _import_parsl
+from .session import (
+    _get_slurm_job_ids,
+    _scancel_jobs,
+    _shutdown_parsl,
+    parsl_session,
+)
 
 if TYPE_CHECKING:
     from .config import ExecutorConfig
+
+# Re-exported for backward compatibility — the canonical home is ``session``.
+__all__ = [
+    "build_systems",
+    "parsl_session",
+    "_shutdown_parsl",
+    "_get_slurm_job_ids",
+    "_scancel_jobs",
+]
 
 
 def build_systems(
@@ -89,25 +102,9 @@ def build_systems(
         logger.info(f"[dry-run] Provider: {config.provider}")
         return descriptions
 
-    parsl = _import_parsl()
-
-    # Guard against already-active DataFlowKernel
-    try:
-        parsl.dfk()
-    except Exception:
-        pass  # No active DFK, good
-    else:
-        raise RuntimeError(
-            "A Parsl DataFlowKernel is already active. "
-            "Call parsl.clear() before starting a new build session."
-        )
-
-    # Build parsl config and load
-    parsl_config = config.to_parsl_config()
-    parsl.load(parsl_config)
-
-    cleanup_needed = True
-    try:
+    # parsl_session owns the full DFK lifecycle: guard, load, and shutdown
+    # (including scancel of lingering SLURM jobs) on exit.
+    with parsl_session(config) as session:
         build_app = get_build_app()
 
         # Submit all builds
@@ -121,82 +118,18 @@ def build_systems(
 
         if not wait:
             logger.warning("Returning raw futures — caller must call parsl.clear() when done.")
-            cleanup_needed = False
+            session.detach()
             return futures
 
         # Poll futures with live status reporting
-        results = _wait_with_progress(futures, hashes=input_hashes)
-        return results
-    finally:
-        if cleanup_needed:
-            _shutdown_parsl()
-
-
-def _shutdown_parsl():
-    """Shut down Parsl and cancel any remaining SLURM jobs."""
-    try:
-        import parsl  # type: ignore[import-not-found]
-    except ImportError:
-        return
-
-    job_ids = []
-    try:
-        dfk = parsl.dfk()
-        job_ids = _get_slurm_job_ids(dfk)
-    except Exception as exc:
-        logger.debug(f"Could not query Parsl DFK for SLURM jobs: {exc}")
-
-    try:
-        parsl.clear()
-    except Exception as exc:
-        logger.warning(f"Parsl shutdown failed — DFK may still be loaded: {exc}")
-
-    # Always attempt scancel if we found job IDs
-    if job_ids:
-        _scancel_jobs(job_ids)
-
-
-def _get_slurm_job_ids(dfk) -> list[str]:
-    """Extract active SLURM job IDs from the Parsl DataFlowKernel."""
-    job_ids = []
-    try:
-        for executor in dfk.executors.values():
-            if hasattr(executor, "provider") and hasattr(executor.provider, "resources"):
-                for _block_id, resource in executor.provider.resources.items():
-                    job_id = resource.get("remote_job_id") or resource.get("job_id")
-                    if job_id:
-                        job_ids.append(str(job_id))
-    except Exception as exc:
-        logger.debug(f"Could not enumerate SLURM jobs for explicit scancel: {exc}")
-    return job_ids
-
-
-def _scancel_jobs(job_ids: list[str]):
-    """Run scancel on the given SLURM job IDs."""
-    if not job_ids:
-        return
-    try:
-        cmd = ["scancel"] + job_ids
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
-        if result.returncode == 0:
-            logger.info(f"Cancelled SLURM jobs: {', '.join(job_ids)}")
-        else:
-            logger.debug(f"scancel stderr: {result.stderr.strip()}")
-    except FileNotFoundError:
-        logger.debug("scancel not found (not on SLURM cluster)")
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            f"scancel timed out after 10 s — SLURM jobs {', '.join(job_ids)} may still "
-            f"be running. Run `scancel {' '.join(job_ids)}` manually."
-        )
-    except Exception as exc:
-        logger.debug(f"scancel failed: {exc}")
+        return _wait_with_progress(futures, hashes=input_hashes, label="Parsl Builds")
 
 
 def _wait_with_progress(
     futures: list,
     *,
     hashes: list[str] | None = None,
+    label: str = "Parsl Builds",
     poll_interval: float = 2.0,
 ) -> list[dict]:
     """Wait for futures with a live terminal progress display.
@@ -210,6 +143,9 @@ def _wait_with_progress(
         List of Parsl AppFutures.
     hashes : list[str], optional
         Known hashes for each build (displayed in activity log).
+    label : str
+        Heading shown next to the progress bar. Defaults to ``"Parsl Builds"``;
+        pass e.g. ``"Simulations"`` to reuse this display for other workflows.
     poll_interval : float
         Seconds between status polls.
 
@@ -240,7 +176,7 @@ def _wait_with_progress(
 
     # Progress bar
     progress = Progress(
-        TextColumn("⚒ [bold]Parsl Builds[/]"),
+        TextColumn(f"⚒ [bold]{label}[/]"),
         BarColumn(bar_width=40),
         MofNCompleteColumn(),
         TextColumn("·"),

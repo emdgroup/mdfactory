@@ -114,10 +114,11 @@ class TestConfigureWithCluster:
             "50G",
             "4",
         ]
-        # text prompts: gres, worker_init
+        # text prompts: gres, worker_init, constraint
         mock_q.text.return_value.ask.side_effect = [
             "gpu:a100:1",
             "",
+            "a100",
         ]
         # confirm for QOS
         mock_q.confirm.return_value.ask.return_value = False
@@ -129,6 +130,7 @@ class TestConfigureWithCluster:
         assert cfg.cpus_per_node == 16
         assert cfg.mem == "50G"
         assert cfg.max_blocks == 4
+        assert cfg.constraint == "a100"
 
 
 class TestUserCancellation:

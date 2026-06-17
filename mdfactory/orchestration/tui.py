@@ -400,6 +400,16 @@ def _configure_with_cluster(cluster: ClusterInfo) -> SlurmExecutorConfig:
                 "qos",
             )
 
+    # --- Constraint ---
+    constraint_input = _require(
+        questionary.text(
+            "Node feature constraint (--constraint), leave empty to skip:",
+            default="",
+        ).ask(),
+        "constraint",
+    )
+    constraint: str | None = constraint_input.strip() or None
+
     return SlurmExecutorConfig(
         account=account,
         partition=partition_name,
@@ -408,6 +418,7 @@ def _configure_with_cluster(cluster: ClusterInfo) -> SlurmExecutorConfig:
         gres=gres,
         mem=mem,
         qos=qos,
+        constraint=constraint,
         max_blocks=max_blocks,
         worker_init=worker_init,
     )
