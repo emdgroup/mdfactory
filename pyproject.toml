@@ -43,6 +43,9 @@ foundry = [
 submitit = [
     "submitit>=1.5.1",
 ]
+parsl = [
+    "parsl>=2024.1.1",
+]
 dev = [
     "bump-my-version",
     "hatch",
@@ -97,6 +100,7 @@ openmm = "*"
 
 [tool.pixi.pypi-dependencies]
 mdfactory = { path = ".", editable = true }
+parsl = ">=2024.1.1"
 
 [tool.pixi.tasks]
 test = "pytest -k 'not build' mdfactory"
@@ -164,6 +168,7 @@ select = [
 ignore = [
     "D105", # Missing docstring in magic functions
     "D107", # Missing docstring in __init__
+    "PLC0415", # Import not at top of file (lazy imports for optional deps)
     "PLR0912", # Too many branches
     "PLR0913", # Too many arguments in function definition
     "PLR0915", # Too many statements
@@ -209,3 +214,4 @@ addopts = "-m 'not foundry_live and not slow' -v --cov mdfactory --cov-report xm
 
 [tool.coverage.run]
 omit = ["mdfactory/tests/*"]
+

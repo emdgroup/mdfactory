@@ -8,7 +8,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import pandas as pd
 import questionary
@@ -33,7 +33,10 @@ from .prepare import df_to_build_input_models
 from .utils.data_manager import check_run_exists
 from .utils.push import push_systems
 from .utils.utilities import working_directory
-from .workflows import run_build_from_file
+from .workflows import run_build_from_dict, run_build_from_file
+
+if TYPE_CHECKING:
+    from .orchestration import ExecutorConfig
 
 app = App(name="MDFactory", version=__version__)
 
@@ -82,26 +85,7 @@ def prepare_build(input: Path, output: Path = Path(".")):
 
     logger.info("Created DataFrame for systems:\n{}", df)
 
-    dirs = []
-    for _, row in df.iterrows():
-        out = output / Path(row.hash)
-        out.mkdir(parents=True, exist_ok=False)
-        yml_path = out / f"{row.hash}.yaml"
-        dirs.append(str(out.resolve()))
-        with open(yml_path, "w") as fb:
-            yaml.safe_dump(row.model.model_dump(), fb)
-
-    summary = {
-        "n_systems": df.shape[0],
-        "input": str(input),
-        "output": str(output),
-        "hash": df.hash.values.tolist(),
-        "simulation_type": [x.simulation_type for x in df.model.values],
-        "system_directory": dirs,
-        "date": datetime.now(),
-    }
-    with open(yml_build_path, "w") as fb:
-        yaml.safe_dump(summary, fb)
+    _prepare_system_directories(models, input, output, exist_ok=False)
 
 
 def df_models_from_input_csv(input):
@@ -112,22 +96,312 @@ def df_models_from_input_csv(input):
     return df, models, errors
 
 
+def _prepare_system_directories(
+    models: list,
+    input_path: Path,
+    output: Path,
+    *,
+    exist_ok: bool = True,
+) -> tuple[list[str], Path]:
+    """Create per-hash build directories, write system YAMLs, and generate summary.
+
+    Parameters
+    ----------
+    models : list
+        List of BuildInput models.
+    input_path : Path
+        Original input file path (used for summary YAML naming).
+    output : Path
+        Base output directory.
+    exist_ok : bool
+        Whether to allow existing directories.
+
+    Returns
+    -------
+    tuple[list[str], Path]
+        List of system directory paths, and path to the summary YAML.
+
+    """
+    dirs = []
+    for model in models:
+        build_dir = output / model.hash
+        build_dir.mkdir(parents=True, exist_ok=exist_ok)
+        yml_path = build_dir / f"{model.hash}.yaml"
+        if not yml_path.exists():
+            with open(yml_path, "w") as f:
+                yaml.safe_dump(model.model_dump(), f)
+        dirs.append(str(build_dir.resolve()))
+
+    summary_path = output / f"{input_path.stem}.yaml"
+    summary = {
+        "n_systems": len(models),
+        "input": str(input_path),
+        "output": str(output),
+        "hash": [m.hash for m in models],
+        "simulation_type": [m.simulation_type for m in models],
+        "system_directory": dirs,
+        "date": datetime.now(),
+    }
+    with open(summary_path, "w") as f:
+        yaml.safe_dump(summary, f)
+    return dirs, summary_path
+
+
+def _resolve_slurm_flag(slurm: str | None) -> "ExecutorConfig | Path | None":
+    """Resolve the ``--slurm`` CLI flag to an executor config or YAML path.
+
+    Parameters
+    ----------
+    slurm : str or None
+        Raw value from the ``--slurm`` flag.  ``"tui"`` launches the
+        interactive wizard (which returns a config object directly).
+        Any other non-None value is treated as a file path.
+
+    Returns
+    -------
+    ExecutorConfig, Path, or None
+        An ExecutorConfig when using TUI mode, a Path to executor config
+        YAML, or None if no SLURM config requested.
+
+    """
+    if slurm is None:
+        return None
+
+    if slurm.strip().lower() == "tui":
+        from mdfactory.orchestration.tui import UserCancelledError, configure_slurm_interactive
+
+        try:
+            return configure_slurm_interactive()
+        except UserCancelledError:
+            logger.info("SLURM configuration cancelled.")
+            sys.exit(0)
+
+    path = Path(slurm)
+    if not path.exists():
+        logger.error(f"SLURM config file not found: {path}")
+        sys.exit(1)
+    return path
+
+
+def _load_executor_config(config: "ExecutorConfig | Path | None") -> "ExecutorConfig":
+    """Load executor config from path or return directly if already loaded.
+
+    Parameters
+    ----------
+    config : ExecutorConfig, Path, or None
+        An already-loaded config object, a path to a YAML file, or None
+        for default local execution.
+
+    Returns
+    -------
+    ExecutorConfig
+        The resolved executor configuration.
+
+    """
+    if config is None:
+        from mdfactory.orchestration import ExecutorConfig
+
+        return ExecutorConfig()
+    if isinstance(config, Path):
+        from mdfactory.orchestration import ExecutorConfig
+
+        return ExecutorConfig.from_yaml(config)
+    return config  # already an ExecutorConfig instance
+
+
 @app.command(name="build", group="Build")
-def build_system(input: Path, output: Path = Path(".")):
-    """Build MD system from YAML input file.
+def build_system(
+    input: Path,
+    output: Path = Path("."),
+    slurm: Annotated[
+        str | None,
+        Parameter(
+            help=("SLURM executor config: path to YAML file, or 'tui' for interactive setup.")
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool, Parameter(help="Print what would be built without executing.")
+    ] = False,
+):
+    """Build MD system(s) from YAML, CSV, or summary input.
+
+    Supports three input modes:
+
+    - Single YAML: builds one system locally (original behavior)
+    - CSV file: builds systems from each row (parallel with --slurm, sequential without)
+    - Summary YAML: dispatches builds for previously prepared systems
 
     Parameters
     ----------
     input : Path
-        Path to the YAML file specifying the `BuildInput`
+        Path to input file (YAML for single build, CSV for batch, summary YAML for prepared).
     output : Path, optional
-        Output directory, by default Path(".")
+        Output directory, by default Path(".").
+    slurm : str, optional
+        Path to SLURM executor config YAML, or ``"tui"`` to launch the
+        interactive configuration wizard.
+    dry_run : bool, optional
+        Print what would be built without executing.
 
     """
     input = input.resolve()
-    logger.info(f"Building system from YAML file {input} and output directory: {output}.")
-    with working_directory(output, create=True):
-        run_build_from_file(input)
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+
+    # Resolve --slurm flag: "tui" launches the interactive wizard,
+    # anything else is treated as a path to a YAML config file.
+    config: "ExecutorConfig | Path | None" = _resolve_slurm_flag(slurm)
+
+    suffix = input.suffix.lower()
+
+    if suffix == ".csv":
+        _build_from_csv(input, output, config=config, dry_run=dry_run)
+    elif suffix in (".yaml", ".yml"):
+        _build_from_yaml(input, output, config=config, dry_run=dry_run)
+    else:
+        logger.error(f"Unsupported input file format: {suffix}. Use .csv, .yaml, or .yml.")
+        sys.exit(1)
+
+
+def _build_from_csv(
+    input: Path,
+    output: Path,
+    *,
+    config: "ExecutorConfig | Path | None" = None,
+    dry_run: bool = False,
+):
+    """Handle CSV input for the build command."""
+    df, models, errors = df_models_from_input_csv(input)
+    if errors:
+        logger.error("Errors building models from CSV:")
+        for k, v in errors.items():
+            logger.error(f"  Row {k}: {v}")
+        sys.exit(1)
+
+    if dry_run:
+        from mdfactory.orchestration import build_systems
+
+        executor_config = _load_executor_config(config)
+        build_systems(models, executor_config, output_dir=output, dry_run=True)
+        return
+
+    # Create per-hash directories, write per-system YAMLs, and generate summary
+    dirs, summary_path = _prepare_system_directories(models, input, output, exist_ok=True)
+    logger.info(f"Summary YAML written to {summary_path}")
+
+    if config is not None:
+        # Parallel builds via Parsl
+        from mdfactory.orchestration import build_systems
+
+        executor_config = _load_executor_config(config)
+        results = build_systems(models, executor_config, output_dir=output)
+        _report_build_results(results)
+    else:
+        # Sequential local builds
+        logger.info(f"Building {len(models)} system(s) sequentially.")
+        for model in models:
+            build_dir = output / model.hash
+            logger.info(f"Building {model.hash} ({model.simulation_type})...")
+            with working_directory(build_dir, create=True):
+                run_build_from_dict(model)
+
+
+def _build_from_yaml(
+    input: Path,
+    output: Path,
+    *,
+    config: "ExecutorConfig | Path | None" = None,
+    dry_run: bool = False,
+):
+    """Handle YAML input for the build command."""
+    with open(input) as f:
+        data = yaml.safe_load(f)
+
+    if not isinstance(data, dict):
+        logger.error(f"Invalid YAML input file (empty or not a mapping): {input}")
+        sys.exit(1)
+
+    if "system_directory" in data:
+        # Summary YAML -- dispatch builds for prepared systems
+        _build_from_summary_yaml(data, output, config=config, dry_run=dry_run)
+    else:
+        # Single build YAML
+        from mdfactory.models.input import BuildInput
+
+        model = BuildInput(**data)
+
+        if config is not None or dry_run:
+            from mdfactory.orchestration import build_systems
+
+            executor_config = _load_executor_config(config)
+            results = build_systems([model], executor_config, output_dir=output, dry_run=dry_run)
+            if not dry_run:
+                _report_build_results(results)
+        else:
+            build_dir = output / model.hash
+            logger.info(f"Building {model.hash} ({model.simulation_type}) -> {build_dir}")
+            with working_directory(build_dir, create=True):
+                run_build_from_file(input)
+
+
+def _build_from_summary_yaml(
+    data: dict,
+    output: Path,
+    *,
+    config: "ExecutorConfig | Path | None" = None,
+    dry_run: bool = False,
+):
+    """Handle summary YAML (from prepare-build) for the build command."""
+    dirs = data.get("system_directory", [])
+    hashes = data.get("hash", [])
+
+    if not dirs:
+        logger.error("Summary YAML contains no system_directory entries.")
+        sys.exit(1)
+
+    if len(dirs) != len(hashes):
+        logger.error(
+            f"Summary YAML is malformed: system_directory has {len(dirs)} entries "
+            f"but hash has {len(hashes)}."
+        )
+        sys.exit(1)
+
+    from mdfactory.models.input import BuildInput
+
+    models = []
+    for sim_dir, sim_hash in zip(dirs, hashes):
+        yml_path = Path(sim_dir) / f"{sim_hash}.yaml"
+        if not yml_path.exists():
+            logger.error(f"Build YAML not found: {yml_path}")
+            sys.exit(1)
+        with open(yml_path) as f:
+            model_data = yaml.safe_load(f)
+        models.append(BuildInput(**model_data))
+
+    if config is not None or dry_run:
+        from mdfactory.orchestration import build_systems
+
+        executor_config = _load_executor_config(config)
+        results = build_systems(models, executor_config, output_dir=output, dry_run=dry_run)
+        if not dry_run:
+            _report_build_results(results)
+    else:
+        # Sequential local builds
+        logger.info(f"Building {len(models)} prepared system(s) sequentially.")
+        for model, sim_dir in zip(models, dirs):
+            logger.info(f"Building {model.hash} ({model.simulation_type})...")
+            with working_directory(Path(sim_dir), create=True):
+                run_build_from_dict(model)
+
+
+def _report_build_results(results: list[dict]):
+    """Report build results to the user."""
+    succeeded = sum(1 for r in results if r.get("status") == "success")
+    failed = sum(1 for r in results if r.get("status") == "failed")
+    logger.info(f"Build complete: {succeeded} succeeded, {failed} failed.")
+    for r in results:
+        if r.get("status") == "failed":
+            logger.error(f"  {r.get('hash', 'unknown')}: {r.get('error', 'unknown error')}")
 
 
 @app.command(name="clean")
@@ -1792,6 +2066,25 @@ def config_edit():
 
     editor = os.environ.get("EDITOR", "vi")
     subprocess.run([editor, str(config_path)], check=False)
+
+
+@config_app.command(name="slurm")
+def config_slurm():
+    """Interactive wizard to configure a SLURM executor and save to YAML.
+
+    Queries the local SLURM scheduler for available accounts, partitions,
+    and hardware, then walks through resource selection interactively.
+    The result is saved to a YAML file that can be reused with
+    ``mdfactory build --slurm <file>``.
+
+    On non-SLURM machines, falls back to manual text entry.
+    """
+    from mdfactory.orchestration.tui import UserCancelledError, configure_and_save_slurm
+
+    try:
+        configure_and_save_slurm()
+    except UserCancelledError:
+        logger.info("SLURM configuration cancelled.")
 
 
 @config_app.command(name="cluster")

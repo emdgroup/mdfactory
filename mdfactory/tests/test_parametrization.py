@@ -263,6 +263,28 @@ def test_smirnoff_parametrization_water(tmp_path):
 
 
 @pytest.mark.skipif(not is_openff_available(), reason="OpenFF not available")
+def test_smirnoff_parametrization_water_wat_resname(tmp_path):
+    """Test SMIRNOFF parametrization of water with non-SOL resname (regression).
+
+    Verifies that water parametrization with resname="WAT" still produces
+    consistent SOL-based atom types and ITP files. Before the fix, this
+    caused a KeyError due to mismatched atom type prefixes (WAT_0 vs SOL_0).
+    """
+    config.parameter_store = tmp_path / "parameters"
+
+    spec = SingleMoleculeSpecies(smiles="O", count=1, resname="WAT")
+    param = parametrize_smirnoff_gromacs(spec)
+
+    assert param.itp.is_file()
+    # Molecule type should always be SOL regardless of input resname
+    assert param.moleculetype == "SOL"
+    assert param.parametrization == "smirnoff"
+    # Verify the parameter ITP was generated correctly
+    assert param.parameter_itp is not None
+    assert param.parameter_itp.is_file()
+
+
+@pytest.mark.skipif(not is_openff_available(), reason="OpenFF not available")
 def test_smirnoff_parametrization_ions(tmp_path):
     """Test SMIRNOFF parametrization of ions."""
     config.parameter_store = tmp_path / "parameters"
