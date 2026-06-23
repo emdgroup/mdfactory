@@ -2000,6 +2000,186 @@ def analysis_remove(
     print(df)
 
 
+# ─── search ─────────────────────────────────────────────────────────────────────
+
+
+@app.command(name="search")
+def search_simulations(
+    source: Annotated[Path, Parameter(help="Root directory to search for simulations.")],
+    *,
+    simulation_type: Annotated[
+        str | None,
+        Parameter(name=["--type", "-t"], help="Filter by simulation type."),
+    ] = None,
+    status: Annotated[
+        str | None,
+        Parameter(name=["--status", "-s"], help="Minimum status threshold."),
+    ] = None,
+    hash_prefix: Annotated[
+        str | None,
+        Parameter(name=["--hash"], help="Filter by hash prefix."),
+    ] = None,
+    tag: Annotated[
+        list[str] | None,
+        Parameter(name=["--tag"], help="Filter by tag (key=value). Repeatable."),
+    ] = None,
+    smiles: Annotated[
+        str | None,
+        Parameter(name=["--smiles"], help="Filter by SMILES substructure match."),
+    ] = None,
+    trajectory_file: Annotated[
+        str, Parameter(name=["--trajectory-file"], help="Trajectory filename.")
+    ] = "prod.xtc",
+    structure_file: Annotated[
+        str, Parameter(name=["--structure-file"], help="Structure filename.")
+    ] = "system.pdb",
+    min_status: Annotated[
+        str, Parameter(name=["--min-status"], help="Minimum status for discovery.")
+    ] = "build",
+):
+    """Search and filter simulations in a directory tree.
+
+    Parameters
+    ----------
+    source : Path
+        Root directory to search for simulations.
+    simulation_type : str | None
+        Filter by simulation type (e.g., bilayer, mixedbox, lnp).
+    status : str | None
+        Minimum status threshold for results.
+    hash_prefix : str | None
+        Filter by hash prefix.
+    tag : list[str] | None
+        Tag filters as key=value pairs. Repeatable.
+    smiles : str | None
+        SMILES substructure to match against species.
+    trajectory_file : str
+        Trajectory filename for discovery.
+    structure_file : str
+        Structure filename for discovery.
+    min_status : str
+        Minimum status for discovery (default: build to find all sims).
+
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    # Parse tag filters
+    tag_filters = None
+    if tag:
+        tag_filters = {}
+        for t in tag:
+            if "=" not in t:
+                print(f"Error: Invalid tag format '{t}'. Use key=value.")
+                raise SystemExit(1)
+            k, v = t.split("=", 1)
+            tag_filters[k] = v
+
+    store = SimulationStore(
+        source.resolve(),
+        trajectory_file=trajectory_file,
+        structure_file=structure_file,
+        min_status=min_status,
+    )
+    store.discover()
+
+    results = store.search(
+        simulation_type=simulation_type,
+        status=status,
+        hash_prefix=hash_prefix,
+        tags=tag_filters,
+        smiles=smiles,
+    )
+
+    console = Console()
+
+    if results.empty:
+        console.print("[yellow]No simulations found matching the filters.[/yellow]")
+        return
+
+    table = Table(title=f"Found {len(results)} simulation(s)")
+    table.add_column("Hash", style="cyan", no_wrap=True)
+    table.add_column("Type", style="green")
+    table.add_column("Status", style="magenta")
+    table.add_column("Tags")
+    table.add_column("Path", style="dim")
+
+    for _, row in results.iterrows():
+        tags_str = ""
+        if row["tags"]:
+            tags_str = ", ".join(f"{k}={v}" for k, v in row["tags"].items())
+
+        table.add_row(
+            row["hash"][:12],
+            row["simulation_type"],
+            row["status"],
+            tags_str,
+            str(row["path"]),
+        )
+
+    console.print(table)
+
+
+# ─── browse ──────────────────────────────────────────────────────────────────────
+
+
+@app.command(name="browse")
+def browse_simulations(
+    source: Annotated[Path, Parameter(help="Root directory to browse for simulations.")],
+    *,
+    trajectory_file: Annotated[
+        str, Parameter(name=["--trajectory-file"], help="Trajectory filename.")
+    ] = "prod.xtc",
+    structure_file: Annotated[
+        str, Parameter(name=["--structure-file"], help="Structure filename.")
+    ] = "system.pdb",
+    min_status: Annotated[
+        str, Parameter(name=["--min-status"], help="Minimum status for discovery.")
+    ] = "build",
+):
+    """Launch interactive TUI for browsing simulations.
+
+    Requires the [tui] extra: pip install mdfactory[tui]
+
+    Parameters
+    ----------
+    source : Path
+        Root directory to browse for simulations.
+    trajectory_file : str
+        Trajectory filename for discovery.
+    structure_file : str
+        Structure filename for discovery.
+    min_status : str
+        Minimum status for discovery (default: build to find all sims).
+
+    """
+    try:
+        from .tui import _check_textual_available
+
+        _check_textual_available()
+    except ImportError as e:
+        print(str(e))
+        raise SystemExit(1)
+
+    from loguru import logger as _logger
+
+    from .tui.app import SimulationBrowser
+
+    # Remove all loguru handlers — stderr output corrupts the TUI
+    _logger.remove()
+
+    store = SimulationStore(
+        source.resolve(),
+        trajectory_file=trajectory_file,
+        structure_file=structure_file,
+        min_status=min_status,
+    )
+    store.discover()
+
+    browser = SimulationBrowser(store=store)
+    browser.run()
+
+
 config_app = App(help="Manage mdfactory configuration.")
 app.command(config_app, name="config")
 

@@ -21,6 +21,7 @@ def mock_build_input():
     mock.simulation_type = "bilayer"
     mock.engine = "gromacs"
     mock.parametrization = "cgenff"
+    mock.tags = None
     mock.system = Mock()
     mock.system.total_count = 600
     return mock
@@ -716,3 +717,319 @@ def test_ensure_discovered_auto_runs(mock_discover, tmp_path, mock_discovery_df)
     # Should have auto-discovered
     mock_discover.assert_called_once()
     assert len(result) == 2
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_min_status_passthrough(mock_discover, tmp_path, mock_discovery_df):
+    """Test that SimulationStore passes min_status to discover_simulations."""
+    mock_discover.return_value = mock_discovery_df
+
+    store = SimulationStore(tmp_path, min_status="build")
+    store.discover()
+
+    # Check min_status was passed through
+    call_kwargs = mock_discover.call_args[1]
+    assert call_kwargs.get("min_status") == "build"
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_min_status_default(mock_discover, tmp_path, mock_discovery_df):
+    """Test that SimulationStore defaults to production min_status."""
+    mock_discover.return_value = mock_discovery_df
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    call_kwargs = mock_discover.call_args[1]
+    assert call_kwargs.get("min_status") == "production"
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_metadata_table_includes_tags(mock_discover, tmp_path):
+    """Test that build_metadata_table includes tag columns."""
+    from mdfactory.analysis.simulation import Simulation
+
+    # Create mock with tags
+    mock_bi = Mock(spec=BuildInput)
+    mock_bi.hash = "HASH1"
+    mock_bi.simulation_type = "mixedbox"
+    mock_bi.tags = {"project": "test", "batch": "001"}
+    mock_bi.system = Mock()
+    mock_bi.system.total_count = 1000
+
+    sim_dir = tmp_path / "sim1"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").touch()
+    (sim_dir / "prod.xtc").touch()
+    sim = Simulation(sim_dir, build_input=mock_bi)
+
+    mock_discover.return_value = pd.DataFrame(
+        {
+            "hash": ["HASH1"],
+            "path": [sim_dir],
+            "simulation": [sim],
+        }
+    )
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    def simple_flatten(bi):
+        return {"sim_type": bi.simulation_type}
+
+    table = store.build_metadata_table(simple_flatten)
+
+    assert "tag_project" in table.columns
+    assert "tag_batch" in table.columns
+    assert table.iloc[0]["tag_project"] == "test"
+    assert table.iloc[0]["tag_batch"] == "001"
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_metadata_table_no_tags(mock_discover, tmp_path):
+    """Test that build_metadata_table works when tags are None."""
+    from mdfactory.analysis.simulation import Simulation
+
+    mock_bi = Mock(spec=BuildInput)
+    mock_bi.hash = "HASH1"
+    mock_bi.simulation_type = "mixedbox"
+    mock_bi.tags = None
+    mock_bi.system = Mock()
+    mock_bi.system.total_count = 1000
+
+    sim_dir = tmp_path / "sim1"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").touch()
+    (sim_dir / "prod.xtc").touch()
+    sim = Simulation(sim_dir, build_input=mock_bi)
+
+    mock_discover.return_value = pd.DataFrame(
+        {
+            "hash": ["HASH1"],
+            "path": [sim_dir],
+            "simulation": [sim],
+        }
+    )
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    def simple_flatten(bi):
+        return {"sim_type": bi.simulation_type}
+
+    table = store.build_metadata_table(simple_flatten)
+
+    assert "hash" in table.columns
+    assert "sim_type" in table.columns
+    # No tag_ columns should be present
+    tag_cols = [c for c in table.columns if c.startswith("tag_")]
+    assert len(tag_cols) == 0
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_no_filters(mock_discover, tmp_path, mock_discovery_df):
+    """Test search with no filters returns all simulations."""
+    mock_discover.return_value = mock_discovery_df
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+    results = store.search()
+
+    assert len(results) == 2
+    assert "hash" in results.columns
+    assert "path" in results.columns
+    assert "simulation_type" in results.columns
+    assert "status" in results.columns
+    assert "tags" in results.columns
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_by_simulation_type(mock_discover, tmp_path, mock_discovery_df):
+    """Test search filters by simulation_type."""
+    mock_discover.return_value = mock_discovery_df
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    # mock_build_input has simulation_type="bilayer"
+    results = store.search(simulation_type="bilayer")
+    assert len(results) == 2
+
+    results = store.search(simulation_type="mixedbox")
+    assert len(results) == 0
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_by_hash_prefix(mock_discover, tmp_path, mock_discovery_df):
+    """Test search filters by hash prefix."""
+    mock_discover.return_value = mock_discovery_df
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    results = store.search(hash_prefix="HASH1")
+    assert len(results) == 1
+    assert results.iloc[0]["hash"] == "HASH1"
+
+    results = store.search(hash_prefix="HASH")
+    assert len(results) == 2
+
+    results = store.search(hash_prefix="NONEXISTENT")
+    assert len(results) == 0
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_by_tags(mock_discover, tmp_path):
+    """Test search filters by tags."""
+    from mdfactory.analysis.simulation import Simulation
+
+    # Create two sims with different tags
+    mock_bi1 = Mock(spec=BuildInput)
+    mock_bi1.hash = "HASH1"
+    mock_bi1.simulation_type = "mixedbox"
+    mock_bi1.tags = {"project": "alpha", "batch": "001"}
+    mock_bi1.system = Mock()
+    mock_bi1.system.species = []
+
+    mock_bi2 = Mock(spec=BuildInput)
+    mock_bi2.hash = "HASH2"
+    mock_bi2.simulation_type = "mixedbox"
+    mock_bi2.tags = {"project": "beta"}
+    mock_bi2.system = Mock()
+    mock_bi2.system.species = []
+
+    sim1_dir = tmp_path / "sim1"
+    sim1_dir.mkdir()
+    (sim1_dir / "system.pdb").touch()
+    (sim1_dir / "prod.xtc").touch()
+    sim2_dir = tmp_path / "sim2"
+    sim2_dir.mkdir()
+    (sim2_dir / "system.pdb").touch()
+    (sim2_dir / "prod.xtc").touch()
+
+    sim1 = Simulation(sim1_dir, build_input=mock_bi1)
+    sim2 = Simulation(sim2_dir, build_input=mock_bi2)
+
+    mock_discover.return_value = pd.DataFrame(
+        {
+            "hash": ["HASH1", "HASH2"],
+            "path": [sim1_dir, sim2_dir],
+            "simulation": [sim1, sim2],
+        }
+    )
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    results = store.search(tags={"project": "alpha"})
+    assert len(results) == 1
+    assert results.iloc[0]["hash"] == "HASH1"
+
+    results = store.search(tags={"project": "beta"})
+    assert len(results) == 1
+    assert results.iloc[0]["hash"] == "HASH2"
+
+    # Multiple tag filter (AND)
+    results = store.search(tags={"project": "alpha", "batch": "001"})
+    assert len(results) == 1
+
+    results = store.search(tags={"project": "alpha", "batch": "999"})
+    assert len(results) == 0
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_no_tags_skipped(mock_discover, tmp_path):
+    """Test that simulations without tags are excluded when filtering by tags."""
+    from mdfactory.analysis.simulation import Simulation
+
+    mock_bi = Mock(spec=BuildInput)
+    mock_bi.hash = "HASH1"
+    mock_bi.simulation_type = "mixedbox"
+    mock_bi.tags = None
+    mock_bi.system = Mock()
+    mock_bi.system.species = []
+
+    sim_dir = tmp_path / "sim1"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").touch()
+    (sim_dir / "prod.xtc").touch()
+    sim = Simulation(sim_dir, build_input=mock_bi)
+
+    mock_discover.return_value = pd.DataFrame(
+        {
+            "hash": ["HASH1"],
+            "path": [sim_dir],
+            "simulation": [sim],
+        }
+    )
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    results = store.search(tags={"project": "alpha"})
+    assert len(results) == 0
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_combined_filters(mock_discover, tmp_path):
+    """Test search with multiple filters applied together."""
+    from mdfactory.analysis.simulation import Simulation
+
+    mock_bi1 = Mock(spec=BuildInput)
+    mock_bi1.hash = "HASH1"
+    mock_bi1.simulation_type = "bilayer"
+    mock_bi1.tags = {"project": "alpha"}
+    mock_bi1.system = Mock()
+    mock_bi1.system.species = []
+
+    mock_bi2 = Mock(spec=BuildInput)
+    mock_bi2.hash = "HASH2"
+    mock_bi2.simulation_type = "mixedbox"
+    mock_bi2.tags = {"project": "alpha"}
+    mock_bi2.system = Mock()
+    mock_bi2.system.species = []
+
+    sim1_dir = tmp_path / "sim1"
+    sim1_dir.mkdir()
+    (sim1_dir / "system.pdb").touch()
+    (sim1_dir / "prod.xtc").touch()
+    sim2_dir = tmp_path / "sim2"
+    sim2_dir.mkdir()
+    (sim2_dir / "system.pdb").touch()
+    (sim2_dir / "prod.xtc").touch()
+
+    sim1 = Simulation(sim1_dir, build_input=mock_bi1)
+    sim2 = Simulation(sim2_dir, build_input=mock_bi2)
+
+    mock_discover.return_value = pd.DataFrame(
+        {
+            "hash": ["HASH1", "HASH2"],
+            "path": [sim1_dir, sim2_dir],
+            "simulation": [sim1, sim2],
+        }
+    )
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    # Both match project=alpha
+    results = store.search(tags={"project": "alpha"})
+    assert len(results) == 2
+
+    # Only HASH1 is bilayer
+    results = store.search(tags={"project": "alpha"}, simulation_type="bilayer")
+    assert len(results) == 1
+    assert results.iloc[0]["hash"] == "HASH1"
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_empty_store(mock_discover, tmp_path):
+    """Test search on empty store returns empty DataFrame with correct columns."""
+    mock_discover.return_value = pd.DataFrame(columns=["hash", "path", "simulation"])
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    results = store.search()
+    assert len(results) == 0
+    assert list(results.columns) == ["hash", "path", "simulation_type", "status", "tags"]
