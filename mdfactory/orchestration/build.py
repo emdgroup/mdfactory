@@ -193,6 +193,7 @@ def _wait_with_progress(
     hashes: list[str] | None = None,
     label: str = "Parsl Builds",
     poll_interval: float = 2.0,
+    stall_timeout: float = 600.0,
 ) -> list[dict]:
     """Wait for futures with a live terminal progress display.
 
@@ -210,6 +211,10 @@ def _wait_with_progress(
         pass e.g. ``"Simulations"`` to reuse this display for other workflows.
     poll_interval : float
         Seconds between status polls.
+    stall_timeout : float
+        Seconds without any new future completing before a warning is logged.
+        Defaults to 600 (10 minutes). Only one warning is emitted per stall
+        period; the timer resets when progress resumes.
 
     Returns
     -------
@@ -311,9 +316,14 @@ def _wait_with_progress(
         except Exception:
             return False
 
+    # Stall detection: warn (once) when no future completes for stall_timeout seconds
+    last_progress_time = time.time()
+    stall_warned = False
+
     try:
         with Live(_render(), console=console, refresh_per_second=2) as live:
             while True:
+                prev_done = succeeded + failed
                 done_count = 0
                 for i, future in enumerate(futures):
                     if results[i] is not None:
@@ -345,6 +355,21 @@ def _wait_with_progress(
                             line.append(f"  {error_detail}", style="red")
                             activity.append(line)
                         done_count += 1
+
+                # Stall detection
+                new_done = succeeded + failed
+                if new_done > prev_done:
+                    last_progress_time = time.time()
+                    stall_warned = False
+                elif not stall_warned and time.time() - last_progress_time > stall_timeout:
+                    remaining = total - new_done
+                    elapsed = time.time() - last_progress_time
+                    logger.warning(
+                        f"No progress for {elapsed:.0f}s — "
+                        f"{remaining} future(s) still pending. "
+                        "Use Ctrl+C to abort if stuck."
+                    )
+                    stall_warned = True
 
                 live.update(_render())
 

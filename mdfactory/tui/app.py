@@ -239,7 +239,7 @@ class SimulationBrowser(App):
         self.query_one("#filter-type", Select).value = None
         self.query_one("#filter-status", Select).value = None
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True)
     def _run_search(self) -> None:
         """Run search with current filter values and update table."""
         # Gather filter values from selects
@@ -264,8 +264,8 @@ class SimulationBrowser(App):
         # Run search (Select value is None for "All")
         try:
             results = self.store.search(
-                simulation_type=type_val if type_val is not Select.BLANK else None,
-                status=status_val if status_val is not Select.BLANK else None,
+                simulation_type=type_val,
+                status=status_val,
                 hash_prefix=hash_val,
                 tags=tags_filter,
                 smiles=smiles_val,

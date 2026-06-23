@@ -1033,3 +1033,359 @@ def test_search_empty_store(mock_discover, tmp_path):
     results = store.search()
     assert len(results) == 0
     assert list(results.columns) == ["hash", "path", "simulation_type", "status", "tags"]
+
+
+# ---------------------------------------------------------------------------
+# Finding 3: search(smiles=...) integration tests
+# ---------------------------------------------------------------------------
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_smiles_match(mock_discover, tmp_path):
+    """Test search(smiles=...) returns simulation whose species match the substructure."""
+    from mdfactory.analysis.simulation import Simulation
+
+    # Create species with smiles attributes
+    sp1 = Mock()
+    sp1.smiles = "CCO"
+    sp1.resname = "ETH"
+
+    mock_bi = Mock(spec=BuildInput)
+    mock_bi.hash = "HASH1"
+    mock_bi.simulation_type = "bilayer"
+    mock_bi.tags = None
+    mock_bi.system = Mock()
+    mock_bi.system.species = [sp1]
+
+    sim_dir = tmp_path / "sim1"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").touch()
+    (sim_dir / "prod.xtc").touch()
+    sim = Simulation(sim_dir, build_input=mock_bi)
+
+    mock_discover.return_value = pd.DataFrame(
+        {
+            "hash": ["HASH1"],
+            "path": [sim_dir],
+            "simulation": [sim],
+        }
+    )
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    with patch(
+        "mdfactory.utils.chemistry_utilities.smiles_substructure_match",
+        return_value=True,
+    ):
+        results = store.search(smiles="CC")
+
+    assert len(results) == 1
+    assert results.iloc[0]["hash"] == "HASH1"
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_smiles_no_match(mock_discover, tmp_path):
+    """Test search(smiles=...) excludes simulation whose species do NOT match."""
+    from mdfactory.analysis.simulation import Simulation
+
+    sp1 = Mock()
+    sp1.smiles = "CCO"
+    sp1.resname = "ETH"
+
+    mock_bi = Mock(spec=BuildInput)
+    mock_bi.hash = "HASH1"
+    mock_bi.simulation_type = "bilayer"
+    mock_bi.tags = None
+    mock_bi.system = Mock()
+    mock_bi.system.species = [sp1]
+
+    sim_dir = tmp_path / "sim1"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").touch()
+    (sim_dir / "prod.xtc").touch()
+    sim = Simulation(sim_dir, build_input=mock_bi)
+
+    mock_discover.return_value = pd.DataFrame(
+        {
+            "hash": ["HASH1"],
+            "path": [sim_dir],
+            "simulation": [sim],
+        }
+    )
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    with patch(
+        "mdfactory.utils.chemistry_utilities.smiles_substructure_match",
+        return_value=False,
+    ):
+        results = store.search(smiles="c1ccccc1")
+
+    assert len(results) == 0
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_smiles_filters_correctly(mock_discover, tmp_path):
+    """Test search(smiles=...) returns only matching simulations out of multiple."""
+    from mdfactory.analysis.simulation import Simulation
+
+    # Sim 1: species with matching SMILES
+    sp_match = Mock()
+    sp_match.smiles = "CCCCCCCC"
+    sp_match.resname = "OCT"
+
+    mock_bi1 = Mock(spec=BuildInput)
+    mock_bi1.hash = "HASH1"
+    mock_bi1.simulation_type = "bilayer"
+    mock_bi1.tags = None
+    mock_bi1.system = Mock()
+    mock_bi1.system.species = [sp_match]
+
+    # Sim 2: species with non-matching SMILES
+    sp_nomatch = Mock()
+    sp_nomatch.smiles = "O"
+    sp_nomatch.resname = "WAT"
+
+    mock_bi2 = Mock(spec=BuildInput)
+    mock_bi2.hash = "HASH2"
+    mock_bi2.simulation_type = "bilayer"
+    mock_bi2.tags = None
+    mock_bi2.system = Mock()
+    mock_bi2.system.species = [sp_nomatch]
+
+    sim1_dir = tmp_path / "sim1"
+    sim1_dir.mkdir()
+    (sim1_dir / "system.pdb").touch()
+    (sim1_dir / "prod.xtc").touch()
+    sim2_dir = tmp_path / "sim2"
+    sim2_dir.mkdir()
+    (sim2_dir / "system.pdb").touch()
+    (sim2_dir / "prod.xtc").touch()
+
+    sim1 = Simulation(sim1_dir, build_input=mock_bi1)
+    sim2 = Simulation(sim2_dir, build_input=mock_bi2)
+
+    mock_discover.return_value = pd.DataFrame(
+        {
+            "hash": ["HASH1", "HASH2"],
+            "path": [sim1_dir, sim2_dir],
+            "simulation": [sim1, sim2],
+        }
+    )
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    def _mock_substructure(query, target):
+        """Return True only for CCCCCCCC (the octane species)."""
+        return target == "CCCCCCCC"
+
+    with patch(
+        "mdfactory.utils.chemistry_utilities.smiles_substructure_match",
+        side_effect=_mock_substructure,
+    ):
+        results = store.search(smiles="CCCC")
+
+    assert len(results) == 1
+    assert results.iloc[0]["hash"] == "HASH1"
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_smiles_import_error(mock_discover, tmp_path, mock_discovery_df):
+    """Test search(smiles=...) raises ImportError when RDKit is unavailable."""
+    mock_discover.return_value = mock_discovery_df
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    with patch(
+        "mdfactory.utils.chemistry_utilities.smiles_substructure_match",
+        side_effect=ImportError("No module named 'rdkit'"),
+    ):
+        with patch.dict(
+            "sys.modules",
+            {"mdfactory.utils.chemistry_utilities": None},
+        ):
+            with pytest.raises(ImportError, match="RDKit is required"):
+                store.search(smiles="CCO")
+
+
+# ---------------------------------------------------------------------------
+# Finding 4: search(status=...) threshold logic tests
+# ---------------------------------------------------------------------------
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_status_threshold_includes(mock_discover, tmp_path):
+    """Test search(status=...) includes simulations at or above threshold."""
+    from mdfactory.analysis.simulation import Simulation
+
+    mock_bi1 = Mock(spec=BuildInput)
+    mock_bi1.hash = "HASH1"
+    mock_bi1.simulation_type = "bilayer"
+    mock_bi1.tags = None
+    mock_bi1.system = Mock()
+    mock_bi1.system.species = []
+
+    mock_bi2 = Mock(spec=BuildInput)
+    mock_bi2.hash = "HASH2"
+    mock_bi2.simulation_type = "bilayer"
+    mock_bi2.tags = None
+    mock_bi2.system = Mock()
+    mock_bi2.system.species = []
+
+    sim1_dir = tmp_path / "sim1"
+    sim1_dir.mkdir()
+    (sim1_dir / "system.pdb").touch()
+    (sim1_dir / "prod.xtc").touch()
+    # sim1: has prod.xtc but no prod.gro → "production"
+
+    sim2_dir = tmp_path / "sim2"
+    sim2_dir.mkdir()
+    (sim2_dir / "system.pdb").touch()
+    (sim2_dir / "prod.xtc").touch()
+    (sim2_dir / "prod.gro").touch()
+    # sim2: has prod.gro → "completed"
+
+    sim1 = Simulation(sim1_dir, build_input=mock_bi1)
+    sim2 = Simulation(sim2_dir, build_input=mock_bi2)
+
+    assert sim1.status == "production"
+    assert sim2.status == "completed"
+
+    mock_discover.return_value = pd.DataFrame(
+        {
+            "hash": ["HASH1", "HASH2"],
+            "path": [sim1_dir, sim2_dir],
+            "simulation": [sim1, sim2],
+        }
+    )
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    # status="production" → both should be included (production >= production)
+    results = store.search(status="production")
+    assert len(results) == 2
+
+    # status="completed" → only sim2
+    results = store.search(status="completed")
+    assert len(results) == 1
+    assert results.iloc[0]["hash"] == "HASH2"
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_status_threshold_excludes_build(mock_discover, tmp_path):
+    """Test search(status='production') excludes build-only simulations."""
+    from mdfactory.analysis.simulation import Simulation
+
+    mock_bi = Mock(spec=BuildInput)
+    mock_bi.hash = "HASH1"
+    mock_bi.simulation_type = "bilayer"
+    mock_bi.tags = None
+    mock_bi.system = Mock()
+    mock_bi.system.species = []
+
+    sim_dir = tmp_path / "sim1"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").touch()
+    # No prod.xtc, no prod.gro, no equilibration files → "build"
+
+    sim = Simulation(sim_dir, build_input=mock_bi, trajectory_file=None)
+
+    assert sim.status == "build"
+
+    mock_discover.return_value = pd.DataFrame(
+        {
+            "hash": ["HASH1"],
+            "path": [sim_dir],
+            "simulation": [sim],
+        }
+    )
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    results = store.search(status="production")
+    assert len(results) == 0
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_search_status_invalid_raises(mock_discover, tmp_path, mock_discovery_df):
+    """Test search(status=...) raises ValueError for an invalid status string."""
+    mock_discover.return_value = mock_discovery_df
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    with pytest.raises(ValueError, match="Invalid status"):
+        store.search(status="nonexistent_status")
+
+
+# ---------------------------------------------------------------------------
+# Finding 18: remove_all_analyses(simulation_type=...) filter test
+# ---------------------------------------------------------------------------
+
+
+@patch("mdfactory.analysis.store.discover_simulations")
+def test_remove_all_analyses_filtered(mock_discover, tmp_path):
+    """Test remove_all_analyses respects simulation_type filter."""
+    from mdfactory.analysis.simulation import Simulation
+
+    # Create two simulations of different types
+    mock_bi1 = Mock(spec=BuildInput)
+    mock_bi1.hash = "HASH1"
+    mock_bi1.simulation_type = "bilayer"
+    mock_bi1.tags = None
+    mock_bi1.system = Mock()
+    mock_bi1.system.total_count = 600
+
+    mock_bi2 = Mock(spec=BuildInput)
+    mock_bi2.hash = "HASH2"
+    mock_bi2.simulation_type = "mixedbox"
+    mock_bi2.tags = None
+    mock_bi2.system = Mock()
+    mock_bi2.system.total_count = 600
+
+    sim1_dir = tmp_path / "sim1"
+    sim1_dir.mkdir()
+    (sim1_dir / "system.pdb").touch()
+    (sim1_dir / "prod.xtc").touch()
+    sim2_dir = tmp_path / "sim2"
+    sim2_dir.mkdir()
+    (sim2_dir / "system.pdb").touch()
+    (sim2_dir / "prod.xtc").touch()
+
+    sim1 = Simulation(sim1_dir, build_input=mock_bi1)
+    sim2 = Simulation(sim2_dir, build_input=mock_bi2)
+
+    mock_discover.return_value = pd.DataFrame(
+        {
+            "hash": ["HASH1", "HASH2"],
+            "path": [sim1_dir, sim2_dir],
+            "simulation": [sim1, sim2],
+        }
+    )
+
+    store = SimulationStore(tmp_path)
+    store.discover()
+
+    # Filter to only bilayer — should only affect sim1
+    summary = store.remove_all_analyses(simulation_type="bilayer")
+    assert len(summary) == 1
+    assert summary.iloc[0]["hash"] == "HASH1"
+    assert summary.iloc[0]["simulation_type"] == "bilayer"
+    assert summary.iloc[0]["status"] == "success"
+
+    # Filter to mixedbox — should only affect sim2
+    summary = store.remove_all_analyses(simulation_type="mixedbox")
+    assert len(summary) == 1
+    assert summary.iloc[0]["hash"] == "HASH2"
+    assert summary.iloc[0]["simulation_type"] == "mixedbox"
+    assert summary.iloc[0]["status"] == "success"
+
+    # Filter to nonexistent type — empty result
+    summary = store.remove_all_analyses(simulation_type="unknown")
+    assert summary.empty

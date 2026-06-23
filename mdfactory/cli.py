@@ -591,6 +591,109 @@ def _exit_sync_push_error(exc: Exception) -> None:
     sys.exit(1)
 
 
+def _write_output(df: pd.DataFrame, output: Path) -> None:
+    """Write a DataFrame to a file (CSV or JSON).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame to write.
+    output : Path
+        Output file path.  If the suffix is ``.json``, writes
+        newline-delimited JSON; otherwise defaults to CSV.
+
+    """
+    output = output.resolve()
+    suffix = output.suffix.lower()
+
+    if suffix == ".json":
+        df.to_json(output, orient="records", lines=True)
+    else:
+        # Default to CSV
+        df.to_csv(output, index=False)
+
+    logger.success(f"Wrote {len(df)} record(s) to {output}")
+
+
+def _resolve_slurm_config(
+    *,
+    account: str | None,
+    partition: str | None,
+    time: str,
+    cpus: int,
+    mem_gb: int,
+    qos: str | None,
+    constraint: str | None,
+    job_name_prefix: str,
+) -> SlurmConfig:
+    """Build a :class:`SlurmConfig`, using autodiscovery when *account* is ``None``.
+
+    Parameters
+    ----------
+    account : str or None
+        SLURM account.  If ``None``, cluster autodiscovery is attempted.
+    partition : str or None
+        SLURM partition.  Passed through to autodiscovery or defaults to
+        ``"cpu"`` when *account* is given explicitly.
+    time : str
+        Wall-clock time limit (e.g. ``"2h"``).
+    cpus : int
+        Number of CPUs per task (also used as *min_cpus* for autodiscovery).
+    mem_gb : int
+        Memory in GB (also used as *min_mem_gb* for autodiscovery).
+    qos : str or None
+        Quality-of-service string.
+    constraint : str or None
+        SLURM constraint string.
+    job_name_prefix : str
+        Prefix for SLURM job names.
+
+    Returns
+    -------
+    SlurmConfig
+
+    Raises
+    ------
+    ValueError
+        If autodiscovery fails and no *account* was provided.
+
+    """
+    if account is None:
+        try:
+            slurm_cfg = SlurmConfig.from_cluster(
+                needs_gpu=False,
+                min_cpus=cpus,
+                min_mem_gb=mem_gb,
+                time=time,
+                cpus_per_task=cpus,
+                mem_gb=mem_gb,
+                qos=qos,
+                constraint=constraint,
+                job_name_prefix=job_name_prefix,
+                **({"partition": partition} if partition is not None else {}),
+            )
+            logger.info(
+                f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
+                f"partition={slurm_cfg.partition}"
+            )
+        except RuntimeError as e:
+            raise ValueError(
+                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
+            ) from e
+    else:
+        slurm_cfg = SlurmConfig(
+            account=account,
+            partition=partition or "cpu",
+            time=time,
+            cpus_per_task=cpus,
+            mem_gb=mem_gb,
+            qos=qos,
+            constraint=constraint,
+            job_name_prefix=job_name_prefix,
+        )
+    return slurm_cfg
+
+
 sync_push_app = App(help="Push local systems or analyses into the database.")
 sync_app.command(sync_push_app, name="push")
 
@@ -713,16 +816,7 @@ def sync_pull_systems(
 
     # File output - always includes all columns
     if output is not None:
-        output = output.resolve()
-        suffix = output.suffix.lower()
-
-        if suffix == ".json":
-            df.to_json(output, orient="records", lines=True)
-        else:
-            # Default to CSV
-            df.to_csv(output, index=False)
-
-        logger.success(f"Wrote {len(df)} record(s) to {output}")
+        _write_output(df, output)
         return
 
     # CLI output
@@ -1249,16 +1343,7 @@ def sync_pull_analysis(
 
     # File output
     if output is not None:
-        output = output.resolve()
-        suffix = output.suffix.lower()
-
-        if suffix == ".json":
-            df.to_json(output, orient="records", lines=True)
-        else:
-            # Default to CSV
-            df.to_csv(output, index=False)
-
-        logger.success(f"Wrote {len(df)} record(s) to {output}")
+        _write_output(df, output)
         return
 
     # CLI output
@@ -1343,16 +1428,7 @@ def sync_pull_artifacts(
 
     # File output
     if output is not None:
-        output = output.resolve()
-        suffix = output.suffix.lower()
-
-        if suffix == ".json":
-            df.to_json(output, orient="records", lines=True)
-        else:
-            # Default to CSV
-            df.to_csv(output, index=False)
-
-        logger.success(f"Wrote {len(df)} record(s) to {output}")
+        _write_output(df, output)
         return
 
     # CLI output
@@ -1505,40 +1581,16 @@ def analysis_run(
         print(result_df)
         return
 
-    # Use autodiscovery if account not provided
-    if account is None:
-        try:
-            slurm_cfg = SlurmConfig.from_cluster(
-                needs_gpu=False,
-                min_cpus=cpus,
-                min_mem_gb=mem_gb,
-                time=time,
-                cpus_per_task=cpus,
-                mem_gb=mem_gb,
-                qos=qos,
-                constraint=constraint,
-                job_name_prefix=job_name_prefix,
-                **({"partition": partition} if partition is not None else {}),
-            )
-            logger.info(
-                f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
-                f"partition={slurm_cfg.partition}"
-            )
-        except RuntimeError as e:
-            raise ValueError(
-                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
-            ) from e
-    else:
-        slurm_cfg = SlurmConfig(
-            account=account,
-            partition=partition or "cpu",
-            time=time,
-            cpus_per_task=cpus,
-            mem_gb=mem_gb,
-            qos=qos,
-            constraint=constraint,
-            job_name_prefix=job_name_prefix,
-        )
+    slurm_cfg = _resolve_slurm_config(
+        account=account,
+        partition=partition,
+        time=time,
+        cpus=cpus,
+        mem_gb=mem_gb,
+        qos=qos,
+        constraint=constraint,
+        job_name_prefix=job_name_prefix,
+    )
     if log_dir is None:
         log_dir = determine_log_dir(sim_paths)
     result_df = submit_analyses_slurm(
@@ -1816,40 +1868,16 @@ def analysis_artifacts_run(
         print(summary)
         return
 
-    # Use autodiscovery if account not provided
-    if account is None:
-        try:
-            slurm_cfg = SlurmConfig.from_cluster(
-                needs_gpu=False,
-                min_cpus=cpus,
-                min_mem_gb=mem_gb,
-                time=time,
-                cpus_per_task=cpus,
-                mem_gb=mem_gb,
-                qos=qos,
-                constraint=constraint,
-                job_name_prefix=job_name_prefix,
-                **({"partition": partition} if partition is not None else {}),
-            )
-            logger.info(
-                f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
-                f"partition={slurm_cfg.partition}"
-            )
-        except RuntimeError as e:
-            raise ValueError(
-                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
-            ) from e
-    else:
-        slurm_cfg = SlurmConfig(
-            account=account,
-            partition=partition or "cpu",
-            time=time,
-            cpus_per_task=cpus,
-            mem_gb=mem_gb,
-            qos=qos,
-            constraint=constraint,
-            job_name_prefix=job_name_prefix,
-        )
+    slurm_cfg = _resolve_slurm_config(
+        account=account,
+        partition=partition,
+        time=time,
+        cpus=cpus,
+        mem_gb=mem_gb,
+        qos=qos,
+        constraint=constraint,
+        job_name_prefix=job_name_prefix,
+    )
 
     if log_dir is None:
         log_dir = determine_log_dir(sim_paths)
@@ -2083,13 +2111,17 @@ def search_simulations(
     )
     store.discover()
 
-    results = store.search(
-        simulation_type=simulation_type,
-        status=status,
-        hash_prefix=hash_prefix,
-        tags=tag_filters,
-        smiles=smiles,
-    )
+    try:
+        results = store.search(
+            simulation_type=simulation_type,
+            status=status,
+            hash_prefix=hash_prefix,
+            tags=tag_filters,
+            smiles=smiles,
+        )
+    except (ValueError, ImportError) as e:
+        print(f"Error: {e}")
+        raise SystemExit(1)
 
     console = Console()
 

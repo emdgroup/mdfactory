@@ -300,6 +300,24 @@ class SimulationStore:
             logger.info("No simulations to search")
             return pd.DataFrame(columns=["hash", "path", "simulation_type", "status", "tags"])
 
+        # Pre-validate and import dependencies before iterating
+        from .constants import STATUS_ORDER
+
+        if status is not None and status not in STATUS_ORDER:
+            raise ValueError(f"Invalid status '{status}'. Must be one of: {STATUS_ORDER}")
+
+        smiles_substructure_match = None
+        if smiles is not None:
+            try:
+                from mdfactory.utils.chemistry_utilities import (
+                    smiles_substructure_match,
+                )
+            except ImportError:
+                raise ImportError(
+                    "RDKit is required for SMILES search. "
+                    "Install it via conda: conda install -c conda-forge rdkit"
+                )
+
         # Build result rows from discovery
         rows = []
         for _, row in self._discovery_df.iterrows():
@@ -315,10 +333,6 @@ class SimulationStore:
 
             # Filter: status (minimum threshold)
             if status is not None:
-                from .constants import STATUS_ORDER
-
-                if status not in STATUS_ORDER:
-                    raise ValueError(f"Invalid status '{status}'. Must be one of: {STATUS_ORDER}")
                 status_idx = STATUS_ORDER.index(sim_status)
                 min_idx = STATUS_ORDER.index(status)
                 if status_idx < min_idx:
@@ -338,13 +352,6 @@ class SimulationStore:
 
             # Filter: SMILES substructure
             if smiles is not None:
-                try:
-                    from mdfactory.utils.chemistry_utilities import smiles_substructure_match
-                except ImportError:
-                    raise ImportError(
-                        "RDKit is required for SMILES search. "
-                        "Install it via conda: conda install -c conda-forge rdkit"
-                    )
                 match_found = False
                 for species in bi.system.species:
                     species_smiles = getattr(species, "smiles", None)
