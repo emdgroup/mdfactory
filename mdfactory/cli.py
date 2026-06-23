@@ -8,7 +8,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import pandas as pd
 import questionary
@@ -33,7 +33,10 @@ from .prepare import df_to_build_input_models
 from .utils.data_manager import check_run_exists
 from .utils.push import push_systems
 from .utils.utilities import working_directory
-from .workflows import run_build_from_file
+from .workflows import run_build_from_dict, run_build_from_file
+
+if TYPE_CHECKING:
+    from .orchestration import ExecutorConfig
 
 app = App(name="MDFactory", version=__version__)
 
@@ -82,26 +85,7 @@ def prepare_build(input: Path, output: Path = Path(".")):
 
     logger.info("Created DataFrame for systems:\n{}", df)
 
-    dirs = []
-    for _, row in df.iterrows():
-        out = output / Path(row.hash)
-        out.mkdir(parents=True, exist_ok=False)
-        yml_path = out / f"{row.hash}.yaml"
-        dirs.append(str(out.resolve()))
-        with open(yml_path, "w") as fb:
-            yaml.safe_dump(row.model.model_dump(), fb)
-
-    summary = {
-        "n_systems": df.shape[0],
-        "input": str(input),
-        "output": str(output),
-        "hash": df.hash.values.tolist(),
-        "simulation_type": [x.simulation_type for x in df.model.values],
-        "system_directory": dirs,
-        "date": datetime.now(),
-    }
-    with open(yml_build_path, "w") as fb:
-        yaml.safe_dump(summary, fb)
+    _prepare_system_directories(models, input, output, exist_ok=False)
 
 
 def df_models_from_input_csv(input):
@@ -112,22 +96,312 @@ def df_models_from_input_csv(input):
     return df, models, errors
 
 
+def _prepare_system_directories(
+    models: list,
+    input_path: Path,
+    output: Path,
+    *,
+    exist_ok: bool = True,
+) -> tuple[list[str], Path]:
+    """Create per-hash build directories, write system YAMLs, and generate summary.
+
+    Parameters
+    ----------
+    models : list
+        List of BuildInput models.
+    input_path : Path
+        Original input file path (used for summary YAML naming).
+    output : Path
+        Base output directory.
+    exist_ok : bool
+        Whether to allow existing directories.
+
+    Returns
+    -------
+    tuple[list[str], Path]
+        List of system directory paths, and path to the summary YAML.
+
+    """
+    dirs = []
+    for model in models:
+        build_dir = output / model.hash
+        build_dir.mkdir(parents=True, exist_ok=exist_ok)
+        yml_path = build_dir / f"{model.hash}.yaml"
+        if not yml_path.exists():
+            with open(yml_path, "w") as f:
+                yaml.safe_dump(model.model_dump(), f)
+        dirs.append(str(build_dir.resolve()))
+
+    summary_path = output / f"{input_path.stem}.yaml"
+    summary = {
+        "n_systems": len(models),
+        "input": str(input_path),
+        "output": str(output),
+        "hash": [m.hash for m in models],
+        "simulation_type": [m.simulation_type for m in models],
+        "system_directory": dirs,
+        "date": datetime.now(),
+    }
+    with open(summary_path, "w") as f:
+        yaml.safe_dump(summary, f)
+    return dirs, summary_path
+
+
+def _resolve_slurm_flag(slurm: str | None) -> "ExecutorConfig | Path | None":
+    """Resolve the ``--slurm`` CLI flag to an executor config or YAML path.
+
+    Parameters
+    ----------
+    slurm : str or None
+        Raw value from the ``--slurm`` flag.  ``"tui"`` launches the
+        interactive wizard (which returns a config object directly).
+        Any other non-None value is treated as a file path.
+
+    Returns
+    -------
+    ExecutorConfig, Path, or None
+        An ExecutorConfig when using TUI mode, a Path to executor config
+        YAML, or None if no SLURM config requested.
+
+    """
+    if slurm is None:
+        return None
+
+    if slurm.strip().lower() == "tui":
+        from mdfactory.orchestration.tui import UserCancelledError, configure_slurm_interactive
+
+        try:
+            return configure_slurm_interactive()
+        except UserCancelledError:
+            logger.info("SLURM configuration cancelled.")
+            sys.exit(0)
+
+    path = Path(slurm)
+    if not path.exists():
+        logger.error(f"SLURM config file not found: {path}")
+        sys.exit(1)
+    return path
+
+
+def _load_executor_config(config: "ExecutorConfig | Path | None") -> "ExecutorConfig":
+    """Load executor config from path or return directly if already loaded.
+
+    Parameters
+    ----------
+    config : ExecutorConfig, Path, or None
+        An already-loaded config object, a path to a YAML file, or None
+        for default local execution.
+
+    Returns
+    -------
+    ExecutorConfig
+        The resolved executor configuration.
+
+    """
+    if config is None:
+        from mdfactory.orchestration import ExecutorConfig
+
+        return ExecutorConfig()
+    if isinstance(config, Path):
+        from mdfactory.orchestration import ExecutorConfig
+
+        return ExecutorConfig.from_yaml(config)
+    return config  # already an ExecutorConfig instance
+
+
 @app.command(name="build", group="Build")
-def build_system(input: Path, output: Path = Path(".")):
-    """Build MD system from YAML input file.
+def build_system(
+    input: Path,
+    output: Path = Path("."),
+    slurm: Annotated[
+        str | None,
+        Parameter(
+            help=("SLURM executor config: path to YAML file, or 'tui' for interactive setup.")
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool, Parameter(help="Print what would be built without executing.")
+    ] = False,
+):
+    """Build MD system(s) from YAML, CSV, or summary input.
+
+    Supports three input modes:
+
+    - Single YAML: builds one system locally (original behavior)
+    - CSV file: builds systems from each row (parallel with --slurm, sequential without)
+    - Summary YAML: dispatches builds for previously prepared systems
 
     Parameters
     ----------
     input : Path
-        Path to the YAML file specifying the `BuildInput`
+        Path to input file (YAML for single build, CSV for batch, summary YAML for prepared).
     output : Path, optional
-        Output directory, by default Path(".")
+        Output directory, by default Path(".").
+    slurm : str, optional
+        Path to SLURM executor config YAML, or ``"tui"`` to launch the
+        interactive configuration wizard.
+    dry_run : bool, optional
+        Print what would be built without executing.
 
     """
     input = input.resolve()
-    logger.info(f"Building system from YAML file {input} and output directory: {output}.")
-    with working_directory(output, create=True):
-        run_build_from_file(input)
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+
+    # Resolve --slurm flag: "tui" launches the interactive wizard,
+    # anything else is treated as a path to a YAML config file.
+    config: "ExecutorConfig | Path | None" = _resolve_slurm_flag(slurm)
+
+    suffix = input.suffix.lower()
+
+    if suffix == ".csv":
+        _build_from_csv(input, output, config=config, dry_run=dry_run)
+    elif suffix in (".yaml", ".yml"):
+        _build_from_yaml(input, output, config=config, dry_run=dry_run)
+    else:
+        logger.error(f"Unsupported input file format: {suffix}. Use .csv, .yaml, or .yml.")
+        sys.exit(1)
+
+
+def _build_from_csv(
+    input: Path,
+    output: Path,
+    *,
+    config: "ExecutorConfig | Path | None" = None,
+    dry_run: bool = False,
+):
+    """Handle CSV input for the build command."""
+    df, models, errors = df_models_from_input_csv(input)
+    if errors:
+        logger.error("Errors building models from CSV:")
+        for k, v in errors.items():
+            logger.error(f"  Row {k}: {v}")
+        sys.exit(1)
+
+    if dry_run:
+        from mdfactory.orchestration import build_systems
+
+        executor_config = _load_executor_config(config)
+        build_systems(models, executor_config, output_dir=output, dry_run=True)
+        return
+
+    # Create per-hash directories, write per-system YAMLs, and generate summary
+    dirs, summary_path = _prepare_system_directories(models, input, output, exist_ok=True)
+    logger.info(f"Summary YAML written to {summary_path}")
+
+    if config is not None:
+        # Parallel builds via Parsl
+        from mdfactory.orchestration import build_systems
+
+        executor_config = _load_executor_config(config)
+        results = build_systems(models, executor_config, output_dir=output)
+        _report_build_results(results)
+    else:
+        # Sequential local builds
+        logger.info(f"Building {len(models)} system(s) sequentially.")
+        for model in models:
+            build_dir = output / model.hash
+            logger.info(f"Building {model.hash} ({model.simulation_type})...")
+            with working_directory(build_dir, create=True):
+                run_build_from_dict(model)
+
+
+def _build_from_yaml(
+    input: Path,
+    output: Path,
+    *,
+    config: "ExecutorConfig | Path | None" = None,
+    dry_run: bool = False,
+):
+    """Handle YAML input for the build command."""
+    with open(input) as f:
+        data = yaml.safe_load(f)
+
+    if not isinstance(data, dict):
+        logger.error(f"Invalid YAML input file (empty or not a mapping): {input}")
+        sys.exit(1)
+
+    if "system_directory" in data:
+        # Summary YAML -- dispatch builds for prepared systems
+        _build_from_summary_yaml(data, output, config=config, dry_run=dry_run)
+    else:
+        # Single build YAML
+        from mdfactory.models.input import BuildInput
+
+        model = BuildInput(**data)
+
+        if config is not None or dry_run:
+            from mdfactory.orchestration import build_systems
+
+            executor_config = _load_executor_config(config)
+            results = build_systems([model], executor_config, output_dir=output, dry_run=dry_run)
+            if not dry_run:
+                _report_build_results(results)
+        else:
+            build_dir = output / model.hash
+            logger.info(f"Building {model.hash} ({model.simulation_type}) -> {build_dir}")
+            with working_directory(build_dir, create=True):
+                run_build_from_file(input)
+
+
+def _build_from_summary_yaml(
+    data: dict,
+    output: Path,
+    *,
+    config: "ExecutorConfig | Path | None" = None,
+    dry_run: bool = False,
+):
+    """Handle summary YAML (from prepare-build) for the build command."""
+    dirs = data.get("system_directory", [])
+    hashes = data.get("hash", [])
+
+    if not dirs:
+        logger.error("Summary YAML contains no system_directory entries.")
+        sys.exit(1)
+
+    if len(dirs) != len(hashes):
+        logger.error(
+            f"Summary YAML is malformed: system_directory has {len(dirs)} entries "
+            f"but hash has {len(hashes)}."
+        )
+        sys.exit(1)
+
+    from mdfactory.models.input import BuildInput
+
+    models = []
+    for sim_dir, sim_hash in zip(dirs, hashes):
+        yml_path = Path(sim_dir) / f"{sim_hash}.yaml"
+        if not yml_path.exists():
+            logger.error(f"Build YAML not found: {yml_path}")
+            sys.exit(1)
+        with open(yml_path) as f:
+            model_data = yaml.safe_load(f)
+        models.append(BuildInput(**model_data))
+
+    if config is not None or dry_run:
+        from mdfactory.orchestration import build_systems
+
+        executor_config = _load_executor_config(config)
+        results = build_systems(models, executor_config, output_dir=output, dry_run=dry_run)
+        if not dry_run:
+            _report_build_results(results)
+    else:
+        # Sequential local builds
+        logger.info(f"Building {len(models)} prepared system(s) sequentially.")
+        for model, sim_dir in zip(models, dirs):
+            logger.info(f"Building {model.hash} ({model.simulation_type})...")
+            with working_directory(Path(sim_dir), create=True):
+                run_build_from_dict(model)
+
+
+def _report_build_results(results: list[dict]):
+    """Report build results to the user."""
+    succeeded = sum(1 for r in results if r.get("status") == "success")
+    failed = sum(1 for r in results if r.get("status") == "failed")
+    logger.info(f"Build complete: {succeeded} succeeded, {failed} failed.")
+    for r in results:
+        if r.get("status") == "failed":
+            logger.error(f"  {r.get('hash', 'unknown')}: {r.get('error', 'unknown error')}")
 
 
 @app.command(name="clean")
@@ -317,6 +591,109 @@ def _exit_sync_push_error(exc: Exception) -> None:
     sys.exit(1)
 
 
+def _write_output(df: pd.DataFrame, output: Path) -> None:
+    """Write a DataFrame to a file (CSV or JSON).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame to write.
+    output : Path
+        Output file path.  If the suffix is ``.json``, writes
+        newline-delimited JSON; otherwise defaults to CSV.
+
+    """
+    output = output.resolve()
+    suffix = output.suffix.lower()
+
+    if suffix == ".json":
+        df.to_json(output, orient="records", lines=True)
+    else:
+        # Default to CSV
+        df.to_csv(output, index=False)
+
+    logger.success(f"Wrote {len(df)} record(s) to {output}")
+
+
+def _resolve_slurm_config(
+    *,
+    account: str | None,
+    partition: str | None,
+    time: str,
+    cpus: int,
+    mem_gb: int,
+    qos: str | None,
+    constraint: str | None,
+    job_name_prefix: str,
+) -> SlurmConfig:
+    """Build a :class:`SlurmConfig`, using autodiscovery when *account* is ``None``.
+
+    Parameters
+    ----------
+    account : str or None
+        SLURM account.  If ``None``, cluster autodiscovery is attempted.
+    partition : str or None
+        SLURM partition.  Passed through to autodiscovery or defaults to
+        ``"cpu"`` when *account* is given explicitly.
+    time : str
+        Wall-clock time limit (e.g. ``"2h"``).
+    cpus : int
+        Number of CPUs per task (also used as *min_cpus* for autodiscovery).
+    mem_gb : int
+        Memory in GB (also used as *min_mem_gb* for autodiscovery).
+    qos : str or None
+        Quality-of-service string.
+    constraint : str or None
+        SLURM constraint string.
+    job_name_prefix : str
+        Prefix for SLURM job names.
+
+    Returns
+    -------
+    SlurmConfig
+
+    Raises
+    ------
+    ValueError
+        If autodiscovery fails and no *account* was provided.
+
+    """
+    if account is None:
+        try:
+            slurm_cfg = SlurmConfig.from_cluster(
+                needs_gpu=False,
+                min_cpus=cpus,
+                min_mem_gb=mem_gb,
+                time=time,
+                cpus_per_task=cpus,
+                mem_gb=mem_gb,
+                qos=qos,
+                constraint=constraint,
+                job_name_prefix=job_name_prefix,
+                **({"partition": partition} if partition is not None else {}),
+            )
+            logger.info(
+                f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
+                f"partition={slurm_cfg.partition}"
+            )
+        except RuntimeError as e:
+            raise ValueError(
+                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
+            ) from e
+    else:
+        slurm_cfg = SlurmConfig(
+            account=account,
+            partition=partition or "cpu",
+            time=time,
+            cpus_per_task=cpus,
+            mem_gb=mem_gb,
+            qos=qos,
+            constraint=constraint,
+            job_name_prefix=job_name_prefix,
+        )
+    return slurm_cfg
+
+
 sync_push_app = App(help="Push local systems or analyses into the database.")
 sync_app.command(sync_push_app, name="push")
 
@@ -439,16 +816,7 @@ def sync_pull_systems(
 
     # File output - always includes all columns
     if output is not None:
-        output = output.resolve()
-        suffix = output.suffix.lower()
-
-        if suffix == ".json":
-            df.to_json(output, orient="records", lines=True)
-        else:
-            # Default to CSV
-            df.to_csv(output, index=False)
-
-        logger.success(f"Wrote {len(df)} record(s) to {output}")
+        _write_output(df, output)
         return
 
     # CLI output
@@ -975,16 +1343,7 @@ def sync_pull_analysis(
 
     # File output
     if output is not None:
-        output = output.resolve()
-        suffix = output.suffix.lower()
-
-        if suffix == ".json":
-            df.to_json(output, orient="records", lines=True)
-        else:
-            # Default to CSV
-            df.to_csv(output, index=False)
-
-        logger.success(f"Wrote {len(df)} record(s) to {output}")
+        _write_output(df, output)
         return
 
     # CLI output
@@ -1069,16 +1428,7 @@ def sync_pull_artifacts(
 
     # File output
     if output is not None:
-        output = output.resolve()
-        suffix = output.suffix.lower()
-
-        if suffix == ".json":
-            df.to_json(output, orient="records", lines=True)
-        else:
-            # Default to CSV
-            df.to_csv(output, index=False)
-
-        logger.success(f"Wrote {len(df)} record(s) to {output}")
+        _write_output(df, output)
         return
 
     # CLI output
@@ -1153,7 +1503,7 @@ def analysis_run(
     skip_existing: bool = True,
     slurm: bool = False,
     account: str | None = None,
-    partition: str = "cpu",
+    partition: str | None = None,
     time: str = "2h",
     cpus: int = 4,
     mem_gb: int = 8,
@@ -1187,8 +1537,6 @@ def analysis_run(
     if source is None:
         raise ValueError("Provide SOURCE as a simulation directory or build summary YAML.")
 
-    if slurm and account is None:
-        raise ValueError("--account is required when using --slurm.")
     if analysis_workers is not None and analysis_workers < 1:
         raise ValueError("--analysis-workers must be >= 1.")
 
@@ -1233,11 +1581,11 @@ def analysis_run(
         print(result_df)
         return
 
-    slurm_cfg = SlurmConfig(
-        account=account or "",
+    slurm_cfg = _resolve_slurm_config(
+        account=account,
         partition=partition,
         time=time,
-        cpus_per_task=cpus,
+        cpus=cpus,
         mem_gb=mem_gb,
         qos=qos,
         constraint=constraint,
@@ -1473,7 +1821,7 @@ def analysis_artifacts_run(
     skip_existing: bool = True,
     slurm: bool = False,
     account: str | None = None,
-    partition: str = "cpu",
+    partition: str | None = None,
     time: str = "2h",
     cpus: int = 4,
     mem_gb: int = 8,
@@ -1520,19 +1868,17 @@ def analysis_artifacts_run(
         print(summary)
         return
 
-    if account is None:
-        raise ValueError("--account is required when using --slurm.")
-
-    slurm_cfg = SlurmConfig(
+    slurm_cfg = _resolve_slurm_config(
         account=account,
         partition=partition,
         time=time,
-        cpus_per_task=cpus,
+        cpus=cpus,
         mem_gb=mem_gb,
         qos=qos,
         constraint=constraint,
         job_name_prefix=job_name_prefix,
     )
+
     if log_dir is None:
         log_dir = determine_log_dir(sim_paths)
     result_df = submit_artifacts_slurm(
@@ -1682,6 +2028,190 @@ def analysis_remove(
     print(df)
 
 
+# ─── search ─────────────────────────────────────────────────────────────────────
+
+
+@app.command(name="search")
+def search_simulations(
+    source: Annotated[Path, Parameter(help="Root directory to search for simulations.")],
+    *,
+    simulation_type: Annotated[
+        str | None,
+        Parameter(name=["--type", "-t"], help="Filter by simulation type."),
+    ] = None,
+    status: Annotated[
+        str | None,
+        Parameter(name=["--status", "-s"], help="Minimum status threshold."),
+    ] = None,
+    hash_prefix: Annotated[
+        str | None,
+        Parameter(name=["--hash"], help="Filter by hash prefix."),
+    ] = None,
+    tag: Annotated[
+        list[str] | None,
+        Parameter(name=["--tag"], help="Filter by tag (key=value). Repeatable."),
+    ] = None,
+    smiles: Annotated[
+        str | None,
+        Parameter(name=["--smiles"], help="Filter by SMILES substructure match."),
+    ] = None,
+    trajectory_file: Annotated[
+        str, Parameter(name=["--trajectory-file"], help="Trajectory filename.")
+    ] = "prod.xtc",
+    structure_file: Annotated[
+        str, Parameter(name=["--structure-file"], help="Structure filename.")
+    ] = "system.pdb",
+    min_status: Annotated[
+        str, Parameter(name=["--min-status"], help="Minimum status for discovery.")
+    ] = "build",
+):
+    """Search and filter simulations in a directory tree.
+
+    Parameters
+    ----------
+    source : Path
+        Root directory to search for simulations.
+    simulation_type : str | None
+        Filter by simulation type (e.g., bilayer, mixedbox, lnp).
+    status : str | None
+        Minimum status threshold for results.
+    hash_prefix : str | None
+        Filter by hash prefix.
+    tag : list[str] | None
+        Tag filters as key=value pairs. Repeatable.
+    smiles : str | None
+        SMILES substructure to match against species.
+    trajectory_file : str
+        Trajectory filename for discovery.
+    structure_file : str
+        Structure filename for discovery.
+    min_status : str
+        Minimum status for discovery (default: build to find all sims).
+
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    # Parse tag filters
+    tag_filters = None
+    if tag:
+        tag_filters = {}
+        for t in tag:
+            if "=" not in t:
+                print(f"Error: Invalid tag format '{t}'. Use key=value.")
+                raise SystemExit(1)
+            k, v = t.split("=", 1)
+            tag_filters[k] = v
+
+    store = SimulationStore(
+        source.resolve(),
+        trajectory_file=trajectory_file,
+        structure_file=structure_file,
+        min_status=min_status,
+    )
+    store.discover()
+
+    try:
+        results = store.search(
+            simulation_type=simulation_type,
+            status=status,
+            hash_prefix=hash_prefix,
+            tags=tag_filters,
+            smiles=smiles,
+        )
+    except (ValueError, ImportError) as e:
+        print(f"Error: {e}")
+        raise SystemExit(1)
+
+    console = Console()
+
+    if results.empty:
+        console.print("[yellow]No simulations found matching the filters.[/yellow]")
+        return
+
+    table = Table(title=f"Found {len(results)} simulation(s)")
+    table.add_column("Hash", style="cyan", no_wrap=True)
+    table.add_column("Type", style="green")
+    table.add_column("Status", style="magenta")
+    table.add_column("Tags")
+    table.add_column("Path", style="dim")
+
+    for _, row in results.iterrows():
+        tags_str = ""
+        if row["tags"]:
+            tags_str = ", ".join(f"{k}={v}" for k, v in row["tags"].items())
+
+        table.add_row(
+            row["hash"][:12],
+            row["simulation_type"],
+            row["status"],
+            tags_str,
+            str(row["path"]),
+        )
+
+    console.print(table)
+
+
+# ─── browse ──────────────────────────────────────────────────────────────────────
+
+
+@app.command(name="browse")
+def browse_simulations(
+    source: Annotated[Path, Parameter(help="Root directory to browse for simulations.")],
+    *,
+    trajectory_file: Annotated[
+        str, Parameter(name=["--trajectory-file"], help="Trajectory filename.")
+    ] = "prod.xtc",
+    structure_file: Annotated[
+        str, Parameter(name=["--structure-file"], help="Structure filename.")
+    ] = "system.pdb",
+    min_status: Annotated[
+        str, Parameter(name=["--min-status"], help="Minimum status for discovery.")
+    ] = "build",
+):
+    """Launch interactive TUI for browsing simulations.
+
+    Requires the [tui] extra: pip install mdfactory[tui]
+
+    Parameters
+    ----------
+    source : Path
+        Root directory to browse for simulations.
+    trajectory_file : str
+        Trajectory filename for discovery.
+    structure_file : str
+        Structure filename for discovery.
+    min_status : str
+        Minimum status for discovery (default: build to find all sims).
+
+    """
+    try:
+        from .tui import _check_textual_available
+
+        _check_textual_available()
+    except ImportError as e:
+        print(str(e))
+        raise SystemExit(1)
+
+    from loguru import logger as _logger
+
+    from .tui.app import SimulationBrowser
+
+    # Remove all loguru handlers — stderr output corrupts the TUI
+    _logger.remove()
+
+    store = SimulationStore(
+        source.resolve(),
+        trajectory_file=trajectory_file,
+        structure_file=structure_file,
+        min_status=min_status,
+    )
+    store.discover()
+
+    browser = SimulationBrowser(store=store)
+    browser.run()
+
+
 config_app = App(help="Manage mdfactory configuration.")
 app.command(config_app, name="config")
 
@@ -1748,6 +2278,131 @@ def config_edit():
 
     editor = os.environ.get("EDITOR", "vi")
     subprocess.run([editor, str(config_path)], check=False)
+
+
+@config_app.command(name="slurm")
+def config_slurm():
+    """Interactive wizard to configure a SLURM executor and save to YAML.
+
+    Queries the local SLURM scheduler for available accounts, partitions,
+    and hardware, then walks through resource selection interactively.
+    The result is saved to a YAML file that can be reused with
+    ``mdfactory build --slurm <file>``.
+
+    On non-SLURM machines, falls back to manual text entry.
+    """
+    from mdfactory.orchestration.tui import UserCancelledError, configure_and_save_slurm
+
+    try:
+        configure_and_save_slurm()
+    except UserCancelledError:
+        logger.info("SLURM configuration cancelled.")
+
+
+@config_app.command(name="cluster")
+def config_cluster(
+    json_output: Annotated[bool, Parameter("--json", help="Output in JSON format.")] = False,
+):
+    """Show discovered SLURM cluster information.
+
+    Queries the local SLURM scheduler and displays available partitions,
+    accounts, and QOS policies. Useful for verifying autodiscovery works
+    and understanding cluster resources before submitting jobs.
+
+    On non-SLURM machines, prints a helpful message instead of failing.
+    """
+    import json as json_module
+
+    from mdfactory.performance.cluster import discover_cluster
+
+    cluster = discover_cluster()
+
+    if cluster is None:
+        if json_output:
+            print(json_module.dumps({"error": "SLURM not available", "cluster": None}))
+        else:
+            print("SLURM cluster not detected.")
+            print()
+            print("This machine does not appear to be a SLURM cluster node,")
+            print("or SLURM commands (sinfo, sacctmgr) are not in PATH.")
+            print()
+            print("To use SLURM submission, run this command on a cluster login node.")
+        return
+
+    if json_output:
+        # Build JSON-serializable structure
+        data = {
+            "default_account": cluster.default_account,
+            "accounts": cluster.accounts,
+            "qos_policies": cluster.qos_policies,
+            "partitions": [
+                {
+                    "name": p.name,
+                    "state": p.state,
+                    "is_default": p.is_default,
+                    "max_time": p.max_time,
+                    "default_time": p.default_time,
+                    "total_nodes": p.total_nodes,
+                    "node_types": [
+                        {
+                            "cpus": nt.cpus,
+                            "memory_mb": nt.memory_mb,
+                            "gpu_specs": [
+                                {"count": count, "type": gtype} for count, gtype in nt.gpu_specs
+                            ],
+                            "features": list(nt.features),
+                            "count": nt.count,
+                        }
+                        for nt in p.node_types
+                    ],
+                }
+                for p in cluster.partitions
+            ],
+        }
+        print(json_module.dumps(data, indent=2))
+        return
+
+    # Human-readable output
+    print("SLURM Cluster Information")
+    print("=" * 50)
+    print()
+
+    # Account info
+    print(f"Default Account: {cluster.default_account or '(none)'}")
+    if cluster.accounts:
+        print(f"Available Accounts: {', '.join(cluster.accounts)}")
+    print()
+
+    # QOS info
+    if cluster.qos_policies:
+        print(f"QOS Policies: {', '.join(cluster.qos_policies)}")
+        print()
+
+    # Partition info
+    print("Partitions:")
+    print("-" * 50)
+    for partition in cluster.partitions:
+        default_marker = " (default)" if partition.is_default else ""
+        state_marker = f" [{partition.state}]" if partition.state != "up" else ""
+        print(f"\n  {partition.name}{default_marker}{state_marker}")
+        print(f"    Nodes: {partition.total_nodes}")
+        print(f"    Max Time: {partition.max_time}")
+        if partition.default_time != partition.max_time:
+            print(f"    Default Time: {partition.default_time}")
+
+        # Summarize node types
+        for nt in partition.node_types:
+            gpu_info = ""
+            if nt.gpu_specs:
+                # Format multiple GPU types like "7x b200, 7x 1g.23gb"
+                gpu_parts = [f"{count}x {gtype or 'unknown'}" for count, gtype in nt.gpu_specs]
+                gpu_info = f", {', '.join(gpu_parts)}"
+            mem_gb = nt.memory_mb // 1024
+            features_str = ""
+            if nt.features:
+                features_str = f" [{', '.join(nt.features)}]"
+            count_str = f" ({nt.count} node{'s' if nt.count != 1 else ''})"
+            print(f"      - {nt.cpus} CPUs, {mem_gb} GB{gpu_info}{features_str}{count_str}")
 
 
 def main():

@@ -32,11 +32,14 @@ class BuildInput(BaseModel):
         None, description="Parametrization-specific configuration. If None, uses defaults."
     )
     engine: Literal["gromacs"] = Field("gromacs", description="MD engine.")
+    tags: dict[str, str] | None = Field(
+        None, description="User-defined metadata tags, excluded from hash."
+    )
 
     @property
     def hash(self):
         """Return a SHA-1 hash of the full JSON representation."""
-        json_repr = self.model_dump_json()
+        json_repr = self.model_dump_json(exclude={"tags"})
         return hashlib.sha1(json_repr.encode("UTF-8")).hexdigest().upper()
 
     @property
@@ -84,6 +87,7 @@ class BuildInput(BaseModel):
             "species_composition": species_composition,
             "system_specific": system_specific,
             "build_input_json": self.model_dump_json(),
+            "tags": self.tags,
         }
 
     def to_data_row(self) -> dict[str, Any]:

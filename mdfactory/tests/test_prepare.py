@@ -120,3 +120,58 @@ def test_df_to_models():
     assert 1 in errors
     assert 3 in errors
     # df.to_csv("test_errors.csv")
+
+
+def test_tags_from_csv_dot_notation():
+    """Test that tags.key columns in CSV produce BuildInput with tags dict."""
+    row = {
+        "simulation_type": "mixedbox",
+        "engine": "gromacs",
+        "parametrization": "cgenff",
+        "system.total_count": 1000,
+        "system.species.ABC.smiles": "CCC",
+        "system.species.ABC.fraction": 0.5,
+        "system.species.DEF.smiles": "CCO",
+        "system.species.DEF.fraction": 0.5,
+        "tags.formulation_id": "F42",
+        "tags.project": "lnp_screen",
+    }
+    nested = dict_to_nested_dict_with_species_prefix(row)
+    assert nested["tags"] == {"formulation_id": "F42", "project": "lnp_screen"}
+
+    inp = BuildInput(**nested)
+    assert inp.tags == {"formulation_id": "F42", "project": "lnp_screen"}
+
+
+def test_tags_from_csv_df():
+    """Test tags columns flow through df_to_build_input_models."""
+    rows = [
+        {
+            "simulation_type": "mixedbox",
+            "engine": "gromacs",
+            "parametrization": "cgenff",
+            "system.total_count": 1000,
+            "system.species.ABC.smiles": "CCC",
+            "system.species.ABC.fraction": 0.5,
+            "system.species.DEF.smiles": "CCO",
+            "system.species.DEF.fraction": 0.5,
+            "tags.project": "test",
+        },
+        {
+            "simulation_type": "mixedbox",
+            "engine": "gromacs",
+            "parametrization": "cgenff",
+            "system.total_count": 1500,
+            "system.species.ABC.smiles": "CCC",
+            "system.species.ABC.fraction": 0.5,
+            "system.species.DEF.smiles": "CCO",
+            "system.species.DEF.fraction": 0.5,
+            "tags.project": "test",
+        },
+    ]
+    df = pd.DataFrame(rows)
+    models, errors = df_to_build_input_models(df)
+    assert not errors
+    assert len(models) == 2
+    assert models[0].tags == {"project": "test"}
+    assert models[1].tags == {"project": "test"}

@@ -70,6 +70,12 @@ class Settings:
                 "ANALYSIS_DB_PATH": "/Group Functions/mdfactory/analysis",
                 "ARTIFACT_DB_PATH": "/Group Functions/mdfactory/artifacts",
             },
+            "slurm": {
+                "ACCOUNT": "",
+                "PARTITION_CPU": "",
+                "PARTITION_GPU": "",
+                "DEFAULT_QOS": "",
+            },
         }
 
     # Keep DEFAULT_CONFIG as class attribute for backward compat in tests
@@ -95,6 +101,12 @@ class Settings:
             "RUN_DB_PATH": "/Group Functions/mdfactory/runs",
             "ANALYSIS_DB_PATH": "/Group Functions/mdfactory/analysis",
             "ARTIFACT_DB_PATH": "/Group Functions/mdfactory/artifacts",
+        },
+        "slurm": {
+            "ACCOUNT": "",
+            "PARTITION_CPU": "",
+            "PARTITION_GPU": "",
+            "DEFAULT_QOS": "",
         },
     }
 
@@ -311,6 +323,43 @@ class Settings:
         path_key = db_mapping.get(db_name, db_name)
         raw_path = self.config["csv"].get(path_key, "")
         return self._resolve_local_path(raw_path)
+
+    # --- SLURM properties ---
+
+    @property
+    def slurm_account(self) -> str | None:
+        """Return configured SLURM account, or None if not set."""
+        val = self.config.get("slurm", "ACCOUNT", fallback="").strip()
+        return val if val else None
+
+    @property
+    def slurm_partition_cpu(self) -> str | None:
+        """Return configured CPU partition name, or None if not set.
+
+        Maps to ``[slurm] PARTITION_CPU`` in config.ini.
+        Used by ``BaseSlurmConfig.from_cluster()`` when ``needs_gpu=False``.
+        """
+        val = self.config.get("slurm", "PARTITION_CPU", fallback="").strip()
+        return val if val else None
+
+    @property
+    def slurm_partition_gpu(self) -> str | None:
+        """Return configured GPU partition name, or None if not set.
+
+        Maps to ``[slurm] PARTITION_GPU`` in config.ini.
+        Used by ``BaseSlurmConfig.from_cluster()`` when ``needs_gpu=True``.
+        """
+        val = self.config.get("slurm", "PARTITION_GPU", fallback="").strip()
+        return val if val else None
+
+    @property
+    def slurm_qos(self) -> str | None:
+        """Return configured SLURM default QOS, or None if not set.
+
+        Maps to ``[slurm] DEFAULT_QOS`` in config.ini.
+        """
+        val = self.config.get("slurm", "DEFAULT_QOS", fallback="").strip()
+        return val if val else None
 
 
 # Module-level singleton

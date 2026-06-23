@@ -2,14 +2,17 @@
 # ABOUTME: and file locking behavior under concurrent access.
 """Tests for general utility functions including YAML file loading."""
 
+import subprocess
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
 
 from mdfactory.utils.utilities import (
     load_yaml_file,
+    run_command,
 )
 
 from .utils import ProcessWithException
@@ -131,3 +134,76 @@ def test_lock_folder_processes(tmp_path):
         if proc.exception:
             raise Exception(f"{proc.exception[1]}") from proc.exception[0]
     assert not lockfile.is_file()
+
+
+# ---------------------------------------------------------------------------
+# Tests: run_command
+# ---------------------------------------------------------------------------
+
+
+class TestRunCommand:
+    """Test run_command with various failure modes and options."""
+
+    def test_graceful_returns_none_on_timeout(self):
+        """Test that graceful=True returns None on timeout."""
+        with patch(
+            "mdfactory.utils.utilities.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["test_cmd"], timeout=30),
+        ):
+            result = run_command(["test_cmd"], timeout=30, graceful=True)
+        assert result is None
+
+    def test_graceful_returns_none_on_file_not_found(self):
+        """Test that graceful=True returns None when binary not found."""
+        with patch(
+            "mdfactory.utils.utilities.subprocess.run",
+            side_effect=FileNotFoundError("No such file"),
+        ):
+            result = run_command(["nonexistent_binary"], graceful=True)
+        assert result is None
+
+    def test_graceful_returns_none_on_nonzero_exit(self):
+        """Test that graceful=True returns None on non-zero exit."""
+        with patch(
+            "mdfactory.utils.utilities.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["test"], returncode=1, stdout="", stderr="error"
+            ),
+        ):
+            result = run_command(["test", "--flag"], graceful=True)
+        assert result is None
+
+    def test_graceful_returns_stdout_on_success(self):
+        """Test that graceful=True returns stdout on success."""
+        with patch(
+            "mdfactory.utils.utilities.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["echo"], returncode=0, stdout="hello\n", stderr=""
+            ),
+        ):
+            result = run_command(["echo", "hello"], graceful=True)
+        assert result == "hello"
+
+    def test_check_raises_on_nonzero_exit(self):
+        """Test that check=True raises on non-zero exit."""
+        with patch(
+            "mdfactory.utils.utilities.subprocess.run",
+            side_effect=subprocess.CalledProcessError(
+                returncode=1, cmd=["false"], output="", stderr="error"
+            ),
+        ):
+            with pytest.raises(subprocess.CalledProcessError):
+                run_command(["false"], check=True)
+
+    def test_returns_completed_process_when_no_capture(self):
+        """Test that result is CompletedProcess when not capturing output."""
+        with patch(
+            "mdfactory.utils.utilities.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["echo"], returncode=0, stdout=None, stderr=None
+            ),
+        ) as mock_run:
+            result = run_command(["echo", "test"], capture_output=False)
+            assert isinstance(result, subprocess.CompletedProcess)
+            assert result.returncode == 0
+            mock_run.assert_called_once()

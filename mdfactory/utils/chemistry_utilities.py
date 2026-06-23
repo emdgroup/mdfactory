@@ -762,3 +762,40 @@ def create_lipid_assignment(
 
     print(f"Lipid assignment visualization saved to {output_file}")
     return segments
+
+
+def smiles_substructure_match(query_smiles: str, target_smiles: str) -> bool:
+    """Check if target molecule contains query as a substructure.
+
+    Parameters
+    ----------
+    query_smiles : str
+        SMILES of the query substructure.
+    target_smiles : str
+        SMILES of the target molecule.
+
+    Returns
+    -------
+    bool
+        True if target contains query substructure.
+
+    Raises
+    ------
+    ValueError
+        If either SMILES string is invalid.
+
+    """
+    from rdkit import RDLogger
+
+    # Suppress RDKit stderr spam for invalid SMILES (expected input case)
+    RDLogger.DisableLog("rdApp.*")
+    try:
+        query_mol = Chem.MolFromSmiles(query_smiles)
+        if query_mol is None:
+            raise ValueError(f"Invalid query SMILES: {query_smiles}")
+        target_mol = Chem.MolFromSmiles(target_smiles)
+        if target_mol is None:
+            raise ValueError(f"Invalid target SMILES: {target_smiles}")
+        return target_mol.HasSubstructMatch(query_mol)
+    finally:
+        RDLogger.EnableLog("rdApp.*")

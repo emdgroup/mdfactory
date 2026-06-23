@@ -40,6 +40,7 @@ class SimulationStore:
         roots: list[Path | str] | Path | str,
         trajectory_file: str = "prod.xtc",
         structure_file: str = "system.pdb",
+        min_status: str = "production",
     ):
         """Initialize store with one or more root paths.
 
@@ -51,6 +52,9 @@ class SimulationStore:
             Trajectory filename to discover
         structure_file : str
             Structure filename to discover
+        min_status : str
+            Minimum simulation status to include in discovery. One of:
+            "build", "equilibrated", "production", "completed".
 
         """
         # Normalize roots to list of Paths
@@ -61,6 +65,7 @@ class SimulationStore:
 
         self.trajectory_file = trajectory_file
         self.structure_file = structure_file
+        self.min_status = min_status
 
         self._simulations: dict[str, Simulation] = {}  # hash -> Simulation
         self._discovery_df: pd.DataFrame | None = None
@@ -105,6 +110,7 @@ class SimulationStore:
                 root,
                 trajectory_file=self.trajectory_file,
                 structure_file=self.structure_file,
+                min_status=self.min_status,
             )
             dfs.append(df)
 
@@ -240,12 +246,136 @@ class SimulationStore:
                 "path": path,
                 **flattened,
             }
+
+            # Merge tags into metadata row
+            if build_input.tags:
+                for tag_key, tag_val in build_input.tags.items():
+                    metadata_row[f"tag_{tag_key}"] = tag_val
+
             metadata_rows.append(metadata_row)
 
         metadata_df = pd.DataFrame(metadata_rows)
         logger.info(f"Built metadata table with {len(metadata_df)} rows")
 
         return metadata_df
+
+    def search(
+        self,
+        *,
+        simulation_type: str | None = None,
+        status: str | None = None,
+        hash_prefix: str | None = None,
+        tags: dict[str, str] | None = None,
+        smiles: str | None = None,
+    ) -> pd.DataFrame:
+        """Search and filter discovered simulations.
+
+        Applies all provided filters conjunctively (AND logic).
+
+        Parameters
+        ----------
+        simulation_type : str | None
+            Filter by simulation type (exact match).
+        status : str | None
+            Filter by minimum status threshold.
+        hash_prefix : str | None
+            Filter by hash prefix (case-insensitive).
+        tags : dict[str, str] | None
+            Filter by tag key-value pairs (all must match).
+        smiles : str | None
+            Filter by SMILES substructure match against any species.
+
+        Returns
+        -------
+        pd.DataFrame
+            Filtered DataFrame with columns: hash, path, simulation_type,
+            status, tags (dict or None).
+
+        """
+        from loguru import logger
+
+        self._ensure_discovered()
+
+        if len(self._discovery_df) == 0:
+            logger.info("No simulations to search")
+            return pd.DataFrame(columns=["hash", "path", "simulation_type", "status", "tags"])
+
+        # Pre-validate and import dependencies before iterating
+        from .constants import STATUS_ORDER
+
+        if status is not None and status not in STATUS_ORDER:
+            raise ValueError(f"Invalid status '{status}'. Must be one of: {STATUS_ORDER}")
+
+        smiles_substructure_match = None
+        if smiles is not None:
+            try:
+                from mdfactory.utils.chemistry_utilities import (
+                    smiles_substructure_match,
+                )
+            except ImportError:
+                raise ImportError(
+                    "RDKit is required for SMILES search. "
+                    "Install it via conda: conda install -c conda-forge rdkit"
+                )
+
+        # Build result rows from discovery
+        rows = []
+        for _, row in self._discovery_df.iterrows():
+            sim = row["simulation"]
+            bi = sim.build_input
+            sim_hash = row["hash"]
+            sim_path = row["path"]
+            sim_status = sim.status
+
+            # Filter: simulation_type
+            if simulation_type is not None and bi.simulation_type != simulation_type:
+                continue
+
+            # Filter: status (minimum threshold)
+            if status is not None:
+                status_idx = STATUS_ORDER.index(sim_status)
+                min_idx = STATUS_ORDER.index(status)
+                if status_idx < min_idx:
+                    continue
+
+            # Filter: hash prefix
+            if hash_prefix is not None:
+                if not sim_hash.upper().startswith(hash_prefix.upper()):
+                    continue
+
+            # Filter: tags
+            if tags is not None:
+                if bi.tags is None:
+                    continue
+                if not all(bi.tags.get(k) == v for k, v in tags.items()):
+                    continue
+
+            # Filter: SMILES substructure
+            if smiles is not None:
+                match_found = False
+                for species in bi.system.species:
+                    species_smiles = getattr(species, "smiles", None)
+                    if species_smiles and smiles_substructure_match(smiles, species_smiles):
+                        match_found = True
+                        break
+                if not match_found:
+                    continue
+
+            rows.append(
+                {
+                    "hash": sim_hash,
+                    "path": sim_path,
+                    "simulation_type": bi.simulation_type,
+                    "status": sim_status,
+                    "tags": bi.tags,
+                }
+            )
+
+        logger.info(f"Search returned {len(rows)} results")
+        return pd.DataFrame(
+            rows,
+            columns=["hash", "path", "simulation_type", "status", "tags"],
+        )
 
     def load_analysis_with_metadata(
         self,

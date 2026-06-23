@@ -465,3 +465,111 @@ def test_shell_composition_counts_sum_correctly():
     assert abs(ratios[0] - 0.33) < 0.05
     assert abs(ratios[1] - 0.33) < 0.05
     assert abs(ratios[2] - 0.34) < 0.05
+
+
+def test_build_input_tags_field():
+    """Test that BuildInput accepts optional tags field."""
+    spec = SingleMoleculeSpecies(smiles="CCC", count=100, resname="ABC")
+    comp = MixedBoxComposition(species=[spec], total_count=100)
+
+    # Without tags
+    inp = BuildInput(simulation_type="mixedbox", system=comp)
+    assert inp.tags is None
+
+    # With tags
+    inp_tagged = BuildInput(
+        simulation_type="mixedbox",
+        system=comp,
+        tags={"project": "test", "batch": "001"},
+    )
+    assert inp_tagged.tags == {"project": "test", "batch": "001"}
+
+
+def test_build_input_tags_excluded_from_hash():
+    """Test that tags do not affect hash computation."""
+    spec = SingleMoleculeSpecies(smiles="CCC", count=100, resname="ABC")
+    comp = MixedBoxComposition(species=[spec], total_count=100)
+
+    inp_no_tags = BuildInput(simulation_type="mixedbox", system=comp)
+    inp_none_tags = BuildInput(simulation_type="mixedbox", system=comp, tags=None)
+    inp_with_tags = BuildInput(
+        simulation_type="mixedbox",
+        system=comp,
+        tags={"project": "test"},
+    )
+    inp_diff_tags = BuildInput(
+        simulation_type="mixedbox",
+        system=comp,
+        tags={"project": "other", "batch": "002"},
+    )
+
+    assert inp_no_tags.hash == inp_none_tags.hash
+    assert inp_no_tags.hash == inp_with_tags.hash
+    assert inp_no_tags.hash == inp_diff_tags.hash
+
+
+def test_build_input_tags_roundtrip():
+    """Test that tags survive to_data_row/from_data_row round-trip."""
+    spec = SingleMoleculeSpecies(smiles="CCC", count=100, resname="ABC")
+    comp = MixedBoxComposition(species=[spec], total_count=100)
+
+    inp = BuildInput(
+        simulation_type="mixedbox",
+        system=comp,
+        tags={"formulation_id": "F42", "project": "lnp_screen"},
+    )
+
+    row = inp.to_data_row()
+    reconstructed = BuildInput.from_data_row(row)
+
+    assert reconstructed.tags == {"formulation_id": "F42", "project": "lnp_screen"}
+    assert reconstructed.hash == inp.hash
+    assert reconstructed == inp
+
+
+def test_build_input_tags_in_metadata():
+    """Test that tags are included in metadata property."""
+    spec = SingleMoleculeSpecies(smiles="CCC", count=100, resname="ABC")
+    comp = MixedBoxComposition(species=[spec], total_count=100)
+
+    inp = BuildInput(
+        simulation_type="mixedbox",
+        system=comp,
+        tags={"project": "test"},
+    )
+    meta = inp.metadata
+    assert meta["tags"] == {"project": "test"}
+
+    # Without tags
+    inp_no_tags = BuildInput(simulation_type="mixedbox", system=comp)
+    meta_no_tags = inp_no_tags.metadata
+    assert meta_no_tags["tags"] is None
+
+
+def test_build_input_tags_yaml_roundtrip():
+    """Test that tags survive YAML serialization (model_dump/reconstruct)."""
+    import yaml
+
+    spec = SingleMoleculeSpecies(smiles="CCC", count=100, resname="ABC")
+    comp = MixedBoxComposition(species=[spec], total_count=100)
+
+    inp = BuildInput(
+        simulation_type="mixedbox",
+        system=comp,
+        tags={"project": "test", "batch": "001"},
+    )
+
+    # Simulate YAML round-trip (same as cli.py does)
+    dumped = yaml.safe_dump(inp.model_dump())
+    loaded = yaml.safe_load(dumped)
+    reconstructed = BuildInput(**loaded)
+
+    assert reconstructed.tags == {"project": "test", "batch": "001"}
+    assert reconstructed.hash == inp.hash
+
+    # Without tags (simulates loading old YAML files)
+    data = inp.model_dump()
+    del data["tags"]
+    reconstructed_no_tags = BuildInput(**data)
+    assert reconstructed_no_tags.tags is None
+    assert reconstructed_no_tags.hash == inp.hash
