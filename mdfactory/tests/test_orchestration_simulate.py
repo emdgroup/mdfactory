@@ -10,8 +10,11 @@ import pytest
 from mdfactory.orchestration.config import ExecutorConfig
 from mdfactory.orchestration.simulate import (
     _detect_needed_stages,
+    _execute_stage_list,
     _log_dry_run_plan,
     _validate_simulation_dir,
+    _validate_stage_prerequisites,
+    _validate_trajectory_complete,
     run_simulations,
 )
 
@@ -89,11 +92,14 @@ def test_checkpoint_force_never_skips(mock_sim_dir):
 
 
 def test_checkpoint_all_stages_complete(mock_sim_dir):
-    """All stages skipped when outputs exist."""
+    """All stages skipped when outputs AND prerequisite checkpoints exist."""
     (mock_sim_dir / "min.gro").write_text("FAKE")
     (mock_sim_dir / "nvt.gro").write_text("FAKE")
+    (mock_sim_dir / "nvt.cpt").write_text("FAKE CPT")  # NPT needs this
     (mock_sim_dir / "npt.gro").write_text("FAKE")
-    (mock_sim_dir / "prod.xtc").write_text("FAKE")
+    (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")  # Production needs this
+    # Create large trajectory file (> 10 MB) to pass size fallback validation
+    (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 11_000_000)
 
     needed = _detect_needed_stages(mock_sim_dir, ["EM", "NVT", "NPT", "Production"], "auto")
     assert len(needed) == 0
@@ -138,8 +144,8 @@ def test_log_dry_run_plan_format(mock_sim_dir):
 
 
 @patch("mdfactory.orchestration.simulate.parsl_session")
-@patch("mdfactory.orchestration.simulate.run_full_pipeline")
-def test_parallel_submission(mock_pipeline, mock_session, tmp_path):
+@patch("mdfactory.orchestration.simulate._execute_stage_list")
+def test_parallel_submission(mock_execute, mock_session, tmp_path):
     """Multiple simulations submit in parallel."""
     # Create 10 mock simulations
     sim_dirs = []
@@ -152,11 +158,11 @@ def test_parallel_submission(mock_pipeline, mock_session, tmp_path):
             (sim_dir / f"{mdp}.mdp").write_text("FAKE")
         sim_dirs.append(sim_dir)
 
-    # Mock pipeline returns future
+    # Mock execute_stage_list returns future
     mock_future = MagicMock()
     mock_future.result.return_value = {"status": "success"}
     mock_future.done.return_value = True
-    mock_pipeline.return_value = mock_future
+    mock_execute.return_value = mock_future
 
     # Mock session context
     mock_session.return_value.__enter__.return_value = MagicMock()
@@ -164,8 +170,8 @@ def test_parallel_submission(mock_pipeline, mock_session, tmp_path):
     # Run
     results = run_simulations(sim_dirs, ExecutorConfig(), stages=["EM", "NVT", "NPT", "Production"])
 
-    # Verify 10 pipelines submitted
-    assert mock_pipeline.call_count == 10
+    # Verify 10 stage lists executed
+    assert mock_execute.call_count == 10
 
 
 def test_stage_filtering(mock_sim_dir):
@@ -207,15 +213,18 @@ def test_multiple_simulations_mixed_states(tmp_path):
         (sim2 / f).write_text("FAKE")
     (sim2 / "min.gro").write_text("FAKE")
 
-    # Sim 3: all complete
+    # Sim 3: all complete (with prerequisite checkpoints)
     sim3 = tmp_path / "sim3"
     sim3.mkdir()
     for f in ["system.pdb", "topology.top", "em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"]:
         (sim3 / f).write_text("FAKE")
     (sim3 / "min.gro").write_text("FAKE")
     (sim3 / "nvt.gro").write_text("FAKE")
+    (sim3 / "nvt.cpt").write_text("FAKE CPT")  # NPT prerequisite
     (sim3 / "npt.gro").write_text("FAKE")
-    (sim3 / "prod.xtc").write_text("FAKE")
+    (sim3 / "npt.cpt").write_text("FAKE CPT")  # Production prerequisite
+    # Create large trajectory file (> 10 MB) to pass size fallback validation
+    (sim3 / "prod.xtc").write_bytes(b"X" * 11_000_000)
 
     results = run_simulations([sim1, sim2, sim3], ExecutorConfig(), dry_run=True)
 
@@ -230,7 +239,9 @@ def test_checkpoint_production_output(mock_sim_dir):
     (mock_sim_dir / "min.gro").write_text("FAKE")
     (mock_sim_dir / "nvt.gro").write_text("FAKE")
     (mock_sim_dir / "npt.gro").write_text("FAKE")
-    (mock_sim_dir / "prod.xtc").write_text("FAKE")
+    (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")  # Production prerequisite
+    # Create large trajectory file (> 10 MB) to pass size fallback validation
+    (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 11_000_000)
 
     needed = _detect_needed_stages(mock_sim_dir, ["Production"], "auto")
     assert "Production" not in needed
@@ -243,11 +254,11 @@ def test_stage_order_preservation(mock_sim_dir):
 
 
 @patch("mdfactory.orchestration.simulate.parsl_session")
-@patch("mdfactory.orchestration.simulate.run_full_pipeline")
-def test_wait_false_returns_futures(mock_pipeline, mock_session, mock_sim_dir):
+@patch("mdfactory.orchestration.simulate._execute_stage_list")
+def test_wait_false_returns_futures(mock_execute, mock_session, mock_sim_dir):
     """When wait=False, returns raw futures."""
     mock_future = MagicMock()
-    mock_pipeline.return_value = mock_future
+    mock_execute.return_value = mock_future
 
     mock_session_obj = MagicMock()
     mock_session.return_value.__enter__.return_value = mock_session_obj
@@ -264,3 +275,670 @@ def test_empty_sim_list():
     """Handle empty simulation list gracefully."""
     results = run_simulations([], ExecutorConfig(), dry_run=True)
     assert results == []
+
+
+# === Decision 2: Strict Checkpoint Validation Tests ===
+
+
+def test_checkpoint_auto_requires_cpt_files(mock_sim_dir):
+    """NPT requires both npt.gro AND nvt.cpt for auto mode."""
+    # Create npt.gro but NOT nvt.cpt
+    (mock_sim_dir / "min.gro").write_text("FAKE")
+    (mock_sim_dir / "nvt.gro").write_text("FAKE")
+    (mock_sim_dir / "npt.gro").write_text("FAKE")
+    # nvt.cpt is missing!
+
+    needed = _detect_needed_stages(mock_sim_dir, ["EM", "NVT", "NPT"], "auto")
+
+    # NPT should still be needed because nvt.cpt is missing
+    assert "EM" not in needed  # min.gro exists
+    assert "NVT" not in needed  # nvt.gro exists
+    assert "NPT" in needed  # nvt.cpt missing
+
+
+def test_checkpoint_auto_skips_with_all_files(mock_sim_dir):
+    """NPT skipped when both npt.gro AND nvt.cpt exist."""
+    (mock_sim_dir / "min.gro").write_text("FAKE")
+    (mock_sim_dir / "nvt.gro").write_text("FAKE")
+    (mock_sim_dir / "nvt.cpt").write_text("FAKE CPT")
+    (mock_sim_dir / "npt.gro").write_text("FAKE")
+
+    needed = _detect_needed_stages(mock_sim_dir, ["NPT"], "auto")
+
+    assert "NPT" not in needed  # Both npt.gro and nvt.cpt exist
+
+
+def test_checkpoint_production_requires_npt_cpt(mock_sim_dir):
+    """Production requires prod.xtc AND npt.cpt."""
+    (mock_sim_dir / "prod.xtc").write_text("FAKE TRAJ")
+    # npt.cpt is missing!
+
+    needed = _detect_needed_stages(mock_sim_dir, ["Production"], "auto")
+
+    # Production should be needed because npt.cpt is missing
+    assert "Production" in needed
+
+
+def test_checkpoint_production_skips_with_all_files(mock_sim_dir):
+    """Production skipped when both prod.xtc AND npt.cpt exist."""
+    (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")
+    # Create large trajectory file (> 10 MB) to pass size fallback validation
+    (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 11_000_000)
+
+    needed = _detect_needed_stages(mock_sim_dir, ["Production"], "auto")
+
+    assert "Production" not in needed
+
+
+def test_validate_prerequisites_em_no_requirements():
+    """EM has no prerequisites."""
+    # EM doesn't need any input files (uses system.pdb which is validated elsewhere)
+    from pathlib import Path
+
+    sim_dir = Path("/tmp/fake")
+    _validate_stage_prerequisites(sim_dir, "EM")  # Should not raise
+
+
+def test_validate_prerequisites_nvt_requires_min_gro(mock_sim_dir):
+    """NVT requires min.gro from EM."""
+    # min.gro is missing
+    with pytest.raises(FileNotFoundError, match="Cannot start NVT.*min.gro"):
+        _validate_stage_prerequisites(mock_sim_dir, "NVT")
+
+
+def test_validate_prerequisites_nvt_succeeds_with_min_gro(mock_sim_dir):
+    """NVT validation passes when min.gro exists."""
+    (mock_sim_dir / "min.gro").write_text("FAKE")
+    _validate_stage_prerequisites(mock_sim_dir, "NVT")  # Should not raise
+
+
+def test_validate_prerequisites_npt_requires_nvt_files(mock_sim_dir):
+    """NPT requires both nvt.gro AND nvt.cpt."""
+    # Only create nvt.gro, not nvt.cpt
+    (mock_sim_dir / "nvt.gro").write_text("FAKE")
+
+    with pytest.raises(FileNotFoundError, match="Cannot start NPT.*nvt.cpt"):
+        _validate_stage_prerequisites(mock_sim_dir, "NPT")
+
+
+def test_validate_prerequisites_npt_succeeds_with_all_files(mock_sim_dir):
+    """NPT validation passes when nvt.gro AND nvt.cpt exist."""
+    (mock_sim_dir / "nvt.gro").write_text("FAKE")
+    (mock_sim_dir / "nvt.cpt").write_text("FAKE CPT")
+    _validate_stage_prerequisites(mock_sim_dir, "NPT")  # Should not raise
+
+
+def test_validate_prerequisites_production_requires_npt_files(mock_sim_dir):
+    """Production requires both npt.gro AND npt.cpt."""
+    # Only create npt.gro, not npt.cpt
+    (mock_sim_dir / "npt.gro").write_text("FAKE")
+
+    with pytest.raises(FileNotFoundError, match="Cannot start Production.*npt.cpt"):
+        _validate_stage_prerequisites(mock_sim_dir, "Production")
+
+
+def test_validate_prerequisites_production_succeeds_with_all_files(mock_sim_dir):
+    """Production validation passes when npt.gro AND npt.cpt exist."""
+    (mock_sim_dir / "npt.gro").write_text("FAKE")
+    (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")
+    _validate_stage_prerequisites(mock_sim_dir, "Production")  # Should not raise
+
+
+def test_validate_prerequisites_error_message_includes_fix(mock_sim_dir):
+    """Error message includes actionable fix commands."""
+    with pytest.raises(FileNotFoundError) as exc_info:
+        _validate_stage_prerequisites(mock_sim_dir, "NPT")
+
+    error_msg = str(exc_info.value)
+    assert "mdfactory simulate" in error_msg  # Fix command included
+    assert "--stages EM NVT" in error_msg  # Suggests running earlier stages
+    assert "--checkpoint force" in error_msg  # Alternative fix
+
+
+@patch("mdfactory.orchestration.simulate.parsl_session")
+def test_prerequisite_validation_before_parsl_session(mock_session, mock_sim_dir):
+    """Prerequisites validated before Parsl session starts."""
+    # Create incomplete state: NVT complete but missing nvt.cpt (needed for NPT)
+    (mock_sim_dir / "min.gro").write_text("FAKE")
+    (mock_sim_dir / "nvt.gro").write_text("FAKE")
+    # nvt.cpt is missing!
+
+    # Try to run NPT (which requires nvt.cpt)
+    with pytest.raises(FileNotFoundError, match="Cannot start NPT"):
+        run_simulations(
+            [mock_sim_dir],
+            ExecutorConfig(),
+            stages=["NPT", "Production"],
+            checkpoint_mode="force",  # Force to ensure NPT is in work plan
+        )
+
+    # Parsl session should NOT have been started
+    mock_session.assert_not_called()
+
+
+# === Decision 3: Resource Auto-Detection Tests ===
+
+
+def test_mdrun_app_cpu_fallback():
+    """Mdrun bash app uses default thread count when env vars unset."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(deffnm="test", work_dir="/tmp/test")
+
+    # Should use default of 12 threads
+    assert "NTHR=${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-12}}" in bash_script
+    # Should use CPU mode (no GPU flags)
+    assert "gmx mdrun -deffnm test -nt $NTHR" in bash_script
+
+
+def test_mdrun_app_gpu_detection():
+    """Mdrun bash app detects GPU from CUDA_VISIBLE_DEVICES."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(deffnm="test", work_dir="/tmp/test")
+
+    # Should check for CUDA_VISIBLE_DEVICES
+    assert "CUDA_VISIBLE_DEVICES" in bash_script
+    # GPU mode should use -ntmpi 1 -ntomp -gpu_id -nb gpu -pme gpu
+    assert "-ntmpi 1" in bash_script
+    assert "-ntomp $NTHR" in bash_script
+    assert "-gpu_id $GPU_ID" in bash_script
+    assert "-nb gpu" in bash_script
+    assert "-pme gpu" in bash_script
+
+
+def test_mdrun_app_logging():
+    """Mdrun bash app logs resource configuration to stderr."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(deffnm="test", work_dir="/tmp/test")
+
+    # Should log what resources are being used
+    assert "Running on GPU" in bash_script
+    assert "Running on CPU" in bash_script
+    assert ">&2" in bash_script  # Logs to stderr
+
+
+def test_mdrun_app_slurm_priority():
+    """SLURM_CPUS_PER_TASK has priority over OMP_NUM_THREADS."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(deffnm="test", work_dir="/tmp/test")
+
+    # Check priority order in bash variable expansion
+    assert "${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-12}}" in bash_script
+
+
+def test_stage_functions_no_hardcoded_nt():
+    """Stage functions don't pass hardcoded nt parameter to mdrun."""
+    from mdfactory.orchestration import stages
+    import inspect
+
+    # Check all stage functions
+    for name in ["run_em_stage", "run_nvt_stage", "run_npt_stage", "run_production_stage"]:
+        func = getattr(stages, name)
+        source = inspect.getsource(func)
+        # Should NOT have nt=12 anywhere
+        assert "nt=12" not in source, f"{name} still has hardcoded nt=12"
+        assert "nt=24" not in source, f"{name} has hardcoded nt"
+
+
+# === Decision 1: Explicit Stage Execution Tests ===
+
+
+def test_execute_stage_list_empty():
+    """Execute stage list returns None when no stages provided."""
+    result = _execute_stage_list(Path("/tmp/test"), [], None, None)
+    assert result is None
+
+
+def test_execute_stage_list_validates_order():
+    """Execute stage list validates stages are in dependency order."""
+    with pytest.raises(ValueError, match="must be in dependency order"):
+        # NPT before NVT is invalid
+        _execute_stage_list(Path("/tmp/test"), ["NPT", "NVT"], None, None)
+
+
+def test_execute_stage_list_validates_unknown_stage():
+    """Execute stage list rejects unknown stage names."""
+    with pytest.raises(ValueError, match="Unknown stage.*Equilibration"):
+        _execute_stage_list(Path("/tmp/test"), ["Equilibration"], None, None)
+
+
+@patch("mdfactory.orchestration.simulate.run_em_stage")
+def test_execute_stage_list_em_only(mock_em):
+    """Execute stage list runs EM without dependencies."""
+    mock_future = MagicMock()
+    mock_em.return_value = mock_future
+
+    result = _execute_stage_list(
+        Path("/tmp/test"), ["EM"], MagicMock(), MagicMock()
+    )
+
+    # EM should be called once
+    mock_em.assert_called_once()
+    assert result == mock_future
+
+
+@patch("mdfactory.orchestration.simulate.run_em_stage")
+@patch("mdfactory.orchestration.simulate.run_nvt_stage")
+def test_execute_stage_list_em_nvt_chain(mock_nvt, mock_em):
+    """Execute stage list chains EM → NVT dependencies."""
+    em_future = MagicMock()
+    nvt_future = MagicMock()
+    mock_em.return_value = em_future
+    mock_nvt.return_value = nvt_future
+
+    grompp_app = MagicMock()
+    mdrun_app = MagicMock()
+
+    result = _execute_stage_list(
+        Path("/tmp/test"), ["EM", "NVT"], grompp_app, mdrun_app
+    )
+
+    # EM called first
+    mock_em.assert_called_once_with(Path("/tmp/test"), grompp_app, mdrun_app)
+    # NVT called with EM future as dependency
+    mock_nvt.assert_called_once_with(
+        Path("/tmp/test"), em_future, grompp_app, mdrun_app
+    )
+    # Returns final NVT future
+    assert result == nvt_future
+
+
+@patch("mdfactory.orchestration.simulate.run_em_stage")
+@patch("mdfactory.orchestration.simulate.run_nvt_stage")
+@patch("mdfactory.orchestration.simulate.run_npt_stage")
+@patch("mdfactory.orchestration.simulate.run_production_stage")
+def test_execute_stage_list_full_pipeline(mock_prod, mock_npt, mock_nvt, mock_em):
+    """Execute stage list chains all 4 stages correctly."""
+    em_fut = MagicMock()
+    nvt_fut = MagicMock()
+    npt_fut = MagicMock()
+    prod_fut = MagicMock()
+
+    mock_em.return_value = em_fut
+    mock_nvt.return_value = nvt_fut
+    mock_npt.return_value = npt_fut
+    mock_prod.return_value = prod_fut
+
+    grompp_app = MagicMock()
+    mdrun_app = MagicMock()
+    sim_dir = Path("/tmp/test")
+
+    result = _execute_stage_list(
+        sim_dir, ["EM", "NVT", "NPT", "Production"], grompp_app, mdrun_app
+    )
+
+    # Verify call chain
+    mock_em.assert_called_once_with(sim_dir, grompp_app, mdrun_app)
+    mock_nvt.assert_called_once_with(sim_dir, em_fut, grompp_app, mdrun_app)
+    mock_npt.assert_called_once_with(sim_dir, nvt_fut, grompp_app, mdrun_app)
+    mock_prod.assert_called_once_with(sim_dir, npt_fut, grompp_app, mdrun_app)
+
+    # Returns final production future
+    assert result == prod_fut
+
+
+@patch("mdfactory.orchestration.simulate.run_nvt_stage")
+@patch("mdfactory.orchestration.simulate.run_npt_stage")
+def test_execute_stage_list_partial_pipeline_from_checkpoint(mock_npt, mock_nvt):
+    """Execute stage list handles checkpoint resume (first stage not EM)."""
+    # Resume from NVT (EM already complete)
+    nvt_fut = MagicMock()
+    npt_fut = MagicMock()
+    mock_nvt.return_value = nvt_fut
+    mock_npt.return_value = npt_fut
+
+    grompp_app = MagicMock()
+    mdrun_app = MagicMock()
+    sim_dir = Path("/tmp/test")
+
+    # Execute NVT → NPT (EM was already complete)
+    result = _execute_stage_list(sim_dir, ["NVT", "NPT"], grompp_app, mdrun_app)
+
+    # NVT called with prev_future=None (checkpoint resume)
+    mock_nvt.assert_called_once_with(sim_dir, None, grompp_app, mdrun_app)
+    # NPT called with NVT's future
+    mock_npt.assert_called_once_with(sim_dir, nvt_fut, grompp_app, mdrun_app)
+    # Returns final NPT future
+    assert result == npt_fut
+
+
+@patch("mdfactory.orchestration.simulate.parsl_session")
+@patch("mdfactory.orchestration.simulate._execute_stage_list")
+def test_run_simulations_uses_execute_stage_list(mock_execute, mock_session, mock_sim_dir):
+    """run_simulations dispatcher now uses _execute_stage_list."""
+    mock_future = MagicMock()
+    mock_future.done.return_value = True
+    mock_future.result.return_value = {"status": "success"}
+    mock_execute.return_value = mock_future
+
+    mock_session.return_value.__enter__.return_value = MagicMock()
+
+    # Create partial checkpoint state (EM complete)
+    (mock_sim_dir / "min.gro").write_text("FAKE")
+
+    results = run_simulations(
+        [mock_sim_dir], ExecutorConfig(), checkpoint_mode="auto"
+    )
+
+    # Should call _execute_stage_list with only needed stages
+    mock_execute.assert_called_once()
+    call_args = mock_execute.call_args
+    # Second argument is the stages list
+    stages_arg = call_args[0][1]
+    # EM should be skipped, others needed
+    assert "EM" not in stages_arg
+    assert "NVT" in stages_arg
+
+
+# === Decision 4: GROMACS Error Handling Tests ===
+
+
+def test_grompp_app_has_error_handling():
+    """Grompp bash app includes robust error handling."""
+    from mdfactory.orchestration.apps import get_grompp_app
+
+    grompp_app = get_grompp_app()
+    bash_script = grompp_app.func(
+        mdp_file="em.mdp",
+        gro_file="system.pdb",
+        top_file="topology.top",
+        tpr_file="min.tpr",
+        work_dir="/tmp/test",
+    )
+
+    # Should have bash strict mode
+    assert "set -euo pipefail" in bash_script
+    # Should check grompp exit code
+    assert "if ! gmx grompp" in bash_script
+    # Should verify TPR was created
+    assert "if [ ! -f min.tpr ]" in bash_script
+    # Should log errors to stderr
+    assert ">&2" in bash_script
+
+
+def test_grompp_app_logs_descriptive_errors():
+    """Grompp error messages include actionable guidance."""
+    from mdfactory.orchestration.apps import get_grompp_app
+
+    grompp_app = get_grompp_app()
+    bash_script = grompp_app.func(
+        mdp_file="em.mdp",
+        gro_file="system.pdb",
+        top_file="topology.top",
+        tpr_file="min.tpr",
+        work_dir="/tmp/test",
+    )
+
+    # Error message should mention the failed file
+    assert "ERROR: grompp failed for min.tpr" in bash_script
+    # Should suggest checking inputs
+    assert "Check that input files" in bash_script
+
+
+def test_mdrun_app_has_error_handling():
+    """Mdrun bash app includes robust error handling."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(deffnm="min", work_dir="/tmp/test")
+
+    # Should have bash strict mode
+    assert "set -euo pipefail" in bash_script
+    # Should check mdrun exit code (both GPU and CPU paths)
+    assert "if ! gmx mdrun" in bash_script
+    assert bash_script.count("if ! gmx mdrun") == 2  # GPU and CPU modes
+    # Should verify output was created
+    assert "if [ ! -f" in bash_script
+    # Should log errors to stderr
+    assert "ERROR: mdrun failed" in bash_script
+
+
+def test_mdrun_app_verifies_stage_specific_outputs():
+    """Mdrun verifies correct output file for each stage."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+
+    # EM stage should check for min.gro
+    em_script = mdrun_app.func(deffnm="min", work_dir="/tmp/test")
+    assert 'EXPECTED_OUTPUT="min.gro"' in em_script
+
+    # Production should check for prod.xtc
+    prod_script = mdrun_app.func(deffnm="prod", work_dir="/tmp/test")
+    assert 'EXPECTED_OUTPUT="prod.xtc"' in prod_script
+
+    # NVT should check for nvt.gro
+    nvt_script = mdrun_app.func(deffnm="nvt", work_dir="/tmp/test")
+    assert 'EXPECTED_OUTPUT="nvt.gro"' in nvt_script
+
+
+def test_mdrun_app_error_message_includes_log_hint():
+    """Mdrun error messages direct users to md.log."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(deffnm="prod", work_dir="/tmp/test")
+
+    # Should suggest checking md.log
+    assert "Check md.log for details" in bash_script
+
+
+def test_bash_apps_use_strict_mode():
+    """All bash apps use set -euo pipefail."""
+    from mdfactory.orchestration.apps import get_grompp_app, get_mdrun_app
+
+    grompp_app = get_grompp_app()
+    mdrun_app = get_mdrun_app()
+
+    grompp_script = grompp_app.func(
+        mdp_file="em.mdp",
+        gro_file="system.pdb",
+        top_file="topology.top",
+        tpr_file="min.tpr",
+        work_dir="/tmp/test",
+    )
+    mdrun_script = mdrun_app.func(deffnm="min", work_dir="/tmp/test")
+
+    # Both should use bash strict mode
+    assert "set -euo pipefail" in grompp_script
+    assert "set -euo pipefail" in mdrun_script
+
+
+# === Decision 8: Trajectory Frame Count Validation Tests ===
+
+
+def test_validate_trajectory_returns_false_for_missing_file(mock_sim_dir):
+    """Trajectory validation returns False if file doesn't exist."""
+    from mdfactory.orchestration.simulate import _validate_trajectory_complete
+
+    result = _validate_trajectory_complete(mock_sim_dir, "prod.xtc")
+    assert result is False
+
+
+def test_validate_trajectory_returns_false_for_empty_file(mock_sim_dir):
+    """Trajectory validation returns False for empty files."""
+    from mdfactory.orchestration.simulate import _validate_trajectory_complete
+
+    (mock_sim_dir / "prod.xtc").write_text("")  # Empty file
+    result = _validate_trajectory_complete(mock_sim_dir, "prod.xtc")
+    assert result is False
+
+
+def test_validate_trajectory_uses_size_fallback_without_structure(mock_sim_dir):
+    """Trajectory validation uses size heuristic when no structure file found."""
+    from mdfactory.orchestration.simulate import _validate_trajectory_complete
+
+    # Create trajectory but no structure files
+    (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 15_000_000)  # 15 MB
+
+    result = _validate_trajectory_complete(mock_sim_dir, "prod.xtc")
+    # Should pass size heuristic (> 10 MB)
+    assert result is True
+
+
+def test_validate_trajectory_size_fallback_rejects_small_files(mock_sim_dir):
+    """Trajectory validation rejects small files in fallback mode."""
+    from mdfactory.orchestration.simulate import _validate_trajectory_complete
+
+    # Create small trajectory (< 10 MB threshold)
+    (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 1000)
+
+    result = _validate_trajectory_complete(mock_sim_dir, "prod.xtc")
+    # Should fail size heuristic
+    assert result is False
+
+
+@patch("mdfactory.orchestration.simulate.mda")
+def test_validate_trajectory_with_mdanalysis_complete(mock_mda, mock_sim_dir):
+    """Trajectory validation uses MDAnalysis to count frames (complete)."""
+    from mdfactory.orchestration.simulate import _validate_trajectory_complete
+
+    # Setup mocks
+    (mock_sim_dir / "prod.xtc").write_bytes(b"FAKE XTC")
+    (mock_sim_dir / "system.pdb").write_text("FAKE PDB")
+
+    mock_traj = MagicMock()
+    mock_traj.__len__.return_value = 100  # 100 frames
+    mock_universe = MagicMock()
+    mock_universe.trajectory = mock_traj
+    mock_mda.Universe.return_value = mock_universe
+
+    result = _validate_trajectory_complete(
+        mock_sim_dir, "prod.xtc", expected_frames=100
+    )
+
+    # Should pass (100 >= 100)
+    assert result is True
+
+
+@patch("mdfactory.orchestration.simulate.mda")
+def test_validate_trajectory_with_mdanalysis_incomplete(mock_mda, mock_sim_dir):
+    """Trajectory validation detects incomplete trajectories."""
+    from mdfactory.orchestration.simulate import _validate_trajectory_complete
+
+    # Setup mocks
+    (mock_sim_dir / "prod.xtc").write_bytes(b"FAKE XTC")
+    (mock_sim_dir / "system.pdb").write_text("FAKE PDB")
+
+    mock_traj = MagicMock()
+    mock_traj.__len__.return_value = 50  # Only 50 frames
+    mock_universe = MagicMock()
+    mock_universe.trajectory = mock_traj
+    mock_mda.Universe.return_value = mock_universe
+
+    result = _validate_trajectory_complete(
+        mock_sim_dir, "prod.xtc", expected_frames=100
+    )
+
+    # Should fail (50 < 100)
+    assert result is False
+
+
+@patch("mdfactory.orchestration.simulate.mda")
+def test_validate_trajectory_without_expected_frames(mock_mda, mock_sim_dir):
+    """Trajectory validation without expected_frames checks readability only."""
+    from mdfactory.orchestration.simulate import _validate_trajectory_complete
+
+    # Setup mocks
+    (mock_sim_dir / "prod.xtc").write_bytes(b"FAKE XTC")
+    (mock_sim_dir / "system.pdb").write_text("FAKE PDB")
+
+    mock_traj = MagicMock()
+    mock_traj.__len__.return_value = 1  # Just 1 frame
+    mock_universe = MagicMock()
+    mock_universe.trajectory = mock_traj
+    mock_mda.Universe.return_value = mock_universe
+
+    result = _validate_trajectory_complete(mock_sim_dir, "prod.xtc")
+
+    # Should pass (> 0 frames, no expectation)
+    assert result is True
+
+
+def test_find_structure_file_priority_order(mock_sim_dir):
+    """Find structure file uses correct priority order."""
+    from mdfactory.orchestration.simulate import _find_structure_file
+
+    # Create files in reverse priority order
+    (mock_sim_dir / "system.pdb").write_text("FAKE")
+    (mock_sim_dir / "min.gro").write_text("FAKE")
+    (mock_sim_dir / "npt.gro").write_text("FAKE")
+
+    # Should prioritize npt.gro over min.gro over system.pdb
+    result = _find_structure_file(mock_sim_dir)
+    assert result == mock_sim_dir / "npt.gro"
+
+
+def test_find_structure_file_returns_none_if_missing(tmp_path):
+    """Find structure file returns None if no candidates exist."""
+    from mdfactory.orchestration.simulate import _find_structure_file
+
+    # Create empty directory with no structure files
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+
+    result = _find_structure_file(empty_dir)
+    assert result is None
+
+
+def test_extract_expected_frames_from_mdp(mock_sim_dir):
+    """Extract expected frames from MDP file."""
+    from mdfactory.orchestration.simulate import _extract_expected_frames_from_mdp
+
+    # Create MDP with nsteps and nstxout-compressed
+    mdp_content = """
+    ; Production MDP
+    nsteps = 500000
+    nstxout-compressed = 5000  ; Save every 5000 steps
+    dt = 0.002
+    """
+    (mock_sim_dir / "md.mdp").write_text(mdp_content)
+
+    result = _extract_expected_frames_from_mdp(mock_sim_dir, "Production")
+
+    # 500000 / 5000 = 100 frames
+    assert result == 100
+
+
+def test_extract_expected_frames_handles_comments(mock_sim_dir):
+    """MDP parser ignores comments correctly."""
+    from mdfactory.orchestration.simulate import _extract_expected_frames_from_mdp
+
+    mdp_content = """
+    ; nsteps = 999999  ; This is a comment
+    nsteps = 100000  ; Real value
+    ; nstxout-compressed = 123
+    nstxout-compressed = 1000  ; Real value
+    """
+    (mock_sim_dir / "md.mdp").write_text(mdp_content)
+
+    result = _extract_expected_frames_from_mdp(mock_sim_dir, "Production")
+
+    # 100000 / 1000 = 100 frames
+    assert result == 100
+
+
+def test_extract_expected_frames_returns_none_for_missing_file(mock_sim_dir):
+    """MDP parser returns None if file doesn't exist."""
+    from mdfactory.orchestration.simulate import _extract_expected_frames_from_mdp
+
+    result = _extract_expected_frames_from_mdp(mock_sim_dir, "Production")
+    assert result is None
+
+
+def test_extract_expected_frames_returns_none_for_incomplete_mdp(mock_sim_dir):
+    """MDP parser returns None if required parameters missing."""
+    from mdfactory.orchestration.simulate import _extract_expected_frames_from_mdp
+
+    # Only nsteps, no nstxout-compressed
+    (mock_sim_dir / "md.mdp").write_text("nsteps = 100000\n")
+
+    result = _extract_expected_frames_from_mdp(mock_sim_dir, "Production")
+    assert result is None
