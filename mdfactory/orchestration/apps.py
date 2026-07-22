@@ -144,9 +144,37 @@ def get_grompp_app():
         cpt_flag = f"-t {cpt_file}" if cpt_file else ""
 
         return f"""
+        set -euo pipefail  # Exit on error, undefined vars, pipe failures
+
         cd {work_dir}
-        gmx grompp -f {mdp_file} -c {gro_file} -p {top_file} -o {tpr_file} \\
-            {ref_flag} {cpt_flag} -maxwarn {maxwarn}
+
+        # Auto-detect GROMACS binary (gmx_mpi for MPI builds, gmx for thread-MPI)
+        if command -v gmx_mpi &> /dev/null; then
+            GMX_BIN="gmx_mpi"
+        elif command -v gmx &> /dev/null; then
+            GMX_BIN="gmx"
+        else
+            echo "ERROR: Neither gmx nor gmx_mpi found in PATH" >&2
+            exit 1
+        fi
+
+        echo "GROMACS grompp: {mdp_file} -> {tpr_file} (using $GMX_BIN)" >&2
+
+        # Run grompp with explicit error checking
+        if ! $GMX_BIN grompp -f {mdp_file} -c {gro_file} -p {top_file} -o {tpr_file} \\
+            {ref_flag} {cpt_flag} -maxwarn {maxwarn}; then
+            echo "ERROR: grompp failed for {tpr_file}" >&2
+            echo "Check that input files ({mdp_file}, {gro_file}, {top_file}) are valid" >&2
+            exit 1
+        fi
+
+        # Verify TPR was created
+        if [ ! -f {tpr_file} ]; then
+            echo "ERROR: grompp succeeded but {tpr_file} was not created" >&2
+            exit 1
+        fi
+
+        echo "GROMACS grompp: SUCCESS - {tpr_file} created" >&2
         """
 
     return run_grompp
@@ -181,12 +209,18 @@ def get_mdrun_app():
     def run_mdrun(
         deffnm: str,
         work_dir: str,
-        nt: int = 12,
         stdout=None,
         stderr=None,
         inputs=None,
     ):
-        """Run GROMACS simulation.
+        """Run GROMACS simulation with auto-detected resources.
+
+        Thread count and GPU usage are auto-detected from SLURM environment
+        variables, with sensible fallbacks for local execution.
+
+        Resource detection priority:
+        - Thread count: SLURM_CPUS_PER_TASK > OMP_NUM_THREADS > default(12)
+        - GPU: Auto-detected from CUDA_VISIBLE_DEVICES
 
         Parameters
         ----------
@@ -194,8 +228,6 @@ def get_mdrun_app():
             Default filename prefix (min, nvt, npt, prod).
         work_dir : str
             Absolute path to simulation directory.
-        nt : int
-            Number of threads to use.
         stdout : str, optional
             File path for stdout.
         stderr : str, optional
@@ -210,8 +242,64 @@ def get_mdrun_app():
 
         """
         return f"""
+        set -euo pipefail  # Exit on error, undefined vars, pipe failures
+
         cd {work_dir}
-        gmx mdrun -deffnm {deffnm} -nt {nt}
+
+        # Auto-detect GROMACS binary (gmx_mpi for MPI builds, gmx for thread-MPI)
+        if command -v gmx_mpi &> /dev/null; then
+            GMX_BIN="gmx_mpi"
+        elif command -v gmx &> /dev/null; then
+            GMX_BIN="gmx"
+        else
+            echo "ERROR: Neither gmx nor gmx_mpi found in PATH" >&2
+            exit 1
+        fi
+
+        # Auto-detect thread count from SLURM allocation
+        # Priority: SLURM_CPUS_PER_TASK > OMP_NUM_THREADS > default(12)
+        NTHR=${{SLURM_CPUS_PER_TASK:-${{OMP_NUM_THREADS:-12}}}}
+
+        echo "GROMACS mdrun: Starting {deffnm} with $NTHR threads (using $GMX_BIN)" >&2
+
+        # Auto-detect GPU availability from CUDA_VISIBLE_DEVICES
+        if [ -n "${{CUDA_VISIBLE_DEVICES}}" ] && [ "${{CUDA_VISIBLE_DEVICES}}" != "NoDevFiles" ]; then
+            # GPU mode: use first GPU with MPI+OpenMP hybrid parallelization
+            GPU_ID=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f1)
+            echo "GROMACS mdrun: Running on GPU $GPU_ID with $NTHR OpenMP threads" >&2
+
+            if ! $GMX_BIN mdrun -deffnm {deffnm} -ntmpi 1 -ntomp $NTHR -gpu_id $GPU_ID -nb gpu -pme gpu; then
+                echo "ERROR: mdrun failed for {deffnm} (GPU mode)" >&2
+                echo "Check md.log for details" >&2
+                exit 1
+            fi
+        else
+            # CPU-only mode: pure thread-MPI parallelization
+            echo "GROMACS mdrun: Running on CPU with $NTHR threads" >&2
+
+            if ! $GMX_BIN mdrun -deffnm {deffnm} -nt $NTHR; then
+                echo "ERROR: mdrun failed for {deffnm} (CPU mode)" >&2
+                echo "Check md.log for details" >&2
+                exit 1
+            fi
+        fi
+
+        # Verify expected output files were created
+        # Different stages produce different outputs
+        if [[ "{deffnm}" == "min" ]]; then
+            EXPECTED_OUTPUT="min.gro"
+        elif [[ "{deffnm}" == "prod" ]]; then
+            EXPECTED_OUTPUT="prod.xtc"
+        else
+            EXPECTED_OUTPUT="{deffnm}.gro"
+        fi
+
+        if [ ! -f "$EXPECTED_OUTPUT" ]; then
+            echo "ERROR: mdrun completed but $EXPECTED_OUTPUT was not created" >&2
+            exit 1
+        fi
+
+        echo "GROMACS mdrun: SUCCESS - {deffnm} completed" >&2
         """
 
     return run_mdrun
