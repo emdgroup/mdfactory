@@ -35,7 +35,7 @@ def run_em_stage(sim_dir: Path, grompp_app, mdrun_app) -> "AppFuture":
     """
     work_dir = str(sim_dir.resolve())
 
-    # Step 1: Preprocessing
+    # Step 1: Preprocessing (no dependencies)
     grompp_fut = grompp_app(
         mdp_file="em.mdp",
         gro_file="system.pdb",
@@ -43,28 +43,31 @@ def run_em_stage(sim_dir: Path, grompp_app, mdrun_app) -> "AppFuture":
         tpr_file="min.tpr",
         work_dir=work_dir,
         maxwarn=1,
+        inputs=[],
     )
 
     # Step 2: Simulation (depends on grompp)
     mdrun_fut = mdrun_app(
         deffnm="min",
         work_dir=work_dir,
-        nt=12,
         inputs=[grompp_fut],
     )
 
     return mdrun_fut
 
 
-def run_nvt_stage(sim_dir: Path, em_future: "AppFuture", grompp_app, mdrun_app) -> "AppFuture":
+def run_nvt_stage(
+    sim_dir: Path, em_future: "AppFuture | None", grompp_app, mdrun_app
+) -> "AppFuture":
     """Execute NVT equilibration stage.
 
     Parameters
     ----------
     sim_dir : Path
         Simulation directory.
-    em_future : AppFuture
-        Future from EM stage (dependency).
+    em_future : AppFuture or None
+        Future from EM stage (dependency). If None, assumes min.gro exists
+        (checkpoint resume scenario).
     grompp_app : callable
         Result of get_grompp_app().
     mdrun_app : callable
@@ -78,7 +81,9 @@ def run_nvt_stage(sim_dir: Path, em_future: "AppFuture", grompp_app, mdrun_app) 
     """
     work_dir = str(sim_dir.resolve())
 
-    # Wait for EM to complete before starting
+    # Build inputs list: include em_future only if provided
+    grompp_inputs = [em_future] if em_future is not None else []
+
     grompp_fut = grompp_app(
         mdp_file="nvt.mdp",
         gro_file="min.gro",
@@ -87,28 +92,30 @@ def run_nvt_stage(sim_dir: Path, em_future: "AppFuture", grompp_app, mdrun_app) 
         tpr_file="nvt.tpr",
         work_dir=work_dir,
         maxwarn=1,
-        inputs=[em_future],
+        inputs=grompp_inputs,
     )
 
     mdrun_fut = mdrun_app(
         deffnm="nvt",
         work_dir=work_dir,
-        nt=12,
         inputs=[grompp_fut],
     )
 
     return mdrun_fut
 
 
-def run_npt_stage(sim_dir: Path, nvt_future: "AppFuture", grompp_app, mdrun_app) -> "AppFuture":
+def run_npt_stage(
+    sim_dir: Path, nvt_future: "AppFuture | None", grompp_app, mdrun_app
+) -> "AppFuture":
     """Execute NPT equilibration stage.
 
     Parameters
     ----------
     sim_dir : Path
         Simulation directory.
-    nvt_future : AppFuture
-        Future from NVT stage (dependency).
+    nvt_future : AppFuture or None
+        Future from NVT stage (dependency). If None, assumes nvt.gro and
+        nvt.cpt exist (checkpoint resume scenario).
     grompp_app : callable
         Result of get_grompp_app().
     mdrun_app : callable
@@ -121,6 +128,9 @@ def run_npt_stage(sim_dir: Path, nvt_future: "AppFuture", grompp_app, mdrun_app)
 
     """
     work_dir = str(sim_dir.resolve())
+
+    # Build inputs list: include nvt_future only if provided
+    grompp_inputs = [nvt_future] if nvt_future is not None else []
 
     grompp_fut = grompp_app(
         mdp_file="npt.mdp",
@@ -131,13 +141,12 @@ def run_npt_stage(sim_dir: Path, nvt_future: "AppFuture", grompp_app, mdrun_app)
         tpr_file="npt.tpr",
         work_dir=work_dir,
         maxwarn=2,
-        inputs=[nvt_future],
+        inputs=grompp_inputs,
     )
 
     mdrun_fut = mdrun_app(
         deffnm="npt",
         work_dir=work_dir,
-        nt=12,
         inputs=[grompp_fut],
     )
 
@@ -145,7 +154,7 @@ def run_npt_stage(sim_dir: Path, nvt_future: "AppFuture", grompp_app, mdrun_app)
 
 
 def run_production_stage(
-    sim_dir: Path, npt_future: "AppFuture", grompp_app, mdrun_app
+    sim_dir: Path, npt_future: "AppFuture | None", grompp_app, mdrun_app
 ) -> "AppFuture":
     """Execute production MD stage.
 
@@ -153,8 +162,9 @@ def run_production_stage(
     ----------
     sim_dir : Path
         Simulation directory.
-    npt_future : AppFuture
-        Future from NPT stage (dependency).
+    npt_future : AppFuture or None
+        Future from NPT stage (dependency). If None, assumes npt.gro and
+        npt.cpt exist (checkpoint resume scenario).
     grompp_app : callable
         Result of get_grompp_app().
     mdrun_app : callable
@@ -168,6 +178,9 @@ def run_production_stage(
     """
     work_dir = str(sim_dir.resolve())
 
+    # Build inputs list: include npt_future only if provided
+    grompp_inputs = [npt_future] if npt_future is not None else []
+
     grompp_fut = grompp_app(
         mdp_file="md.mdp",
         gro_file="npt.gro",
@@ -176,13 +189,12 @@ def run_production_stage(
         tpr_file="prod.tpr",
         work_dir=work_dir,
         maxwarn=2,
-        inputs=[npt_future],
+        inputs=grompp_inputs,
     )
 
     mdrun_fut = mdrun_app(
         deffnm="prod",
         work_dir=work_dir,
-        nt=12,
         inputs=[grompp_fut],
     )
 
