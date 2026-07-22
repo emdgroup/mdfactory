@@ -404,6 +404,139 @@ def _report_build_results(results: list[dict]):
             logger.error(f"  {r.get('hash', 'unknown')}: {r.get('error', 'unknown error')}")
 
 
+@app.command(name="simulate", group="Simulation")
+def simulate_systems(
+    source: Annotated[Path, Parameter(help="Simulation directory or summary YAML")],
+    slurm: Annotated[
+        str | None,
+        Parameter(help="SLURM config YAML or 'tui' for interactive setup"),
+    ] = None,
+    stages: Annotated[
+        list[str] | None,
+        Parameter(help="Stages to run (EM, NVT, NPT, Production)"),
+    ] = None,
+    checkpoint: Annotated[
+        str,
+        Parameter(help="Checkpoint mode: auto (default), skip, force"),
+    ] = "auto",
+    hash: Annotated[
+        list[str] | None,
+        Parameter(help="Filter by hash prefix"),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        Parameter(help="Preview plan without executing"),
+    ] = False,
+):
+    """Run GROMACS MD simulations via Parsl.
+
+    Examples
+    --------
+    Local execution (all stages)::
+
+        mdfactory simulate output_dir/
+
+    SLURM with interactive config::
+
+        mdfactory simulate output_dir/ --slurm tui
+
+    Resume from checkpoint::
+
+        mdfactory simulate output_dir/ --slurm gpu.yaml --checkpoint auto
+
+    Equilibration only::
+
+        mdfactory simulate output_dir/ --stages EM NVT NPT
+
+    Filter specific simulations::
+
+        mdfactory simulate output_dir/ --hash abc123 def456
+
+    Dry-run preview::
+
+        mdfactory simulate output_dir/ --slurm gpu.yaml --dry-run
+
+    """
+    from mdfactory.analysis.submit import filter_paths_by_hash, resolve_simulation_paths
+
+    source = source.resolve()
+
+    # Resolve simulation paths
+    if source.is_dir():
+        sim_paths = resolve_simulation_paths(
+            [source],
+            trajectory_file="prod.xtc",
+            structure_file="system.pdb",
+        )
+    elif source.suffix in (".yaml", ".yml"):
+        # Load from summary YAML
+        with open(source) as f:
+            summary = yaml.safe_load(f)
+        sim_paths = [Path(p) for p in summary.get("system_directory", [])]
+    else:
+        logger.error(f"Invalid source: {source}. Provide directory or YAML.")
+        sys.exit(1)
+
+    # Filter by hash if provided
+    if hash:
+        sim_paths = filter_paths_by_hash(
+            sim_paths,
+            hash,
+            trajectory_file="prod.xtc",
+            structure_file="system.pdb",
+        )
+
+    if not sim_paths:
+        logger.error("No simulations found.")
+        sys.exit(1)
+
+    logger.info(f"Found {len(sim_paths)} simulation(s)")
+
+    # Validate stages
+    if stages:
+        all_stages = ["EM", "NVT", "NPT", "Production"]
+        invalid = [s for s in stages if s not in all_stages]
+        if invalid:
+            logger.error(f"Invalid stages: {invalid}. Valid: {all_stages}")
+            sys.exit(1)
+
+    # Validate checkpoint mode
+    if checkpoint not in ["auto", "skip", "force"]:
+        logger.error(f"Invalid checkpoint mode: {checkpoint}. Valid: auto, skip, force")
+        sys.exit(1)
+
+    # Resolve SLURM config
+    config = _resolve_slurm_flag(slurm)
+    executor_config = _load_executor_config(config)
+
+    # Run simulations
+    from mdfactory.orchestration import run_simulations
+
+    results = run_simulations(
+        sim_paths,
+        executor_config,
+        stages=stages,
+        checkpoint_mode=checkpoint,
+        dry_run=dry_run,
+    )
+
+    # Report results
+    if not dry_run:
+        _report_simulation_results(results)
+
+
+def _report_simulation_results(results: list[dict]):
+    """Report simulation results to user."""
+    succeeded = sum(1 for r in results if r.get("status") == "success")
+    failed = sum(1 for r in results if r.get("status") == "failed")
+
+    logger.info(f"Simulation complete: {succeeded} succeeded, {failed} failed")
+
+    for r in results:
+        if r.get("status") == "failed":
+            logger.error(f"  {r.get('hash', 'unknown')}: {r.get('error', 'unknown error')}")
+
+
 @app.command(name="clean")
 def clean(parameters: bool = True, database: bool = True):
     import shutil
