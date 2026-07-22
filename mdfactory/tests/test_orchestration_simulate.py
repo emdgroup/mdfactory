@@ -428,8 +428,8 @@ def test_mdrun_app_cpu_fallback():
 
     # Should use default of 12 threads
     assert "NTHR=${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-12}}" in bash_script
-    # Should use CPU mode (no GPU flags)
-    assert "gmx mdrun -deffnm test -nt $NTHR" in bash_script
+    # Should use CPU mode (no GPU flags) with dynamic binary detection
+    assert "$GMX_BIN mdrun -deffnm test -nt $NTHR" in bash_script
 
 
 def test_mdrun_app_gpu_detection():
@@ -655,8 +655,8 @@ def test_grompp_app_has_error_handling():
 
     # Should have bash strict mode
     assert "set -euo pipefail" in bash_script
-    # Should check grompp exit code
-    assert "if ! gmx grompp" in bash_script
+    # Should check grompp exit code (with dynamic binary)
+    assert "if ! $GMX_BIN grompp" in bash_script
     # Should verify TPR was created
     assert "if [ ! -f min.tpr ]" in bash_script
     # Should log errors to stderr
@@ -691,9 +691,9 @@ def test_mdrun_app_has_error_handling():
 
     # Should have bash strict mode
     assert "set -euo pipefail" in bash_script
-    # Should check mdrun exit code (both GPU and CPU paths)
-    assert "if ! gmx mdrun" in bash_script
-    assert bash_script.count("if ! gmx mdrun") == 2  # GPU and CPU modes
+    # Should check mdrun exit code (both GPU and CPU paths, with dynamic binary)
+    assert "if ! $GMX_BIN mdrun" in bash_script
+    assert bash_script.count("if ! $GMX_BIN mdrun") == 2  # GPU and CPU modes
     # Should verify output was created
     assert "if [ ! -f" in bash_script
     # Should log errors to stderr
