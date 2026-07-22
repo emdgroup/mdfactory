@@ -3,6 +3,33 @@
 """Parsl application definitions for build orchestration."""
 
 
+def _get_gromacs_detect_script() -> str:
+    """Return bash script for GROMACS binary auto-detection.
+
+    Returns
+    -------
+    str
+        Bash script that sets GMX_BIN variable to gmx or gmx_mpi.
+
+    Notes
+    -----
+    Prefers gmx (thread-MPI) for local execution, falls back to gmx_mpi.
+    This avoids PMI/srun issues when using LocalProvider with MPI builds.
+    """
+    return """
+# Auto-detect GROMACS binary
+# Prefer gmx (thread-MPI) for local execution, fallback to gmx_mpi for cluster
+if command -v gmx &> /dev/null; then
+    GMX_BIN="gmx"
+elif command -v gmx_mpi &> /dev/null; then
+    GMX_BIN="gmx_mpi"
+else
+    echo "ERROR: Neither gmx nor gmx_mpi found in PATH" >&2
+    exit 1
+fi
+"""
+
+
 def _build_system_impl(build_input_dict: dict) -> dict:
     """Run a single system build inside a Parsl worker.
 
@@ -148,15 +175,7 @@ def get_grompp_app():
 
         cd {work_dir}
 
-        # Auto-detect GROMACS binary (gmx_mpi for MPI builds, gmx for thread-MPI)
-        if command -v gmx_mpi &> /dev/null; then
-            GMX_BIN="gmx_mpi"
-        elif command -v gmx &> /dev/null; then
-            GMX_BIN="gmx"
-        else
-            echo "ERROR: Neither gmx nor gmx_mpi found in PATH" >&2
-            exit 1
-        fi
+        {_get_gromacs_detect_script()}
 
         echo "GROMACS grompp: {mdp_file} -> {tpr_file} (using $GMX_BIN)" >&2
 
@@ -246,15 +265,7 @@ def get_mdrun_app():
 
         cd {work_dir}
 
-        # Auto-detect GROMACS binary (gmx_mpi for MPI builds, gmx for thread-MPI)
-        if command -v gmx_mpi &> /dev/null; then
-            GMX_BIN="gmx_mpi"
-        elif command -v gmx &> /dev/null; then
-            GMX_BIN="gmx"
-        else
-            echo "ERROR: Neither gmx nor gmx_mpi found in PATH" >&2
-            exit 1
-        fi
+        {_get_gromacs_detect_script()}
 
         # Auto-detect thread count from SLURM allocation
         # Priority: SLURM_CPUS_PER_TASK > OMP_NUM_THREADS > default(12)

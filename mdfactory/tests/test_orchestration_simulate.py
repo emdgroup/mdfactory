@@ -942,3 +942,48 @@ def test_extract_expected_frames_returns_none_for_incomplete_mdp(mock_sim_dir):
 
     result = _extract_expected_frames_from_mdp(mock_sim_dir, "Production")
     assert result is None
+
+
+# Tests for GROMACS binary detection
+
+
+def test_get_gromacs_detect_script_returns_string():
+    """GROMACS detect function returns valid bash script."""
+    from mdfactory.orchestration.apps import _get_gromacs_detect_script
+
+    script = _get_gromacs_detect_script()
+
+    assert isinstance(script, str)
+    assert len(script) > 0
+
+
+def test_get_gromacs_detect_script_contains_required_logic():
+    """Script contains binary detection logic."""
+    from mdfactory.orchestration.apps import _get_gromacs_detect_script
+
+    script = _get_gromacs_detect_script()
+
+    # Check for gmx detection
+    assert "command -v gmx" in script
+    assert "command -v gmx_mpi" in script
+
+    # Check for GMX_BIN assignment
+    assert 'GMX_BIN="gmx"' in script
+    assert 'GMX_BIN="gmx_mpi"' in script
+
+    # Check for error handling
+    assert "ERROR" in script
+    assert "exit 1" in script
+
+
+def test_get_gromacs_detect_script_prefers_gmx_over_gmx_mpi():
+    """Script checks for gmx first (thread-MPI preferred for local execution)."""
+    from mdfactory.orchestration.apps import _get_gromacs_detect_script
+
+    script = _get_gromacs_detect_script()
+
+    # gmx should be checked before gmx_mpi
+    gmx_pos = script.find("command -v gmx ")
+    gmx_mpi_pos = script.find("command -v gmx_mpi")
+
+    assert gmx_pos < gmx_mpi_pos, "gmx should be checked before gmx_mpi"
