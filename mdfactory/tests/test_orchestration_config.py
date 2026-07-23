@@ -259,3 +259,104 @@ def test_config_yaml_roundtrip(tmp_path):
     assert loaded.walltime == original.walltime
     assert loaded.gres == original.gres
     assert loaded.worker_init == original.worker_init
+
+
+# === Decision 6: Per-stage resource config tests ===
+
+
+def test_stage_overrides_empty_by_default():
+    """SlurmExecutorConfig has empty stage_overrides by default."""
+    cfg = SlurmExecutorConfig(account="acct")
+    assert cfg.stage_overrides == {}
+
+
+def test_stage_overrides_loaded_from_yaml(tmp_path):
+    """stage_overrides field is preserved through YAML roundtrip."""
+    cfg = SlurmExecutorConfig(
+        account="acct",
+        cpus_per_node=12,
+        stage_overrides={"EM": {"cpus_per_node": 4, "gres": None}},
+    )
+    yaml_path = tmp_path / "cfg.yaml"
+    with open(yaml_path, "w") as f:
+        import yaml
+        yaml.safe_dump(cfg.model_dump(), f)
+    loaded = SlurmExecutorConfig.from_yaml(yaml_path)
+    assert loaded.stage_overrides == {"EM": {"cpus_per_node": 4, "gres": None}}
+
+
+def test_get_stage_config_no_override_returns_self():
+    """get_stage_config returns self when no override defined for stage."""
+    cfg = SlurmExecutorConfig(account="acct", cpus_per_node=12)
+    result = cfg.get_stage_config("NVT")
+    assert result is cfg
+
+
+def test_get_stage_config_applies_override():
+    """get_stage_config merges override fields into a copy."""
+    cfg = SlurmExecutorConfig(
+        account="acct",
+        cpus_per_node=12,
+        gres="gpu:l40s:1",
+        stage_overrides={"EM": {"cpus_per_node": 4, "gres": None}},
+    )
+    em_cfg = cfg.get_stage_config("EM")
+    # Override applied
+    assert em_cfg.cpus_per_node == 4
+    assert em_cfg.gres is None
+    # Original unchanged
+    assert cfg.cpus_per_node == 12
+    assert cfg.gres == "gpu:l40s:1"
+
+
+def test_get_stage_config_inherits_non_overridden_fields():
+    """get_stage_config preserves base fields not in the override dict."""
+    cfg = SlurmExecutorConfig(
+        account="my_account",
+        partition="gpu",
+        cpus_per_node=12,
+        gres="gpu:l40s:1",
+        stage_overrides={"EM": {"cpus_per_node": 4}},
+    )
+    em_cfg = cfg.get_stage_config("EM")
+    # Overridden
+    assert em_cfg.cpus_per_node == 4
+    # Inherited from base
+    assert em_cfg.account == "my_account"
+    assert em_cfg.partition == "gpu"
+    assert em_cfg.gres == "gpu:l40s:1"
+
+
+def test_get_stage_config_does_not_mutate_original():
+    """get_stage_config returns a distinct object and leaves original intact."""
+    cfg = SlurmExecutorConfig(
+        account="acct",
+        cpus_per_node=12,
+        stage_overrides={"Production": {"cpus_per_node": 24}},
+    )
+    prod_cfg = cfg.get_stage_config("Production")
+    assert prod_cfg is not cfg
+    assert prod_cfg.cpus_per_node == 24
+    assert cfg.cpus_per_node == 12
+
+
+def test_get_stage_config_multiple_stages():
+    """Each stage can have independent overrides."""
+    cfg = SlurmExecutorConfig(
+        account="acct",
+        cpus_per_node=12,
+        gres="gpu:l40s:1",
+        stage_overrides={
+            "EM": {"cpus_per_node": 4, "gres": None},
+            "Production": {"cpus_per_node": 24},
+        },
+    )
+    em = cfg.get_stage_config("EM")
+    nvt = cfg.get_stage_config("NVT")
+    prod = cfg.get_stage_config("Production")
+
+    assert em.cpus_per_node == 4
+    assert em.gres is None
+    assert nvt is cfg          # no override, returns self
+    assert prod.cpus_per_node == 24
+    assert prod.gres == "gpu:l40s:1"  # inherited

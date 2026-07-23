@@ -241,6 +241,15 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
     mem: str | None = None
     scheduler_options: str = ""
     launch_options: str = ""
+    stage_overrides: dict[str, dict] = Field(
+        default_factory=dict,
+        description=(
+            "Per-stage resource overrides.  Keys are stage names "
+            "(``'EM'``, ``'NVT'``, ``'NPT'``, ``'Production'``); values are "
+            "dicts of :class:`SlurmExecutorConfig` field overrides, e.g. "
+            "``{'EM': {'cpus_per_node': 8, 'gres': None}}``."
+        ),
+    )
 
     @field_validator("walltime", mode="before")
     @classmethod
@@ -249,6 +258,42 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
         from mdfactory.performance.slurm_config import normalize_slurm_time
 
         return normalize_slurm_time(v)
+
+    def get_stage_config(self, stage: str) -> "SlurmExecutorConfig":
+        """Return a copy of this config with per-stage overrides applied.
+
+        Looks up ``stage`` in :attr:`stage_overrides` and returns a shallow
+        copy of *self* with the matching fields merged in.  If no override
+        exists for *stage*, *self* is returned unchanged (no copy).
+
+        Parameters
+        ----------
+        stage : str
+            Stage name, e.g. ``'EM'``, ``'NVT'``, ``'NPT'``, ``'Production'``.
+
+        Returns
+        -------
+        SlurmExecutorConfig
+            Config with stage-specific field values applied.
+
+        Examples
+        --------
+        >>> cfg = SlurmExecutorConfig(cpus_per_node=12, gres="gpu:1",
+        ...     stage_overrides={"EM": {"cpus_per_node": 4, "gres": None}})
+        >>> em_cfg = cfg.get_stage_config("EM")
+        >>> em_cfg.cpus_per_node
+        4
+        >>> em_cfg.gres is None
+        True
+        >>> prod_cfg = cfg.get_stage_config("Production")
+        >>> prod_cfg.cpus_per_node   # unchanged
+        12
+
+        """
+        overrides = self.stage_overrides.get(stage, {})
+        if not overrides:
+            return self
+        return self.model_copy(update=overrides)
 
     def to_parsl_config(self) -> "parsl.Config":
         """Build a Parsl Config with HighThroughputExecutor + SlurmProvider.
