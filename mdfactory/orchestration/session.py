@@ -61,6 +61,12 @@ def parsl_session(config: "ExecutorConfig") -> Iterator[ParslSession]:
     yields a :class:`ParslSession`, and guarantees shutdown on exit unless the
     session was detached via :meth:`ParslSession.detach`.
 
+    Sessions must be **sequential, never nested**.  :func:`_guard_no_active_dfk`
+    raises :class:`RuntimeError` if a DFK is already loaded when this context
+    manager is entered.  On exit, :func:`_shutdown_parsl` calls ``parsl.clear()``
+    so the DFK is fully released before the next session can open.  Do not open
+    a second :func:`parsl_session` from inside an active one.
+
     Examples
     --------
     >>> with parsl_session(config) as session:  # doctest: +SKIP
