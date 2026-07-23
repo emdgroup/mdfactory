@@ -305,31 +305,3 @@ def run_production_stage(
         disable_gpu=disable_gpu,
         inputs=[grompp_fut],
     )
-
-
-def run_full_pipeline(sim_dir: Path, grompp_app, mdrun_app) -> "AppFuture":
-    """Execute full 4-stage GROMACS pipeline with automatic dependencies.
-
-    Chains EM → NVT → NPT → Production with Parsl data dependencies.
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    grompp_app : callable
-        Result of get_grompp_app().
-    mdrun_app : callable
-        Result of get_mdrun_app().
-
-    Returns
-    -------
-    AppFuture
-        Future that resolves when production stage completes.
-
-    """
-    em_fut = run_em_stage(sim_dir, grompp_app, mdrun_app)
-    nvt_fut = run_nvt_stage(sim_dir, em_fut, grompp_app, mdrun_app)
-    npt_fut = run_npt_stage(sim_dir, nvt_fut, grompp_app, mdrun_app)
-    prod_fut = run_production_stage(sim_dir, npt_fut, grompp_app, mdrun_app)
-
-    return prod_fut

@@ -19,7 +19,6 @@ from .build import _wait_with_progress
 from .session import parsl_session
 from .stages import (
     run_em_stage,
-    run_full_pipeline,
     run_npt_stage,
     run_nvt_stage,
     run_production_stage,
