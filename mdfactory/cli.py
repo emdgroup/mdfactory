@@ -404,6 +404,43 @@ def _report_build_results(results: list[dict]):
             logger.error(f"  {r.get('hash', 'unknown')}: {r.get('error', 'unknown error')}")
 
 
+def _discover_sim_dirs(root: Path) -> list[Path]:
+    """Find simulation-ready directories under *root*.
+
+    A directory is considered simulation-ready when it contains ``system.pdb``.
+    Unlike :func:`~mdfactory.analysis.utils.discover_simulations` (which is
+    designed for post-run analysis), this helper does **not** require a
+    ``BuildInput`` YAML or a completed trajectory — it works on freshly
+    prepared directories.
+
+    Rules
+    -----
+    - If *root* itself contains ``system.pdb`` it is returned as a single-item
+      list (direct simulation directory).
+    - Otherwise the immediate children of *root* that contain ``system.pdb``
+      are returned (build-output layout where each hash subdirectory is one
+      simulation).
+
+    Raises
+    ------
+    ValueError
+        If no simulation-ready directories are found under *root*.
+
+    """
+    if (root / "system.pdb").exists():
+        return [root]
+
+    sims = sorted(d for d in root.iterdir() if d.is_dir() and (d / "system.pdb").exists())
+    if not sims:
+        raise ValueError(
+            f"No simulation directories found under {root}.\n"
+            "Each simulation directory must contain system.pdb.  "
+            "Run 'mdfactory build' first, or point directly to a prepared "
+            "simulation directory."
+        )
+    return sims
+
+
 @app.command(name="simulate", group="Simulation")
 def simulate_systems(
     source: Annotated[Path, Parameter(help="Simulation directory or summary YAML")],
@@ -457,17 +494,17 @@ def simulate_systems(
         mdfactory simulate output_dir/ --slurm gpu.yaml --dry-run
 
     """
-    from mdfactory.analysis.submit import filter_paths_by_hash, resolve_simulation_paths
+    from mdfactory.analysis.submit import filter_paths_by_hash
 
     source = source.resolve()
 
     # Resolve simulation paths
     if source.is_dir():
-        sim_paths = resolve_simulation_paths(
-            [source],
-            trajectory_file="prod.xtc",
-            structure_file="system.pdb",
-        )
+        try:
+            sim_paths = _discover_sim_dirs(source)
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(1)
     elif source.suffix in (".yaml", ".yml"):
         # Load from summary YAML
         with open(source) as f:
