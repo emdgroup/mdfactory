@@ -57,7 +57,11 @@ def run_em_stage(sim_dir: Path, grompp_app, mdrun_app) -> "AppFuture":
 
 
 def run_nvt_stage(
-    sim_dir: Path, em_future: "AppFuture | None", grompp_app, mdrun_app
+    sim_dir: Path,
+    em_future: "AppFuture | None",
+    grompp_app,
+    mdrun_app,
+    restart_from_cpt: str = "",
 ) -> "AppFuture":
     """Execute NVT equilibration stage.
 
@@ -72,6 +76,10 @@ def run_nvt_stage(
         Result of get_grompp_app().
     mdrun_app : callable
         Result of get_mdrun_app().
+    restart_from_cpt : str, optional
+        Path to an existing NVT checkpoint file.  When non-empty the grompp
+        step is skipped (the TPR already exists) and mdrun is invoked with
+        ``-cpi <file> -append`` to continue from the saved state.
 
     Returns
     -------
@@ -80,6 +88,16 @@ def run_nvt_stage(
 
     """
     work_dir = str(sim_dir.resolve())
+
+    if restart_from_cpt:
+        # TPR exists from the interrupted run — skip grompp, resume mdrun.
+        mdrun_inputs = [em_future] if em_future is not None else []
+        return mdrun_app(
+            deffnm="nvt",
+            work_dir=work_dir,
+            restart_from_cpt=restart_from_cpt,
+            inputs=mdrun_inputs,
+        )
 
     # Build inputs list: include em_future only if provided
     grompp_inputs = [em_future] if em_future is not None else []
@@ -95,17 +113,19 @@ def run_nvt_stage(
         inputs=grompp_inputs,
     )
 
-    mdrun_fut = mdrun_app(
+    return mdrun_app(
         deffnm="nvt",
         work_dir=work_dir,
         inputs=[grompp_fut],
     )
 
-    return mdrun_fut
-
 
 def run_npt_stage(
-    sim_dir: Path, nvt_future: "AppFuture | None", grompp_app, mdrun_app
+    sim_dir: Path,
+    nvt_future: "AppFuture | None",
+    grompp_app,
+    mdrun_app,
+    restart_from_cpt: str = "",
 ) -> "AppFuture":
     """Execute NPT equilibration stage.
 
@@ -120,6 +140,9 @@ def run_npt_stage(
         Result of get_grompp_app().
     mdrun_app : callable
         Result of get_mdrun_app().
+    restart_from_cpt : str, optional
+        Path to an existing NPT checkpoint file.  When non-empty the grompp
+        step is skipped and mdrun is invoked with ``-cpi <file> -append``.
 
     Returns
     -------
@@ -128,6 +151,16 @@ def run_npt_stage(
 
     """
     work_dir = str(sim_dir.resolve())
+
+    if restart_from_cpt:
+        # TPR exists from the interrupted run — skip grompp, resume mdrun.
+        mdrun_inputs = [nvt_future] if nvt_future is not None else []
+        return mdrun_app(
+            deffnm="npt",
+            work_dir=work_dir,
+            restart_from_cpt=restart_from_cpt,
+            inputs=mdrun_inputs,
+        )
 
     # Build inputs list: include nvt_future only if provided
     grompp_inputs = [nvt_future] if nvt_future is not None else []
@@ -144,17 +177,19 @@ def run_npt_stage(
         inputs=grompp_inputs,
     )
 
-    mdrun_fut = mdrun_app(
+    return mdrun_app(
         deffnm="npt",
         work_dir=work_dir,
         inputs=[grompp_fut],
     )
 
-    return mdrun_fut
-
 
 def run_production_stage(
-    sim_dir: Path, npt_future: "AppFuture | None", grompp_app, mdrun_app
+    sim_dir: Path,
+    npt_future: "AppFuture | None",
+    grompp_app,
+    mdrun_app,
+    restart_from_cpt: str = "",
 ) -> "AppFuture":
     """Execute production MD stage.
 
@@ -169,6 +204,10 @@ def run_production_stage(
         Result of get_grompp_app().
     mdrun_app : callable
         Result of get_mdrun_app().
+    restart_from_cpt : str, optional
+        Path to an existing Production checkpoint file.  When non-empty the
+        grompp step is skipped (prod.tpr already exists) and mdrun is invoked
+        with ``-cpi <file> -append`` to continue the interrupted trajectory.
 
     Returns
     -------
@@ -177,6 +216,16 @@ def run_production_stage(
 
     """
     work_dir = str(sim_dir.resolve())
+
+    if restart_from_cpt:
+        # prod.tpr exists from the interrupted run — skip grompp, resume mdrun.
+        mdrun_inputs = [npt_future] if npt_future is not None else []
+        return mdrun_app(
+            deffnm="prod",
+            work_dir=work_dir,
+            restart_from_cpt=restart_from_cpt,
+            inputs=mdrun_inputs,
+        )
 
     # Build inputs list: include npt_future only if provided
     grompp_inputs = [npt_future] if npt_future is not None else []
@@ -192,13 +241,11 @@ def run_production_stage(
         inputs=grompp_inputs,
     )
 
-    mdrun_fut = mdrun_app(
+    return mdrun_app(
         deffnm="prod",
         work_dir=work_dir,
         inputs=[grompp_fut],
     )
-
-    return mdrun_fut
 
 
 def run_full_pipeline(sim_dir: Path, grompp_app, mdrun_app) -> "AppFuture":

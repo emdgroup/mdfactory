@@ -76,14 +76,21 @@ def run_simulations(
     for sim_dir in sim_paths:
         _validate_simulation_dir(sim_dir, stages)
 
-    # 2. Checkpoint detection
+    # 2. Checkpoint detection (includes restart info for -cpi -append support)
     work_plan = []
     for sim_dir in sim_paths:
-        needed_stages = _detect_needed_stages(sim_dir, stages, checkpoint_mode)
+        stage_items = _detect_needed_stages_with_restart_info(sim_dir, stages, checkpoint_mode)
+        needed_stages = [item["stage"] for item in stage_items]
+        stage_restarts = {
+            item["stage"]: str(item["cpt_file"])
+            for item in stage_items
+            if item["restart"] and item["cpt_file"] is not None
+        }
         work_plan.append({
             "sim_dir": sim_dir,
             "hash": sim_dir.name,
             "stages": needed_stages,
+            "stage_restarts": stage_restarts,
         })
 
     logger.info(f"Prepared work plan for {len(work_plan)} simulation(s)")
@@ -112,7 +119,11 @@ def run_simulations(
 
             # Execute only the needed stages with explicit control
             pipeline_fut = _execute_stage_list(
-                item["sim_dir"], item["stages"], grompp_app, mdrun_app
+                item["sim_dir"],
+                item["stages"],
+                grompp_app,
+                mdrun_app,
+                stage_restarts=item.get("stage_restarts"),
             )
             futures.append((item["hash"], pipeline_fut))
 
@@ -325,7 +336,11 @@ def _detect_needed_stages_with_restart_info(
 
 
 def _execute_stage_list(
-    sim_dir: Path, stages: list[str], grompp_app, mdrun_app
+    sim_dir: Path,
+    stages: list[str],
+    grompp_app,
+    mdrun_app,
+    stage_restarts: "dict[str, str] | None" = None,
 ) -> "AppFuture | None":
     """Execute a list of stages with automatic dependency chaining.
 
@@ -342,6 +357,11 @@ def _execute_stage_list(
         Grompp app from get_grompp_app().
     mdrun_app : callable
         Mdrun app from get_mdrun_app().
+    stage_restarts : dict[str, str] or None, optional
+        Maps stage name → absolute path of checkpoint file to resume from.
+        When a stage has an entry here, grompp is skipped and mdrun is called
+        with ``-cpi <file> -append``.  Stages absent from the dict (or when
+        the dict is ``None``) run normally from scratch.
 
     Returns
     -------
@@ -356,6 +376,8 @@ def _execute_stage_list(
     """
     if not stages:
         return None
+
+    restarts = stage_restarts or {}
 
     # Explicit mapping of stages to their functions
     stage_functions = {
@@ -384,16 +406,23 @@ def _execute_stage_list(
     # Execute stages sequentially, chaining dependencies
     prev_future = None
     for i, stage in enumerate(stages):
+        cpt_file = restarts.get(stage, "")
         if stage == "EM":
-            # EM has no dependencies
+            # EM has no dependencies and no checkpoint restart support
             prev_future = run_em_stage(sim_dir, grompp_app, mdrun_app)
         else:
-            # All other stages depend on previous stage
+            # All other stages depend on previous stage.
             # If this is the first stage (i==0) and it's not EM, we're resuming from
             # checkpoint. Pass None as prev_future - stage functions handle this by
             # not adding it to inputs=[] (files already exist, validated by prerequisites)
             stage_fn = stage_functions[stage]
-            prev_future = stage_fn(sim_dir, prev_future, grompp_app, mdrun_app)
+            if cpt_file:
+                prev_future = stage_fn(
+                    sim_dir, prev_future, grompp_app, mdrun_app,
+                    restart_from_cpt=cpt_file,
+                )
+            else:
+                prev_future = stage_fn(sim_dir, prev_future, grompp_app, mdrun_app)
 
     return prev_future
 
@@ -597,8 +626,15 @@ def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[d
     for item in work_plan:
         logger.info(f"Simulation: {item['hash']}")
         logger.info(f"  Directory: {item['sim_dir']}")
-        stages_str = ", ".join(item["stages"]) if item["stages"] else "None (all complete)"
-        logger.info(f"  Stages: {stages_str}")
+        if item["stages"]:
+            restarts = item.get("stage_restarts", {})
+            stage_parts = []
+            for s in item["stages"]:
+                label = f"{s} (resume from {restarts[s]})" if s in restarts else s
+                stage_parts.append(label)
+            logger.info(f"  Stages: {', '.join(stage_parts)}")
+        else:
+            logger.info("  Stages: None (all complete)")
 
     logger.info("=" * 60)
     logger.info(f"Executor: {config.provider}")

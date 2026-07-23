@@ -992,6 +992,126 @@ def test_get_gromacs_detect_script_prefers_gmx_over_gmx_mpi():
 # === Decision 7: Checkpoint restart flag tests ===
 
 
+# === Decision 7: Restart wiring through stage functions and execute_stage_list ===
+
+
+@patch("mdfactory.orchestration.simulate.run_nvt_stage")
+def test_execute_stage_list_passes_restart_to_stage_fn(mock_nvt):
+    """_execute_stage_list forwards stage_restarts to the stage function."""
+    mock_nvt.return_value = MagicMock()
+    grompp_app = MagicMock()
+    mdrun_app = MagicMock()
+    sim_dir = Path("/tmp/test")
+
+    _execute_stage_list(
+        sim_dir,
+        ["NVT"],
+        grompp_app,
+        mdrun_app,
+        stage_restarts={"NVT": "/sim/nvt.cpt"},
+    )
+
+    # NVT should receive restart_from_cpt kwarg
+    mock_nvt.assert_called_once_with(
+        sim_dir, None, grompp_app, mdrun_app, restart_from_cpt="/sim/nvt.cpt"
+    )
+
+
+@patch("mdfactory.orchestration.simulate.run_npt_stage")
+@patch("mdfactory.orchestration.simulate.run_nvt_stage")
+def test_execute_stage_list_restart_only_for_matching_stage(mock_nvt, mock_npt):
+    """Only the stage with a cpt entry gets restart_from_cpt; others run normally."""
+    mock_nvt.return_value = MagicMock()
+    mock_npt.return_value = MagicMock()
+    grompp_app = MagicMock()
+    mdrun_app = MagicMock()
+    sim_dir = Path("/tmp/test")
+
+    _execute_stage_list(
+        sim_dir,
+        ["NVT", "NPT"],
+        grompp_app,
+        mdrun_app,
+        stage_restarts={"NPT": "/sim/npt.cpt"},
+    )
+
+    # NVT runs normally (no restart kwarg)
+    mock_nvt.assert_called_once_with(sim_dir, None, grompp_app, mdrun_app)
+    # NPT gets the restart kwarg
+    mock_npt.assert_called_once_with(
+        sim_dir, mock_nvt.return_value, grompp_app, mdrun_app,
+        restart_from_cpt="/sim/npt.cpt",
+    )
+
+
+def test_nvt_stage_skips_grompp_on_restart():
+    """run_nvt_stage skips grompp and passes restart_from_cpt to mdrun_app."""
+    from mdfactory.orchestration.stages import run_nvt_stage
+
+    grompp_app = MagicMock()
+    mdrun_app = MagicMock()
+    mdrun_app.return_value = MagicMock()
+
+    run_nvt_stage(
+        Path("/sim"),
+        em_future=None,
+        grompp_app=grompp_app,
+        mdrun_app=mdrun_app,
+        restart_from_cpt="/sim/nvt.cpt",
+    )
+
+    # grompp must NOT be called
+    grompp_app.assert_not_called()
+    # mdrun called with restart kwarg
+    mdrun_app.assert_called_once()
+    call_kwargs = mdrun_app.call_args[1]
+    assert call_kwargs.get("restart_from_cpt") == "/sim/nvt.cpt"
+
+
+def test_npt_stage_skips_grompp_on_restart():
+    """run_npt_stage skips grompp and passes restart_from_cpt to mdrun_app."""
+    from mdfactory.orchestration.stages import run_npt_stage
+
+    grompp_app = MagicMock()
+    mdrun_app = MagicMock()
+    mdrun_app.return_value = MagicMock()
+
+    run_npt_stage(
+        Path("/sim"),
+        nvt_future=None,
+        grompp_app=grompp_app,
+        mdrun_app=mdrun_app,
+        restart_from_cpt="/sim/npt.cpt",
+    )
+
+    grompp_app.assert_not_called()
+    mdrun_app.assert_called_once()
+    call_kwargs = mdrun_app.call_args[1]
+    assert call_kwargs.get("restart_from_cpt") == "/sim/npt.cpt"
+
+
+def test_production_stage_skips_grompp_on_restart():
+    """run_production_stage skips grompp and passes restart_from_cpt to mdrun_app."""
+    from mdfactory.orchestration.stages import run_production_stage
+
+    grompp_app = MagicMock()
+    mdrun_app = MagicMock()
+    mdrun_app.return_value = MagicMock()
+
+    run_production_stage(
+        Path("/sim"),
+        npt_future=None,
+        grompp_app=grompp_app,
+        mdrun_app=mdrun_app,
+        restart_from_cpt="/sim/prod.cpt",
+    )
+
+    grompp_app.assert_not_called()
+    mdrun_app.assert_called_once()
+    call_kwargs = mdrun_app.call_args[1]
+    assert call_kwargs.get("restart_from_cpt") == "/sim/prod.cpt"
+
+
 def test_mdrun_app_no_cpt_flags_by_default():
     """Mdrun bash app omits -cpi/-append when no restart_from_cpt given."""
     from mdfactory.orchestration.apps import get_mdrun_app
