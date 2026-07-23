@@ -30,6 +30,33 @@ fi
 """
 
 
+def _require_bash_app():
+    """Import and return Parsl's ``bash_app`` decorator.
+
+    Factored out of :func:`get_grompp_app` and :func:`get_mdrun_app` to avoid
+    repeating the same try/except import guard in every factory function.
+
+    Returns
+    -------
+    callable
+        The ``parsl.bash_app`` decorator.
+
+    Raises
+    ------
+    ImportError
+        If parsl is not installed.
+
+    """
+    try:
+        from parsl import bash_app  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ImportError(
+            "parsl is required for simulation orchestration. "
+            "Install with `pip install 'mdfactory[parsl]'`."
+        ) from exc
+    return bash_app
+
+
 def _build_system_impl(build_input_dict: dict) -> dict:
     """Run a single system build inside a Parsl worker.
 
@@ -95,82 +122,50 @@ def get_build_app():
     return python_app(_build_system_impl)
 
 
-def get_grompp_app():
-    """Create and return the Parsl bash_app for GROMACS preprocessing.
+def _build_grompp_script(
+    mdp_file: str,
+    gro_file: str,
+    top_file: str,
+    tpr_file: str,
+    work_dir: str,
+    ref_file: str = "",
+    cpt_file: str = "",
+    maxwarn: int = 1,
+) -> str:
+    """Build the bash script for ``gmx grompp``.
 
-    The ``@bash_app`` decorator is applied here (not at module level)
-    because it requires an active Parsl DataFlowKernel.
+    Pure function — no Parsl dependency.  Fully testable without a
+    DataFlowKernel by calling it directly with test arguments.
+
+    Parameters
+    ----------
+    mdp_file : str
+        MDP parameter file (em.mdp, nvt.mdp, npt.mdp, md.mdp).
+    gro_file : str
+        Input structure file (system.pdb, min.gro, etc).
+    top_file : str
+        Topology file (topology.top).
+    tpr_file : str
+        Output TPR file (min.tpr, nvt.tpr, etc).
+    work_dir : str
+        Absolute path to simulation directory.
+    ref_file : str, optional
+        Reference structure for position restraints (-r flag).
+    cpt_file : str, optional
+        Checkpoint file for velocities (-t flag).
+    maxwarn : int
+        Maximum number of warnings to allow.
 
     Returns
     -------
-    callable
-        A Parsl ``@bash_app`` wrapping gmx grompp.
-
-    Raises
-    ------
-    ImportError
-        If parsl is not installed.
+    str
+        Bash script to execute.
 
     """
-    try:
-        from parsl import bash_app  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise ImportError(
-            "parsl is required for simulation orchestration. "
-            "Install with `pip install 'mdfactory[parsl]'`."
-        ) from exc
+    ref_flag = f"-r {ref_file}" if ref_file else ""
+    cpt_flag = f"-t {cpt_file}" if cpt_file else ""
 
-    @bash_app
-    def run_grompp(
-        mdp_file: str,
-        gro_file: str,
-        top_file: str,
-        tpr_file: str,
-        work_dir: str,
-        ref_file: str = "",
-        cpt_file: str = "",
-        maxwarn: int = 1,
-        stdout=None,
-        stderr=None,
-        inputs=None,
-    ):
-        """Generate GROMACS .tpr file via grompp.
-
-        Parameters
-        ----------
-        mdp_file : str
-            MDP parameter file (em.mdp, nvt.mdp, npt.mdp, md.mdp).
-        gro_file : str
-            Input structure file (system.pdb, min.gro, etc).
-        top_file : str
-            Topology file (topology.top).
-        tpr_file : str
-            Output TPR file (min.tpr, nvt.tpr, etc).
-        work_dir : str
-            Absolute path to simulation directory.
-        ref_file : str, optional
-            Reference structure for position restraints (-r flag).
-        cpt_file : str, optional
-            Checkpoint file for velocities (-t flag).
-        maxwarn : int
-            Maximum number of warnings to allow.
-        stdout : str, optional
-            File path for stdout.
-        stderr : str, optional
-            File path for stderr.
-        inputs : list, optional
-            Parsl input dependencies.
-
-        Returns
-        -------
-        str
-            Bash script to execute.
-
-        """
-        ref_flag = f"-r {ref_file}" if ref_file else ""
-        cpt_flag = f"-t {cpt_file}" if cpt_file else ""
-
-        return f"""
+    return f"""
         set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
         cd {work_dir}
@@ -196,123 +191,98 @@ def get_grompp_app():
         echo "GROMACS grompp: SUCCESS - {tpr_file} created" >&2
         """
 
-    return run_grompp
 
+def _build_mdrun_script(
+    deffnm: str,
+    work_dir: str,
+    restart_from_cpt: str = "",
+    ntasks: int = 0,
+    disable_gpu: bool = False,
+    pme_gpu: bool = True,
+    gro_out: str = "",
+    traj_files: "tuple[str, ...]" = (),
+) -> str:
+    """Build the bash script for ``gmx mdrun``.
 
-def get_mdrun_app():
-    """Create and return the Parsl bash_app for GROMACS simulation.
+    Pure function — no Parsl dependency.  Fully testable without a
+    DataFlowKernel by calling it directly with test arguments.
 
-    The ``@bash_app`` decorator is applied here (not at module level)
-    because it requires an active Parsl DataFlowKernel.
+    Output validation is spec-driven via ``gro_out`` / ``traj_files``:
+    no hardcoded ``deffnm`` string comparisons are needed.
+
+    Parameters
+    ----------
+    deffnm : str
+        Default filename prefix (min, nvt, npt, prod).
+    work_dir : str
+        Absolute path to simulation directory.
+    restart_from_cpt : str, optional
+        Path to checkpoint file (.cpt) to resume from. When non-empty,
+        ``-cpi <file> -append`` flags are added.
+    ntasks : int, optional
+        Explicit thread count override.  When > 0 used directly instead
+        of reading ``$SLURM_CPUS_PER_TASK``.
+    disable_gpu : bool, optional
+        When ``True``, force CPU-only execution.
+    pme_gpu : bool, optional
+        When ``True`` and a GPU is available, run PME on GPU (``-pme gpu``).
+        Set to ``False`` for stages whose integrator is non-dynamical (EM),
+        which GROMACS rejects with PME-GPU.
+    gro_out : str, optional
+        Expected output ``.gro`` file to verify after mdrun.  Empty string
+        means no ``.gro`` check (e.g. Production stage writes trajectory).
+    traj_files : tuple of str, optional
+        Trajectory output files to verify — at least one must exist.
+        Non-empty only for Production: ``("prod.xtc", "prod.trr")``.
 
     Returns
     -------
-    callable
-        A Parsl ``@bash_app`` wrapping gmx mdrun.
-
-    Raises
-    ------
-    ImportError
-        If parsl is not installed.
+    str
+        Bash script to execute.
 
     """
-    try:
-        from parsl import bash_app  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise ImportError(
-            "parsl is required for simulation orchestration. "
-            "Install with `pip install 'mdfactory[parsl]'`."
-        ) from exc
+    # Build checkpoint restart flags once; inject literally into the script.
+    cpt_flags = f"-cpi {restart_from_cpt} -append " if restart_from_cpt else ""
+    cpt_msg = f" (resuming from {restart_from_cpt})" if restart_from_cpt else ""
 
-    @bash_app
-    def run_mdrun(
-        deffnm: str,
-        work_dir: str,
-        restart_from_cpt: str = "",
-        ntasks: int = 0,
-        disable_gpu: bool = False,
-        pme_gpu: bool = True,
-        stdout=None,
-        stderr=None,
-        inputs=None,
-    ):
-        """Run GROMACS simulation with auto-detected resources.
+    # Thread-count: explicit override wins over SLURM/OMP auto-detection.
+    nthr_line = (
+        f"NTHR={ntasks}"
+        if ntasks > 0
+        else "NTHR=${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-12}}"
+    )
 
-        Thread count and GPU usage are auto-detected from SLURM environment
-        variables, with sensible fallbacks for local execution.  Explicit
-        ``ntasks`` / ``disable_gpu`` / ``pme_gpu`` arguments override the
-        auto-detection, enabling per-stage resource configuration.
+    # GPU guard: short-circuit with literal "false" when caller requests CPU-only.
+    gpu_condition = (
+        "false"
+        if disable_gpu
+        else '[ -n "${CUDA_VISIBLE_DEVICES}" ] && [ "${CUDA_VISIBLE_DEVICES}" != "NoDevFiles" ]'
+    )
 
-        Resource detection priority:
-        - Thread count: ``ntasks`` arg (if >0) > SLURM_CPUS_PER_TASK >
-          OMP_NUM_THREADS > default(12)
-        - GPU: disabled when ``disable_gpu=True`` or CUDA_VISIBLE_DEVICES unset
-        - PME-on-GPU: only when ``pme_gpu=True`` AND GPU is available.
-          Must be ``False`` for non-dynamical integrators (e.g. EM/steep),
-          which GROMACS does not support on GPU for PME.
+    # PME flag: spec-driven — EM uses "-pme cpu" (steep integrator), others "-pme gpu".
+    pme_flag = "-pme gpu" if pme_gpu else "-pme cpu"
 
-        Parameters
-        ----------
-        deffnm : str
-            Default filename prefix (min, nvt, npt, prod).
-        work_dir : str
-            Absolute path to simulation directory.
-        restart_from_cpt : str, optional
-            Path to checkpoint file (.cpt) to resume from. When non-empty,
-            ``-cpi <file> -append`` flags are added to the mdrun command so
-            the simulation continues from the saved state rather than
-            starting from scratch.
-        ntasks : int, optional
-            Explicit thread count override.  When > 0 this value is used
-            directly instead of reading ``$SLURM_CPUS_PER_TASK``.  Defaults
-            to 0 (auto-detect from environment).
-        disable_gpu : bool, optional
-            When ``True``, force CPU-only execution regardless of whether
-            ``CUDA_VISIBLE_DEVICES`` is set.  Defaults to ``False``.
-        pme_gpu : bool, optional
-            When ``True`` (default) and a GPU is available, run PME on GPU
-            (``-pme gpu``).  Set to ``False`` for stages whose integrator is
-            non-dynamical (EM with ``steep``), which GROMACS rejects with
-            PME-GPU.  When ``False``, GPU non-bonded forces (``-nb gpu``) are
-            still used so EM still benefits from GPU acceleration.
-        stdout : str, optional
-            File path for stdout.
-        stderr : str, optional
-            File path for stderr.
-        inputs : list, optional
-            Parsl input dependencies.
+    # Output-verification block: spec-driven, no hardcoded deffnm comparisons.
+    if traj_files:
+        traj_conds = " && ".join(f'[ ! -f "{f}" ]' for f in traj_files)
+        traj_list = " or ".join(traj_files)
+        output_check = f"""
+        # Verify trajectory output (accept any of the expected formats)
+        if {traj_conds}; then
+            echo "ERROR: mdrun completed but none of ({traj_list}) was created" >&2
+            exit 1
+        fi"""
+    elif gro_out:
+        output_check = f"""
+        # Verify structure output
+        if [ ! -f "{gro_out}" ]; then
+            echo "ERROR: mdrun completed but {gro_out} was not created" >&2
+            exit 1
+        fi"""
+    else:
+        output_check = ""
 
-        Returns
-        -------
-        str
-            Bash script to execute.
-
-        """
-        # Build checkpoint restart flags once; inject literally into the script.
-        # Trailing space when non-empty avoids double-space in the command line.
-        cpt_flags = f"-cpi {restart_from_cpt} -append " if restart_from_cpt else ""
-        cpt_msg = f" (resuming from {restart_from_cpt})" if restart_from_cpt else ""
-
-        # Thread-count: explicit override wins over SLURM/OMP auto-detection.
-        nthr_line = (
-            f"NTHR={ntasks}"
-            if ntasks > 0
-            else "NTHR=${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-12}}"
-        )
-
-        # GPU guard: skip GPU detection entirely when caller requests CPU-only.
-        # We inject a literal "false" as the first condition to short-circuit.
-        gpu_condition = (
-            "false"
-            if disable_gpu
-            else '[ -n "${CUDA_VISIBLE_DEVICES}" ] && [ "${CUDA_VISIBLE_DEVICES}" != "NoDevFiles" ]'
-        )
-
-        # PME flag: "-pme gpu" for dynamical integrators, "-pme cpu" for EM (steep).
-        # Evaluated in Python so the correct literal is baked into the bash script.
-        pme_flag = "-pme gpu" if pme_gpu else "-pme cpu"
-
-        return f"""
+    return f"""
         set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
         cd {work_dir}
@@ -375,29 +345,174 @@ def get_mdrun_app():
                 fi
             fi
         fi
-
-        # Verify expected output files were created.
-        # EM writes a .gro (no trajectory); equilibration/production writes .gro
-        # or .xtc/.trr depending on nstxout-compressed vs nstxout in the MDP.
-        if [[ "{deffnm}" == "min" ]]; then
-            if [ ! -f "min.gro" ]; then
-                echo "ERROR: mdrun completed but min.gro was not created" >&2
-                exit 1
-            fi
-        elif [[ "{deffnm}" == "prod" ]]; then
-            # Accept compressed (.xtc) or full-precision (.trr) trajectory
-            if [ ! -f "prod.xtc" ] && [ ! -f "prod.trr" ]; then
-                echo "ERROR: mdrun completed but neither prod.xtc nor prod.trr was created" >&2
-                exit 1
-            fi
-        else
-            if [ ! -f "{deffnm}.gro" ]; then
-                echo "ERROR: mdrun completed but {deffnm}.gro was not created" >&2
-                exit 1
-            fi
-        fi
-
+        {output_check}
         echo "GROMACS mdrun: SUCCESS - {deffnm} completed" >&2
         """
+
+
+def get_grompp_app():
+    """Create and return the Parsl bash_app for GROMACS preprocessing.
+
+    The ``@bash_app`` decorator is applied here (not at module level)
+    because it requires an active Parsl DataFlowKernel.
+
+    The underlying bash script is built by :func:`_build_grompp_script`, a
+    pure function that can be tested independently of Parsl.
+
+    Returns
+    -------
+    callable
+        A Parsl ``@bash_app`` wrapping gmx grompp.
+
+    Raises
+    ------
+    ImportError
+        If parsl is not installed.
+
+    """
+    bash_app = _require_bash_app()
+
+    @bash_app
+    def run_grompp(
+        mdp_file: str,
+        gro_file: str,
+        top_file: str,
+        tpr_file: str,
+        work_dir: str,
+        ref_file: str = "",
+        cpt_file: str = "",
+        maxwarn: int = 1,
+        stdout=None,
+        stderr=None,
+        inputs=None,
+    ):
+        """Generate GROMACS .tpr file via grompp.
+
+        Parameters
+        ----------
+        mdp_file : str
+            MDP parameter file (em.mdp, nvt.mdp, npt.mdp, md.mdp).
+        gro_file : str
+            Input structure file (system.pdb, min.gro, etc).
+        top_file : str
+            Topology file (topology.top).
+        tpr_file : str
+            Output TPR file (min.tpr, nvt.tpr, etc).
+        work_dir : str
+            Absolute path to simulation directory.
+        ref_file : str, optional
+            Reference structure for position restraints (-r flag).
+        cpt_file : str, optional
+            Checkpoint file for velocities (-t flag).
+        maxwarn : int
+            Maximum number of warnings to allow.
+        stdout : str, optional
+            File path for stdout.
+        stderr : str, optional
+            File path for stderr.
+        inputs : list, optional
+            Parsl input dependencies.
+
+        Returns
+        -------
+        str
+            Bash script to execute.
+
+        """
+        return _build_grompp_script(mdp_file, gro_file, top_file, tpr_file, work_dir, ref_file, cpt_file, maxwarn)
+
+    return run_grompp
+
+
+def get_mdrun_app():
+    """Create and return the Parsl bash_app for GROMACS simulation.
+
+    The ``@bash_app`` decorator is applied here (not at module level)
+    because it requires an active Parsl DataFlowKernel.
+
+    The underlying bash script is built by :func:`_build_mdrun_script`, a
+    pure function that can be tested independently of Parsl.  Output
+    validation is spec-driven via ``gro_out`` / ``traj_files`` — no
+    hardcoded ``deffnm`` string comparisons in the generated bash.
+
+    Returns
+    -------
+    callable
+        A Parsl ``@bash_app`` wrapping gmx mdrun.
+
+    Raises
+    ------
+    ImportError
+        If parsl is not installed.
+
+    """
+    bash_app = _require_bash_app()
+
+    @bash_app
+    def run_mdrun(
+        deffnm: str,
+        work_dir: str,
+        restart_from_cpt: str = "",
+        ntasks: int = 0,
+        disable_gpu: bool = False,
+        pme_gpu: bool = True,
+        gro_out: str = "",
+        traj_files: "tuple[str, ...]" = (),
+        stdout=None,
+        stderr=None,
+        inputs=None,
+    ):
+        """Run GROMACS simulation with auto-detected resources.
+
+        Thread count and GPU usage are auto-detected from SLURM environment
+        variables, with sensible fallbacks for local execution.  Explicit
+        ``ntasks`` / ``disable_gpu`` / ``pme_gpu`` arguments override the
+        auto-detection, enabling per-stage resource configuration.
+
+        Output validation is spec-driven: pass ``gro_out`` for stages that
+        write a ``.gro`` file, or ``traj_files`` for Production (which writes
+        ``.xtc``/``.trr``).
+
+        Resource detection priority:
+        - Thread count: ``ntasks`` arg (if >0) > SLURM_CPUS_PER_TASK >
+          OMP_NUM_THREADS > default(12)
+        - GPU: disabled when ``disable_gpu=True`` or CUDA_VISIBLE_DEVICES unset
+        - PME-on-GPU: only when ``pme_gpu=True`` AND GPU is available.
+          Must be ``False`` for non-dynamical integrators (e.g. EM/steep).
+
+        Parameters
+        ----------
+        deffnm : str
+            Default filename prefix (min, nvt, npt, prod).
+        work_dir : str
+            Absolute path to simulation directory.
+        restart_from_cpt : str, optional
+            Path to checkpoint file (.cpt) to resume from.
+        ntasks : int, optional
+            Explicit thread count override.  When > 0, overrides auto-detect.
+        disable_gpu : bool, optional
+            Force CPU-only execution.
+        pme_gpu : bool, optional
+            Run PME on GPU when a GPU is available. Set to ``False`` for EM.
+        gro_out : str, optional
+            Expected output ``.gro`` file to verify after mdrun.
+        traj_files : tuple of str, optional
+            Trajectory output files to verify (at least one must exist).
+        stdout : str, optional
+            File path for stdout.
+        stderr : str, optional
+            File path for stderr.
+        inputs : list, optional
+            Parsl input dependencies.
+
+        Returns
+        -------
+        str
+            Bash script to execute.
+
+        """
+        return _build_mdrun_script(
+            deffnm, work_dir, restart_from_cpt, ntasks, disable_gpu, pme_gpu, gro_out, traj_files
+        )
 
     return run_mdrun
