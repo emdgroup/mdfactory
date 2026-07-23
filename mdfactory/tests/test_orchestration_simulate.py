@@ -844,7 +844,7 @@ def test_validate_trajectory_without_expected_frames(mock_mda, mock_sim_dir):
 
 def test_find_structure_file_priority_order(mock_sim_dir):
     """Find structure file uses correct priority order."""
-    from mdfactory.orchestration.simulate import _find_structure_file
+    from mdfactory.orchestration.simulate import find_structure_file
 
     # Create files in reverse priority order
     (mock_sim_dir / "system.pdb").write_text("FAKE")
@@ -852,19 +852,19 @@ def test_find_structure_file_priority_order(mock_sim_dir):
     (mock_sim_dir / "npt.gro").write_text("FAKE")
 
     # Should prioritize npt.gro over min.gro over system.pdb
-    result = _find_structure_file(mock_sim_dir)
+    result = find_structure_file(mock_sim_dir)
     assert result == mock_sim_dir / "npt.gro"
 
 
 def test_find_structure_file_returns_none_if_missing(tmp_path):
     """Find structure file returns None if no candidates exist."""
-    from mdfactory.orchestration.simulate import _find_structure_file
+    from mdfactory.orchestration.simulate import find_structure_file
 
     # Create empty directory with no structure files
     empty_dir = tmp_path / "empty"
     empty_dir.mkdir()
 
-    result = _find_structure_file(empty_dir)
+    result = find_structure_file(empty_dir)
     assert result is None
 
 

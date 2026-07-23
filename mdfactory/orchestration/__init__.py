@@ -4,13 +4,14 @@
 
 from .build import build_systems
 from .config import ExecutorConfig, SlurmExecutorConfig
-from .simulate import run_simulations
+from .simulate import find_structure_file, run_simulations
 from .tui import configure_and_save_slurm, configure_slurm_interactive
 
 __all__ = [
     "ExecutorConfig",
     "SlurmExecutorConfig",
     "build_systems",
+    "find_structure_file",
     "run_simulations",
     "configure_and_save_slurm",
     "configure_slurm_interactive",

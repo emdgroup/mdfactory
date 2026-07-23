@@ -547,7 +547,7 @@ def _validate_trajectory_complete(
             raise ImportError("MDAnalysis not available")
 
         # Find structure file for topology
-        structure_file = _find_structure_file(sim_dir)
+        structure_file = find_structure_file(sim_dir)
         if not structure_file:
             logger.warning(
                 f"No structure file found in {sim_dir}, using size check fallback"
@@ -574,8 +574,13 @@ def _validate_trajectory_complete(
         return traj_path.stat().st_size > 10_000_000
 
 
-def _find_structure_file(sim_dir: Path) -> Path | None:
-    """Find structure file for MDAnalysis Universe.
+def find_structure_file(sim_dir: Path) -> Path | None:
+    """Find the best available structure file in a simulation directory.
+
+    Checks candidates in GROMACS output priority order so that the most
+    equilibrated coordinates are used when available.  This is the canonical
+    priority list shared by trajectory validation (this module) and benchmark
+    pre-processing (:mod:`mdfactory.performance.benchmark`).
 
     Parameters
     ----------
@@ -585,7 +590,21 @@ def _find_structure_file(sim_dir: Path) -> Path | None:
     Returns
     -------
     Path or None
-        Path to structure file, or None if not found.
+        Path to the first existing structure file, or ``None`` if none of the
+        candidates are found.
+
+    Notes
+    -----
+    Priority order (highest to lowest):
+
+    1. ``prod.gro`` — fully equilibrated production output
+    2. ``npt.gro``  — NPT-equilibrated coordinates
+    3. ``nvt.gro``  — NVT-equilibrated coordinates
+    4. ``min.gro``  — energy-minimised coordinates
+    5. ``system.pdb`` — raw starting structure
+
+    If a new stage is added to ``STAGE_REGISTRY`` with its own output ``.gro``
+    file, update this list accordingly to keep benchmark and validation in sync.
 
     """
     # Check in order: production, npt, nvt, em, original
