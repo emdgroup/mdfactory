@@ -561,8 +561,6 @@ def simulate_systems(
         mdfactory simulate output_dir/ --slurm gpu.yaml --dry-run
 
     """
-    from mdfactory.analysis.submit import filter_paths_by_hash
-
     source = source.resolve()
 
     # Resolve simulation paths
