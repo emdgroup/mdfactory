@@ -18,6 +18,8 @@ from .apps import get_grompp_app, get_mdrun_app
 from .build import _wait_with_progress
 from .session import parsl_session
 from .stages import (
+    STAGE_BY_NAME,
+    STAGE_REGISTRY,
     run_em_stage,
     run_npt_stage,
     run_nvt_stage,
@@ -95,8 +97,22 @@ def run_simulations(
         Results with status, errors, timing (or futures if wait=False).
 
     """
+    valid_stages = [s.name for s in STAGE_REGISTRY]
+    valid_modes = ("auto", "skip", "force")
+
     if stages is None:
-        stages = ["EM", "NVT", "NPT", "Production"]
+        stages = list(valid_stages)
+    else:
+        invalid = [s for s in stages if s not in valid_stages]
+        if invalid:
+            raise ValueError(
+                f"Invalid stage(s): {invalid}. Valid stages: {valid_stages}"
+            )
+
+    if checkpoint_mode not in valid_modes:
+        raise ValueError(
+            f"Invalid checkpoint_mode: {checkpoint_mode!r}. Valid: {list(valid_modes)}"
+        )
 
     # 1. Validate inputs
     for sim_dir in sim_paths:
@@ -188,14 +204,8 @@ def _validate_simulation_dir(sim_dir: Path, stages: list[str]):
 
     """
     required = ["system.pdb", "topology.top"]
-    mdp_map = {
-        "EM": "em.mdp",
-        "NVT": "nvt.mdp",
-        "NPT": "npt.mdp",
-        "Production": "md.mdp",
-    }
     for stage in stages:
-        required.append(mdp_map[stage])
+        required.append(STAGE_BY_NAME[stage].mdp_file)
 
     missing = [f for f in required if not (sim_dir / f).exists()]
     if missing:
@@ -224,22 +234,15 @@ def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
         {"status": "complete"|"partial"|"not_started", "cpt_file": Path|None}
 
     """
-    stage_files = {
-        "EM": {"output": "min.gro", "cpt": "min.cpt", "tpr": "min.tpr"},
-        "NVT": {"output": "nvt.gro", "cpt": "nvt.cpt", "tpr": "nvt.tpr"},
-        "NPT": {"output": "npt.gro", "cpt": "npt.cpt", "tpr": "npt.tpr", "prereq_cpt": "nvt.cpt"},
-        "Production": {"output": "prod.xtc", "cpt": "prod.cpt", "tpr": "prod.tpr", "prereq_cpt": "npt.cpt"},
-    }
-
-    files = stage_files[stage]
-    output_file = sim_dir / files["output"]
-    cpt_file = sim_dir / files["cpt"]
-    tpr_file = sim_dir / files["tpr"]
+    spec = STAGE_BY_NAME[stage]
+    # Production writes a trajectory; use first traj file as the primary output check.
+    primary_output = spec.traj_files[0] if spec.traj_files else spec.gro_out
+    output_file = sim_dir / primary_output
+    cpt_file = sim_dir / spec.cpt_file
+    tpr_file = sim_dir / spec.tpr_file
 
     # Prerequisite checkpoint (for validating workflow integrity in auto mode)
-    prereq_cpt = None
-    if "prereq_cpt" in files:
-        prereq_cpt = sim_dir / files["prereq_cpt"]
+    prereq_cpt = sim_dir / spec.prereq_cpt if spec.prereq_cpt else None
 
     # For "skip" mode, just check if output file exists (even if empty)
     # Don't validate workflow integrity - trust the user
@@ -285,7 +288,8 @@ def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
 def _detect_needed_stages(sim_dir: Path, stages: list[str], mode: str) -> list[str]:
     """Determine which stages need to run based on checkpoint mode.
 
-    Now validates ALL required files (structure + checkpoint) for scientific correctness.
+    Thin wrapper around :func:`_detect_needed_stages_with_restart_info` that
+    returns only stage names, discarding restart metadata.
 
     Parameters
     ----------
@@ -302,20 +306,10 @@ def _detect_needed_stages(sim_dir: Path, stages: list[str], mode: str) -> list[s
         Stages that need to run.
 
     """
-    if mode == "force":
-        return stages
-
-    needed = []
-    for stage in stages:
-        state = _detect_stage_state(sim_dir, stage, mode)
-
-        if state["status"] == "complete":
-            continue  # Skip completed stages
-        else:
-            # Partial or not_started - needs to run
-            needed.append(stage)
-
-    return needed
+    return [
+        item["stage"]
+        for item in _detect_needed_stages_with_restart_info(sim_dir, stages, mode)
+    ]
 
 
 def _detect_needed_stages_with_restart_info(
@@ -425,8 +419,8 @@ def _execute_stage_list(
         "Production": run_production_stage,
     }
 
-    # Validate that stages are in dependency order
-    stage_order = ["EM", "NVT", "NPT", "Production"]
+    # Validate that stages are in dependency order (derived from STAGE_REGISTRY — single source)
+    stage_order = [s.name for s in STAGE_REGISTRY]
     stage_indices = {name: idx for idx, name in enumerate(stage_order)}
 
     prev_idx = -1
@@ -493,15 +487,15 @@ def _validate_stage_prerequisites(sim_dir: Path, first_stage: str) -> None:
         actionable guidance with fix commands.
 
     """
-    # Prerequisites: files needed BEFORE this stage can start
-    prerequisites = {
-        "EM": [],  # No prerequisites (uses system.pdb from build)
-        "NVT": [sim_dir / "min.gro"],
-        "NPT": [sim_dir / "nvt.gro", sim_dir / "nvt.cpt"],
-        "Production": [sim_dir / "npt.gro", sim_dir / "npt.cpt"],
-    }
-
-    required = prerequisites[first_stage]
+    # Prerequisites: files needed BEFORE this stage can start.
+    # Derived from StageSpec: the input .gro file and, when present, the
+    # prerequisite checkpoint (which is also the grompp -t velocity input).
+    spec = STAGE_BY_NAME[first_stage]
+    required: list[Path] = []
+    if spec.gro_in and spec.gro_in != "system.pdb":
+        required.append(sim_dir / spec.gro_in)
+    if spec.prereq_cpt:
+        required.append(sim_dir / spec.prereq_cpt)
     missing = [f.name for f in required if not f.exists()]
 
     if missing:
@@ -620,8 +614,7 @@ def _extract_expected_frames_from_mdp(sim_dir: Path, stage: str) -> int | None:
         Expected number of frames, or None if cannot be determined.
 
     """
-    mdp_files = {"EM": "em.mdp", "NVT": "nvt.mdp", "NPT": "npt.mdp", "Production": "md.mdp"}
-    mdp_path = sim_dir / mdp_files.get(stage, "md.mdp")
+    mdp_path = sim_dir / STAGE_BY_NAME.get(stage, STAGE_BY_NAME["Production"]).mdp_file
 
     if not mdp_path.exists():
         return None
