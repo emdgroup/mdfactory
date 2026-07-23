@@ -508,6 +508,38 @@ def _discover_sim_dirs(root: Path) -> list[Path]:
     return sims
 
 
+def _resolve_sim_paths_for_simulate(source: Path) -> list[Path]:
+    """Resolve *source* to a list of simulation-ready directories.
+
+    Handles both directory trees (delegating to :func:`_discover_sim_dirs`)
+    and YAML summary files.
+
+    Parameters
+    ----------
+    source : Path
+        Resolved absolute path to a build output directory or summary YAML.
+
+    Returns
+    -------
+    list[Path]
+        Simulation directories ready for submission.
+
+    Raises
+    ------
+    ValueError
+        If *source* is neither a directory nor a recognised YAML file, or if
+        no simulation directories are found.
+
+    """
+    if source.is_dir():
+        return _discover_sim_dirs(source)
+    if source.suffix in (".yaml", ".yml"):
+        with open(source) as f:
+            summary = yaml.safe_load(f)
+        return [Path(p) for p in summary.get("system_directory", [])]
+    raise ValueError(f"Invalid source: {source}. Provide a directory or YAML.")
+
+
 @app.command(name="simulate", group="Simulation")
 def simulate_systems(
     source: Annotated[Path, Parameter(help="Simulation directory or summary YAML")],
@@ -563,25 +595,12 @@ def simulate_systems(
     """
     source = source.resolve()
 
-    # Resolve simulation paths
-    if source.is_dir():
-        try:
-            sim_paths = _discover_sim_dirs(source)
-        except ValueError as exc:
-            logger.error(str(exc))
-            sys.exit(1)
-    elif source.suffix in (".yaml", ".yml"):
-        # Load from summary YAML
-        with open(source) as f:
-            summary = yaml.safe_load(f)
-        sim_paths = [Path(p) for p in summary.get("system_directory", [])]
-    else:
-        logger.error(f"Invalid source: {source}. Provide directory or YAML.")
+    try:
+        sim_paths = _resolve_sim_paths_for_simulate(source)
+    except ValueError as exc:
+        logger.error(str(exc))
         sys.exit(1)
 
-    # Filter by hash if provided.
-    # Use a simple directory-name prefix match rather than SimulationStore.discover()
-    # so this works on freshly built directories that have no trajectory yet.
     if hash:
         try:
             sim_paths = _filter_sim_paths_by_hash_prefix(sim_paths, list(hash))
@@ -595,35 +614,23 @@ def simulate_systems(
 
     logger.info(f"Found {len(sim_paths)} simulation(s)")
 
-    # Validate stages
-    if stages:
-        all_stages = ["EM", "NVT", "NPT", "Production"]
-        invalid = [s for s in stages if s not in all_stages]
-        if invalid:
-            logger.error(f"Invalid stages: {invalid}. Valid: {all_stages}")
-            sys.exit(1)
-
-    # Validate checkpoint mode
-    if checkpoint not in ["auto", "skip", "force"]:
-        logger.error(f"Invalid checkpoint mode: {checkpoint}. Valid: auto, skip, force")
-        sys.exit(1)
-
-    # Resolve SLURM config
     config = _resolve_slurm_flag(slurm)
     executor_config = _load_executor_config(config)
 
-    # Run simulations
     from mdfactory.orchestration import run_simulations
 
-    results = run_simulations(
-        sim_paths,
-        executor_config,
-        stages=stages,
-        checkpoint_mode=checkpoint,
-        dry_run=dry_run,
-    )
+    try:
+        results = run_simulations(
+            sim_paths,
+            executor_config,
+            stages=stages,
+            checkpoint_mode=checkpoint,
+            dry_run=dry_run,
+        )
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
 
-    # Report results
     if not dry_run:
         _report_simulation_results(results)
 
@@ -1652,6 +1659,89 @@ def _resolve_sim_paths(
     return sim_paths
 
 
+def _resolve_analysis_slurm_config(
+    account: "str | None",
+    partition: "str | None",
+    time: str,
+    cpus: int,
+    mem_gb: int,
+    qos: "str | None",
+    constraint: "str | None",
+    job_name_prefix: str,
+) -> "SlurmConfig":
+    """Resolve a :class:`~mdfactory.analysis.submit.SlurmConfig` for analysis/artifact jobs.
+
+    Tries autodiscovery when *account* is ``None``; falls back to an explicit
+    config when *account* is given.  Used by :func:`analysis_run` and
+    :func:`analysis_artifacts_run` to avoid repeating the autodiscovery block.
+
+    Parameters
+    ----------
+    account : str or None
+        SLURM account name.  ``None`` triggers ``SlurmConfig.from_cluster()``.
+    partition : str or None
+        SLURM partition.  ``None`` lets ``from_cluster`` choose; ``"cpu"``
+        is used as the fallback when *account* is explicit.
+    time : str
+        Wall-time limit (e.g. ``"2h"``).
+    cpus : int
+        CPUs per task.
+    mem_gb : int
+        Memory per node in GiB.
+    qos : str or None
+        SLURM QOS string.
+    constraint : str or None
+        SLURM constraint string.
+    job_name_prefix : str
+        Prefix for the SLURM job name.
+
+    Returns
+    -------
+    SlurmConfig
+        Resolved SLURM configuration.
+
+    Raises
+    ------
+    ValueError
+        If autodiscovery fails and *account* was not provided.
+
+    """
+    if account is None:
+        try:
+            slurm_cfg = SlurmConfig.from_cluster(
+                needs_gpu=False,
+                min_cpus=cpus,
+                min_mem_gb=mem_gb,
+                time=time,
+                cpus_per_task=cpus,
+                mem_gb=mem_gb,
+                qos=qos,
+                constraint=constraint,
+                job_name_prefix=job_name_prefix,
+                **({"partition": partition} if partition is not None else {}),
+            )
+            logger.info(
+                f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
+                f"partition={slurm_cfg.partition}"
+            )
+        except RuntimeError as e:
+            raise ValueError(
+                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
+            ) from e
+    else:
+        slurm_cfg = SlurmConfig(
+            account=account,
+            partition=partition or "cpu",
+            time=time,
+            cpus_per_task=cpus,
+            mem_gb=mem_gb,
+            qos=qos,
+            constraint=constraint,
+            job_name_prefix=job_name_prefix,
+        )
+    return slurm_cfg
+
+
 @analysis_app.command(name="run")
 def analysis_run(
     source: Path | None = None,
@@ -1741,40 +1831,9 @@ def analysis_run(
         print(result_df)
         return
 
-    # Use autodiscovery if account not provided
-    if account is None:
-        try:
-            slurm_cfg = SlurmConfig.from_cluster(
-                needs_gpu=False,
-                min_cpus=cpus,
-                min_mem_gb=mem_gb,
-                time=time,
-                cpus_per_task=cpus,
-                mem_gb=mem_gb,
-                qos=qos,
-                constraint=constraint,
-                job_name_prefix=job_name_prefix,
-                **({"partition": partition} if partition is not None else {}),
-            )
-            logger.info(
-                f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
-                f"partition={slurm_cfg.partition}"
-            )
-        except RuntimeError as e:
-            raise ValueError(
-                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
-            ) from e
-    else:
-        slurm_cfg = SlurmConfig(
-            account=account,
-            partition=partition or "cpu",
-            time=time,
-            cpus_per_task=cpus,
-            mem_gb=mem_gb,
-            qos=qos,
-            constraint=constraint,
-            job_name_prefix=job_name_prefix,
-        )
+    slurm_cfg = _resolve_analysis_slurm_config(
+        account, partition, time, cpus, mem_gb, qos, constraint, job_name_prefix
+    )
     if log_dir is None:
         log_dir = determine_log_dir(sim_paths)
     result_df = submit_analyses_slurm(
@@ -2052,41 +2111,9 @@ def analysis_artifacts_run(
         print(summary)
         return
 
-    # Use autodiscovery if account not provided
-    if account is None:
-        try:
-            slurm_cfg = SlurmConfig.from_cluster(
-                needs_gpu=False,
-                min_cpus=cpus,
-                min_mem_gb=mem_gb,
-                time=time,
-                cpus_per_task=cpus,
-                mem_gb=mem_gb,
-                qos=qos,
-                constraint=constraint,
-                job_name_prefix=job_name_prefix,
-                **({"partition": partition} if partition is not None else {}),
-            )
-            logger.info(
-                f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
-                f"partition={slurm_cfg.partition}"
-            )
-        except RuntimeError as e:
-            raise ValueError(
-                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
-            ) from e
-    else:
-        slurm_cfg = SlurmConfig(
-            account=account,
-            partition=partition or "cpu",
-            time=time,
-            cpus_per_task=cpus,
-            mem_gb=mem_gb,
-            qos=qos,
-            constraint=constraint,
-            job_name_prefix=job_name_prefix,
-        )
-
+    slurm_cfg = _resolve_analysis_slurm_config(
+        account, partition, time, cpus, mem_gb, qos, constraint, job_name_prefix
+    )
     if log_dir is None:
         log_dir = determine_log_dir(sim_paths)
     result_df = submit_artifacts_slurm(
