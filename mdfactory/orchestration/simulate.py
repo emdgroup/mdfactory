@@ -114,9 +114,27 @@ def run_simulations(
             f"Invalid checkpoint_mode: {checkpoint_mode!r}. Valid: {list(valid_modes)}"
         )
 
-    # 1. Validate inputs
+    # 1. Filter: skip directories whose build did not complete
+    ready_paths = []
     for sim_dir in sim_paths:
-        _validate_simulation_dir(sim_dir, stages)
+        missing = _missing_build_files(sim_dir, stages)
+        if missing:
+            logger.warning(
+                f"Skipping {sim_dir.name}: build incomplete, missing: {missing}"
+            )
+        else:
+            ready_paths.append(sim_dir)
+
+    n_skipped = len(sim_paths) - len(ready_paths)
+    if n_skipped:
+        logger.info(
+            f"Skipped {n_skipped} simulation(s) with incomplete builds; "
+            f"{len(ready_paths)} ready to simulate."
+        )
+    if not ready_paths:
+        logger.warning("No simulation directories have complete builds. Nothing to run.")
+        return []
+    sim_paths = ready_paths
 
     # 2. Checkpoint detection (includes restart info for -cpi -append support)
     work_plan = []
@@ -187,8 +205,31 @@ def run_simulations(
         )
 
 
-def _validate_simulation_dir(sim_dir: Path, stages: list[str]):
-    """Ensure required files exist before submission.
+def _missing_build_files(sim_dir: Path, stages: list[str]) -> list[str]:
+    """Return the names of required build output files that are absent.
+
+    Checks for ``system.pdb``, ``topology.top``, and the MDP file for every
+    requested stage.  Returns an empty list when the build is complete.
+
+    Parameters
+    ----------
+    sim_dir : Path
+        Simulation directory.
+    stages : list[str]
+        Stages to run (determines which MDP files are required).
+
+    Returns
+    -------
+    list[str]
+        Names of missing files, or ``[]`` when the build is complete.
+
+    """
+    required = ["system.pdb", "topology.top"] + [STAGE_BY_NAME[s].mdp_file for s in stages]
+    return [f for f in required if not (sim_dir / f).exists()]
+
+
+def _validate_simulation_dir(sim_dir: Path, stages: list[str]) -> None:
+    """Raise if any required build output files are missing.
 
     Parameters
     ----------
@@ -203,11 +244,7 @@ def _validate_simulation_dir(sim_dir: Path, stages: list[str]):
         If required files are missing.
 
     """
-    required = ["system.pdb", "topology.top"]
-    for stage in stages:
-        required.append(STAGE_BY_NAME[stage].mdp_file)
-
-    missing = [f for f in required if not (sim_dir / f).exists()]
+    missing = _missing_build_files(sim_dir, stages)
     if missing:
         raise FileNotFoundError(f"Missing files in {sim_dir}: {missing}")
 

@@ -13,6 +13,7 @@ from mdfactory.orchestration.simulate import (
     _detect_needed_stages,
     _execute_stage_list,
     _log_dry_run_plan,
+    _missing_build_files,
     _validate_simulation_dir,
     _validate_stage_prerequisites,
     _validate_trajectory_complete,
@@ -57,6 +58,68 @@ def test_validate_simulation_dir_missing_mdp(mock_sim_dir):
 
     with pytest.raises(FileNotFoundError, match="Missing files.*em.mdp"):
         _validate_simulation_dir(mock_sim_dir, ["EM"])
+
+
+# ---------------------------------------------------------------------------
+# _missing_build_files
+# ---------------------------------------------------------------------------
+
+
+def test_missing_build_files_complete(mock_sim_dir):
+    """Returns empty list when all required files are present."""
+    assert _missing_build_files(mock_sim_dir, ["EM", "NVT", "NPT", "Production"]) == []
+
+
+def test_missing_build_files_empty_dir(tmp_path):
+    """Returns all required files when directory is empty."""
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    missing = _missing_build_files(sim_dir, ["EM"])
+    assert "system.pdb" in missing
+    assert "topology.top" in missing
+    assert "em.mdp" in missing
+
+
+def test_missing_build_files_partial(mock_sim_dir):
+    """Returns only the missing file when one is removed."""
+    (mock_sim_dir / "npt.mdp").unlink()
+    missing = _missing_build_files(mock_sim_dir, ["EM", "NVT", "NPT", "Production"])
+    assert missing == ["npt.mdp"]
+
+
+# ---------------------------------------------------------------------------
+# run_simulations — incomplete-build filtering
+# ---------------------------------------------------------------------------
+
+
+def test_run_simulations_skips_incomplete_build(tmp_path):
+    """run_simulations warns and skips dirs with missing build outputs."""
+    ready = tmp_path / "ready"
+    ready.mkdir()
+    for f in ["system.pdb", "topology.top", "em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"]:
+        (ready / f).write_text("FAKE")
+
+    incomplete = tmp_path / "incomplete"
+    incomplete.mkdir()
+    # No files written — build never completed
+
+    config = ExecutorConfig()
+    results = run_simulations([ready, incomplete], config, dry_run=True)
+
+    # Only the ready directory appears in the dry-run plan
+    plan_dirs = [item["sim_dir"] for item in results]
+    assert ready in plan_dirs
+    assert incomplete not in plan_dirs
+
+
+def test_run_simulations_all_incomplete_returns_empty(tmp_path):
+    """run_simulations returns [] immediately when no directories are ready."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    config = ExecutorConfig()
+    results = run_simulations([empty], config, dry_run=True)
+    assert results == []
 
 
 def test_checkpoint_auto_skips_completed(mock_sim_dir):
@@ -189,14 +252,15 @@ def test_stage_filtering(mock_sim_dir):
 
 
 def test_validation_before_submission(tmp_path):
-    """Validation catches missing files before Parsl submission."""
+    """Incomplete builds are silently skipped before Parsl submission."""
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()
     (sim_dir / "system.pdb").write_text("FAKE")
-    # Missing topology.top
+    # Missing topology.top and all MDP files — build never completed
 
-    with pytest.raises(FileNotFoundError, match="Missing files.*topology.top"):
-        run_simulations([sim_dir], ExecutorConfig(), dry_run=True)
+    # Should not raise; returns [] because no ready directories remain
+    results = run_simulations([sim_dir], ExecutorConfig(), dry_run=True)
+    assert results == []
 
 
 def test_multiple_simulations_mixed_states(tmp_path):
