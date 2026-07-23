@@ -295,7 +295,7 @@ def _build_from_csv(
 
         executor_config = _load_executor_config(config)
         results = build_systems(models, executor_config, output_dir=output)
-        _report_build_results(results)
+        _report_build_results(results, output_dir=output)
     else:
         # Sequential local builds
         logger.info(f"Building {len(models)} system(s) sequentially.")
@@ -336,12 +336,16 @@ def _build_from_yaml(
             executor_config = _load_executor_config(config)
             results = build_systems([model], executor_config, output_dir=output, dry_run=dry_run)
             if not dry_run:
-                _report_build_results(results)
+                _report_build_results(results, output_dir=output)
         else:
             build_dir = output / model.hash
             logger.info(f"Building {model.hash} ({model.simulation_type}) -> {build_dir}")
             with working_directory(build_dir, create=True):
                 run_build_from_file(input)
+            logger.info(f"Output: {output}")
+            logger.info("Next step — run simulations:")
+            logger.info(f"  mdfactory simulate {output}")
+            logger.info(f"  # with SLURM: mdfactory simulate {output} --slurm examples/slurm_gpu.yaml")
 
 
 def _build_from_summary_yaml(
@@ -384,7 +388,7 @@ def _build_from_summary_yaml(
         executor_config = _load_executor_config(config)
         results = build_systems(models, executor_config, output_dir=output, dry_run=dry_run)
         if not dry_run:
-            _report_build_results(results)
+            _report_build_results(results, output_dir=output)
     else:
         # Sequential local builds
         logger.info(f"Building {len(models)} prepared system(s) sequentially.")
@@ -392,16 +396,79 @@ def _build_from_summary_yaml(
             logger.info(f"Building {model.hash} ({model.simulation_type})...")
             with working_directory(Path(sim_dir), create=True):
                 run_build_from_dict(model)
+        logger.info(f"Output: {output}")
+        logger.info("Next step — run simulations:")
+        logger.info(f"  mdfactory simulate {output}")
+        logger.info(f"  # with SLURM: mdfactory simulate {output} --slurm examples/slurm_gpu.yaml")
 
 
-def _report_build_results(results: list[dict]):
-    """Report build results to the user."""
+def _report_build_results(results: list[dict], output_dir: Path | None = None):
+    """Report build results to the user.
+
+    Parameters
+    ----------
+    results : list[dict]
+        Build result dicts from build_systems().
+    output_dir : Path, optional
+        Output directory used for the build.  When provided, a "next steps"
+        hint pointing to ``mdfactory simulate`` is printed so users know
+        exactly what to run next.
+
+    """
     succeeded = sum(1 for r in results if r.get("status") == "success")
     failed = sum(1 for r in results if r.get("status") == "failed")
     logger.info(f"Build complete: {succeeded} succeeded, {failed} failed.")
     for r in results:
         if r.get("status") == "failed":
             logger.error(f"  {r.get('hash', 'unknown')}: {r.get('error', 'unknown error')}")
+    if succeeded and output_dir is not None:
+        logger.info(f"Output: {output_dir}")
+        logger.info("Next step — run simulations:")
+        logger.info(f"  mdfactory simulate {output_dir}")
+        logger.info(f"  # with SLURM: mdfactory simulate {output_dir} --slurm examples/slurm_gpu.yaml")
+
+
+def _filter_sim_paths_by_hash_prefix(
+    sim_paths: list[Path], prefixes: list[str]
+) -> list[Path]:
+    """Filter simulation paths by hash prefix without requiring completed trajectories.
+
+    Unlike :func:`~mdfactory.analysis.submit.filter_paths_by_hash`, this
+    helper works purely on directory names and therefore works on freshly
+    built directories that have not yet been simulated.
+
+    Hash matching is case-insensitive so short prefixes typed in lower-case
+    still resolve correctly.
+
+    Parameters
+    ----------
+    sim_paths : list[Path]
+        Candidate simulation directories (already validated by
+        :func:`_discover_sim_dirs`).
+    prefixes : list[str]
+        Hash strings or prefix fragments to match against directory names.
+
+    Returns
+    -------
+    list[Path]
+        Subset of *sim_paths* whose directory names start with at least one
+        requested prefix.
+
+    Raises
+    ------
+    ValueError
+        If none of the requested prefixes match any discovered directory.
+
+    """
+    upper_prefixes = [p.upper() for p in prefixes]
+    matched = [p for p in sim_paths if any(p.name.upper().startswith(pref) for pref in upper_prefixes)]
+    if not matched:
+        available = sorted(p.name for p in sim_paths)
+        raise ValueError(
+            f"No simulation directories match {prefixes}.\n"
+            f"Available: {available}"
+        )
+    return sorted(matched)
 
 
 def _discover_sim_dirs(root: Path) -> list[Path]:
@@ -514,14 +581,11 @@ def simulate_systems(
         logger.error(f"Invalid source: {source}. Provide directory or YAML.")
         sys.exit(1)
 
-    # Filter by hash if provided
+    # Filter by hash if provided.
+    # Use a simple directory-name prefix match rather than SimulationStore.discover()
+    # so this works on freshly built directories that have no trajectory yet.
     if hash:
-        sim_paths = filter_paths_by_hash(
-            sim_paths,
-            hash,
-            trajectory_file="prod.xtc",
-            structure_file="system.pdb",
-        )
+        sim_paths = _filter_sim_paths_by_hash_prefix(sim_paths, list(hash))
 
     if not sim_paths:
         logger.error("No simulations found.")
