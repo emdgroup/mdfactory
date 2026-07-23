@@ -327,7 +327,8 @@ def get_mdrun_app():
             echo "GROMACS mdrun: Running on GPU $GPU_ID with $NTHR OpenMP threads" >&2
 
             if $IS_MPI_BUILD; then
-                # MPI build: no -ntmpi; MPI rank count controlled by launcher
+                # MPI build: single-rank execution (no MPI launcher invoked).
+                # -ntomp sets OpenMP threads; add srun/mpirun here for multi-rank.
                 if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntomp $NTHR -gpu_id $GPU_ID -nb gpu -pme gpu; then
                     echo "ERROR: mdrun failed for {deffnm} (GPU/MPI mode)" >&2
                     echo "Check md.log for details" >&2
@@ -346,7 +347,7 @@ def get_mdrun_app():
             echo "GROMACS mdrun: Running on CPU with $NTHR threads" >&2
 
             if $IS_MPI_BUILD; then
-                # MPI build: -ntomp sets OpenMP threads per rank
+                # MPI build: single-rank execution; -ntomp sets OpenMP threads per rank
                 if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntomp $NTHR; then
                     echo "ERROR: mdrun failed for {deffnm} (CPU/MPI mode)" >&2
                     echo "Check md.log for details" >&2
@@ -362,19 +363,25 @@ def get_mdrun_app():
             fi
         fi
 
-        # Verify expected output files were created
-        # Different stages produce different outputs
+        # Verify expected output files were created.
+        # EM writes a .gro (no trajectory); equilibration/production writes .gro
+        # or .xtc/.trr depending on nstxout-compressed vs nstxout in the MDP.
         if [[ "{deffnm}" == "min" ]]; then
-            EXPECTED_OUTPUT="min.gro"
+            if [ ! -f "min.gro" ]; then
+                echo "ERROR: mdrun completed but min.gro was not created" >&2
+                exit 1
+            fi
         elif [[ "{deffnm}" == "prod" ]]; then
-            EXPECTED_OUTPUT="prod.xtc"
+            # Accept compressed (.xtc) or full-precision (.trr) trajectory
+            if [ ! -f "prod.xtc" ] && [ ! -f "prod.trr" ]; then
+                echo "ERROR: mdrun completed but neither prod.xtc nor prod.trr was created" >&2
+                exit 1
+            fi
         else
-            EXPECTED_OUTPUT="{deffnm}.gro"
-        fi
-
-        if [ ! -f "$EXPECTED_OUTPUT" ]; then
-            echo "ERROR: mdrun completed but $EXPECTED_OUTPUT was not created" >&2
-            exit 1
+            if [ ! -f "{deffnm}.gro" ]; then
+                echo "ERROR: mdrun completed but {deffnm}.gro was not created" >&2
+                exit 1
+            fi
         fi
 
         echo "GROMACS mdrun: SUCCESS - {deffnm} completed" >&2

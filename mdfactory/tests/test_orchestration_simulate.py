@@ -708,15 +708,16 @@ def test_mdrun_app_verifies_stage_specific_outputs():
 
     # EM stage should check for min.gro
     em_script = mdrun_app.func(deffnm="min", work_dir="/tmp/test")
-    assert 'EXPECTED_OUTPUT="min.gro"' in em_script
+    assert "min.gro" in em_script
 
-    # Production should check for prod.xtc
+    # Production should accept .xtc or .trr (MDP may use nstxout or nstxout-compressed)
     prod_script = mdrun_app.func(deffnm="prod", work_dir="/tmp/test")
-    assert 'EXPECTED_OUTPUT="prod.xtc"' in prod_script
+    assert "prod.xtc" in prod_script
+    assert "prod.trr" in prod_script
 
     # NVT should check for nvt.gro
     nvt_script = mdrun_app.func(deffnm="nvt", work_dir="/tmp/test")
-    assert 'EXPECTED_OUTPUT="nvt.gro"' in nvt_script
+    assert "nvt.gro" in nvt_script
 
 
 def test_mdrun_app_error_message_includes_log_hint():
