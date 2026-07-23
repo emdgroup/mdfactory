@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mdfactory.orchestration.config import ExecutorConfig
+from mdfactory.orchestration.apps import _build_mdrun_script
 from mdfactory.orchestration.simulate import (
     _detect_needed_stages,
     _execute_stage_list,
@@ -421,10 +422,7 @@ def test_prerequisite_validation_before_parsl_session(mock_session, mock_sim_dir
 
 def test_mdrun_app_cpu_fallback():
     """Mdrun bash app uses default thread count when env vars unset."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(deffnm="test", work_dir="/tmp/test")
+    bash_script = _build_mdrun_script(deffnm="test", work_dir="/tmp/test")
 
     # Should use default of 12 threads
     assert "NTHR=${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-12}}" in bash_script
@@ -434,10 +432,7 @@ def test_mdrun_app_cpu_fallback():
 
 def test_mdrun_app_gpu_detection():
     """Mdrun bash app detects GPU from CUDA_VISIBLE_DEVICES."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(deffnm="test", work_dir="/tmp/test")
+    bash_script = _build_mdrun_script(deffnm="test", work_dir="/tmp/test")
 
     # Should check for CUDA_VISIBLE_DEVICES
     assert "CUDA_VISIBLE_DEVICES" in bash_script
@@ -451,10 +446,7 @@ def test_mdrun_app_gpu_detection():
 
 def test_mdrun_app_logging():
     """Mdrun bash app logs resource configuration to stderr."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(deffnm="test", work_dir="/tmp/test")
+    bash_script = _build_mdrun_script(deffnm="test", work_dir="/tmp/test")
 
     # Should log what resources are being used
     assert "Running on GPU" in bash_script
@@ -464,10 +456,7 @@ def test_mdrun_app_logging():
 
 def test_mdrun_app_slurm_priority():
     """SLURM_CPUS_PER_TASK has priority over OMP_NUM_THREADS."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(deffnm="test", work_dir="/tmp/test")
+    bash_script = _build_mdrun_script(deffnm="test", work_dir="/tmp/test")
 
     # Check priority order in bash variable expansion
     assert "${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-12}}" in bash_script
@@ -642,10 +631,9 @@ def test_run_simulations_uses_execute_stage_list(mock_execute, mock_session, moc
 
 def test_grompp_app_has_error_handling():
     """Grompp bash app includes robust error handling."""
-    from mdfactory.orchestration.apps import get_grompp_app
+    from mdfactory.orchestration.apps import _build_grompp_script
 
-    grompp_app = get_grompp_app()
-    bash_script = grompp_app.func(
+    bash_script = _build_grompp_script(
         mdp_file="em.mdp",
         gro_file="system.pdb",
         top_file="topology.top",
@@ -665,10 +653,9 @@ def test_grompp_app_has_error_handling():
 
 def test_grompp_app_logs_descriptive_errors():
     """Grompp error messages include actionable guidance."""
-    from mdfactory.orchestration.apps import get_grompp_app
+    from mdfactory.orchestration.apps import _build_grompp_script
 
-    grompp_app = get_grompp_app()
-    bash_script = grompp_app.func(
+    bash_script = _build_grompp_script(
         mdp_file="em.mdp",
         gro_file="system.pdb",
         top_file="topology.top",
@@ -684,10 +671,8 @@ def test_grompp_app_logs_descriptive_errors():
 
 def test_mdrun_app_has_error_handling():
     """Mdrun bash app includes robust error handling."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(deffnm="min", work_dir="/tmp/test")
+    # Pass gro_out so output-verification block is included
+    bash_script = _build_mdrun_script(deffnm="min", work_dir="/tmp/test", gro_out="min.gro")
 
     # Should have bash strict mode
     assert "set -euo pipefail" in bash_script
@@ -701,31 +686,28 @@ def test_mdrun_app_has_error_handling():
 
 
 def test_mdrun_app_verifies_stage_specific_outputs():
-    """Mdrun verifies correct output file for each stage."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-
-    # EM stage should check for min.gro
-    em_script = mdrun_app.func(deffnm="min", work_dir="/tmp/test")
+    """Mdrun verifies correct output file for each stage (spec-driven, no deffnm comparisons)."""
+    # EM stage: spec passes gro_out="min.gro"
+    em_script = _build_mdrun_script(deffnm="min", work_dir="/tmp/test", gro_out="min.gro")
     assert "min.gro" in em_script
+    assert 'deffnm" == "min"' not in em_script  # no hardcoded deffnm comparison
 
-    # Production should accept .xtc or .trr (MDP may use nstxout or nstxout-compressed)
-    prod_script = mdrun_app.func(deffnm="prod", work_dir="/tmp/test")
+    # Production: spec passes traj_files
+    prod_script = _build_mdrun_script(
+        deffnm="prod", work_dir="/tmp/test", traj_files=("prod.xtc", "prod.trr")
+    )
     assert "prod.xtc" in prod_script
     assert "prod.trr" in prod_script
+    assert 'deffnm" == "prod"' not in prod_script  # no hardcoded deffnm comparison
 
-    # NVT should check for nvt.gro
-    nvt_script = mdrun_app.func(deffnm="nvt", work_dir="/tmp/test")
+    # NVT: spec passes gro_out="nvt.gro"
+    nvt_script = _build_mdrun_script(deffnm="nvt", work_dir="/tmp/test", gro_out="nvt.gro")
     assert "nvt.gro" in nvt_script
 
 
 def test_mdrun_app_error_message_includes_log_hint():
     """Mdrun error messages direct users to md.log."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(deffnm="prod", work_dir="/tmp/test")
+    bash_script = _build_mdrun_script(deffnm="prod", work_dir="/tmp/test")
 
     # Should suggest checking md.log
     assert "Check md.log for details" in bash_script
@@ -733,19 +715,16 @@ def test_mdrun_app_error_message_includes_log_hint():
 
 def test_bash_apps_use_strict_mode():
     """All bash apps use set -euo pipefail."""
-    from mdfactory.orchestration.apps import get_grompp_app, get_mdrun_app
+    from mdfactory.orchestration.apps import _build_grompp_script
 
-    grompp_app = get_grompp_app()
-    mdrun_app = get_mdrun_app()
-
-    grompp_script = grompp_app.func(
+    grompp_script = _build_grompp_script(
         mdp_file="em.mdp",
         gro_file="system.pdb",
         top_file="topology.top",
         tpr_file="min.tpr",
         work_dir="/tmp/test",
     )
-    mdrun_script = mdrun_app.func(deffnm="min", work_dir="/tmp/test")
+    mdrun_script = _build_mdrun_script(deffnm="min", work_dir="/tmp/test")
 
     # Both should use bash strict mode
     assert "set -euo pipefail" in grompp_script
@@ -1157,10 +1136,7 @@ def test_execute_stage_list_no_stage_config_for_local(mock_em):
 
 def test_mdrun_app_ntasks_override_used_when_set():
     """Mdrun bash app uses explicit NTHR when ntasks > 0."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(deffnm="nvt", work_dir="/tmp/test", ntasks=8)
+    bash_script = _build_mdrun_script(deffnm="nvt", work_dir="/tmp/test", ntasks=8)
 
     assert "NTHR=8" in bash_script
     # Should NOT fall back to SLURM auto-detection
@@ -1169,10 +1145,7 @@ def test_mdrun_app_ntasks_override_used_when_set():
 
 def test_mdrun_app_cpu_mode_forced_when_disable_gpu():
     """Mdrun bash app uses CPU-only path when disable_gpu=True."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(deffnm="min", work_dir="/tmp/test", disable_gpu=True)
+    bash_script = _build_mdrun_script(deffnm="min", work_dir="/tmp/test", disable_gpu=True)
 
     # GPU condition should be replaced with literal "false"
     assert "if false;" in bash_script
@@ -1200,10 +1173,7 @@ def test_em_stage_passes_resource_hints_to_mdrun():
 
 def test_mdrun_app_no_cpt_flags_by_default():
     """Mdrun bash app omits -cpi/-append when no restart_from_cpt given."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(deffnm="nvt", work_dir="/tmp/test")
+    bash_script = _build_mdrun_script(deffnm="nvt", work_dir="/tmp/test")
 
     assert "-cpi" not in bash_script
     assert "-append" not in bash_script
@@ -1211,10 +1181,7 @@ def test_mdrun_app_no_cpt_flags_by_default():
 
 def test_mdrun_app_cpt_flags_added_when_restart_set():
     """Mdrun bash app adds -cpi <file> -append when restart_from_cpt provided."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(
+    bash_script = _build_mdrun_script(
         deffnm="npt",
         work_dir="/tmp/test",
         restart_from_cpt="/sim/npt.cpt",
@@ -1225,27 +1192,20 @@ def test_mdrun_app_cpt_flags_added_when_restart_set():
 
 def test_mdrun_app_cpt_flags_in_both_cpu_and_gpu_branches():
     """Checkpoint restart flags appear in both CPU and GPU command lines."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(
+    bash_script = _build_mdrun_script(
         deffnm="prod",
         work_dir="/tmp/test",
         restart_from_cpt="/sim/prod.cpt",
     )
 
     # Both GPU and CPU branches should carry the -cpi flag
-    # The flag appears once in the script (same cpt_flags variable)
     cpi_count = bash_script.count("-cpi /sim/prod.cpt -append")
     assert cpi_count >= 2, f"Expected -cpi flag in both GPU and CPU branches, found {cpi_count}"
 
 
 def test_mdrun_app_cpt_log_message_mentions_file():
     """Mdrun bash app logs the checkpoint file it is resuming from."""
-    from mdfactory.orchestration.apps import get_mdrun_app
-
-    mdrun_app = get_mdrun_app()
-    bash_script = mdrun_app.func(
+    bash_script = _build_mdrun_script(
         deffnm="prod",
         work_dir="/tmp/test",
         restart_from_cpt="/sim/prod.cpt",
