@@ -345,7 +345,7 @@ def _build_from_yaml(
             logger.info(f"Output: {output}")
             logger.info("Next step — run simulations:")
             logger.info(f"  mdfactory simulate {output}")
-            logger.info(f"  # with SLURM: mdfactory simulate {output} --slurm examples/slurm_gpu.yaml")
+            logger.info(f"  # with SLURM: mdfactory simulate {output} --slurm <executor-config.yaml>")
 
 
 def _build_from_summary_yaml(
@@ -399,7 +399,7 @@ def _build_from_summary_yaml(
         logger.info(f"Output: {output}")
         logger.info("Next step — run simulations:")
         logger.info(f"  mdfactory simulate {output}")
-        logger.info(f"  # with SLURM: mdfactory simulate {output} --slurm examples/slurm_gpu.yaml")
+        logger.info(f"  # with SLURM: mdfactory simulate {output} --slurm <executor-config.yaml>")
 
 
 def _report_build_results(results: list[dict], output_dir: Path | None = None):
@@ -425,7 +425,7 @@ def _report_build_results(results: list[dict], output_dir: Path | None = None):
         logger.info(f"Output: {output_dir}")
         logger.info("Next step — run simulations:")
         logger.info(f"  mdfactory simulate {output_dir}")
-        logger.info(f"  # with SLURM: mdfactory simulate {output_dir} --slurm examples/slurm_gpu.yaml")
+        logger.info(f"  # with SLURM: mdfactory simulate {output_dir} --slurm <executor-config.yaml>")
 
 
 def _filter_sim_paths_by_hash_prefix(
