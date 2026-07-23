@@ -249,7 +249,7 @@ def _build_mdrun_script(
     nthr_line = (
         f"NTHR={ntasks}"
         if ntasks > 0
-        else "NTHR=${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-12}}"
+        else "NTHR=${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-$(nproc)}}"
     )
 
     # GPU guard: short-circuit with literal "false" when caller requests CPU-only.
@@ -289,8 +289,13 @@ def _build_mdrun_script(
 
         {_get_gromacs_detect_script()}
 
-        # Thread count: explicit override ({ntasks}) > SLURM > OMP > default(12)
+        # Thread count: explicit override ({ntasks}) > SLURM > OMP > default(nproc)
         {nthr_line}
+        # Re-export so gmx_mpi -ntomp and OMP_NUM_THREADS always agree.
+        # Parsl's SlurmProvider sets OMP_NUM_THREADS=<cores_per_node> in the
+        # worker environment; if a stage override uses fewer threads the two
+        # values conflict and GROMACS aborts with a fatal error.
+        export OMP_NUM_THREADS=$NTHR
 
         # Detect build type: gmx_mpi is a pure MPI build (no thread-MPI support).
         # -nt / -ntmpi are thread-MPI flags; MPI builds use -ntomp for OpenMP threads
@@ -475,7 +480,7 @@ def get_mdrun_app():
 
         Resource detection priority:
         - Thread count: ``ntasks`` arg (if >0) > SLURM_CPUS_PER_TASK >
-          OMP_NUM_THREADS > default(12)
+          OMP_NUM_THREADS > default(nproc)
         - GPU: disabled when ``disable_gpu=True`` or CUDA_VISIBLE_DEVICES unset
         - PME-on-GPU: only when ``pme_gpu=True`` AND GPU is available.
           Must be ``False`` for non-dynamical integrators (e.g. EM/steep).
