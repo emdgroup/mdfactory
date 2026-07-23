@@ -124,6 +124,7 @@ def run_simulations(
                 grompp_app,
                 mdrun_app,
                 stage_restarts=item.get("stage_restarts"),
+                config=config,
             )
             futures.append((item["hash"], pipeline_fut))
 
@@ -341,6 +342,7 @@ def _execute_stage_list(
     grompp_app,
     mdrun_app,
     stage_restarts: "dict[str, str] | None" = None,
+    config: "ExecutorConfig | None" = None,
 ) -> "AppFuture | None":
     """Execute a list of stages with automatic dependency chaining.
 
@@ -362,6 +364,11 @@ def _execute_stage_list(
         When a stage has an entry here, grompp is skipped and mdrun is called
         with ``-cpi <file> -append``.  Stages absent from the dict (or when
         the dict is ``None``) run normally from scratch.
+    config : ExecutorConfig or None, optional
+        Executor configuration.  When a :class:`SlurmExecutorConfig` is
+        provided, per-stage resource overrides are applied via
+        :meth:`~mdfactory.orchestration.config.SlurmExecutorConfig.get_stage_config`
+        before each stage function call.
 
     Returns
     -------
@@ -407,9 +414,14 @@ def _execute_stage_list(
     prev_future = None
     for i, stage in enumerate(stages):
         cpt_file = restarts.get(stage, "")
+        # Resolve per-stage resource overrides when a SlurmExecutorConfig is given.
+        # Only inject stage_config kwarg when non-None to avoid polluting mock
+        # assertions in tests that don't exercise per-stage config.
+        stage_cfg = config.get_stage_config(stage) if hasattr(config, "get_stage_config") else None
+        cfg_kwarg = {"stage_config": stage_cfg} if stage_cfg is not None else {}
         if stage == "EM":
             # EM has no dependencies and no checkpoint restart support
-            prev_future = run_em_stage(sim_dir, grompp_app, mdrun_app)
+            prev_future = run_em_stage(sim_dir, grompp_app, mdrun_app, **cfg_kwarg)
         else:
             # All other stages depend on previous stage.
             # If this is the first stage (i==0) and it's not EM, we're resuming from
@@ -420,9 +432,13 @@ def _execute_stage_list(
                 prev_future = stage_fn(
                     sim_dir, prev_future, grompp_app, mdrun_app,
                     restart_from_cpt=cpt_file,
+                    **cfg_kwarg,
                 )
             else:
-                prev_future = stage_fn(sim_dir, prev_future, grompp_app, mdrun_app)
+                prev_future = stage_fn(
+                    sim_dir, prev_future, grompp_app, mdrun_app,
+                    **cfg_kwarg,
+                )
 
     return prev_future
 

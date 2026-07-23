@@ -1112,6 +1112,91 @@ def test_production_stage_skips_grompp_on_restart():
     assert call_kwargs.get("restart_from_cpt") == "/sim/prod.cpt"
 
 
+# === Decision 6: Per-stage resource config wiring tests ===
+
+
+@patch("mdfactory.orchestration.simulate.run_em_stage")
+def test_execute_stage_list_passes_stage_config_when_slurm(mock_em):
+    """_execute_stage_list calls get_stage_config and forwards to EM stage."""
+    from mdfactory.orchestration.config import SlurmExecutorConfig
+
+    cfg = SlurmExecutorConfig(
+        account="acct",
+        cpus_per_node=12,
+        stage_overrides={"EM": {"cpus_per_node": 4, "gres": None}},
+    )
+    mock_em.return_value = MagicMock()
+    grompp_app = MagicMock()
+    mdrun_app = MagicMock()
+
+    _execute_stage_list(Path("/tmp/test"), ["EM"], grompp_app, mdrun_app, config=cfg)
+
+    # stage_config kwarg should be the EM-overridden config
+    mock_em.assert_called_once()
+    _, call_kwargs = mock_em.call_args
+    em_cfg = call_kwargs.get("stage_config")
+    assert em_cfg is not None
+    assert em_cfg.cpus_per_node == 4
+
+
+@patch("mdfactory.orchestration.simulate.run_em_stage")
+def test_execute_stage_list_no_stage_config_for_local(mock_em):
+    """_execute_stage_list does not inject stage_config for LocalProvider (no overrides)."""
+    from mdfactory.orchestration.config import ExecutorConfig
+
+    cfg = ExecutorConfig()  # no get_stage_config method
+    mock_em.return_value = MagicMock()
+
+    _execute_stage_list(Path("/tmp/test"), ["EM"], MagicMock(), MagicMock(), config=cfg)
+
+    # No stage_config kwarg should be injected
+    _, call_kwargs = mock_em.call_args
+    assert "stage_config" not in call_kwargs
+
+
+def test_mdrun_app_ntasks_override_used_when_set():
+    """Mdrun bash app uses explicit NTHR when ntasks > 0."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(deffnm="nvt", work_dir="/tmp/test", ntasks=8)
+
+    assert "NTHR=8" in bash_script
+    # Should NOT fall back to SLURM auto-detection
+    assert "${SLURM_CPUS_PER_TASK" not in bash_script
+
+
+def test_mdrun_app_cpu_mode_forced_when_disable_gpu():
+    """Mdrun bash app uses CPU-only path when disable_gpu=True."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(deffnm="min", work_dir="/tmp/test", disable_gpu=True)
+
+    # GPU condition should be replaced with literal "false"
+    assert "if false;" in bash_script
+
+
+def test_em_stage_passes_resource_hints_to_mdrun():
+    """run_em_stage extracts resource hints from stage_config and passes to mdrun_app."""
+    from mdfactory.orchestration.config import SlurmExecutorConfig
+    from mdfactory.orchestration.stages import run_em_stage
+
+    cfg = SlurmExecutorConfig(account="acct", cpus_per_node=4, gres=None)
+
+    grompp_app = MagicMock()
+    grompp_app.return_value = MagicMock()
+    mdrun_app = MagicMock()
+    mdrun_app.return_value = MagicMock()
+
+    run_em_stage(Path("/sim"), grompp_app, mdrun_app, stage_config=cfg)
+
+    mdrun_app.assert_called_once()
+    _, call_kwargs = mdrun_app.call_args
+    assert call_kwargs.get("ntasks") == 4
+    assert call_kwargs.get("disable_gpu") is True  # gres=None → no GPU
+
+
 def test_mdrun_app_no_cpt_flags_by_default():
     """Mdrun bash app omits -cpi/-append when no restart_from_cpt given."""
     from mdfactory.orchestration.apps import get_mdrun_app

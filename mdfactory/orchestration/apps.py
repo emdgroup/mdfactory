@@ -229,6 +229,8 @@ def get_mdrun_app():
         deffnm: str,
         work_dir: str,
         restart_from_cpt: str = "",
+        ntasks: int = 0,
+        disable_gpu: bool = False,
         stdout=None,
         stderr=None,
         inputs=None,
@@ -236,11 +238,14 @@ def get_mdrun_app():
         """Run GROMACS simulation with auto-detected resources.
 
         Thread count and GPU usage are auto-detected from SLURM environment
-        variables, with sensible fallbacks for local execution.
+        variables, with sensible fallbacks for local execution.  Explicit
+        ``ntasks`` / ``disable_gpu`` arguments override the auto-detection,
+        enabling per-stage resource configuration.
 
         Resource detection priority:
-        - Thread count: SLURM_CPUS_PER_TASK > OMP_NUM_THREADS > default(12)
-        - GPU: Auto-detected from CUDA_VISIBLE_DEVICES
+        - Thread count: ``ntasks`` arg (if >0) > SLURM_CPUS_PER_TASK >
+          OMP_NUM_THREADS > default(12)
+        - GPU: disabled when ``disable_gpu=True`` or CUDA_VISIBLE_DEVICES unset
 
         Parameters
         ----------
@@ -253,6 +258,14 @@ def get_mdrun_app():
             ``-cpi <file> -append`` flags are added to the mdrun command so
             the simulation continues from the saved state rather than
             starting from scratch.
+        ntasks : int, optional
+            Explicit thread count override.  When > 0 this value is used
+            directly instead of reading ``$SLURM_CPUS_PER_TASK``.  Defaults
+            to 0 (auto-detect from environment).
+        disable_gpu : bool, optional
+            When ``True``, force CPU-only execution regardless of whether
+            ``CUDA_VISIBLE_DEVICES`` is set.  Useful for stages like EM that
+            do not benefit from GPU acceleration.  Defaults to ``False``.
         stdout : str, optional
             File path for stdout.
         stderr : str, optional
@@ -271,6 +284,21 @@ def get_mdrun_app():
         cpt_flags = f"-cpi {restart_from_cpt} -append " if restart_from_cpt else ""
         cpt_msg = f" (resuming from {restart_from_cpt})" if restart_from_cpt else ""
 
+        # Thread-count: explicit override wins over SLURM/OMP auto-detection.
+        nthr_line = (
+            f"NTHR={ntasks}"
+            if ntasks > 0
+            else "NTHR=${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-12}}"
+        )
+
+        # GPU guard: skip GPU detection entirely when caller requests CPU-only.
+        # We inject a literal "false" as the first condition to short-circuit.
+        gpu_condition = (
+            "false"
+            if disable_gpu
+            else '[ -n "${CUDA_VISIBLE_DEVICES}" ] && [ "${CUDA_VISIBLE_DEVICES}" != "NoDevFiles" ]'
+        )
+
         return f"""
         set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
@@ -278,14 +306,13 @@ def get_mdrun_app():
 
         {_get_gromacs_detect_script()}
 
-        # Auto-detect thread count from SLURM allocation
-        # Priority: SLURM_CPUS_PER_TASK > OMP_NUM_THREADS > default(12)
-        NTHR=${{SLURM_CPUS_PER_TASK:-${{OMP_NUM_THREADS:-12}}}}
+        # Thread count: explicit override ({ntasks}) > SLURM > OMP > default(12)
+        {nthr_line}
 
         echo "GROMACS mdrun: Starting {deffnm} with $NTHR threads (using $GMX_BIN){cpt_msg}" >&2
 
         # Auto-detect GPU availability from CUDA_VISIBLE_DEVICES
-        if [ -n "${{CUDA_VISIBLE_DEVICES}}" ] && [ "${{CUDA_VISIBLE_DEVICES}}" != "NoDevFiles" ]; then
+        if {gpu_condition}; then
             # GPU mode: use first GPU with MPI+OpenMP hybrid parallelization
             GPU_ID=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f1)
             echo "GROMACS mdrun: Running on GPU $GPU_ID with $NTHR OpenMP threads" >&2

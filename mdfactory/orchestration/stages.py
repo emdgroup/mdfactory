@@ -9,13 +9,39 @@ for the 4-stage GROMACS pipeline: EM → NVT → NPT → Production.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from parsl import AppFuture
 
 
-def run_em_stage(sim_dir: Path, grompp_app, mdrun_app) -> "AppFuture":
+def _extract_resource_hints(stage_config: Any) -> tuple[int, bool]:
+    """Extract mdrun resource hints from a stage-specific executor config.
+
+    Parameters
+    ----------
+    stage_config : SlurmExecutorConfig or None
+        Per-stage config returned by :meth:`SlurmExecutorConfig.get_stage_config`.
+        May be ``None`` for local / unconfigured runs.
+
+    Returns
+    -------
+    ntasks : int
+        Explicit thread count (0 = auto-detect from SLURM env var).
+    disable_gpu : bool
+        ``True`` when the stage config has no GPU resource (``gres`` is
+        ``None`` or does not contain ``"gpu"``).
+
+    """
+    if stage_config is None:
+        return 0, False
+    ntasks = getattr(stage_config, "cpus_per_node", 0) or 0
+    gres = getattr(stage_config, "gres", None)
+    disable_gpu = gres is None or "gpu" not in str(gres).lower()
+    return ntasks, disable_gpu
+
+
+def run_em_stage(sim_dir: Path, grompp_app, mdrun_app, stage_config: Any = None) -> "AppFuture":
     """Execute energy minimization stage.
 
     Parameters
@@ -26,6 +52,11 @@ def run_em_stage(sim_dir: Path, grompp_app, mdrun_app) -> "AppFuture":
         Result of get_grompp_app().
     mdrun_app : callable
         Result of get_mdrun_app().
+    stage_config : SlurmExecutorConfig or None, optional
+        Stage-specific resource config from
+        :meth:`~mdfactory.orchestration.config.SlurmExecutorConfig.get_stage_config`.
+        When provided, resource hints (thread count, GPU disable) are extracted
+        and forwarded to the mdrun bash app.
 
     Returns
     -------
@@ -34,6 +65,7 @@ def run_em_stage(sim_dir: Path, grompp_app, mdrun_app) -> "AppFuture":
 
     """
     work_dir = str(sim_dir.resolve())
+    ntasks, disable_gpu = _extract_resource_hints(stage_config)
 
     # Step 1: Preprocessing (no dependencies)
     grompp_fut = grompp_app(
@@ -47,13 +79,13 @@ def run_em_stage(sim_dir: Path, grompp_app, mdrun_app) -> "AppFuture":
     )
 
     # Step 2: Simulation (depends on grompp)
-    mdrun_fut = mdrun_app(
+    return mdrun_app(
         deffnm="min",
         work_dir=work_dir,
+        ntasks=ntasks,
+        disable_gpu=disable_gpu,
         inputs=[grompp_fut],
     )
-
-    return mdrun_fut
 
 
 def run_nvt_stage(
@@ -62,6 +94,7 @@ def run_nvt_stage(
     grompp_app,
     mdrun_app,
     restart_from_cpt: str = "",
+    stage_config: Any = None,
 ) -> "AppFuture":
     """Execute NVT equilibration stage.
 
@@ -80,6 +113,9 @@ def run_nvt_stage(
         Path to an existing NVT checkpoint file.  When non-empty the grompp
         step is skipped (the TPR already exists) and mdrun is invoked with
         ``-cpi <file> -append`` to continue from the saved state.
+    stage_config : SlurmExecutorConfig or None, optional
+        Per-stage resource config.  Resource hints are extracted and forwarded
+        to the mdrun bash app.
 
     Returns
     -------
@@ -88,6 +124,7 @@ def run_nvt_stage(
 
     """
     work_dir = str(sim_dir.resolve())
+    ntasks, disable_gpu = _extract_resource_hints(stage_config)
 
     if restart_from_cpt:
         # TPR exists from the interrupted run — skip grompp, resume mdrun.
@@ -96,6 +133,8 @@ def run_nvt_stage(
             deffnm="nvt",
             work_dir=work_dir,
             restart_from_cpt=restart_from_cpt,
+            ntasks=ntasks,
+            disable_gpu=disable_gpu,
             inputs=mdrun_inputs,
         )
 
@@ -116,6 +155,8 @@ def run_nvt_stage(
     return mdrun_app(
         deffnm="nvt",
         work_dir=work_dir,
+        ntasks=ntasks,
+        disable_gpu=disable_gpu,
         inputs=[grompp_fut],
     )
 
@@ -126,6 +167,7 @@ def run_npt_stage(
     grompp_app,
     mdrun_app,
     restart_from_cpt: str = "",
+    stage_config: Any = None,
 ) -> "AppFuture":
     """Execute NPT equilibration stage.
 
@@ -143,6 +185,9 @@ def run_npt_stage(
     restart_from_cpt : str, optional
         Path to an existing NPT checkpoint file.  When non-empty the grompp
         step is skipped and mdrun is invoked with ``-cpi <file> -append``.
+    stage_config : SlurmExecutorConfig or None, optional
+        Per-stage resource config.  Resource hints are extracted and forwarded
+        to the mdrun bash app.
 
     Returns
     -------
@@ -151,6 +196,7 @@ def run_npt_stage(
 
     """
     work_dir = str(sim_dir.resolve())
+    ntasks, disable_gpu = _extract_resource_hints(stage_config)
 
     if restart_from_cpt:
         # TPR exists from the interrupted run — skip grompp, resume mdrun.
@@ -159,6 +205,8 @@ def run_npt_stage(
             deffnm="npt",
             work_dir=work_dir,
             restart_from_cpt=restart_from_cpt,
+            ntasks=ntasks,
+            disable_gpu=disable_gpu,
             inputs=mdrun_inputs,
         )
 
@@ -180,6 +228,8 @@ def run_npt_stage(
     return mdrun_app(
         deffnm="npt",
         work_dir=work_dir,
+        ntasks=ntasks,
+        disable_gpu=disable_gpu,
         inputs=[grompp_fut],
     )
 
@@ -190,6 +240,7 @@ def run_production_stage(
     grompp_app,
     mdrun_app,
     restart_from_cpt: str = "",
+    stage_config: Any = None,
 ) -> "AppFuture":
     """Execute production MD stage.
 
@@ -208,6 +259,9 @@ def run_production_stage(
         Path to an existing Production checkpoint file.  When non-empty the
         grompp step is skipped (prod.tpr already exists) and mdrun is invoked
         with ``-cpi <file> -append`` to continue the interrupted trajectory.
+    stage_config : SlurmExecutorConfig or None, optional
+        Per-stage resource config.  Resource hints are extracted and forwarded
+        to the mdrun bash app.
 
     Returns
     -------
@@ -216,6 +270,7 @@ def run_production_stage(
 
     """
     work_dir = str(sim_dir.resolve())
+    ntasks, disable_gpu = _extract_resource_hints(stage_config)
 
     if restart_from_cpt:
         # prod.tpr exists from the interrupted run — skip grompp, resume mdrun.
@@ -224,6 +279,8 @@ def run_production_stage(
             deffnm="prod",
             work_dir=work_dir,
             restart_from_cpt=restart_from_cpt,
+            ntasks=ntasks,
+            disable_gpu=disable_gpu,
             inputs=mdrun_inputs,
         )
 
@@ -244,6 +301,8 @@ def run_production_stage(
     return mdrun_app(
         deffnm="prod",
         work_dir=work_dir,
+        ntasks=ntasks,
+        disable_gpu=disable_gpu,
         inputs=[grompp_fut],
     )
 
