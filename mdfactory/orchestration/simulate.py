@@ -35,6 +35,33 @@ if TYPE_CHECKING:
     from .config import ExecutorConfig
 
 
+def _bash_result_to_dict(raw: object, sim_hash: str) -> dict:
+    """Normalise a bash_app result to a status dict.
+
+    Parsl ``@bash_app`` futures resolve to ``None`` or an integer exit code
+    on success — neither of which satisfies the ``dict`` contract expected by
+    :func:`_report_simulation_results`.  This transform converts any non-dict
+    value to ``{"hash": sim_hash, "status": "success"}``.  Dict values (e.g.
+    from ``@python_app`` callers) are passed through unchanged.
+
+    Parameters
+    ----------
+    raw : object
+        Raw value from ``AppFuture.result()``.
+    sim_hash : str
+        Display identifier for the simulation (used as ``hash`` key).
+
+    Returns
+    -------
+    dict
+        Result dict with at minimum ``hash`` and ``status`` keys.
+
+    """
+    if isinstance(raw, dict):
+        return raw
+    return {"hash": sim_hash, "status": "success"}
+
+
 def run_simulations(
     sim_paths: list[Path],
     config: "ExecutorConfig",
@@ -137,7 +164,12 @@ def run_simulations(
         # 7. Wait with progress UI (reuse from build.py)
         hashes = [h for h, _ in futures]
         parsl_futures = [fut for _, fut in futures]
-        return _wait_with_progress(parsl_futures, hashes=hashes, label="Simulations")
+        return _wait_with_progress(
+            parsl_futures,
+            hashes=hashes,
+            label="Simulations",
+            result_transform=_bash_result_to_dict,
+        )
 
 
 def _validate_simulation_dir(sim_dir: Path, stages: list[str]):

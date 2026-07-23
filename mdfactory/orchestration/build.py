@@ -192,6 +192,7 @@ def _wait_with_progress(
     *,
     hashes: list[str] | None = None,
     label: str = "Parsl Builds",
+    result_transform=None,
     poll_interval: float = 2.0,
 ) -> list[dict]:
     """Wait for futures with a live terminal progress display.
@@ -208,6 +209,12 @@ def _wait_with_progress(
     label : str
         Heading shown next to the progress bar. Defaults to ``"Parsl Builds"``;
         pass e.g. ``"Simulations"`` to reuse this display for other workflows.
+    result_transform : callable or None, optional
+        ``(raw_result, display_hash) -> dict`` applied to each successful
+        future's return value before it is stored.  The default (``None``)
+        assumes the future already returns a dict (``@python_app`` behaviour).
+        Pass a transform when using ``@bash_app`` futures whose ``result()``
+        resolves to ``None`` or an integer exit code rather than a dict.
     poll_interval : float
         Seconds between status polls.
 
@@ -321,11 +328,12 @@ def _wait_with_progress(
                         continue
                     if future.done():
                         try:
-                            result = future.result()
-                            # Bash apps return an int (exit code); python apps return a dict.
-                            # Normalise to dict so callers can always call r.get("status").
-                            if not isinstance(result, dict):
-                                result = {"hash": display_hashes[i], "status": "success"}
+                            raw = future.result()
+                            result = (
+                                result_transform(raw, display_hashes[i])
+                                if result_transform is not None
+                                else raw
+                            )
                             results[i] = result
                             succeeded += 1
                             line = Text()
