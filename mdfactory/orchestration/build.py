@@ -322,6 +322,10 @@ def _wait_with_progress(
                     if future.done():
                         try:
                             result = future.result()
+                            # Bash apps return an int (exit code); python apps return a dict.
+                            # Normalise to dict so callers can always call r.get("status").
+                            if not isinstance(result, dict):
+                                result = {"hash": display_hashes[i], "status": "success"}
                             results[i] = result
                             succeeded += 1
                             line = Text()
