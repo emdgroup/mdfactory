@@ -222,7 +222,7 @@ class BaseSlurmConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    account: str
+    account: str = ""
     partition: str = "cpu"
     qos: str | None = None
     constraint: str | None = None
