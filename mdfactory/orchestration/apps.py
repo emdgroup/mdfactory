@@ -309,27 +309,56 @@ def get_mdrun_app():
         # Thread count: explicit override ({ntasks}) > SLURM > OMP > default(12)
         {nthr_line}
 
+        # Detect build type: gmx_mpi is a pure MPI build (no thread-MPI support).
+        # -nt / -ntmpi are thread-MPI flags; MPI builds use -ntomp for OpenMP threads
+        # and rely on the MPI launcher (mpirun/srun) for rank count.
+        if [ "$GMX_BIN" = "gmx_mpi" ]; then
+            IS_MPI_BUILD=true
+        else
+            IS_MPI_BUILD=false
+        fi
+
         echo "GROMACS mdrun: Starting {deffnm} with $NTHR threads (using $GMX_BIN){cpt_msg}" >&2
 
         # Auto-detect GPU availability from CUDA_VISIBLE_DEVICES
         if {gpu_condition}; then
-            # GPU mode: use first GPU with MPI+OpenMP hybrid parallelization
+            # GPU mode: use first GPU with OpenMP hybrid parallelization
             GPU_ID=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f1)
             echo "GROMACS mdrun: Running on GPU $GPU_ID with $NTHR OpenMP threads" >&2
 
-            if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntmpi 1 -ntomp $NTHR -gpu_id $GPU_ID -nb gpu -pme gpu; then
-                echo "ERROR: mdrun failed for {deffnm} (GPU mode)" >&2
-                echo "Check md.log for details" >&2
-                exit 1
+            if $IS_MPI_BUILD; then
+                # MPI build: no -ntmpi; MPI rank count controlled by launcher
+                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntomp $NTHR -gpu_id $GPU_ID -nb gpu -pme gpu; then
+                    echo "ERROR: mdrun failed for {deffnm} (GPU/MPI mode)" >&2
+                    echo "Check md.log for details" >&2
+                    exit 1
+                fi
+            else
+                # Thread-MPI build: pin to 1 MPI rank, $NTHR OpenMP threads
+                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntmpi 1 -ntomp $NTHR -gpu_id $GPU_ID -nb gpu -pme gpu; then
+                    echo "ERROR: mdrun failed for {deffnm} (GPU/thread-MPI mode)" >&2
+                    echo "Check md.log for details" >&2
+                    exit 1
+                fi
             fi
         else
-            # CPU-only mode: pure thread-MPI parallelization
+            # CPU-only mode
             echo "GROMACS mdrun: Running on CPU with $NTHR threads" >&2
 
-            if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-nt $NTHR; then
-                echo "ERROR: mdrun failed for {deffnm} (CPU mode)" >&2
-                echo "Check md.log for details" >&2
-                exit 1
+            if $IS_MPI_BUILD; then
+                # MPI build: -ntomp sets OpenMP threads per rank
+                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntomp $NTHR; then
+                    echo "ERROR: mdrun failed for {deffnm} (CPU/MPI mode)" >&2
+                    echo "Check md.log for details" >&2
+                    exit 1
+                fi
+            else
+                # Thread-MPI build: -nt sets total threads
+                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-nt $NTHR; then
+                    echo "ERROR: mdrun failed for {deffnm} (CPU/thread-MPI mode)" >&2
+                    echo "Check md.log for details" >&2
+                    exit 1
+                fi
             fi
         fi
 

@@ -693,7 +693,7 @@ def test_mdrun_app_has_error_handling():
     assert "set -euo pipefail" in bash_script
     # Should check mdrun exit code (both GPU and CPU paths, with dynamic binary)
     assert "if ! $GMX_BIN mdrun" in bash_script
-    assert bash_script.count("if ! $GMX_BIN mdrun") == 2  # GPU and CPU modes
+    assert bash_script.count("if ! $GMX_BIN mdrun") == 4  # GPU and CPU × {MPI, thread-MPI}
     # Should verify output was created
     assert "if [ ! -f" in bash_script
     # Should log errors to stderr
