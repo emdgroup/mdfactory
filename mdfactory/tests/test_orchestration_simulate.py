@@ -987,3 +987,62 @@ def test_get_gromacs_detect_script_prefers_gmx_over_gmx_mpi():
     gmx_mpi_pos = script.find("command -v gmx_mpi")
 
     assert gmx_pos < gmx_mpi_pos, "gmx should be checked before gmx_mpi"
+
+
+# === Decision 7: Checkpoint restart flag tests ===
+
+
+def test_mdrun_app_no_cpt_flags_by_default():
+    """Mdrun bash app omits -cpi/-append when no restart_from_cpt given."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(deffnm="nvt", work_dir="/tmp/test")
+
+    assert "-cpi" not in bash_script
+    assert "-append" not in bash_script
+
+
+def test_mdrun_app_cpt_flags_added_when_restart_set():
+    """Mdrun bash app adds -cpi <file> -append when restart_from_cpt provided."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(
+        deffnm="npt",
+        work_dir="/tmp/test",
+        restart_from_cpt="/sim/npt.cpt",
+    )
+
+    assert "-cpi /sim/npt.cpt -append" in bash_script
+
+
+def test_mdrun_app_cpt_flags_in_both_cpu_and_gpu_branches():
+    """Checkpoint restart flags appear in both CPU and GPU command lines."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(
+        deffnm="prod",
+        work_dir="/tmp/test",
+        restart_from_cpt="/sim/prod.cpt",
+    )
+
+    # Both GPU and CPU branches should carry the -cpi flag
+    # The flag appears once in the script (same cpt_flags variable)
+    cpi_count = bash_script.count("-cpi /sim/prod.cpt -append")
+    assert cpi_count >= 2, f"Expected -cpi flag in both GPU and CPU branches, found {cpi_count}"
+
+
+def test_mdrun_app_cpt_log_message_mentions_file():
+    """Mdrun bash app logs the checkpoint file it is resuming from."""
+    from mdfactory.orchestration.apps import get_mdrun_app
+
+    mdrun_app = get_mdrun_app()
+    bash_script = mdrun_app.func(
+        deffnm="prod",
+        work_dir="/tmp/test",
+        restart_from_cpt="/sim/prod.cpt",
+    )
+
+    assert "resuming from /sim/prod.cpt" in bash_script

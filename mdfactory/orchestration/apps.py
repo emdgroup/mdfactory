@@ -228,6 +228,7 @@ def get_mdrun_app():
     def run_mdrun(
         deffnm: str,
         work_dir: str,
+        restart_from_cpt: str = "",
         stdout=None,
         stderr=None,
         inputs=None,
@@ -247,6 +248,11 @@ def get_mdrun_app():
             Default filename prefix (min, nvt, npt, prod).
         work_dir : str
             Absolute path to simulation directory.
+        restart_from_cpt : str, optional
+            Path to checkpoint file (.cpt) to resume from. When non-empty,
+            ``-cpi <file> -append`` flags are added to the mdrun command so
+            the simulation continues from the saved state rather than
+            starting from scratch.
         stdout : str, optional
             File path for stdout.
         stderr : str, optional
@@ -260,6 +266,11 @@ def get_mdrun_app():
             Bash script to execute.
 
         """
+        # Build checkpoint restart flags once; inject literally into the script.
+        # Trailing space when non-empty avoids double-space in the command line.
+        cpt_flags = f"-cpi {restart_from_cpt} -append " if restart_from_cpt else ""
+        cpt_msg = f" (resuming from {restart_from_cpt})" if restart_from_cpt else ""
+
         return f"""
         set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
@@ -271,7 +282,7 @@ def get_mdrun_app():
         # Priority: SLURM_CPUS_PER_TASK > OMP_NUM_THREADS > default(12)
         NTHR=${{SLURM_CPUS_PER_TASK:-${{OMP_NUM_THREADS:-12}}}}
 
-        echo "GROMACS mdrun: Starting {deffnm} with $NTHR threads (using $GMX_BIN)" >&2
+        echo "GROMACS mdrun: Starting {deffnm} with $NTHR threads (using $GMX_BIN){cpt_msg}" >&2
 
         # Auto-detect GPU availability from CUDA_VISIBLE_DEVICES
         if [ -n "${{CUDA_VISIBLE_DEVICES}}" ] && [ "${{CUDA_VISIBLE_DEVICES}}" != "NoDevFiles" ]; then
@@ -279,7 +290,7 @@ def get_mdrun_app():
             GPU_ID=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f1)
             echo "GROMACS mdrun: Running on GPU $GPU_ID with $NTHR OpenMP threads" >&2
 
-            if ! $GMX_BIN mdrun -deffnm {deffnm} -ntmpi 1 -ntomp $NTHR -gpu_id $GPU_ID -nb gpu -pme gpu; then
+            if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntmpi 1 -ntomp $NTHR -gpu_id $GPU_ID -nb gpu -pme gpu; then
                 echo "ERROR: mdrun failed for {deffnm} (GPU mode)" >&2
                 echo "Check md.log for details" >&2
                 exit 1
@@ -288,7 +299,7 @@ def get_mdrun_app():
             # CPU-only mode: pure thread-MPI parallelization
             echo "GROMACS mdrun: Running on CPU with $NTHR threads" >&2
 
-            if ! $GMX_BIN mdrun -deffnm {deffnm} -nt $NTHR; then
+            if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-nt $NTHR; then
                 echo "ERROR: mdrun failed for {deffnm} (CPU mode)" >&2
                 echo "Check md.log for details" >&2
                 exit 1
