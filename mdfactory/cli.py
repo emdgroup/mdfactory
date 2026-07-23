@@ -585,7 +585,11 @@ def simulate_systems(
     # Use a simple directory-name prefix match rather than SimulationStore.discover()
     # so this works on freshly built directories that have no trajectory yet.
     if hash:
-        sim_paths = _filter_sim_paths_by_hash_prefix(sim_paths, list(hash))
+        try:
+            sim_paths = _filter_sim_paths_by_hash_prefix(sim_paths, list(hash))
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(1)
 
     if not sim_paths:
         logger.error("No simulations found.")
