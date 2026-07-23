@@ -19,10 +19,16 @@ def test_executor_config_defaults():
     assert cfg.max_workers_per_node == 1
 
 
-def test_slurm_executor_config_requires_account():
-    """SlurmExecutorConfig requires account field."""
-    with pytest.raises(Exception):
-        SlurmExecutorConfig()
+def test_slurm_executor_config_account_optional():
+    """SlurmExecutorConfig works without an account for clusters that don't need one.
+
+    account defaults to "" so that clusters without account-based scheduling
+    (or users relying on their default SLURM account) can write a YAML config
+    without an account field.  Parsl omits --account from the sbatch script
+    when the string is empty.
+    """
+    cfg = SlurmExecutorConfig()
+    assert cfg.account == ""
 
 
 def test_slurm_executor_config_defaults():
