@@ -67,6 +67,10 @@ class ExecutorConfig(BaseModel):
         Defaults to ``~/.parsl/mdfactory`` so logs land in a predictable,
         controllable location instead of scattering ``runinfo/`` into the
         current working directory (typically the login-node home on HPC).
+    retries : int
+        Number of times Parsl re-runs a failed app before propagating the
+        exception. Defaults to 3 to handle transient SLURM / network faults.
+        Set to 0 to disable retries.
 
     """
 
@@ -77,6 +81,7 @@ class ExecutorConfig(BaseModel):
     max_blocks: int = 1
     available_accelerators: int | list[str] = 0
     run_dir: Path = Field(default_factory=lambda: Path("~/.parsl/mdfactory").expanduser())
+    retries: int = Field(default=3, ge=0, description="Number of times Parsl retries a failed app.")
 
     @field_validator("run_dir", mode="before")
     @classmethod
@@ -116,7 +121,11 @@ class ExecutorConfig(BaseModel):
             available_accelerators=self.available_accelerators,
             working_dir=str(self.working_directory) if self.working_directory else None,
         )
-        return parsl.Config(executors=[executor], run_dir=str(self.run_dir))
+        return parsl.Config(
+            executors=[executor],
+            run_dir=str(self.run_dir),
+            retries=self.retries,
+        )
 
     @classmethod
     def from_yaml(cls, path: Path) -> "ExecutorConfig | SlurmExecutorConfig":
@@ -297,4 +306,8 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
             available_accelerators=self.available_accelerators,
             working_dir=str(self.working_directory) if self.working_directory else None,
         )
-        return parsl.Config(executors=[executor], run_dir=str(self.run_dir))
+        return parsl.Config(
+            executors=[executor],
+            run_dir=str(self.run_dir),
+            retries=self.retries,
+        )
