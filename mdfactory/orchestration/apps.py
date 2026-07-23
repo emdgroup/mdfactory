@@ -231,6 +231,7 @@ def get_mdrun_app():
         restart_from_cpt: str = "",
         ntasks: int = 0,
         disable_gpu: bool = False,
+        pme_gpu: bool = True,
         stdout=None,
         stderr=None,
         inputs=None,
@@ -239,13 +240,16 @@ def get_mdrun_app():
 
         Thread count and GPU usage are auto-detected from SLURM environment
         variables, with sensible fallbacks for local execution.  Explicit
-        ``ntasks`` / ``disable_gpu`` arguments override the auto-detection,
-        enabling per-stage resource configuration.
+        ``ntasks`` / ``disable_gpu`` / ``pme_gpu`` arguments override the
+        auto-detection, enabling per-stage resource configuration.
 
         Resource detection priority:
         - Thread count: ``ntasks`` arg (if >0) > SLURM_CPUS_PER_TASK >
           OMP_NUM_THREADS > default(12)
         - GPU: disabled when ``disable_gpu=True`` or CUDA_VISIBLE_DEVICES unset
+        - PME-on-GPU: only when ``pme_gpu=True`` AND GPU is available.
+          Must be ``False`` for non-dynamical integrators (e.g. EM/steep),
+          which GROMACS does not support on GPU for PME.
 
         Parameters
         ----------
@@ -264,8 +268,13 @@ def get_mdrun_app():
             to 0 (auto-detect from environment).
         disable_gpu : bool, optional
             When ``True``, force CPU-only execution regardless of whether
-            ``CUDA_VISIBLE_DEVICES`` is set.  Useful for stages like EM that
-            do not benefit from GPU acceleration.  Defaults to ``False``.
+            ``CUDA_VISIBLE_DEVICES`` is set.  Defaults to ``False``.
+        pme_gpu : bool, optional
+            When ``True`` (default) and a GPU is available, run PME on GPU
+            (``-pme gpu``).  Set to ``False`` for stages whose integrator is
+            non-dynamical (EM with ``steep``), which GROMACS rejects with
+            PME-GPU.  When ``False``, GPU non-bonded forces (``-nb gpu``) are
+            still used so EM still benefits from GPU acceleration.
         stdout : str, optional
             File path for stdout.
         stderr : str, optional
@@ -299,6 +308,10 @@ def get_mdrun_app():
             else '[ -n "${CUDA_VISIBLE_DEVICES}" ] && [ "${CUDA_VISIBLE_DEVICES}" != "NoDevFiles" ]'
         )
 
+        # PME flag: "-pme gpu" for dynamical integrators, "-pme cpu" for EM (steep).
+        # Evaluated in Python so the correct literal is baked into the bash script.
+        pme_flag = "-pme gpu" if pme_gpu else "-pme cpu"
+
         return f"""
         set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
@@ -322,21 +335,21 @@ def get_mdrun_app():
 
         # Auto-detect GPU availability from CUDA_VISIBLE_DEVICES
         if {gpu_condition}; then
-            # GPU mode: use first GPU with OpenMP hybrid parallelization
+            # GPU mode: non-bonded on GPU; PME on GPU or CPU depending on integrator.
             GPU_ID=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f1)
-            echo "GROMACS mdrun: Running on GPU $GPU_ID with $NTHR OpenMP threads" >&2
+            echo "GROMACS mdrun: Running on GPU $GPU_ID with $NTHR OpenMP threads ({pme_flag})" >&2
 
             if $IS_MPI_BUILD; then
                 # MPI build: single-rank execution (no MPI launcher invoked).
                 # -ntomp sets OpenMP threads; add srun/mpirun here for multi-rank.
-                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntomp $NTHR -gpu_id $GPU_ID -nb gpu -pme gpu; then
+                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntomp $NTHR -gpu_id $GPU_ID -nb gpu {pme_flag}; then
                     echo "ERROR: mdrun failed for {deffnm} (GPU/MPI mode)" >&2
                     echo "Check md.log for details" >&2
                     exit 1
                 fi
             else
                 # Thread-MPI build: pin to 1 MPI rank, $NTHR OpenMP threads
-                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntmpi 1 -ntomp $NTHR -gpu_id $GPU_ID -nb gpu -pme gpu; then
+                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntmpi 1 -ntomp $NTHR -gpu_id $GPU_ID -nb gpu {pme_flag}; then
                     echo "ERROR: mdrun failed for {deffnm} (GPU/thread-MPI mode)" >&2
                     echo "Check md.log for details" >&2
                     exit 1

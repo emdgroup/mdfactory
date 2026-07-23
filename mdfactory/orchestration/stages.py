@@ -79,11 +79,14 @@ def run_em_stage(sim_dir: Path, grompp_app, mdrun_app, stage_config: Any = None)
     )
 
     # Step 2: Simulation (depends on grompp)
+    # pme_gpu=False: GROMACS rejects -pme gpu for non-dynamical integrators
+    # (steep/cg used in EM). NB forces still run on GPU via -nb gpu.
     return mdrun_app(
         deffnm="min",
         work_dir=work_dir,
         ntasks=ntasks,
         disable_gpu=disable_gpu,
+        pme_gpu=False,
         inputs=[grompp_fut],
     )
 
