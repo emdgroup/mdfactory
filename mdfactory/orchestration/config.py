@@ -71,6 +71,12 @@ class ExecutorConfig(BaseModel):
         Number of times Parsl re-runs a failed app before propagating the
         exception. Defaults to 3 to handle transient SLURM / network faults.
         Set to 0 to disable retries.
+    gmx_binary : str
+        GROMACS binary selection for mdrun: ``"gmx"`` (thread-MPI build),
+        ``"gmx_mpi"`` (pure MPI build), or ``"auto"`` (detect at runtime,
+        default).  Setting an explicit value eliminates all runtime if-blocks
+        from the generated bash script.  Can be overridden per-stage via
+        ``stage_overrides`` on :class:`SlurmExecutorConfig`.
 
     """
 
@@ -82,6 +88,16 @@ class ExecutorConfig(BaseModel):
     available_accelerators: int | list[str] = 0
     run_dir: Path = Field(default_factory=lambda: Path("~/.parsl/mdfactory").expanduser())
     retries: int = Field(default=3, ge=0, description="Number of times Parsl retries a failed app.")
+    gmx_binary: Literal["auto", "gmx", "gmx_mpi"] = Field(
+        default="auto",
+        description=(
+            "GROMACS binary selection for mdrun. "
+            "``'gmx'`` — thread-MPI build; ``'gmx_mpi'`` — pure MPI build; "
+            "``'auto'`` — detect at runtime (default, backward compatible). "
+            "Setting an explicit value eliminates all runtime if-blocks from "
+            "the generated bash script."
+        ),
+    )
 
     @field_validator("run_dir", mode="before")
     @classmethod

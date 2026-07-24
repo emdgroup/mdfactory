@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from parsl import AppFuture
@@ -136,7 +136,27 @@ STAGE_REGISTRY: list[StageSpec] = [
 STAGE_BY_NAME: dict[str, StageSpec] = {s.name: s for s in STAGE_REGISTRY}
 
 
-def _extract_resource_hints(stage_config: Any) -> tuple[int, bool]:
+class ResourceHints(NamedTuple):
+    """Resource hints extracted from a stage executor config for mdrun.
+
+    Parameters
+    ----------
+    ntasks : int
+        Explicit thread count (0 = auto-detect from SLURM env var).
+    disable_gpu : bool
+        ``True`` when the stage config has no GPU resource (``gres`` is
+        ``None`` or does not contain ``"gpu"``).
+    gmx_binary : str
+        GROMACS binary selection: ``"auto"``, ``"gmx"``, or ``"gmx_mpi"``.
+
+    """
+
+    ntasks: int
+    disable_gpu: bool
+    gmx_binary: str  # "auto" | "gmx" | "gmx_mpi"
+
+
+def _extract_resource_hints(stage_config: Any) -> ResourceHints:
     """Extract mdrun resource hints from a stage-specific executor config.
 
     Parameters
@@ -147,19 +167,22 @@ def _extract_resource_hints(stage_config: Any) -> tuple[int, bool]:
 
     Returns
     -------
-    ntasks : int
-        Explicit thread count (0 = auto-detect from SLURM env var).
-    disable_gpu : bool
-        ``True`` when the stage config has no GPU resource (``gres`` is
-        ``None`` or does not contain ``"gpu"``).
+    ResourceHints
+        Named tuple with ``ntasks``, ``disable_gpu``, and ``gmx_binary``.
+
+    Notes
+    -----
+    Uses :func:`getattr` with safe fallbacks so the function remains
+    callable with any config object that does not yet declare all fields.
 
     """
     if stage_config is None:
-        return 0, False
+        return ResourceHints(ntasks=0, disable_gpu=False, gmx_binary="auto")
     ntasks = getattr(stage_config, "cpus_per_node", 0) or 0
     gres = getattr(stage_config, "gres", None)
     disable_gpu = gres is None or "gpu" not in str(gres).lower()
-    return ntasks, disable_gpu
+    gmx_binary = getattr(stage_config, "gmx_binary", "auto")
+    return ResourceHints(ntasks=ntasks, disable_gpu=disable_gpu, gmx_binary=gmx_binary)
 
 
 def run_stage(
@@ -208,7 +231,7 @@ def run_stage(
 
     """
     work_dir = str(sim_dir.resolve())
-    ntasks, disable_gpu = _extract_resource_hints(stage_config)
+    hints = _extract_resource_hints(stage_config)
 
     if restart_from_cpt:
         # TPR exists from the interrupted run — skip grompp, resume mdrun.
@@ -217,8 +240,9 @@ def run_stage(
             deffnm=spec.deffnm,
             work_dir=work_dir,
             restart_from_cpt=restart_from_cpt,
-            ntasks=ntasks,
-            disable_gpu=disable_gpu,
+            ntasks=hints.ntasks,
+            disable_gpu=hints.disable_gpu,
+            gmx_binary=hints.gmx_binary,
             gro_out=spec.gro_out,
             traj_files=spec.traj_files,
             inputs=mdrun_inputs,
@@ -245,9 +269,10 @@ def run_stage(
     return mdrun_app(
         deffnm=spec.deffnm,
         work_dir=work_dir,
-        ntasks=ntasks,
-        disable_gpu=disable_gpu,
+        ntasks=hints.ntasks,
+        disable_gpu=hints.disable_gpu,
         pme_gpu=spec.supports_pme_gpu,
+        gmx_binary=hints.gmx_binary,
         gro_out=spec.gro_out,
         traj_files=spec.traj_files,
         inputs=[grompp_fut],
