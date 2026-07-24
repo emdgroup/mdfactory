@@ -250,6 +250,47 @@ def _build_env_preamble(work_dir: str, nthr_expr: str, has_gpu: bool) -> str:
     return "\n".join(lines)
 
 
+def _build_gmx_detect_block(gmx_extra: str = "", gmx_mpi_extra: str = "") -> str:
+    """Emit the core GROMACS binary detection if/elif/else/fi block.
+
+    Assigns ``$GMX_BIN`` to ``gmx`` or ``gmx_mpi`` depending on what is
+    found in ``PATH``, and exits with an error if neither is available.
+    Optional extra shell assignments (e.g. setting ``$MDRUN_THREAD_FLAGS``)
+    are appended with a semicolon to the respective branch lines.
+
+    Parameters
+    ----------
+    gmx_extra : str, optional
+        Additional assignment appended to the ``gmx`` branch, e.g.
+        ``'MDRUN_THREAD_FLAGS="-nt $NTHR"'``.  Empty string means no extra.
+    gmx_mpi_extra : str, optional
+        Additional assignment appended to the ``gmx_mpi`` branch.
+
+    Returns
+    -------
+    str
+        Multi-line if/elif/else/fi block with no leading or trailing newline.
+
+    Notes
+    -----
+    This is the single source of truth for the detection skeleton shared by
+    :func:`_build_binary_detection_preamble` (mdrun) and
+    :func:`_get_gromacs_detect_script` (grompp).
+
+    """
+    gmx_line = f"    GMX_BIN=gmx{'; ' + gmx_extra if gmx_extra else ''}"
+    gmx_mpi_line = f"    GMX_BIN=gmx_mpi{'; ' + gmx_mpi_extra if gmx_mpi_extra else ''}"
+    return (
+        "if command -v gmx &>/dev/null; then\n"
+        f"{gmx_line}\n"
+        "elif command -v gmx_mpi &>/dev/null; then\n"
+        f"{gmx_mpi_line}\n"
+        "else\n"
+        '    echo "ERROR: Neither gmx nor gmx_mpi found in PATH" >&2; exit 1\n'
+        "fi"
+    )
+
+
 def _build_binary_detection_preamble(has_gpu: bool) -> str:
     """Emit the GROMACS binary detection block for auto mode.
 
@@ -273,20 +314,13 @@ def _build_binary_detection_preamble(has_gpu: bool) -> str:
     -----
     The block is absent when ``gmx_binary`` is set to ``"gmx"`` or
     ``"gmx_mpi"`` — only auto mode needs runtime binary detection.
+    Delegates to :func:`_build_gmx_detect_block` for the shared skeleton.
 
     """
-    if has_gpu:
-        tmpi_flags = '"-ntmpi 1 -ntomp $NTHR"'
-    else:
-        tmpi_flags = '"-nt $NTHR"'
-    return (
-        "if command -v gmx &>/dev/null; then\n"
-        f"    GMX_BIN=gmx; MDRUN_THREAD_FLAGS={tmpi_flags}\n"
-        "elif command -v gmx_mpi &>/dev/null; then\n"
-        '    GMX_BIN=gmx_mpi; MDRUN_THREAD_FLAGS="-ntomp $NTHR"\n'
-        "else\n"
-        '    echo "ERROR: Neither gmx nor gmx_mpi found in PATH" >&2; exit 1\n'
-        "fi"
+    tmpi_flags = '"-ntmpi 1 -ntomp $NTHR"' if has_gpu else '"-nt $NTHR"'
+    return _build_gmx_detect_block(
+        gmx_extra=f"MDRUN_THREAD_FLAGS={tmpi_flags}",
+        gmx_mpi_extra='MDRUN_THREAD_FLAGS="-ntomp $NTHR"',
     )
 
 
@@ -328,30 +362,31 @@ def _build_output_check(gro_out: str, traj_files: "tuple[str, ...]") -> str:
 
 
 def _get_gromacs_detect_script() -> str:
-    """Return bash script for GROMACS binary auto-detection.
+    """Return bash snippet for GROMACS binary auto-detection (grompp use).
+
+    Wraps :func:`_build_gmx_detect_block` with a comment header and
+    surrounding newlines so it embeds cleanly inside the grompp f-string.
 
     Returns
     -------
     str
-        Bash script that sets GMX_BIN variable to gmx or gmx_mpi.
+        Bash block that sets ``$GMX_BIN`` to ``gmx`` or ``gmx_mpi``,
+        with a leading blank line, comment, and trailing newline.
 
     Notes
     -----
-    Prefers gmx (thread-MPI) for local execution, falls back to gmx_mpi.
-    This avoids PMI/srun issues when using LocalProvider with MPI builds.
+    Prefers ``gmx`` (thread-MPI) for local execution; falls back to
+    ``gmx_mpi``.  This avoids PMI/srun issues when using LocalProvider
+    with MPI builds.  Only ``$GMX_BIN`` is set here — no thread-flag
+    assignment is needed for grompp.
+
     """
-    return """
-# Auto-detect GROMACS binary
-# Prefer gmx (thread-MPI) for local execution, fallback to gmx_mpi for cluster
-if command -v gmx &> /dev/null; then
-    GMX_BIN="gmx"
-elif command -v gmx_mpi &> /dev/null; then
-    GMX_BIN="gmx_mpi"
-else
-    echo "ERROR: Neither gmx nor gmx_mpi found in PATH" >&2
-    exit 1
-fi
-"""
+    block = _build_gmx_detect_block()
+    return (
+        "\n# Auto-detect GROMACS binary"
+        " (prefer gmx thread-MPI, fall back to gmx_mpi)\n"
+        f"{block}\n"
+    )
 
 
 def _require_bash_app():

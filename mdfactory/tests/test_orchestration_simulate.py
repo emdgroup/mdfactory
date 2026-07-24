@@ -1074,6 +1074,39 @@ def test_extract_expected_frames_returns_none_for_incomplete_mdp(mock_sim_dir):
 # Tests for GROMACS binary detection
 
 
+def test_build_gmx_detect_block_no_extras():
+    """Core detection block sets GMX_BIN only when no extras supplied."""
+    from mdfactory.orchestration.apps import _build_gmx_detect_block
+
+    block = _build_gmx_detect_block()
+    assert "GMX_BIN=gmx\n" in block
+    assert "GMX_BIN=gmx_mpi" in block
+    assert "MDRUN_THREAD_FLAGS" not in block
+    assert block.startswith("if command -v gmx")
+    assert block.endswith("fi")
+
+
+def test_build_gmx_detect_block_with_extras():
+    """Extra assignments are appended to each branch via semicolons."""
+    from mdfactory.orchestration.apps import _build_gmx_detect_block
+
+    block = _build_gmx_detect_block(
+        gmx_extra='MDRUN_THREAD_FLAGS="-nt $NTHR"',
+        gmx_mpi_extra='MDRUN_THREAD_FLAGS="-ntomp $NTHR"',
+    )
+    assert 'GMX_BIN=gmx; MDRUN_THREAD_FLAGS="-nt $NTHR"' in block
+    assert 'GMX_BIN=gmx_mpi; MDRUN_THREAD_FLAGS="-ntomp $NTHR"' in block
+
+
+def test_build_gmx_detect_block_error_handling():
+    """Block contains the canonical error message and exit 1."""
+    from mdfactory.orchestration.apps import _build_gmx_detect_block
+
+    block = _build_gmx_detect_block()
+    assert "ERROR: Neither gmx nor gmx_mpi found in PATH" in block
+    assert "exit 1" in block
+
+
 def test_get_gromacs_detect_script_returns_string():
     """GROMACS detect function returns valid bash script."""
     from mdfactory.orchestration.apps import _get_gromacs_detect_script
@@ -1094,9 +1127,9 @@ def test_get_gromacs_detect_script_contains_required_logic():
     assert "command -v gmx" in script
     assert "command -v gmx_mpi" in script
 
-    # Check for GMX_BIN assignment
-    assert 'GMX_BIN="gmx"' in script
-    assert 'GMX_BIN="gmx_mpi"' in script
+    # Check for GMX_BIN assignment (unquoted, consistent with _build_gmx_detect_block)
+    assert "GMX_BIN=gmx\n" in script  # gmx branch (not gmx_mpi)
+    assert "GMX_BIN=gmx_mpi" in script
 
     # Check for error handling
     assert "ERROR" in script
