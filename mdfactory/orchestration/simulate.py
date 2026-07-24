@@ -33,6 +33,8 @@ except ImportError:
     mda = None
 
 if TYPE_CHECKING:
+    from parsl import AppFuture
+
     from .config import ExecutorConfig
 
 
@@ -105,9 +107,7 @@ def run_simulations(
     else:
         invalid = [s for s in stages if s not in valid_stages]
         if invalid:
-            raise ValueError(
-                f"Invalid stage(s): {invalid}. Valid stages: {valid_stages}"
-            )
+            raise ValueError(f"Invalid stage(s): {invalid}. Valid stages: {valid_stages}")
 
     if checkpoint_mode not in valid_modes:
         raise ValueError(
@@ -119,9 +119,7 @@ def run_simulations(
     for sim_dir in sim_paths:
         missing = _missing_build_files(sim_dir, stages)
         if missing:
-            logger.warning(
-                f"Skipping {sim_dir.name}: build incomplete, missing: {missing}"
-            )
+            logger.warning(f"Skipping {sim_dir.name}: build incomplete, missing: {missing}")
         else:
             ready_paths.append(sim_dir)
 
@@ -146,12 +144,14 @@ def run_simulations(
             for item in stage_items
             if item["restart"] and item["cpt_file"] is not None
         }
-        work_plan.append({
-            "sim_dir": sim_dir,
-            "hash": sim_dir.name,
-            "stages": needed_stages,
-            "stage_restarts": stage_restarts,
-        })
+        work_plan.append(
+            {
+                "sim_dir": sim_dir,
+                "hash": sim_dir.name,
+                "stages": needed_stages,
+                "stage_restarts": stage_restarts,
+            }
+        )
 
     logger.info(f"Prepared work plan for {len(work_plan)} simulation(s)")
 
@@ -249,6 +249,61 @@ def _validate_simulation_dir(sim_dir: Path, stages: list[str]) -> None:
         raise FileNotFoundError(f"Missing files in {sim_dir}: {missing}")
 
 
+def _detect_skip_mode_state(output_file: Path, cpt_file: Path, tpr_file: Path) -> dict:
+    """Return stage state dict for 'skip' checkpoint mode (no integrity checks).
+
+    Parameters
+    ----------
+    output_file : Path
+        Primary output file (gro or trajectory).
+    cpt_file : Path
+        Stage checkpoint file.
+    tpr_file : Path
+        Stage TPR run-input file.
+
+    Returns
+    -------
+    dict
+        Stage state dict with ``status``, ``cpt_file``, and ``restart`` keys.
+
+    """
+    if output_file.exists():
+        return {"status": "complete", "cpt_file": None, "restart": False}
+    if cpt_file.exists() and tpr_file.exists():
+        return {"status": "partial", "cpt_file": cpt_file, "restart": True}
+    return {"status": "not_started", "cpt_file": None, "restart": False}
+
+
+def _detect_production_output_state(sim_dir: Path, cpt_file: Path, tpr_file: Path) -> dict:
+    """Return stage state dict for Production when the trajectory output exists.
+
+    Validates frame count; falls back to partial restart if the trajectory is
+    incomplete and a checkpoint/TPR pair exists.
+
+    Parameters
+    ----------
+    sim_dir : Path
+        Simulation directory (must contain prod.xtc and prod.mdp).
+    cpt_file : Path
+        Production checkpoint file.
+    tpr_file : Path
+        Production TPR file.
+
+    Returns
+    -------
+    dict
+        Stage state dict with ``status``, ``cpt_file``, and ``restart`` keys.
+
+    """
+    expected_frames = _extract_expected_frames_from_mdp(sim_dir, "Production")
+    if _validate_trajectory_complete(sim_dir, "prod.xtc", expected_frames):
+        return {"status": "complete", "cpt_file": None, "restart": False}
+    if cpt_file.exists() and tpr_file.exists():
+        return {"status": "partial", "cpt_file": cpt_file, "restart": True}
+    # Trajectory exists but incomplete, no checkpoint to restart from
+    return {"status": "partial", "cpt_file": None, "restart": False}
+
+
 def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
     """Detect completion or partial progress of a stage.
 
@@ -281,41 +336,24 @@ def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
     # Prerequisite checkpoint (for validating workflow integrity in auto mode)
     prereq_cpt = sim_dir / spec.prereq_cpt if spec.prereq_cpt else None
 
-    # For "skip" mode, just check if output file exists (even if empty)
-    # Don't validate workflow integrity - trust the user
+    # For "skip" mode, just check if output file exists (even if empty).
+    # Don't validate workflow integrity - trust the user.
     if mode == "skip":
-        if output_file.exists():
-            return {"status": "complete", "cpt_file": None, "restart": False}
-        elif cpt_file.exists() and tpr_file.exists():
-            return {"status": "partial", "cpt_file": cpt_file, "restart": True}
-        else:
-            return {"status": "not_started", "cpt_file": None, "restart": False}
+        return _detect_skip_mode_state(output_file, cpt_file, tpr_file)
 
-    # For "auto" mode, validate workflow integrity by checking prerequisite checkpoints
+    # For "auto" mode, validate workflow integrity by checking prerequisite checkpoints.
     if output_file.exists() and output_file.stat().st_size > 0:
-        # Check workflow integrity: prerequisite checkpoint must exist
+        # Check workflow integrity: prerequisite checkpoint must exist.
         if prereq_cpt and not prereq_cpt.exists():
-            # Output exists but prerequisite checkpoint missing - workflow integrity broken
-            # Can't trust this output, need to re-run from earlier stage
+            # Output exists but prerequisite checkpoint missing - workflow integrity broken.
+            # Can't trust this output; need to re-run from earlier stage.
             return {"status": "not_started", "cpt_file": None, "restart": False}
-
-        # For trajectories, validate frame count
         if stage == "Production":
-            expected_frames = _extract_expected_frames_from_mdp(sim_dir, stage)
-            if _validate_trajectory_complete(sim_dir, "prod.xtc", expected_frames):
-                return {"status": "complete", "cpt_file": None, "restart": False}
-            else:
-                # Trajectory exists but incomplete - can restart
-                if cpt_file.exists() and tpr_file.exists():
-                    return {"status": "partial", "cpt_file": cpt_file, "restart": True}
-                else:
-                    # Can't restart without checkpoint
-                    return {"status": "partial", "cpt_file": None, "restart": False}
-        else:
-            # Non-trajectory stages: output exists + prerequisite valid = complete
-            return {"status": "complete", "cpt_file": None, "restart": False}
+            return _detect_production_output_state(sim_dir, cpt_file, tpr_file)
+        # Non-trajectory stages: output exists + prerequisite valid = complete.
+        return {"status": "complete", "cpt_file": None, "restart": False}
 
-    # Check partial progress (checkpoint exists, output doesn't)
+    # Check partial progress (checkpoint exists, output doesn't).
     if cpt_file.exists() and tpr_file.exists():
         return {"status": "partial", "cpt_file": cpt_file, "restart": True}
 
@@ -344,8 +382,7 @@ def _detect_needed_stages(sim_dir: Path, stages: list[str], mode: str) -> list[s
 
     """
     return [
-        item["stage"]
-        for item in _detect_needed_stages_with_restart_info(sim_dir, stages, mode)
+        item["stage"] for item in _detect_needed_stages_with_restart_info(sim_dir, stages, mode)
     ]
 
 
@@ -382,18 +419,22 @@ def _detect_needed_stages_with_restart_info(
             continue  # Skip completed stages
         elif state["status"] == "partial" and state["restart"]:
             # Can resume from checkpoint
-            needed.append({
-                "stage": stage,
-                "restart": True,
-                "cpt_file": state["cpt_file"],
-            })
+            needed.append(
+                {
+                    "stage": stage,
+                    "restart": True,
+                    "cpt_file": state["cpt_file"],
+                }
+            )
         else:
             # Not started or can't restart - run from beginning
-            needed.append({
-                "stage": stage,
-                "restart": False,
-                "cpt_file": None,
-            })
+            needed.append(
+                {
+                    "stage": stage,
+                    "restart": False,
+                    "cpt_file": None,
+                }
+            )
 
     return needed
 
@@ -467,9 +508,7 @@ def _execute_stage_list(
 
         curr_idx = stage_indices[stage]
         if curr_idx <= prev_idx:
-            raise ValueError(
-                f"Stages must be in dependency order: {stage_order}. Got: {stages}"
-            )
+            raise ValueError(f"Stages must be in dependency order: {stage_order}. Got: {stages}")
         prev_idx = curr_idx
 
     # Execute stages sequentially, chaining dependencies
@@ -492,13 +531,19 @@ def _execute_stage_list(
             stage_fn = stage_functions[stage]
             if cpt_file:
                 prev_future = stage_fn(
-                    sim_dir, prev_future, grompp_app, mdrun_app,
+                    sim_dir,
+                    prev_future,
+                    grompp_app,
+                    mdrun_app,
                     restart_from_cpt=cpt_file,
                     **cfg_kwarg,
                 )
             else:
                 prev_future = stage_fn(
-                    sim_dir, prev_future, grompp_app, mdrun_app,
+                    sim_dir,
+                    prev_future,
+                    grompp_app,
+                    mdrun_app,
                     **cfg_kwarg,
                 )
 
@@ -586,9 +631,7 @@ def _validate_trajectory_complete(
         # Find structure file for topology
         structure_file = find_structure_file(sim_dir)
         if not structure_file:
-            logger.warning(
-                f"No structure file found in {sim_dir}, using size check fallback"
-            )
+            logger.warning(f"No structure file found in {sim_dir}, using size check fallback")
             # Heuristic: typical prod.xtc is > 10 MB for any reasonable system
             return traj_path.stat().st_size > 10_000_000
 
@@ -680,8 +723,8 @@ def _extract_expected_frames_from_mdp(sim_dir: Path, stage: str) -> int | None:
         nsteps = None
         nstxout = None
 
-        for line in content.split("\n"):
-            line = line.split(";")[0].strip()  # Remove comments
+        for raw_line in content.split("\n"):
+            line = raw_line.split(";")[0].strip()  # Remove comments
             if "=" in line:
                 key, val = line.split("=", 1)
                 key = key.strip()

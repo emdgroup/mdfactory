@@ -236,7 +236,7 @@ class TestBaseSlurmConfigFromCluster:
     """Tests run without a real SLURM cluster (discover_cluster mocked)."""
 
     def test_autodiscovery_populates_account_and_partition(self, monkeypatch, no_slurm_settings):
-        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
+        monkeypatch.setattr(cluster_mod, "discover_cluster", _make_cluster)
         cfg = SlurmConfig.from_cluster()
         assert cfg.account == "myaccount"
         assert cfg.partition == "compute"
@@ -282,7 +282,7 @@ class TestBaseSlurmConfigFromCluster:
     def test_config_account_overrides_autodiscovery(self, monkeypatch):
         from mdfactory.settings import Settings
 
-        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
+        monkeypatch.setattr(cluster_mod, "discover_cluster", _make_cluster)
         monkeypatch.setattr(Settings, "slurm_account", property(lambda self: "config-account"))
         cfg = SlurmConfig.from_cluster()
         assert cfg.account == "config-account"
@@ -290,7 +290,7 @@ class TestBaseSlurmConfigFromCluster:
     def test_config_cpu_partition_overrides_autodiscovery(self, monkeypatch):
         from mdfactory.settings import Settings
 
-        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
+        monkeypatch.setattr(cluster_mod, "discover_cluster", _make_cluster)
         monkeypatch.setattr(Settings, "slurm_partition_cpu", property(lambda self: "config-cpu"))
         cfg = SlurmConfig.from_cluster(needs_gpu=False)
         assert cfg.partition == "config-cpu"
@@ -307,7 +307,7 @@ class TestBaseSlurmConfigFromCluster:
     def test_config_qos_propagated(self, monkeypatch):
         from mdfactory.settings import Settings
 
-        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
+        monkeypatch.setattr(cluster_mod, "discover_cluster", _make_cluster)
         monkeypatch.setattr(Settings, "slurm_qos", property(lambda self: "high"))
         cfg = SlurmConfig.from_cluster()
         assert cfg.qos == "high"
@@ -317,7 +317,7 @@ class TestBaseSlurmConfigFromCluster:
     def test_explicit_account_overrides_config_and_autodiscovery(self, monkeypatch):
         from mdfactory.settings import Settings
 
-        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
+        monkeypatch.setattr(cluster_mod, "discover_cluster", _make_cluster)
         monkeypatch.setattr(Settings, "slurm_account", property(lambda self: "config-account"))
         cfg = SlurmConfig.from_cluster(account="explicit-account")
         assert cfg.account == "explicit-account"
@@ -325,7 +325,7 @@ class TestBaseSlurmConfigFromCluster:
     def test_explicit_partition_overrides_config_and_autodiscovery(self, monkeypatch):
         from mdfactory.settings import Settings
 
-        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
+        monkeypatch.setattr(cluster_mod, "discover_cluster", _make_cluster)
         monkeypatch.setattr(
             Settings, "slurm_partition_cpu", property(lambda self: "config-partition")
         )
@@ -335,20 +335,20 @@ class TestBaseSlurmConfigFromCluster:
     def test_explicit_qos_overrides_config(self, monkeypatch):
         from mdfactory.settings import Settings
 
-        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
+        monkeypatch.setattr(cluster_mod, "discover_cluster", _make_cluster)
         monkeypatch.setattr(Settings, "slurm_qos", property(lambda self: "high"))
         cfg = SlurmConfig.from_cluster(qos="debug")
         assert cfg.qos == "debug"
 
     def test_explicit_constraint_forwarded(self, monkeypatch):
-        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
+        monkeypatch.setattr(cluster_mod, "discover_cluster", _make_cluster)
         cfg = SlurmConfig.from_cluster(constraint="epyc")
         assert cfg.constraint == "epyc"
 
     # --- submitit-specific extra fields forwarded ---
 
     def test_submitit_fields_forwarded(self, monkeypatch):
-        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
+        monkeypatch.setattr(cluster_mod, "discover_cluster", _make_cluster)
         cfg = SlurmConfig.from_cluster(
             time="4h",
             cpus_per_task=8,
@@ -361,7 +361,7 @@ class TestBaseSlurmConfigFromCluster:
         assert cfg.job_name_prefix == "my-prefix"
 
     def test_returns_slurm_config_type(self, monkeypatch):
-        monkeypatch.setattr(cluster_mod, "discover_cluster", lambda: _make_cluster())
+        monkeypatch.setattr(cluster_mod, "discover_cluster", _make_cluster)
         result = SlurmConfig.from_cluster()
         assert isinstance(result, SlurmConfig)
 

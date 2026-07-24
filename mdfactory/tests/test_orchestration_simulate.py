@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mdfactory.orchestration.config import ExecutorConfig
 from mdfactory.orchestration.apps import (
     _assemble_mdrun_command,
     _build_mdrun_script,
@@ -18,6 +17,7 @@ from mdfactory.orchestration.apps import (
     _resolve_thread_count_expr,
     _resolve_thread_flags,
 )
+from mdfactory.orchestration.config import ExecutorConfig
 from mdfactory.orchestration.simulate import (
     _detect_needed_stages,
     _execute_stage_list,
@@ -241,7 +241,7 @@ def test_parallel_submission(mock_execute, mock_session, tmp_path):
     mock_session.return_value.__enter__.return_value = MagicMock()
 
     # Run
-    results = run_simulations(sim_dirs, ExecutorConfig(), stages=["EM", "NVT", "NPT", "Production"])
+    run_simulations(sim_dirs, ExecutorConfig(), stages=["EM", "NVT", "NPT", "Production"])
 
     # Verify 10 stage lists executed
     assert mock_execute.call_count == 10
@@ -617,8 +617,9 @@ def test_mdrun_app_slurm_priority():
 
 def test_stage_functions_no_hardcoded_nt():
     """Stage functions don't pass hardcoded nt parameter to mdrun."""
-    from mdfactory.orchestration import stages
     import inspect
+
+    from mdfactory.orchestration import stages
 
     # Check all stage functions
     for name in ["run_em_stage", "run_nvt_stage", "run_npt_stage", "run_production_stage"]:
@@ -657,9 +658,7 @@ def test_execute_stage_list_em_only(mock_em):
     mock_future = MagicMock()
     mock_em.return_value = mock_future
 
-    result = _execute_stage_list(
-        Path("/tmp/test"), ["EM"], MagicMock(), MagicMock()
-    )
+    result = _execute_stage_list(Path("/tmp/test"), ["EM"], MagicMock(), MagicMock())
 
     # EM should be called once
     mock_em.assert_called_once()
@@ -678,16 +677,12 @@ def test_execute_stage_list_em_nvt_chain(mock_nvt, mock_em):
     grompp_app = MagicMock()
     mdrun_app = MagicMock()
 
-    result = _execute_stage_list(
-        Path("/tmp/test"), ["EM", "NVT"], grompp_app, mdrun_app
-    )
+    result = _execute_stage_list(Path("/tmp/test"), ["EM", "NVT"], grompp_app, mdrun_app)
 
     # EM called first
     mock_em.assert_called_once_with(Path("/tmp/test"), grompp_app, mdrun_app)
     # NVT called with EM future as dependency
-    mock_nvt.assert_called_once_with(
-        Path("/tmp/test"), em_future, grompp_app, mdrun_app
-    )
+    mock_nvt.assert_called_once_with(Path("/tmp/test"), em_future, grompp_app, mdrun_app)
     # Returns final NVT future
     assert result == nvt_future
 
@@ -712,9 +707,7 @@ def test_execute_stage_list_full_pipeline(mock_prod, mock_npt, mock_nvt, mock_em
     mdrun_app = MagicMock()
     sim_dir = Path("/tmp/test")
 
-    result = _execute_stage_list(
-        sim_dir, ["EM", "NVT", "NPT", "Production"], grompp_app, mdrun_app
-    )
+    result = _execute_stage_list(sim_dir, ["EM", "NVT", "NPT", "Production"], grompp_app, mdrun_app)
 
     # Verify call chain
     mock_em.assert_called_once_with(sim_dir, grompp_app, mdrun_app)
@@ -765,9 +758,7 @@ def test_run_simulations_uses_execute_stage_list(mock_execute, mock_session, moc
     # Create partial checkpoint state (EM complete)
     (mock_sim_dir / "min.gro").write_text("FAKE")
 
-    results = run_simulations(
-        [mock_sim_dir], ExecutorConfig(), checkpoint_mode="auto"
-    )
+    run_simulations([mock_sim_dir], ExecutorConfig(), checkpoint_mode="auto")
 
     # Should call _execute_stage_list with only needed stages
     mock_execute.assert_called_once()
@@ -903,7 +894,6 @@ def test_bash_apps_use_strict_mode():
 
 def test_validate_trajectory_returns_false_for_missing_file(mock_sim_dir):
     """Trajectory validation returns False if file doesn't exist."""
-    from mdfactory.orchestration.simulate import _validate_trajectory_complete
 
     result = _validate_trajectory_complete(mock_sim_dir, "prod.xtc")
     assert result is False
@@ -911,7 +901,6 @@ def test_validate_trajectory_returns_false_for_missing_file(mock_sim_dir):
 
 def test_validate_trajectory_returns_false_for_empty_file(mock_sim_dir):
     """Trajectory validation returns False for empty files."""
-    from mdfactory.orchestration.simulate import _validate_trajectory_complete
 
     (mock_sim_dir / "prod.xtc").write_text("")  # Empty file
     result = _validate_trajectory_complete(mock_sim_dir, "prod.xtc")
@@ -920,7 +909,6 @@ def test_validate_trajectory_returns_false_for_empty_file(mock_sim_dir):
 
 def test_validate_trajectory_uses_size_fallback_without_structure(mock_sim_dir):
     """Trajectory validation uses size heuristic when no structure file found."""
-    from mdfactory.orchestration.simulate import _validate_trajectory_complete
 
     # Create trajectory but no structure files
     (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 15_000_000)  # 15 MB
@@ -932,7 +920,6 @@ def test_validate_trajectory_uses_size_fallback_without_structure(mock_sim_dir):
 
 def test_validate_trajectory_size_fallback_rejects_small_files(mock_sim_dir):
     """Trajectory validation rejects small files in fallback mode."""
-    from mdfactory.orchestration.simulate import _validate_trajectory_complete
 
     # Create small trajectory (< 10 MB threshold)
     (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 1000)
@@ -945,7 +932,6 @@ def test_validate_trajectory_size_fallback_rejects_small_files(mock_sim_dir):
 @patch("mdfactory.orchestration.simulate.mda")
 def test_validate_trajectory_with_mdanalysis_complete(mock_mda, mock_sim_dir):
     """Trajectory validation uses MDAnalysis to count frames (complete)."""
-    from mdfactory.orchestration.simulate import _validate_trajectory_complete
 
     # Setup mocks
     (mock_sim_dir / "prod.xtc").write_bytes(b"FAKE XTC")
@@ -957,9 +943,7 @@ def test_validate_trajectory_with_mdanalysis_complete(mock_mda, mock_sim_dir):
     mock_universe.trajectory = mock_traj
     mock_mda.Universe.return_value = mock_universe
 
-    result = _validate_trajectory_complete(
-        mock_sim_dir, "prod.xtc", expected_frames=100
-    )
+    result = _validate_trajectory_complete(mock_sim_dir, "prod.xtc", expected_frames=100)
 
     # Should pass (100 >= 100)
     assert result is True
@@ -968,7 +952,6 @@ def test_validate_trajectory_with_mdanalysis_complete(mock_mda, mock_sim_dir):
 @patch("mdfactory.orchestration.simulate.mda")
 def test_validate_trajectory_with_mdanalysis_incomplete(mock_mda, mock_sim_dir):
     """Trajectory validation detects incomplete trajectories."""
-    from mdfactory.orchestration.simulate import _validate_trajectory_complete
 
     # Setup mocks
     (mock_sim_dir / "prod.xtc").write_bytes(b"FAKE XTC")
@@ -980,9 +963,7 @@ def test_validate_trajectory_with_mdanalysis_incomplete(mock_mda, mock_sim_dir):
     mock_universe.trajectory = mock_traj
     mock_mda.Universe.return_value = mock_universe
 
-    result = _validate_trajectory_complete(
-        mock_sim_dir, "prod.xtc", expected_frames=100
-    )
+    result = _validate_trajectory_complete(mock_sim_dir, "prod.xtc", expected_frames=100)
 
     # Should fail (50 < 100)
     assert result is False
@@ -991,7 +972,6 @@ def test_validate_trajectory_with_mdanalysis_incomplete(mock_mda, mock_sim_dir):
 @patch("mdfactory.orchestration.simulate.mda")
 def test_validate_trajectory_without_expected_frames(mock_mda, mock_sim_dir):
     """Trajectory validation without expected_frames checks readability only."""
-    from mdfactory.orchestration.simulate import _validate_trajectory_complete
 
     # Setup mocks
     (mock_sim_dir / "prod.xtc").write_bytes(b"FAKE XTC")
@@ -1186,7 +1166,10 @@ def test_execute_stage_list_restart_only_for_matching_stage(mock_nvt, mock_npt):
     mock_nvt.assert_called_once_with(sim_dir, None, grompp_app, mdrun_app)
     # NPT gets the restart kwarg
     mock_npt.assert_called_once_with(
-        sim_dir, mock_nvt.return_value, grompp_app, mdrun_app,
+        sim_dir,
+        mock_nvt.return_value,
+        grompp_app,
+        mdrun_app,
         restart_from_cpt="/sim/npt.cpt",
     )
 

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-
 # ---------------------------------------------------------------------------
 # Layer 1: Single-responsibility decision resolvers
 # ---------------------------------------------------------------------------
@@ -189,9 +188,10 @@ def _assemble_mdrun_command(
 
     Examples
     --------
-    >>> _assemble_mdrun_command("gmx", "prod", "-cpi prod.cpt -append",
-    ...                         "-ntmpi 1 -ntomp $NTHR", "-nb gpu -pme gpu -gpu_id $GPU_ID")
-    'gmx mdrun -deffnm prod -cpi prod.cpt -append -ntmpi 1 -ntomp $NTHR -nb gpu -pme gpu -gpu_id $GPU_ID'
+    >>> _assemble_mdrun_command("gmx", "min", "", "-nt $NTHR", "")
+    'gmx mdrun -deffnm min -nt $NTHR'
+    >>> _assemble_mdrun_command("gmx_mpi", "prod", "-cpi prod.cpt -append", "-ntomp $NTHR", "")
+    'gmx_mpi mdrun -deffnm prod -cpi prod.cpt -append -ntomp $NTHR'
 
     """
     parts = [binary, "mdrun", f"-deffnm {deffnm}"]
@@ -673,7 +673,9 @@ def get_grompp_app():
             Bash script to execute.
 
         """
-        return _build_grompp_script(mdp_file, gro_file, top_file, tpr_file, work_dir, ref_file, cpt_file, maxwarn)
+        return _build_grompp_script(
+            mdp_file, gro_file, top_file, tpr_file, work_dir, ref_file, cpt_file, maxwarn
+        )
 
     return run_grompp
 
@@ -772,8 +774,15 @@ def get_mdrun_app():
 
         """
         return _build_mdrun_script(
-            deffnm, work_dir, restart_from_cpt, ntasks, disable_gpu,
-            pme_gpu, gro_out, traj_files, gmx_binary
+            deffnm,
+            work_dir,
+            restart_from_cpt,
+            ntasks,
+            disable_gpu,
+            pme_gpu,
+            gro_out,
+            traj_files,
+            gmx_binary,
         )
 
     return run_mdrun
