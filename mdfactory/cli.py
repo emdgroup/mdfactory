@@ -345,7 +345,9 @@ def _build_from_yaml(
             logger.info(f"Output: {output}")
             logger.info("Next step — run simulations:")
             logger.info(f"  mdfactory simulate {output}")
-            logger.info(f"  # with SLURM: mdfactory simulate {output} --slurm <executor-config.yaml>")
+            logger.info(
+                f"  # with SLURM: mdfactory simulate {output} --slurm <executor-config.yaml>"
+            )
 
 
 def _build_from_summary_yaml(
@@ -425,12 +427,12 @@ def _report_build_results(results: list[dict], output_dir: Path | None = None):
         logger.info(f"Output: {output_dir}")
         logger.info("Next step — run simulations:")
         logger.info(f"  mdfactory simulate {output_dir}")
-        logger.info(f"  # with SLURM: mdfactory simulate {output_dir} --slurm <executor-config.yaml>")
+        logger.info(
+            f"  # with SLURM: mdfactory simulate {output_dir} --slurm <executor-config.yaml>"
+        )
 
 
-def _filter_sim_paths_by_hash_prefix(
-    sim_paths: list[Path], prefixes: list[str]
-) -> list[Path]:
+def _filter_sim_paths_by_hash_prefix(sim_paths: list[Path], prefixes: list[str]) -> list[Path]:
     """Filter simulation paths by hash prefix without requiring completed trajectories.
 
     Unlike :func:`~mdfactory.analysis.submit.filter_paths_by_hash`, this
@@ -461,13 +463,12 @@ def _filter_sim_paths_by_hash_prefix(
 
     """
     upper_prefixes = [p.upper() for p in prefixes]
-    matched = [p for p in sim_paths if any(p.name.upper().startswith(pref) for pref in upper_prefixes)]
+    matched = [
+        p for p in sim_paths if any(p.name.upper().startswith(pref) for pref in upper_prefixes)
+    ]
     if not matched:
         available = sorted(p.name for p in sim_paths)
-        raise ValueError(
-            f"No simulation directories match {prefixes}.\n"
-            f"Available: {available}"
-        )
+        raise ValueError(f"No simulation directories match {prefixes}.\nAvailable: {available}")
     return sorted(matched)
 
 

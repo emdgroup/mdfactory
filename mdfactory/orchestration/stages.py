@@ -281,6 +281,7 @@ def run_stage(
 
 # ---- Convenience one-liner wrappers (backward-compatible named API) ----
 
+
 def run_em_stage(sim_dir: Path, grompp_app, mdrun_app, stage_config: Any = None) -> "AppFuture":
     """Execute energy minimization stage.
 

@@ -286,6 +286,7 @@ def test_stage_overrides_loaded_from_yaml(tmp_path):
     yaml_path = tmp_path / "cfg.yaml"
     with open(yaml_path, "w") as f:
         import yaml
+
         yaml.safe_dump(cfg.model_dump(), f)
     loaded = SlurmExecutorConfig.from_yaml(yaml_path)
     assert loaded.stage_overrides == {"EM": {"cpus_per_node": 4, "gres": None}}
@@ -363,7 +364,7 @@ def test_get_stage_config_multiple_stages():
 
     assert em.cpus_per_node == 4
     assert em.gres is None
-    assert nvt is cfg          # no override, returns self
+    assert nvt is cfg  # no override, returns self
     assert prod.cpus_per_node == 24
     assert prod.gres == "gpu:l40s:1"  # inherited
 
@@ -419,6 +420,7 @@ def test_executor_config_gmx_binary_yaml_roundtrip(tmp_path):
     original = SlurmExecutorConfig(account="acct", gmx_binary="gmx_mpi")
     cfg_path = tmp_path / "cfg.yaml"
     import yaml
+
     with open(cfg_path, "w") as f:
         yaml.safe_dump(original.model_dump(), f)
 
