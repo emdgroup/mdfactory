@@ -383,9 +383,7 @@ def _get_gromacs_detect_script() -> str:
     """
     block = _build_gmx_detect_block()
     return (
-        "\n# Auto-detect GROMACS binary"
-        " (prefer gmx thread-MPI, fall back to gmx_mpi)\n"
-        f"{block}\n"
+        f"\n# Auto-detect GROMACS binary (prefer gmx thread-MPI, fall back to gmx_mpi)\n{block}\n"
     )
 
 
