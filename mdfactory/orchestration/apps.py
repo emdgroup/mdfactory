@@ -2,6 +2,330 @@
 # ABOUTME: Wraps run_build_from_dict as a @python_app with runtime decoration
 """Parsl application definitions for build orchestration."""
 
+from __future__ import annotations
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: Single-responsibility decision resolvers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_thread_count_expr(ntasks: int) -> str:
+    """Return the bash expression used to assign NTHR.
+
+    Parameters
+    ----------
+    ntasks : int
+        Explicit thread count.  When > 0, returns a literal decimal string
+        so that no shell expansion is needed.  When 0, returns a three-level
+        fallback expression: SLURM_CPUS_PER_TASK > OMP_NUM_THREADS > nproc.
+
+    Returns
+    -------
+    str
+        Literal integer string or shell parameter expansion.
+
+    Notes
+    -----
+    The three-level fallback
+    ``${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-$(nproc)}}`` is load-bearing.
+    Parsl's SlurmProvider injects OMP_NUM_THREADS=<cores_per_node> into worker
+    environments; the two-level form ``${SLURM_CPUS_PER_TASK:-$(nproc)}``
+    would silently use *all* cores on the node when SLURM_CPUS_PER_TASK is
+    absent, causing a thread-count mismatch that GROMACS aborts on.
+
+    """
+    if ntasks > 0:
+        return str(ntasks)
+    return "${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-$(nproc)}}"
+
+
+def _resolve_is_mpi(gmx_binary: str) -> "bool | None":
+    """Return whether the GROMACS binary is an MPI build.
+
+    Parameters
+    ----------
+    gmx_binary : str
+        One of ``"gmx"``, ``"gmx_mpi"``, or ``"auto"``.
+
+    Returns
+    -------
+    bool or None
+        ``True`` for ``gmx_mpi``, ``False`` for ``gmx``, ``None`` for auto
+        (binary unknown until runtime).
+
+    """
+    if gmx_binary == "gmx_mpi":
+        return True
+    if gmx_binary == "gmx":
+        return False
+    return None
+
+
+def _resolve_thread_flags(is_mpi: "bool | None", has_gpu: bool) -> str:
+    """Return the thread-count flags for the mdrun invocation.
+
+    Parameters
+    ----------
+    is_mpi : bool or None
+        ``True`` for MPI build, ``False`` for thread-MPI build, ``None`` when
+        the binary is unknown (auto mode).
+    has_gpu : bool
+        Whether GPU execution is active.
+
+    Returns
+    -------
+    str
+        Thread flag string to embed literally in the mdrun command line.
+
+    """
+    if is_mpi is None:
+        return "$MDRUN_THREAD_FLAGS"
+    if is_mpi:
+        return "-ntomp $NTHR"
+    if has_gpu:
+        return "-ntmpi 1 -ntomp $NTHR"
+    return "-nt $NTHR"
+
+
+def _resolve_gpu_flags(has_gpu: bool, pme_gpu: bool) -> str:
+    """Return the GPU offload flags for the mdrun invocation.
+
+    Parameters
+    ----------
+    has_gpu : bool
+        Whether GPU execution is active.
+    pme_gpu : bool
+        Whether PME should run on GPU.  Must be ``False`` for non-dynamical
+        integrators (e.g. EM/steep) which GROMACS rejects with PME-GPU.
+
+    Returns
+    -------
+    str
+        GPU flag string, or ``""`` for CPU-only runs.
+
+    """
+    if not has_gpu:
+        return ""
+    pme_flag = "-pme gpu" if pme_gpu else "-pme cpu"
+    return f"-nb gpu {pme_flag} -gpu_id $GPU_ID"
+
+
+def _resolve_restart_flags(restart_from_cpt: str) -> str:
+    """Return checkpoint restart flags for the mdrun invocation.
+
+    Parameters
+    ----------
+    restart_from_cpt : str
+        Path to checkpoint file, or ``""`` for a fresh run.
+
+    Returns
+    -------
+    str
+        ``"-cpi <file> -append"`` when a checkpoint is given, else ``""``.
+
+    """
+    if not restart_from_cpt:
+        return ""
+    return f"-cpi {restart_from_cpt} -append"
+
+
+def _resolve_binary_token(gmx_binary: str) -> str:
+    """Return the executable token for use in the mdrun command line.
+
+    Parameters
+    ----------
+    gmx_binary : str
+        One of ``"gmx"``, ``"gmx_mpi"``, or ``"auto"``.
+
+    Returns
+    -------
+    str
+        Literal executable name (``"gmx"`` / ``"gmx_mpi"``) or the shell
+        variable reference ``"$GMX_BIN"`` for auto mode.
+
+    """
+    if gmx_binary == "gmx":
+        return "gmx"
+    if gmx_binary == "gmx_mpi":
+        return "gmx_mpi"
+    return "$GMX_BIN"
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: Command assembler
+# ---------------------------------------------------------------------------
+
+
+def _assemble_mdrun_command(
+    binary: str,
+    deffnm: str,
+    restart_flags: str,
+    thread_flags: str,
+    gpu_flags: str,
+) -> str:
+    """Compose the single concrete mdrun command line.
+
+    All inputs are already-resolved strings (literals or shell variable
+    references). Joins non-empty parts with single spaces; no branching.
+
+    Parameters
+    ----------
+    binary : str
+        Executable token: ``"gmx"``, ``"gmx_mpi"``, or ``"$GMX_BIN"``.
+    deffnm : str
+        Default filename prefix (min, nvt, npt, prod).
+    restart_flags : str
+        Checkpoint flags (``"-cpi <file> -append"`` or ``""``).
+    thread_flags : str
+        Thread-count flags (``"-ntomp $NTHR"``, ``"-nt $NTHR"``, etc.).
+    gpu_flags : str
+        GPU offload flags (``"-nb gpu -pme gpu -gpu_id $GPU_ID"`` or ``""``).
+
+    Returns
+    -------
+    str
+        The complete mdrun command as a single line.
+
+    Examples
+    --------
+    >>> _assemble_mdrun_command("gmx", "prod", "-cpi prod.cpt -append",
+    ...                         "-ntmpi 1 -ntomp $NTHR", "-nb gpu -pme gpu -gpu_id $GPU_ID")
+    'gmx mdrun -deffnm prod -cpi prod.cpt -append -ntmpi 1 -ntomp $NTHR -nb gpu -pme gpu -gpu_id $GPU_ID'
+
+    """
+    parts = [binary, "mdrun", f"-deffnm {deffnm}"]
+    for flag in (restart_flags, thread_flags, gpu_flags):
+        if flag:
+            parts.append(flag)
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: Script section builders
+# ---------------------------------------------------------------------------
+
+
+def _build_env_preamble(work_dir: str, nthr_expr: str, has_gpu: bool) -> str:
+    """Emit the environment-setup lines for the bash script.
+
+    No conditional branching — all lines are unconditional assignments.
+
+    Parameters
+    ----------
+    work_dir : str
+        Absolute path to simulation directory (``cd`` target).
+    nthr_expr : str
+        Expression to assign to NTHR (from :func:`_resolve_thread_count_expr`).
+    has_gpu : bool
+        When ``True``, include the ``GPU_ID`` assignment.
+
+    Returns
+    -------
+    str
+        Multi-line preamble string with no leading or trailing newline.
+
+    Notes
+    -----
+    Emit order:
+
+    1. ``set -euo pipefail``
+    2. ``cd <work_dir>``
+    3. ``NTHR=<nthr_expr>``
+    4. ``GPU_ID=${CUDA_VISIBLE_DEVICES%%,*}`` — only when ``has_gpu=True``
+    5. ``export OMP_NUM_THREADS=$NTHR``
+
+    The GPU_ID assignment precedes the export so the export line is always the
+    final line of the preamble section.
+
+    """
+    lines = [
+        "set -euo pipefail",
+        f"cd {work_dir}",
+        f"NTHR={nthr_expr}",
+    ]
+    if has_gpu:
+        lines.append("GPU_ID=${CUDA_VISIBLE_DEVICES%%,*}")
+    lines.append("export OMP_NUM_THREADS=$NTHR")
+    return "\n".join(lines)
+
+
+def _build_binary_detection_preamble(has_gpu: bool) -> str:
+    """Emit the GROMACS binary detection block for auto mode.
+
+    This is the only permitted runtime branching in the mdrun script.  It
+    assigns both ``$GMX_BIN`` and ``$MDRUN_THREAD_FLAGS`` so that the mdrun
+    command line can reference both and remain a single unconditional line.
+
+    Parameters
+    ----------
+    has_gpu : bool
+        When ``True``, the thread-MPI branch uses ``-ntmpi 1 -ntomp $NTHR``
+        (GPU requires thread-MPI pinning); when ``False``, uses ``-nt $NTHR``
+        (let GROMACS allocate threads freely on CPU).
+
+    Returns
+    -------
+    str
+        Multi-line if/elif/else/fi block with no leading or trailing newline.
+
+    Notes
+    -----
+    The block is absent when ``gmx_binary`` is set to ``"gmx"`` or
+    ``"gmx_mpi"`` — only auto mode needs runtime binary detection.
+
+    """
+    if has_gpu:
+        tmpi_flags = '"-ntmpi 1 -ntomp $NTHR"'
+    else:
+        tmpi_flags = '"-nt $NTHR"'
+    return (
+        "if command -v gmx &>/dev/null; then\n"
+        f"    GMX_BIN=gmx; MDRUN_THREAD_FLAGS={tmpi_flags}\n"
+        "elif command -v gmx_mpi &>/dev/null; then\n"
+        '    GMX_BIN=gmx_mpi; MDRUN_THREAD_FLAGS="-ntomp $NTHR"\n'
+        "else\n"
+        '    echo "ERROR: Neither gmx nor gmx_mpi found in PATH" >&2; exit 1\n'
+        "fi"
+    )
+
+
+def _build_output_check(gro_out: str, traj_files: "tuple[str, ...]") -> str:
+    """Emit output existence verification for the bash script.
+
+    Parameters
+    ----------
+    gro_out : str
+        Expected output ``.gro`` file, or ``""`` when not applicable.
+    traj_files : tuple of str
+        Expected trajectory files (accept any of them), or ``()`` when not
+        applicable.  Non-empty for the Production stage only.
+
+    Returns
+    -------
+    str
+        An if-block that exits with code 1 when outputs are missing, or ``""``
+        when no output verification is required.
+
+    """
+    if traj_files:
+        traj_conds = " && ".join(f'[ ! -f "{f}" ]' for f in traj_files)
+        traj_list = " or ".join(traj_files)
+        return (
+            f"if {traj_conds}; then\n"
+            f'    echo "ERROR: mdrun completed but none of ({traj_list}) was created" >&2\n'
+            f"    exit 1\n"
+            f"fi"
+        )
+    if gro_out:
+        return (
+            f'if [ ! -f "{gro_out}" ]; then\n'
+            f'    echo "ERROR: mdrun completed but {gro_out} was not created" >&2\n'
+            f"    exit 1\n"
+            f"fi"
+        )
+    return ""
+
 
 def _get_gromacs_detect_script() -> str:
     """Return bash script for GROMACS binary auto-detection.
@@ -201,11 +525,18 @@ def _build_mdrun_script(
     pme_gpu: bool = True,
     gro_out: str = "",
     traj_files: "tuple[str, ...]" = (),
+    gmx_binary: str = "auto",
 ) -> str:
     """Build the bash script for ``gmx mdrun``.
 
     Pure function — no Parsl dependency.  Fully testable without a
     DataFlowKernel by calling it directly with test arguments.
+
+    All conditional logic is resolved in Python before any bash is generated.
+    The resulting script contains no if-clauses in the command section; only
+    variable assignments and a single unconditional ``mdrun`` command.  The
+    only permitted runtime branch is the binary-detection preamble emitted
+    when ``gmx_binary="auto"``.
 
     Output validation is spec-driven via ``gro_out`` / ``traj_files``:
     no hardcoded ``deffnm`` string comparisons are needed.
@@ -225,7 +556,7 @@ def _build_mdrun_script(
     disable_gpu : bool, optional
         When ``True``, force CPU-only execution.
     pme_gpu : bool, optional
-        When ``True`` and a GPU is available, run PME on GPU (``-pme gpu``).
+        When ``True`` and GPU mode is active, run PME on GPU (``-pme gpu``).
         Set to ``False`` for stages whose integrator is non-dynamical (EM),
         which GROMACS rejects with PME-GPU.
     gro_out : str, optional
@@ -234,6 +565,10 @@ def _build_mdrun_script(
     traj_files : tuple of str, optional
         Trajectory output files to verify — at least one must exist.
         Non-empty only for Production: ``("prod.xtc", "prod.trr")``.
+    gmx_binary : str, optional
+        GROMACS binary selection: ``"gmx"`` (thread-MPI build),
+        ``"gmx_mpi"`` (pure MPI build), or ``"auto"`` (detect at runtime).
+        Defaults to ``"auto"`` for backward compatibility.
 
     Returns
     -------
@@ -241,118 +576,32 @@ def _build_mdrun_script(
         Bash script to execute.
 
     """
-    # Build checkpoint restart flags once; inject literally into the script.
-    cpt_flags = f"-cpi {restart_from_cpt} -append " if restart_from_cpt else ""
+    # Layer 1: resolve all decisions in Python before any bash is generated.
+    has_gpu = not disable_gpu
+    is_mpi = _resolve_is_mpi(gmx_binary)
+    nthr_expr = _resolve_thread_count_expr(ntasks)
+    thread_flags = _resolve_thread_flags(is_mpi, has_gpu)
+    gpu_flags = _resolve_gpu_flags(has_gpu, pme_gpu)
+    restart_flags = _resolve_restart_flags(restart_from_cpt)
+    binary = _resolve_binary_token(gmx_binary)
     cpt_msg = f" (resuming from {restart_from_cpt})" if restart_from_cpt else ""
 
-    # Thread-count: explicit override wins over SLURM/OMP auto-detection.
-    nthr_line = (
-        f"NTHR={ntasks}"
-        if ntasks > 0
-        else "NTHR=${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-$(nproc)}}"
+    # Layer 2: assemble the single unconditional mdrun command.
+    command = _assemble_mdrun_command(binary, deffnm, restart_flags, thread_flags, gpu_flags)
+
+    # Layer 3 + 4: assemble script sections; join with newlines.
+    sections = [_build_env_preamble(work_dir, nthr_expr, has_gpu)]
+    if gmx_binary == "auto":
+        sections.append(_build_binary_detection_preamble(has_gpu))
+    sections.append(
+        f'echo "GROMACS mdrun: Starting {deffnm} with $NTHR threads (using {binary}){cpt_msg}" >&2'
     )
-
-    # GPU guard: short-circuit with literal "false" when caller requests CPU-only.
-    gpu_condition = (
-        "false"
-        if disable_gpu
-        else '[ -n "${CUDA_VISIBLE_DEVICES}" ] && [ "${CUDA_VISIBLE_DEVICES}" != "NoDevFiles" ]'
-    )
-
-    # PME flag: spec-driven — EM uses "-pme cpu" (steep integrator), others "-pme gpu".
-    pme_flag = "-pme gpu" if pme_gpu else "-pme cpu"
-
-    # Output-verification block: spec-driven, no hardcoded deffnm comparisons.
-    if traj_files:
-        traj_conds = " && ".join(f'[ ! -f "{f}" ]' for f in traj_files)
-        traj_list = " or ".join(traj_files)
-        output_check = f"""
-        # Verify trajectory output (accept any of the expected formats)
-        if {traj_conds}; then
-            echo "ERROR: mdrun completed but none of ({traj_list}) was created" >&2
-            exit 1
-        fi"""
-    elif gro_out:
-        output_check = f"""
-        # Verify structure output
-        if [ ! -f "{gro_out}" ]; then
-            echo "ERROR: mdrun completed but {gro_out} was not created" >&2
-            exit 1
-        fi"""
-    else:
-        output_check = ""
-
-    return f"""
-        set -euo pipefail  # Exit on error, undefined vars, pipe failures
-
-        cd {work_dir}
-
-        {_get_gromacs_detect_script()}
-
-        # Thread count: explicit override ({ntasks}) > SLURM > OMP > default(nproc)
-        {nthr_line}
-        # Re-export so gmx_mpi -ntomp and OMP_NUM_THREADS always agree.
-        # Parsl's SlurmProvider sets OMP_NUM_THREADS=<cores_per_node> in the
-        # worker environment; if a stage override uses fewer threads the two
-        # values conflict and GROMACS aborts with a fatal error.
-        export OMP_NUM_THREADS=$NTHR
-
-        # Detect build type: gmx_mpi is a pure MPI build (no thread-MPI support).
-        # -nt / -ntmpi are thread-MPI flags; MPI builds use -ntomp for OpenMP threads
-        # and rely on the MPI launcher (mpirun/srun) for rank count.
-        if [ "$GMX_BIN" = "gmx_mpi" ]; then
-            IS_MPI_BUILD=true
-        else
-            IS_MPI_BUILD=false
-        fi
-
-        echo "GROMACS mdrun: Starting {deffnm} with $NTHR threads (using $GMX_BIN){cpt_msg}" >&2
-
-        # Auto-detect GPU availability from CUDA_VISIBLE_DEVICES
-        if {gpu_condition}; then
-            # GPU mode: non-bonded on GPU; PME on GPU or CPU depending on integrator.
-            GPU_ID=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f1)
-            echo "GROMACS mdrun: Running on GPU $GPU_ID with $NTHR OpenMP threads ({pme_flag})" >&2
-
-            if $IS_MPI_BUILD; then
-                # MPI build: single-rank execution (no MPI launcher invoked).
-                # -ntomp sets OpenMP threads; add srun/mpirun here for multi-rank.
-                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntomp $NTHR -gpu_id $GPU_ID -nb gpu {pme_flag}; then
-                    echo "ERROR: mdrun failed for {deffnm} (GPU/MPI mode)" >&2
-                    echo "Check md.log for details" >&2
-                    exit 1
-                fi
-            else
-                # Thread-MPI build: pin to 1 MPI rank, $NTHR OpenMP threads
-                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntmpi 1 -ntomp $NTHR -gpu_id $GPU_ID -nb gpu {pme_flag}; then
-                    echo "ERROR: mdrun failed for {deffnm} (GPU/thread-MPI mode)" >&2
-                    echo "Check md.log for details" >&2
-                    exit 1
-                fi
-            fi
-        else
-            # CPU-only mode
-            echo "GROMACS mdrun: Running on CPU with $NTHR threads" >&2
-
-            if $IS_MPI_BUILD; then
-                # MPI build: single-rank execution; -ntomp sets OpenMP threads per rank
-                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-ntomp $NTHR; then
-                    echo "ERROR: mdrun failed for {deffnm} (CPU/MPI mode)" >&2
-                    echo "Check md.log for details" >&2
-                    exit 1
-                fi
-            else
-                # Thread-MPI build: -nt sets total threads
-                if ! $GMX_BIN mdrun -deffnm {deffnm} {cpt_flags}-nt $NTHR; then
-                    echo "ERROR: mdrun failed for {deffnm} (CPU/thread-MPI mode)" >&2
-                    echo "Check md.log for details" >&2
-                    exit 1
-                fi
-            fi
-        fi
-        {output_check}
-        echo "GROMACS mdrun: SUCCESS - {deffnm} completed" >&2
-        """
+    sections.append(command)
+    output_check = _build_output_check(gro_out, traj_files)
+    if output_check:
+        sections.append(output_check)
+    sections.append(f'echo "GROMACS mdrun: SUCCESS - {deffnm} completed" >&2')
+    return "\n".join(sections)
 
 
 def get_grompp_app():
@@ -463,26 +712,30 @@ def get_mdrun_app():
         pme_gpu: bool = True,
         gro_out: str = "",
         traj_files: "tuple[str, ...]" = (),
+        gmx_binary: str = "auto",
         stdout=None,
         stderr=None,
         inputs=None,
     ):
-        """Run GROMACS simulation with auto-detected resources.
+        """Run GROMACS simulation with resolved resources.
 
-        Thread count and GPU usage are auto-detected from SLURM environment
-        variables, with sensible fallbacks for local execution.  Explicit
-        ``ntasks`` / ``disable_gpu`` / ``pme_gpu`` arguments override the
-        auto-detection, enabling per-stage resource configuration.
+        All conditional logic (binary selection, GPU mode, thread count, restart
+        flags) is resolved in Python by :func:`_build_mdrun_script` before any
+        bash is generated.  The resulting bash script contains a single
+        unconditional ``mdrun`` command.
 
         Output validation is spec-driven: pass ``gro_out`` for stages that
         write a ``.gro`` file, or ``traj_files`` for Production (which writes
         ``.xtc``/``.trr``).
 
-        Resource detection priority:
+        Resource resolution priority:
         - Thread count: ``ntasks`` arg (if >0) > SLURM_CPUS_PER_TASK >
-          OMP_NUM_THREADS > default(nproc)
-        - GPU: disabled when ``disable_gpu=True`` or CUDA_VISIBLE_DEVICES unset
-        - PME-on-GPU: only when ``pme_gpu=True`` AND GPU is available.
+          OMP_NUM_THREADS > nproc
+        - GPU: active when ``disable_gpu=False`` (GPU mode decided at submission
+          time, not at runtime).
+        - Binary: ``gmx_binary`` selects the executable; ``"auto"`` enables
+          runtime detection via a single isolated if-block.
+        - PME-on-GPU: only when ``pme_gpu=True`` AND GPU mode is active.
           Must be ``False`` for non-dynamical integrators (e.g. EM/steep).
 
         Parameters
@@ -498,11 +751,13 @@ def get_mdrun_app():
         disable_gpu : bool, optional
             Force CPU-only execution.
         pme_gpu : bool, optional
-            Run PME on GPU when a GPU is available. Set to ``False`` for EM.
+            Run PME on GPU when GPU mode is active. Set to ``False`` for EM.
         gro_out : str, optional
             Expected output ``.gro`` file to verify after mdrun.
         traj_files : tuple of str, optional
             Trajectory output files to verify (at least one must exist).
+        gmx_binary : str, optional
+            GROMACS binary: ``"gmx"``, ``"gmx_mpi"``, or ``"auto"``.
         stdout : str, optional
             File path for stdout.
         stderr : str, optional
@@ -517,7 +772,8 @@ def get_mdrun_app():
 
         """
         return _build_mdrun_script(
-            deffnm, work_dir, restart_from_cpt, ntasks, disable_gpu, pme_gpu, gro_out, traj_files
+            deffnm, work_dir, restart_from_cpt, ntasks, disable_gpu,
+            pme_gpu, gro_out, traj_files, gmx_binary
         )
 
     return run_mdrun
