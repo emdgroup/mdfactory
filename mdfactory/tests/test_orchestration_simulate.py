@@ -8,7 +8,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mdfactory.orchestration.config import ExecutorConfig
-from mdfactory.orchestration.apps import _build_mdrun_script
+from mdfactory.orchestration.apps import (
+    _assemble_mdrun_command,
+    _build_mdrun_script,
+    _resolve_binary_token,
+    _resolve_gpu_flags,
+    _resolve_is_mpi,
+    _resolve_restart_flags,
+    _resolve_thread_count_expr,
+    _resolve_thread_flags,
+)
 from mdfactory.orchestration.simulate import (
     _detect_needed_stages,
     _execute_stage_list,
@@ -482,48 +491,128 @@ def test_prerequisite_validation_before_parsl_session(mock_session, mock_sim_dir
 
 
 # === Decision 3: Resource Auto-Detection Tests ===
+# Tests refactored to target resolver functions directly (pure Python, no bash parsing).
 
 
-def test_mdrun_app_cpu_fallback():
-    """Mdrun bash app uses default thread count when env vars unset."""
-    bash_script = _build_mdrun_script(deffnm="test", work_dir="/tmp/test")
-
-    # Should use default of 12 threads
-    assert "NTHR=${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-12}}" in bash_script
-    # Should use CPU mode (no GPU flags) with dynamic binary detection
-    assert "$GMX_BIN mdrun -deffnm test -nt $NTHR" in bash_script
+def test_resolve_thread_count_expr_auto():
+    """Auto thread count uses three-level SLURM > OMP > nproc fallback."""
+    expr = _resolve_thread_count_expr(0)
+    assert expr == "${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-$(nproc)}}"
 
 
-def test_mdrun_app_gpu_detection():
-    """Mdrun bash app detects GPU from CUDA_VISIBLE_DEVICES."""
-    bash_script = _build_mdrun_script(deffnm="test", work_dir="/tmp/test")
+def test_resolve_thread_count_expr_explicit():
+    """Explicit ntasks produces a literal decimal string."""
+    assert _resolve_thread_count_expr(8) == "8"
+    assert _resolve_thread_count_expr(12) == "12"
 
-    # Should check for CUDA_VISIBLE_DEVICES
-    assert "CUDA_VISIBLE_DEVICES" in bash_script
-    # GPU mode should use -ntmpi 1 -ntomp -gpu_id -nb gpu -pme gpu
-    assert "-ntmpi 1" in bash_script
-    assert "-ntomp $NTHR" in bash_script
-    assert "-gpu_id $GPU_ID" in bash_script
-    assert "-nb gpu" in bash_script
-    assert "-pme gpu" in bash_script
+
+def test_resolve_thread_count_expr_nproc_fallback():
+    """Three-level fallback uses nproc (not a fixed number) as the last resort.
+
+    Guards against accidental regression to the old two-level form
+    ``${SLURM_CPUS_PER_TASK:-$(nproc)}``, which ignores OMP_NUM_THREADS
+    and would cause a thread-count mismatch in Parsl worker environments.
+    """
+    expr = _resolve_thread_count_expr(0)
+    # All three levels must be present in the correct order
+    assert "SLURM_CPUS_PER_TASK" in expr
+    assert "OMP_NUM_THREADS" in expr
+    assert "$(nproc)" in expr
+    assert expr.index("SLURM_CPUS_PER_TASK") < expr.index("OMP_NUM_THREADS") < expr.index("nproc")
+
+
+def test_resolve_gpu_flags_gpu_and_pme_gpu():
+    """GPU mode with PME-on-GPU emits correct GPU flags."""
+    flags = _resolve_gpu_flags(has_gpu=True, pme_gpu=True)
+    assert flags == "-nb gpu -pme gpu -gpu_id $GPU_ID"
+
+
+def test_resolve_gpu_flags_gpu_no_pme():
+    """GPU mode with PME-on-CPU (e.g. EM) emits -pme cpu."""
+    flags = _resolve_gpu_flags(has_gpu=True, pme_gpu=False)
+    assert flags == "-nb gpu -pme cpu -gpu_id $GPU_ID"
+
+
+def test_resolve_gpu_flags_no_gpu():
+    """CPU-only mode emits an empty string."""
+    assert _resolve_gpu_flags(has_gpu=False, pme_gpu=True) == ""
+    assert _resolve_gpu_flags(has_gpu=False, pme_gpu=False) == ""
+
+
+def test_resolve_is_mpi():
+    """Binary selector resolves to expected is_mpi values."""
+    assert _resolve_is_mpi("gmx_mpi") is True
+    assert _resolve_is_mpi("gmx") is False
+    assert _resolve_is_mpi("auto") is None
+
+
+def test_resolve_thread_flags_explicit_mpi():
+    """MPI build always uses -ntomp regardless of GPU mode."""
+    assert _resolve_thread_flags(is_mpi=True, has_gpu=True) == "-ntomp $NTHR"
+    assert _resolve_thread_flags(is_mpi=True, has_gpu=False) == "-ntomp $NTHR"
+
+
+def test_resolve_thread_flags_tmpi_gpu():
+    """Thread-MPI build with GPU uses -ntmpi 1 -ntomp."""
+    assert _resolve_thread_flags(is_mpi=False, has_gpu=True) == "-ntmpi 1 -ntomp $NTHR"
+
+
+def test_resolve_thread_flags_tmpi_cpu():
+    """Thread-MPI build without GPU uses -nt (all-thread count)."""
+    assert _resolve_thread_flags(is_mpi=False, has_gpu=False) == "-nt $NTHR"
+
+
+def test_resolve_thread_flags_auto():
+    """Auto mode defers to shell variable $MDRUN_THREAD_FLAGS."""
+    assert _resolve_thread_flags(is_mpi=None, has_gpu=True) == "$MDRUN_THREAD_FLAGS"
+    assert _resolve_thread_flags(is_mpi=None, has_gpu=False) == "$MDRUN_THREAD_FLAGS"
+
+
+def test_resolve_binary_token():
+    """Binary token resolver returns expected strings."""
+    assert _resolve_binary_token("gmx") == "gmx"
+    assert _resolve_binary_token("gmx_mpi") == "gmx_mpi"
+    assert _resolve_binary_token("auto") == "$GMX_BIN"
+
+
+def test_assemble_mdrun_command_gpu_tmpi():
+    """Assembler produces correct GPU + thread-MPI command."""
+    cmd = _assemble_mdrun_command(
+        "gmx",
+        "prod",
+        "-cpi prod.cpt -append",
+        "-ntmpi 1 -ntomp $NTHR",
+        "-nb gpu -pme gpu -gpu_id $GPU_ID",
+    )
+    assert cmd == (
+        "gmx mdrun -deffnm prod -cpi prod.cpt -append "
+        "-ntmpi 1 -ntomp $NTHR -nb gpu -pme gpu -gpu_id $GPU_ID"
+    )
+
+
+def test_assemble_mdrun_command_cpu_mpi_no_restart():
+    """Assembler skips empty parts — no duplicate spaces."""
+    cmd = _assemble_mdrun_command("gmx_mpi", "min", "", "-ntomp $NTHR", "")
+    assert cmd == "gmx_mpi mdrun -deffnm min -ntomp $NTHR"
+    assert "  " not in cmd  # no double spaces
 
 
 def test_mdrun_app_logging():
-    """Mdrun bash app logs resource configuration to stderr."""
+    """Mdrun bash app logs starting message to stderr."""
     bash_script = _build_mdrun_script(deffnm="test", work_dir="/tmp/test")
 
-    # Should log what resources are being used
-    assert "Running on GPU" in bash_script
-    assert "Running on CPU" in bash_script
+    # Starting message is always present
+    assert 'echo "GROMACS mdrun: Starting test with $NTHR threads' in bash_script
     assert ">&2" in bash_script  # Logs to stderr
 
 
 def test_mdrun_app_slurm_priority():
-    """SLURM_CPUS_PER_TASK has priority over OMP_NUM_THREADS."""
-    bash_script = _build_mdrun_script(deffnm="test", work_dir="/tmp/test")
-
-    # Check priority order in bash variable expansion
-    assert "${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS:-12}}" in bash_script
+    """SLURM_CPUS_PER_TASK has priority over OMP_NUM_THREADS in the fallback chain."""
+    expr = _resolve_thread_count_expr(0)
+    # Three-level form; SLURM_CPUS_PER_TASK is checked before OMP_NUM_THREADS
+    assert "SLURM_CPUS_PER_TASK" in expr
+    assert "OMP_NUM_THREADS" in expr
+    assert expr.index("SLURM_CPUS_PER_TASK") < expr.index("OMP_NUM_THREADS")
 
 
 def test_stage_functions_no_hardcoded_nt():
@@ -734,19 +823,24 @@ def test_grompp_app_logs_descriptive_errors():
 
 
 def test_mdrun_app_has_error_handling():
-    """Mdrun bash app includes robust error handling."""
+    """Mdrun bash app uses strict mode and spec-driven output verification.
+
+    The new implementation relies on ``set -euo pipefail`` (not inline
+    ``if ! mdrun ...``) to propagate mdrun errors, and uses a single
+    unconditional mdrun command with no surrounding if/then/fi wrapper.
+    """
     # Pass gro_out so output-verification block is included
     bash_script = _build_mdrun_script(deffnm="min", work_dir="/tmp/test", gro_out="min.gro")
 
-    # Should have bash strict mode
+    # bash strict mode is present
     assert "set -euo pipefail" in bash_script
-    # Should check mdrun exit code (both GPU and CPU paths, with dynamic binary)
-    assert "if ! $GMX_BIN mdrun" in bash_script
-    assert bash_script.count("if ! $GMX_BIN mdrun") == 4  # GPU and CPU × {MPI, thread-MPI}
-    # Should verify output was created
-    assert "if [ ! -f" in bash_script
-    # Should log errors to stderr
-    assert "ERROR: mdrun failed" in bash_script
+    # Output check is present (spec-driven, not inline command check)
+    assert 'if [ ! -f "min.gro" ]' in bash_script
+    # No 4-branch if/then/fi command wrappers — mdrun appears as a single line
+    assert bash_script.count("if ! $GMX_BIN mdrun") == 0
+    # The mdrun command is on exactly one line (no surrounding if/fi)
+    mdrun_lines = [ln for ln in bash_script.splitlines() if "mdrun -deffnm" in ln]
+    assert len(mdrun_lines) == 1, f"Expected 1 mdrun command line, found: {mdrun_lines}"
 
 
 def test_mdrun_app_verifies_stage_specific_outputs():
@@ -770,11 +864,20 @@ def test_mdrun_app_verifies_stage_specific_outputs():
 
 
 def test_mdrun_app_error_message_includes_log_hint():
-    """Mdrun error messages direct users to md.log."""
+    """Mdrun command appears as a single unconditional line (no if/fi wrapper).
+
+    The new implementation emits ``set -euo pipefail`` for error propagation
+    instead of inline ``if ! mdrun ...`` guards, producing a readable script
+    with one unconditional mdrun command.
+    """
     bash_script = _build_mdrun_script(deffnm="prod", work_dir="/tmp/test")
 
-    # Should suggest checking md.log
-    assert "Check md.log for details" in bash_script
+    # mdrun command is a single line — no surrounding if/then/fi
+    mdrun_lines = [ln.strip() for ln in bash_script.splitlines() if "mdrun -deffnm" in ln]
+    assert len(mdrun_lines) == 1, f"Expected 1 mdrun line, got: {mdrun_lines}"
+    cmd_line = mdrun_lines[0]
+    assert not cmd_line.startswith("if"), "mdrun command must not be wrapped in an if-check"
+    assert "mdrun -deffnm prod" in cmd_line
 
 
 def test_bash_apps_use_strict_mode():
@@ -1199,20 +1302,27 @@ def test_execute_stage_list_no_stage_config_for_local(mock_em):
 
 
 def test_mdrun_app_ntasks_override_used_when_set():
-    """Mdrun bash app uses explicit NTHR when ntasks > 0."""
-    bash_script = _build_mdrun_script(deffnm="nvt", work_dir="/tmp/test", ntasks=8)
+    """Explicit ntasks embeds a literal NTHR= in the script."""
+    # Check via resolver (pure Python)
+    assert _resolve_thread_count_expr(8) == "8"
 
+    # Confirm it flows through _build_mdrun_script to the preamble
+    bash_script = _build_mdrun_script(deffnm="nvt", work_dir="/tmp/test", ntasks=8)
     assert "NTHR=8" in bash_script
     # Should NOT fall back to SLURM auto-detection
     assert "${SLURM_CPUS_PER_TASK" not in bash_script
 
 
 def test_mdrun_app_cpu_mode_forced_when_disable_gpu():
-    """Mdrun bash app uses CPU-only path when disable_gpu=True."""
-    bash_script = _build_mdrun_script(deffnm="min", work_dir="/tmp/test", disable_gpu=True)
+    """disable_gpu=True produces a script with no GPU flags anywhere."""
+    # Check via resolver (pure Python)
+    assert _resolve_gpu_flags(has_gpu=False, pme_gpu=True) == ""
 
-    # GPU condition should be replaced with literal "false"
-    assert "if false;" in bash_script
+    # Confirm the generated script has no GPU-related content
+    bash_script = _build_mdrun_script(deffnm="min", work_dir="/tmp/test", disable_gpu=True)
+    assert "-nb gpu" not in bash_script
+    assert "-gpu_id" not in bash_script
+    assert "GPU_ID" not in bash_script
 
 
 def test_em_stage_passes_resource_hints_to_mdrun():
@@ -1236,35 +1346,46 @@ def test_em_stage_passes_resource_hints_to_mdrun():
 
 
 def test_mdrun_app_no_cpt_flags_by_default():
-    """Mdrun bash app omits -cpi/-append when no restart_from_cpt given."""
-    bash_script = _build_mdrun_script(deffnm="nvt", work_dir="/tmp/test")
+    """No restart_from_cpt produces empty restart flags."""
+    # Check via resolver (pure Python)
+    assert _resolve_restart_flags("") == ""
 
+    # Confirm the generated script has no checkpoint flags
+    bash_script = _build_mdrun_script(deffnm="nvt", work_dir="/tmp/test")
     assert "-cpi" not in bash_script
     assert "-append" not in bash_script
 
 
 def test_mdrun_app_cpt_flags_added_when_restart_set():
-    """Mdrun bash app adds -cpi <file> -append when restart_from_cpt provided."""
+    """restart_from_cpt adds -cpi <file> -append to the mdrun command."""
+    # Check via resolver (pure Python)
+    assert _resolve_restart_flags("x.cpt") == "-cpi x.cpt -append"
+
+    # Confirm it flows into the generated script
     bash_script = _build_mdrun_script(
         deffnm="npt",
         work_dir="/tmp/test",
         restart_from_cpt="/sim/npt.cpt",
     )
-
     assert "-cpi /sim/npt.cpt -append" in bash_script
 
 
-def test_mdrun_app_cpt_flags_in_both_cpu_and_gpu_branches():
-    """Checkpoint restart flags appear in both CPU and GPU command lines."""
+def test_mdrun_app_cpt_flags_in_single_command():
+    """Checkpoint restart flags appear exactly once in the single mdrun command.
+
+    The new implementation emits one unconditional mdrun command, so -cpi
+    appears exactly once (not duplicated across GPU/CPU branches).
+    """
     bash_script = _build_mdrun_script(
         deffnm="prod",
         work_dir="/tmp/test",
         restart_from_cpt="/sim/prod.cpt",
     )
 
-    # Both GPU and CPU branches should carry the -cpi flag
     cpi_count = bash_script.count("-cpi /sim/prod.cpt -append")
-    assert cpi_count >= 2, f"Expected -cpi flag in both GPU and CPU branches, found {cpi_count}"
+    assert cpi_count == 1, (
+        f"Expected -cpi flag exactly once in the single mdrun command, found {cpi_count}"
+    )
 
 
 def test_mdrun_app_cpt_log_message_mentions_file():

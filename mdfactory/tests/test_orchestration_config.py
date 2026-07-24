@@ -366,3 +366,61 @@ def test_get_stage_config_multiple_stages():
     assert nvt is cfg          # no override, returns self
     assert prod.cpus_per_node == 24
     assert prod.gres == "gpu:l40s:1"  # inherited
+
+
+# === gmx_binary field tests ===
+
+
+def test_executor_config_gmx_binary_default():
+    """gmx_binary defaults to 'auto' on both local and SLURM configs."""
+    local = ExecutorConfig()
+    assert local.gmx_binary == "auto"
+
+    slurm = SlurmExecutorConfig(account="acct")
+    assert slurm.gmx_binary == "auto"
+
+
+def test_executor_config_gmx_binary_explicit_gmx():
+    """gmx_binary accepts 'gmx' for thread-MPI builds."""
+    cfg = ExecutorConfig(gmx_binary="gmx")
+    assert cfg.gmx_binary == "gmx"
+
+
+def test_executor_config_gmx_binary_explicit_gmx_mpi():
+    """gmx_binary accepts 'gmx_mpi' for pure-MPI builds."""
+    cfg = ExecutorConfig(gmx_binary="gmx_mpi")
+    assert cfg.gmx_binary == "gmx_mpi"
+
+
+def test_executor_config_gmx_binary_invalid():
+    """Invalid gmx_binary value raises a Pydantic validation error."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ExecutorConfig(gmx_binary="gmx_openmp")  # not a valid literal
+
+
+def test_slurm_executor_config_gmx_binary_stage_override():
+    """gmx_binary can be overridden per-stage via stage_overrides."""
+    cfg = SlurmExecutorConfig(
+        account="acct",
+        gmx_binary="auto",
+        stage_overrides={"EM": {"gmx_binary": "gmx_mpi"}},
+    )
+    em_cfg = cfg.get_stage_config("EM")
+    nvt_cfg = cfg.get_stage_config("NVT")
+
+    assert em_cfg.gmx_binary == "gmx_mpi"
+    assert nvt_cfg.gmx_binary == "auto"  # inherited, no override
+
+
+def test_executor_config_gmx_binary_yaml_roundtrip(tmp_path):
+    """gmx_binary survives a YAML round-trip."""
+    original = SlurmExecutorConfig(account="acct", gmx_binary="gmx_mpi")
+    cfg_path = tmp_path / "cfg.yaml"
+    import yaml
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(original.model_dump(), f)
+
+    loaded = ExecutorConfig.from_yaml(cfg_path)
+    assert loaded.gmx_binary == "gmx_mpi"
