@@ -550,7 +550,7 @@ def simulate_systems(
     ] = None,
     stages: Annotated[
         list[str] | None,
-        Parameter(help="Stages to run (EM, NVT, NPT, Production)"),
+        Parameter(help="Stages to run (EM, NVT, NPT, Production)", consume_multiple=True),
     ] = None,
     checkpoint: Annotated[
         str,
@@ -558,7 +558,7 @@ def simulate_systems(
     ] = "auto",
     hash: Annotated[
         list[str] | None,
-        Parameter(help="Filter by hash prefix"),
+        Parameter(help="Filter by hash prefix", consume_multiple=True),
     ] = None,
     dry_run: Annotated[
         bool,
