@@ -710,7 +710,11 @@ def find_structure_file(sim_dir: Path) -> Path | None:
 def _extract_expected_frames_from_mdp(sim_dir: Path, stage: str) -> int | None:
     """Extract expected frame count from MDP file.
 
-    Reads nsteps and nstxout-compressed from MDP to compute expected frames.
+    Reads ``nsteps`` and the output-frequency key from the MDP file to compute
+    the expected frame count.  Both XTC (``nstxout-compressed``) and TRR
+    (``nstxout``) variants are recognised.  Keys are matched after lowercasing
+    and dash/underscore normalisation so ``NSTXOUT_COMPRESSED`` and
+    ``nstxout-compressed`` are treated identically.
 
     Parameters
     ----------
@@ -722,7 +726,9 @@ def _extract_expected_frames_from_mdp(sim_dir: Path, stage: str) -> int | None:
     Returns
     -------
     int or None
-        Expected number of frames, or None if cannot be determined.
+        Expected number of frames, or ``None`` when the value cannot be
+        determined (MDP absent, keys missing, zero output frequency, or any
+        parse error).
 
     """
     mdp_path = sim_dir / STAGE_BY_NAME.get(stage, STAGE_BY_NAME["Production"]).mdp_file
@@ -737,15 +743,23 @@ def _extract_expected_frames_from_mdp(sim_dir: Path, stage: str) -> int | None:
 
         for raw_line in content.split("\n"):
             line = raw_line.split(";")[0].strip()  # Remove comments
-            if "=" in line:
-                key, val = line.split("=", 1)
-                key = key.strip()
-                val = val.strip()
-                if key == "nsteps":
-                    nsteps = int(val)
-                elif key == "nstxout-compressed":
-                    nstxout = int(val)
+            if "=" not in line:
+                continue
+            raw_key, val = line.split("=", 1)
+            # Normalise: lowercase + unify dashes and underscores
+            norm_key = raw_key.strip().lower().replace("-", "_")
+            val = val.strip()
 
+            if norm_key == "nsteps":
+                nsteps = int(val)
+            elif norm_key == "nstxout_compressed":
+                # XTC output frequency — preferred over TRR when both declared
+                nstxout = int(val)
+            elif norm_key == "nstxout" and nstxout is None:
+                # TRR output frequency — only used when XTC key absent
+                nstxout = int(val)
+
+        # Guard against zero output-frequency (trajectory writing disabled)
         if nsteps and nstxout:
             return nsteps // nstxout
     except Exception as e:
