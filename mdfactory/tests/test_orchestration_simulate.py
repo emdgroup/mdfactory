@@ -404,6 +404,28 @@ def test_checkpoint_production_skips_with_all_files(mock_sim_dir):
     assert "Production" not in needed
 
 
+def test_checkpoint_production_complete_with_trr_only(mock_sim_dir):
+    """Production marked complete when only prod.trr exists (TRR-only MDP config)."""
+    (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")
+    # XTC absent; TRR large enough to pass the size-heuristic fallback
+    (mock_sim_dir / "prod.trr").write_bytes(b"X" * 11_000_000)
+
+    needed = _detect_needed_stages(mock_sim_dir, ["Production"], "auto")
+
+    assert "Production" not in needed
+
+
+def test_checkpoint_production_partial_with_neither_traj(mock_sim_dir):
+    """Production is partial (not complete) when neither prod.xtc nor prod.trr exists."""
+    (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")
+    (mock_sim_dir / "prod.cpt").write_text("FAKE CPT")
+    (mock_sim_dir / "prod.tpr").write_text("FAKE TPR")
+
+    needed = _detect_needed_stages(mock_sim_dir, ["Production"], "auto")
+
+    assert "Production" in needed
+
+
 def test_validate_prerequisites_em_no_requirements():
     """EM has no prerequisites."""
     # EM doesn't need any input files (uses system.pdb which is validated elsewhere)
