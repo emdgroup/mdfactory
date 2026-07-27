@@ -1037,6 +1037,32 @@ def test_find_structure_file_returns_none_if_missing(tmp_path):
     assert result is None
 
 
+def test_find_structure_file_candidates_derived_from_registry():
+    """_STRUCTURE_CANDIDATES matches the current STAGE_REGISTRY gro_out fields."""
+    from mdfactory.orchestration.simulate import _STRUCTURE_CANDIDATES
+    from mdfactory.orchestration.stages import STAGE_REGISTRY
+
+    expected = [spec.gro_out for spec in reversed(STAGE_REGISTRY) if spec.gro_out] + ["system.pdb"]
+    assert _STRUCTURE_CANDIDATES == expected
+
+
+def test_find_structure_file_picks_up_new_stage_gro(tmp_path, monkeypatch):
+    """find_structure_file returns a new stage's .gro when _STRUCTURE_CANDIDATES is extended."""
+    import mdfactory.orchestration.simulate as sim_module
+    from mdfactory.orchestration.simulate import find_structure_file
+
+    # Simulate a hypothetical future 'Heating' stage by patching the candidate list.
+    extended = ["heat.gro"] + sim_module._STRUCTURE_CANDIDATES
+    monkeypatch.setattr(sim_module, "_STRUCTURE_CANDIDATES", extended)
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    (sim_dir / "heat.gro").write_text("FAKE HEATED COORDS")
+
+    result = find_structure_file(sim_dir)
+    assert result == sim_dir / "heat.gro"
+
+
 def test_extract_expected_frames_from_mdp(mock_sim_dir):
     """Extract expected frames from MDP file."""
     from mdfactory.orchestration.simulate import _extract_expected_frames_from_mdp

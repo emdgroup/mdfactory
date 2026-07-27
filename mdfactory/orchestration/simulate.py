@@ -674,6 +674,16 @@ def _validate_trajectory_complete(
         return traj_path.stat().st_size > 10_000_000
 
 
+#: Candidate structure files checked by :func:`find_structure_file` in
+#: priority order (most-equilibrated first), followed by the raw input.
+#: Derived from :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY` at
+#: import time — add a new stage to the registry and this list stays in sync
+#: automatically without any further edits to this module.
+_STRUCTURE_CANDIDATES: list[str] = [
+    spec.gro_out for spec in reversed(STAGE_REGISTRY) if spec.gro_out
+] + ["system.pdb"]
+
+
 def find_structure_file(sim_dir: Path) -> Path | None:
     """Find the best available structure file in a simulation directory.
 
@@ -681,6 +691,12 @@ def find_structure_file(sim_dir: Path) -> Path | None:
     equilibrated coordinates are used when available.  This is the canonical
     priority list shared by trajectory validation (this module) and benchmark
     pre-processing (:mod:`mdfactory.performance.benchmark`).
+
+    The candidate list is derived from
+    :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY` at import time
+    (see :data:`_STRUCTURE_CANDIDATES`), so adding a new stage with a
+    ``gro_out`` field automatically extends the search without modifying this
+    function.
 
     Parameters
     ----------
@@ -697,18 +713,12 @@ def find_structure_file(sim_dir: Path) -> Path | None:
     -----
     Priority order (highest to lowest):
 
-    1. ``prod.gro`` — fully equilibrated production output
-    2. ``npt.gro``  — NPT-equilibrated coordinates
-    3. ``nvt.gro``  — NVT-equilibrated coordinates
-    4. ``min.gro``  — energy-minimised coordinates
-    5. ``system.pdb`` — raw starting structure
-
-    If a new stage is added to ``STAGE_REGISTRY`` with its own output ``.gro``
-    file, update this list accordingly to keep benchmark and validation in sync.
+    1. Most-recently-added stage's ``.gro`` (most equilibrated)
+    2. …earlier stages in reverse registry order…
+    3. ``system.pdb`` — raw starting structure
 
     """
-    # Check in order: production, npt, nvt, em, original
-    for candidate in ["prod.gro", "npt.gro", "nvt.gro", "min.gro", "system.pdb"]:
+    for candidate in _STRUCTURE_CANDIDATES:
         path = sim_dir / candidate
         if path.exists():
             return path
