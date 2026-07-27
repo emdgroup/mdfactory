@@ -242,6 +242,7 @@ def run_stage(
             restart_from_cpt=restart_from_cpt,
             ntasks=hints.ntasks,
             disable_gpu=hints.disable_gpu,
+            pme_gpu=spec.supports_pme_gpu,
             gmx_binary=hints.gmx_binary,
             gro_out=spec.gro_out,
             traj_files=spec.traj_files,
