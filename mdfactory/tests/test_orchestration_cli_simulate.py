@@ -14,7 +14,6 @@ from mdfactory.cli import (
     _resolve_sim_paths_for_simulate,
 )
 
-
 # ---------------------------------------------------------------------------
 # _discover_sim_dirs
 # ---------------------------------------------------------------------------
@@ -195,7 +194,10 @@ def test_report_simulation_results_skipped_not_in_error_log():
 # ---------------------------------------------------------------------------
 
 
-@patch("mdfactory.orchestration.run_simulations", return_value=[{"hash": "abc", "status": "success"}])
+_SUCCESS_RESULTS = [{"hash": "abc", "status": "success"}]
+
+
+@patch("mdfactory.orchestration.run_simulations", return_value=_SUCCESS_RESULTS)
 @patch("mdfactory.cli._load_executor_config", return_value=MagicMock(provider="local"))
 @patch("mdfactory.cli._resolve_slurm_flag", return_value=None)
 def test_simulate_systems_calls_run_simulations(
