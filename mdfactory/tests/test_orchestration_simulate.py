@@ -102,7 +102,11 @@ def test_missing_build_files_partial(mock_sim_dir):
 
 
 def test_run_simulations_skips_incomplete_build(tmp_path):
-    """run_simulations warns and skips dirs with missing build outputs."""
+    """run_simulations warns and skips dirs with missing build outputs.
+
+    Skipped dirs appear in the results as status='skipped' entries; only the
+    ready dir appears in the dry-run work-plan portion of the results.
+    """
     ready = tmp_path / "ready"
     ready.mkdir()
     for f in ["system.pdb", "topology.top", "em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"]:
@@ -115,20 +119,28 @@ def test_run_simulations_skips_incomplete_build(tmp_path):
     config = ExecutorConfig()
     results = run_simulations([ready, incomplete], config, dry_run=True)
 
-    # Only the ready directory appears in the dry-run plan
-    plan_dirs = [item["sim_dir"] for item in results]
+    # The incomplete dir is reported as skipped, not silently dropped.
+    skipped = [r for r in results if r.get("status") == "skipped"]
+    skipped_hashes = [r["hash"] for r in skipped]
+    assert "incomplete" in skipped_hashes
+
+    # The ready dir appears in the work-plan portion (has a sim_dir key).
+    plan_items = [r for r in results if "sim_dir" in r]
+    plan_dirs = [item["sim_dir"] for item in plan_items]
     assert ready in plan_dirs
     assert incomplete not in plan_dirs
 
 
-def test_run_simulations_all_incomplete_returns_empty(tmp_path):
-    """run_simulations returns [] immediately when no directories are ready."""
+def test_run_simulations_all_incomplete_returns_skipped_entries(tmp_path):
+    """run_simulations returns skipped entries (not []) when no directories are ready."""
     empty = tmp_path / "empty"
     empty.mkdir()
 
     config = ExecutorConfig()
     results = run_simulations([empty], config, dry_run=True)
-    assert results == []
+    assert len(results) == 1
+    assert results[0]["status"] == "skipped"
+    assert results[0]["hash"] == "empty"
 
 
 def test_checkpoint_auto_skips_completed(mock_sim_dir):
@@ -164,15 +176,15 @@ def test_checkpoint_force_never_skips(mock_sim_dir):
     assert "EM" in needed
 
 
-def test_checkpoint_all_stages_complete(mock_sim_dir):
+@patch("mdfactory.orchestration.simulate._validate_trajectory_complete", return_value=True)
+def test_checkpoint_all_stages_complete(mock_validate, mock_sim_dir):
     """All stages skipped when outputs AND prerequisite checkpoints exist."""
     (mock_sim_dir / "min.gro").write_text("FAKE")
     (mock_sim_dir / "nvt.gro").write_text("FAKE")
     (mock_sim_dir / "nvt.cpt").write_text("FAKE CPT")  # NPT needs this
     (mock_sim_dir / "npt.gro").write_text("FAKE")
     (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")  # Production needs this
-    # Create large trajectory file (> 10 MB) to pass size fallback validation
-    (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 11_000_000)
+    (mock_sim_dir / "prod.xtc").write_text("FAKE")  # Trajectory present
 
     needed = _detect_needed_stages(mock_sim_dir, ["EM", "NVT", "NPT", "Production"], "auto")
     assert len(needed) == 0
@@ -261,15 +273,17 @@ def test_stage_filtering(mock_sim_dir):
 
 
 def test_validation_before_submission(tmp_path):
-    """Incomplete builds are silently skipped before Parsl submission."""
+    """Incomplete builds are skipped before Parsl submission with a skipped entry."""
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()
     (sim_dir / "system.pdb").write_text("FAKE")
     # Missing topology.top and all MDP files — build never completed
 
-    # Should not raise; returns [] because no ready directories remain
+    # Should not raise; returns a skipped entry (not []) so callers can account
+    # for the skipped directory.
     results = run_simulations([sim_dir], ExecutorConfig(), dry_run=True)
-    assert results == []
+    assert len(results) == 1
+    assert results[0]["status"] == "skipped"
 
 
 def test_multiple_simulations_mixed_states(tmp_path):
@@ -297,10 +311,11 @@ def test_multiple_simulations_mixed_states(tmp_path):
     (sim3 / "nvt.cpt").write_text("FAKE CPT")  # NPT prerequisite
     (sim3 / "npt.gro").write_text("FAKE")
     (sim3 / "npt.cpt").write_text("FAKE CPT")  # Production prerequisite
-    # Create large trajectory file (> 10 MB) to pass size fallback validation
-    (sim3 / "prod.xtc").write_bytes(b"X" * 11_000_000)
+    (sim3 / "prod.xtc").write_text("FAKE")  # Trajectory present
 
-    results = run_simulations([sim1, sim2, sim3], ExecutorConfig(), dry_run=True)
+    # Mock trajectory validation so fake XTC counts as complete
+    with patch("mdfactory.orchestration.simulate._validate_trajectory_complete", return_value=True):
+        results = run_simulations([sim1, sim2, sim3], ExecutorConfig(), dry_run=True)
 
     assert len(results) == 3
     assert results[0]["stages"] == ["EM", "NVT", "NPT", "Production"]
@@ -308,14 +323,14 @@ def test_multiple_simulations_mixed_states(tmp_path):
     assert results[2]["stages"] == []
 
 
-def test_checkpoint_production_output(mock_sim_dir):
-    """Production stage uses prod.xtc as checkpoint file."""
+@patch("mdfactory.orchestration.simulate._validate_trajectory_complete", return_value=True)
+def test_checkpoint_production_output(mock_validate, mock_sim_dir):
+    """Production stage skipped when prod.xtc is validated as complete."""
     (mock_sim_dir / "min.gro").write_text("FAKE")
     (mock_sim_dir / "nvt.gro").write_text("FAKE")
     (mock_sim_dir / "npt.gro").write_text("FAKE")
     (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")  # Production prerequisite
-    # Create large trajectory file (> 10 MB) to pass size fallback validation
-    (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 11_000_000)
+    (mock_sim_dir / "prod.xtc").write_text("FAKE")  # Trajectory present
 
     needed = _detect_needed_stages(mock_sim_dir, ["Production"], "auto")
     assert "Production" not in needed
@@ -410,22 +425,23 @@ def test_checkpoint_production_requires_npt_cpt(mock_sim_dir):
     assert "Production" in needed
 
 
-def test_checkpoint_production_skips_with_all_files(mock_sim_dir):
-    """Production skipped when both prod.xtc AND npt.cpt exist."""
+@patch("mdfactory.orchestration.simulate._validate_trajectory_complete", return_value=True)
+def test_checkpoint_production_skips_with_all_files(mock_validate, mock_sim_dir):
+    """Production skipped when both prod.xtc AND npt.cpt exist (trajectory validated)."""
     (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")
-    # Create large trajectory file (> 10 MB) to pass size fallback validation
-    (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 11_000_000)
+    (mock_sim_dir / "prod.xtc").write_text("FAKE")  # Trajectory present
 
     needed = _detect_needed_stages(mock_sim_dir, ["Production"], "auto")
 
     assert "Production" not in needed
 
 
-def test_checkpoint_production_complete_with_trr_only(mock_sim_dir):
+@patch("mdfactory.orchestration.simulate._validate_trajectory_complete", return_value=True)
+def test_checkpoint_production_complete_with_trr_only(mock_validate, mock_sim_dir):
     """Production marked complete when only prod.trr exists (TRR-only MDP config)."""
     (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")
-    # XTC absent; TRR large enough to pass the size-heuristic fallback
-    (mock_sim_dir / "prod.trr").write_bytes(b"X" * 11_000_000)
+    # XTC absent; TRR present and mocked as validated
+    (mock_sim_dir / "prod.trr").write_text("FAKE")
 
     needed = _detect_needed_stages(mock_sim_dir, ["Production"], "auto")
 
@@ -940,25 +956,27 @@ def test_validate_trajectory_returns_false_for_empty_file(mock_sim_dir):
     assert result is False
 
 
-def test_validate_trajectory_uses_size_fallback_without_structure(mock_sim_dir):
-    """Trajectory validation uses size heuristic when no structure file found."""
+def test_validate_trajectory_incomplete_without_structure(mock_sim_dir):
+    """Trajectory validation returns False when no structure file is available.
 
+    Without a topology we cannot parse the trajectory, so the result is
+    conservatively False — the caller should trigger a partial restart rather
+    than silently skipping a stage with an unverifiable trajectory.
+    """
     # Create trajectory but no structure files
     (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 15_000_000)  # 15 MB
 
     result = _validate_trajectory_complete(mock_sim_dir, "prod.xtc")
-    # Should pass size heuristic (> 10 MB)
-    assert result is True
+    # No structure → cannot validate → treat as incomplete
+    assert result is False
 
 
-def test_validate_trajectory_size_fallback_rejects_small_files(mock_sim_dir):
-    """Trajectory validation rejects small files in fallback mode."""
-
-    # Create small trajectory (< 10 MB threshold)
+def test_validate_trajectory_returns_false_for_non_parseable_file(mock_sim_dir):
+    """Trajectory validation returns False for non-parseable trajectory data."""
+    # Small file that can't be parsed as an XTC/TRR
     (mock_sim_dir / "prod.xtc").write_bytes(b"X" * 1000)
 
     result = _validate_trajectory_complete(mock_sim_dir, "prod.xtc")
-    # Should fail size heuristic
     assert result is False
 
 
@@ -1458,3 +1476,194 @@ def test_mdrun_app_cpt_log_message_mentions_file():
     )
 
     assert "resuming from /sim/prod.cpt" in bash_script
+
+
+# ---------------------------------------------------------------------------
+# T1: Checkpoint restart detection from disk state (Finding 5)
+# ---------------------------------------------------------------------------
+
+
+def test_detect_stage_state_partial_restart_nvt(tmp_path):
+    """Partial NVT: .cpt + .tpr present, .gro absent → status=partial, restart=True."""
+    from mdfactory.orchestration.simulate import _detect_stage_state
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    (sim_dir / "nvt.cpt").write_bytes(b"x")
+    (sim_dir / "nvt.tpr").write_bytes(b"x")
+    # nvt.gro intentionally absent
+
+    state = _detect_stage_state(sim_dir, "NVT", "auto")
+
+    assert state["status"] == "partial"
+    assert state["restart"] is True
+    assert state["cpt_file"] == sim_dir / "nvt.cpt"
+
+
+def test_detect_stage_state_partial_restart_em(tmp_path):
+    """Partial EM: min.cpt + min.tpr present, min.gro absent → status=partial."""
+    from mdfactory.orchestration.simulate import _detect_stage_state
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    (sim_dir / "min.cpt").write_bytes(b"x")
+    (sim_dir / "min.tpr").write_bytes(b"x")
+
+    state = _detect_stage_state(sim_dir, "EM", "auto")
+
+    assert state["status"] == "partial"
+    assert state["restart"] is True
+    assert state["cpt_file"] == sim_dir / "min.cpt"
+
+
+def test_detect_stage_state_not_started_when_no_files(tmp_path):
+    """Empty directory → status=not_started, restart=False."""
+    from mdfactory.orchestration.simulate import _detect_stage_state
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+
+    state = _detect_stage_state(sim_dir, "NVT", "auto")
+
+    assert state["status"] == "not_started"
+    assert state["restart"] is False
+    assert state["cpt_file"] is None
+
+
+def test_detect_needed_stages_with_restart_info_partial(tmp_path):
+    """Restart info propagated into the work-plan when partial progress exists."""
+    from mdfactory.orchestration.simulate import _detect_needed_stages_with_restart_info
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    (sim_dir / "nvt.cpt").write_bytes(b"x")
+    (sim_dir / "nvt.tpr").write_bytes(b"x")
+
+    items = _detect_needed_stages_with_restart_info(sim_dir, ["NVT"], "auto")
+
+    assert len(items) == 1
+    assert items[0]["stage"] == "NVT"
+    assert items[0]["restart"] is True
+    assert items[0]["cpt_file"] == sim_dir / "nvt.cpt"
+
+
+@patch("mdfactory.orchestration.simulate.parsl_session")
+@patch("mdfactory.orchestration.simulate._execute_stage_list")
+def test_run_simulations_propagates_stage_restarts(mock_execute, mock_session, tmp_path):
+    """stage_restarts dict assembled from checkpoint detection is passed to _execute_stage_list."""
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    for f in ["system.pdb", "topology.top", "em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"]:
+        (sim_dir / f).write_text("FAKE")
+    # NVT partial: .cpt + .tpr present
+    (sim_dir / "nvt.cpt").write_bytes(b"x")
+    (sim_dir / "nvt.tpr").write_bytes(b"x")
+    # EM already complete
+    (sim_dir / "min.gro").write_text("FAKE")
+
+    mock_execute.return_value = MagicMock()
+    mock_session.return_value.__enter__.return_value = MagicMock()
+    mock_session.return_value.__exit__.return_value = False
+
+    from mdfactory.orchestration.config import ExecutorConfig
+
+    run_simulations([sim_dir], ExecutorConfig(), wait=False)
+
+    # _execute_stage_list must be called; assert stage_restarts contains NVT entry
+    assert mock_execute.called
+    call_kwargs = mock_execute.call_args[1]
+    restarts = call_kwargs.get("stage_restarts", {})
+    assert "NVT" in restarts
+    assert str(sim_dir / "nvt.cpt") == restarts["NVT"]
+
+
+# ---------------------------------------------------------------------------
+# T3: run_stage grompp-kwarg wiring (Finding 7)
+# ---------------------------------------------------------------------------
+
+
+def test_run_stage_nvt_passes_ref_file_to_grompp(tmp_path):
+    """NVT: run_stage calls grompp_app with ref_file=min.gro (position restraints)."""
+    from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
+
+    grompp_app = MagicMock(return_value=MagicMock())
+    mdrun_app = MagicMock(return_value=MagicMock())
+
+    run_stage(STAGE_BY_NAME["NVT"], tmp_path, None, grompp_app, mdrun_app)
+
+    call_kwargs = grompp_app.call_args[1]
+    assert call_kwargs["ref_file"] == "min.gro"
+    # NVT has no prereq_cpt; cpt_file kwarg should be absent
+    assert "cpt_file" not in call_kwargs
+
+
+def test_run_stage_npt_passes_ref_and_cpt_to_grompp(tmp_path):
+    """NPT: run_stage calls grompp_app with both ref_file=nvt.gro and cpt_file=nvt.cpt."""
+    from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
+
+    grompp_app = MagicMock(return_value=MagicMock())
+    mdrun_app = MagicMock(return_value=MagicMock())
+
+    run_stage(STAGE_BY_NAME["NPT"], tmp_path, None, grompp_app, mdrun_app)
+
+    call_kwargs = grompp_app.call_args[1]
+    assert call_kwargs["ref_file"] == "nvt.gro"
+    assert call_kwargs["cpt_file"] == "nvt.cpt"
+    assert call_kwargs["maxwarn"] == 2
+
+
+def test_run_stage_em_has_no_ref_or_cpt_flags(tmp_path):
+    """EM: run_stage calls grompp_app without ref_file or cpt_file (none specified in spec)."""
+    from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
+
+    grompp_app = MagicMock(return_value=MagicMock())
+    mdrun_app = MagicMock(return_value=MagicMock())
+
+    run_stage(STAGE_BY_NAME["EM"], tmp_path, None, grompp_app, mdrun_app)
+
+    call_kwargs = grompp_app.call_args[1]
+    assert "ref_file" not in call_kwargs
+    assert "cpt_file" not in call_kwargs
+
+
+def test_run_stage_production_has_cpt_but_no_ref(tmp_path):
+    """Production: run_stage calls grompp_app with cpt_file=npt.cpt but no ref_file."""
+    from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
+
+    grompp_app = MagicMock(return_value=MagicMock())
+    mdrun_app = MagicMock(return_value=MagicMock())
+
+    run_stage(STAGE_BY_NAME["Production"], tmp_path, None, grompp_app, mdrun_app)
+
+    call_kwargs = grompp_app.call_args[1]
+    assert "ref_file" not in call_kwargs
+    assert call_kwargs["cpt_file"] == "npt.cpt"
+
+
+# ---------------------------------------------------------------------------
+# T5: _bash_result_to_dict (Finding 15)
+# ---------------------------------------------------------------------------
+
+
+def test_bash_result_to_dict_none_becomes_success():
+    """None (bash_app exit) → success dict."""
+    from mdfactory.orchestration.simulate import _bash_result_to_dict
+
+    result = _bash_result_to_dict(None, "abc123")
+    assert result == {"hash": "abc123", "status": "success"}
+
+
+def test_bash_result_to_dict_int_becomes_success():
+    """Integer exit code → success dict."""
+    from mdfactory.orchestration.simulate import _bash_result_to_dict
+
+    result = _bash_result_to_dict(0, "abc123")
+    assert result == {"hash": "abc123", "status": "success"}
+
+
+def test_bash_result_to_dict_dict_passthrough():
+    """Dict values (python_app callers) pass through unchanged."""
+    from mdfactory.orchestration.simulate import _bash_result_to_dict
+
+    d = {"hash": "abc123", "status": "failed", "error": "mdrun crashed"}
+    assert _bash_result_to_dict(d, "abc123") is d
