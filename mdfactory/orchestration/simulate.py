@@ -631,9 +631,10 @@ def _validate_trajectory_complete(
         # Find structure file for topology
         structure_file = find_structure_file(sim_dir)
         if not structure_file:
-            logger.warning(f"No structure file found in {sim_dir}, using size check fallback")
-            # Heuristic: typical prod.xtc is > 10 MB for any reasonable system
-            return traj_path.stat().st_size > 10_000_000
+            logger.warning(f"No structure file found in {sim_dir}, skipping frame check")
+            # Cannot validate frames without a topology — treat as incomplete so
+            # the caller can decide (partial restart will regenerate if needed).
+            return False
 
         # Load trajectory and count frames
         u = mda.Universe(str(structure_file), str(traj_path))
@@ -649,9 +650,10 @@ def _validate_trajectory_complete(
 
     except Exception as e:
         logger.warning(f"Trajectory validation failed for {traj_file}: {e}")
-        # Fallback: size-based heuristic
-        # Typical prod.xtc is > 10 MB for any reasonable system
-        return traj_path.stat().st_size > 10_000_000
+        # A parse failure means the file is corrupt or truncated — not complete.
+        # Return False so the caller triggers a partial restart rather than
+        # silently skipping the stage on a bad trajectory.
+        return False
 
 
 #: Candidate structure files checked by :func:`find_structure_file` in
