@@ -1708,8 +1708,13 @@ def test_build_grompp_script_can_emit_both_flags():
     from mdfactory.orchestration.apps import _build_grompp_script
 
     script = _build_grompp_script(
-        "npt.mdp", "nvt.gro", "topology.top", "npt.tpr", "/sim",
-        ref_file="nvt.gro", cpt_file="nvt.cpt"
+        "npt.mdp",
+        "nvt.gro",
+        "topology.top",
+        "npt.tpr",
+        "/sim",
+        ref_file="nvt.gro",
+        cpt_file="nvt.cpt",
     )
     assert "-r nvt.gro" in script
     assert "-t nvt.cpt" in script
@@ -1751,8 +1756,9 @@ def test_extract_resource_hints_gpu_gres_disables_disable_gpu():
     """GPU gres string → disable_gpu=False (GPU mode active)."""
     from mdfactory.orchestration.stages import _extract_resource_hints
 
-    cfg = MagicMock(cpus_per_node=12, gres="gpu:l40s:1", gmx_binary="gmx_mpi",
-                    max_workers_per_node=1)
+    cfg = MagicMock(
+        cpus_per_node=12, gres="gpu:l40s:1", gmx_binary="gmx_mpi", max_workers_per_node=1
+    )
     hints = _extract_resource_hints(cfg)
 
     assert hints.disable_gpu is False

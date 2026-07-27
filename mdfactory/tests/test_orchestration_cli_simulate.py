@@ -225,9 +225,7 @@ def test_simulate_systems_calls_run_simulations(
 )
 @patch("mdfactory.cli._load_executor_config", return_value=MagicMock(provider="local"))
 @patch("mdfactory.cli._resolve_slurm_flag", return_value=None)
-def test_simulate_systems_reports_failed_results(
-    mock_slurm, mock_config, mock_run, tmp_path
-):
+def test_simulate_systems_reports_failed_results(mock_slurm, mock_config, mock_run, tmp_path):
     """simulate_systems passes results with status=failed to _report_simulation_results."""
     from mdfactory.cli import simulate_systems
 
