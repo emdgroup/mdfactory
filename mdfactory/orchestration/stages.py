@@ -179,6 +179,11 @@ def _extract_resource_hints(stage_config: Any) -> ResourceHints:
     if stage_config is None:
         return ResourceHints(ntasks=0, disable_gpu=True, gmx_binary="auto")
     ntasks = getattr(stage_config, "cpus_per_node", 0) or 0
+    # Avoid oversubscription when multiple workers share a node: each mdrun
+    # worker should claim only its fair share of the node's cores.
+    max_workers = getattr(stage_config, "max_workers_per_node", 1) or 1
+    if ntasks > 0 and max_workers > 1:
+        ntasks = ntasks // max_workers
     gres = getattr(stage_config, "gres", None)
     disable_gpu = gres is None or "gpu" not in str(gres).lower()
     gmx_binary = getattr(stage_config, "gmx_binary", "auto")
