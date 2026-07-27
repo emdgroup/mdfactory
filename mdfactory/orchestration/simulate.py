@@ -20,6 +20,7 @@ from .session import parsl_session
 from .stages import (
     STAGE_BY_NAME,
     STAGE_REGISTRY,
+    StageSpec,
     run_stage,
 )
 
@@ -329,6 +330,89 @@ def _detect_production_output_state(
     return {"status": "partial", "cpt_file": None, "restart": False}
 
 
+def _detect_skip_stage_state(
+    sim_dir: Path,
+    spec: "StageSpec",
+    cpt_file: Path,
+    tpr_file: Path,
+) -> dict:
+    """Return stage state for 'skip' checkpoint mode.
+
+    Checks file existence only — no integrity validation, no frame counting.
+    Trajectory stages accept completion if *any* expected trajectory file exists
+    (mirrors auto mode so TRR-only runs are not repeated).
+
+    Parameters
+    ----------
+    sim_dir : Path
+        Simulation directory.
+    spec : StageSpec
+        Stage descriptor from :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY`.
+    cpt_file : Path
+        Stage checkpoint file path.
+    tpr_file : Path
+        Stage TPR run-input file path.
+
+    Returns
+    -------
+    dict
+        Stage state dict with ``status``, ``cpt_file``, and ``restart`` keys.
+
+    """
+    if spec.traj_files:
+        # Mirror auto mode: complete if ANY trajectory file exists (XTC or TRR).
+        if any((sim_dir / tf).exists() for tf in spec.traj_files):
+            return {"status": "complete", "cpt_file": None, "restart": False}
+        if cpt_file.exists() and tpr_file.exists():
+            return {"status": "partial", "cpt_file": cpt_file, "restart": True}
+        return {"status": "not_started", "cpt_file": None, "restart": False}
+    return _detect_skip_mode_state(sim_dir / spec.gro_out, cpt_file, tpr_file)
+
+
+def _detect_auto_output_state(
+    sim_dir: Path,
+    stage: str,
+    spec: "StageSpec",
+    cpt_file: Path,
+    tpr_file: Path,
+    prereq_cpt: "Path | None",
+) -> dict:
+    """Return stage state for 'auto' mode when output files already exist.
+
+    Validates workflow integrity (prerequisite checkpoint must exist) before
+    accepting the stage as complete.  Production stages additionally validate
+    frame count via :func:`_detect_production_output_state`.
+
+    Parameters
+    ----------
+    sim_dir : Path
+        Simulation directory.
+    stage : str
+        Stage name (e.g. ``"Production"``).
+    spec : StageSpec
+        Stage descriptor.
+    cpt_file : Path
+        Stage checkpoint file path.
+    tpr_file : Path
+        Stage TPR run-input file path.
+    prereq_cpt : Path or None
+        Prerequisite checkpoint path (``None`` for stages with no prereq).
+
+    Returns
+    -------
+    dict
+        Stage state dict with ``status``, ``cpt_file``, and ``restart`` keys.
+
+    """
+    # Workflow integrity: prerequisite checkpoint must exist for the output to
+    # be trustworthy (e.g. npt.gro is only valid if nvt.cpt is present).
+    if prereq_cpt and not prereq_cpt.exists():
+        return {"status": "not_started", "cpt_file": None, "restart": False}
+    if stage == "Production":
+        return _detect_production_output_state(sim_dir, cpt_file, tpr_file, spec.traj_files)
+    return {"status": "complete", "cpt_file": None, "restart": False}
+
+
 def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
     """Detect completion or partial progress of a stage.
 
@@ -355,6 +439,9 @@ def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
     cpt_file = sim_dir / spec.cpt_file
     tpr_file = sim_dir / spec.tpr_file
 
+    if mode == "skip":
+        return _detect_skip_stage_state(sim_dir, spec, cpt_file, tpr_file)
+
     # For trajectory stages (Production) any accepted file counts as output.
     # For structure stages (EM/NVT/NPT) the single gro_out is the output.
     if spec.traj_files:
@@ -365,36 +452,11 @@ def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
         gro_out_file = sim_dir / spec.gro_out
         output_exists = gro_out_file.exists() and gro_out_file.stat().st_size > 0
 
-    # For "skip" mode, just check if output file exists (even if empty).
-    # Don't validate workflow integrity - trust the user.
-    if mode == "skip":
-        if spec.traj_files:
-            # Mirror auto mode: accept Production complete if ANY trajectory
-            # file exists (XTC or TRR), so TRR-only runs are not re-run.
-            any_traj_exists = any((sim_dir / tf).exists() for tf in spec.traj_files)
-            if any_traj_exists:
-                return {"status": "complete", "cpt_file": None, "restart": False}
-            if cpt_file.exists() and tpr_file.exists():
-                return {"status": "partial", "cpt_file": cpt_file, "restart": True}
-            return {"status": "not_started", "cpt_file": None, "restart": False}
-        else:
-            primary_output = sim_dir / spec.gro_out
-            return _detect_skip_mode_state(primary_output, cpt_file, tpr_file)
-
     # Prerequisite checkpoint (for validating workflow integrity in auto mode)
     prereq_cpt = sim_dir / spec.prereq_cpt if spec.prereq_cpt else None
 
-    # For "auto" mode, validate workflow integrity by checking prerequisite checkpoints.
     if output_exists:
-        # Check workflow integrity: prerequisite checkpoint must exist.
-        if prereq_cpt and not prereq_cpt.exists():
-            # Output exists but prerequisite checkpoint missing - workflow integrity broken.
-            # Can't trust this output; need to re-run from earlier stage.
-            return {"status": "not_started", "cpt_file": None, "restart": False}
-        if stage == "Production":
-            return _detect_production_output_state(sim_dir, cpt_file, tpr_file, spec.traj_files)
-        # Non-trajectory stages: output exists + prerequisite valid = complete.
-        return {"status": "complete", "cpt_file": None, "restart": False}
+        return _detect_auto_output_state(sim_dir, stage, spec, cpt_file, tpr_file, prereq_cpt)
 
     # Check partial progress (checkpoint exists, output doesn't).
     if cpt_file.exists() and tpr_file.exists():
