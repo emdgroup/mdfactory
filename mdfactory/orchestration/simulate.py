@@ -188,6 +188,10 @@ def run_simulations(
         logger.info(f"Submitted {len(futures)} simulation(s)")
 
         if not wait:
+            logger.warning(
+                "Returning raw AppFuture objects — futures resolve to None (bash_app exit), "
+                "not status dicts.  Caller must call parsl.clear() when done."
+            )
             session.detach()
             return [fut for _, fut in futures]
 
