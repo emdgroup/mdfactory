@@ -245,7 +245,9 @@ def _build_env_preamble(work_dir: str, nthr_expr: str, has_gpu: bool) -> str:
         f"NTHR={nthr_expr}",
     ]
     if has_gpu:
-        lines.append("GPU_ID=${CUDA_VISIBLE_DEVICES%%,*}")
+        # Use :- instead of %%,* so CUDA_VISIBLE_DEVICES unset → empty string
+        # rather than aborting under set -u on CPU-only hosts.
+        lines.append("GPU_ID=${CUDA_VISIBLE_DEVICES:-}")
     lines.append("export OMP_NUM_THREADS=$NTHR")
     return "\n".join(lines)
 

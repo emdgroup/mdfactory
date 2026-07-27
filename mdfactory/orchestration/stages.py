@@ -177,7 +177,7 @@ def _extract_resource_hints(stage_config: Any) -> ResourceHints:
 
     """
     if stage_config is None:
-        return ResourceHints(ntasks=0, disable_gpu=False, gmx_binary="auto")
+        return ResourceHints(ntasks=0, disable_gpu=True, gmx_binary="auto")
     ntasks = getattr(stage_config, "cpus_per_node", 0) or 0
     gres = getattr(stage_config, "gres", None)
     disable_gpu = gres is None or "gpu" not in str(gres).lower()
