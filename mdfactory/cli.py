@@ -640,8 +640,9 @@ def _report_simulation_results(results: list[dict]):
     """Report simulation results to user."""
     succeeded = sum(1 for r in results if r.get("status") == "success")
     failed = sum(1 for r in results if r.get("status") == "failed")
+    skipped = sum(1 for r in results if r.get("status") == "skipped")
 
-    logger.info(f"Simulation complete: {succeeded} succeeded, {failed} failed")
+    logger.info(f"Simulation complete: {succeeded} succeeded, {failed} failed, {skipped} skipped")
 
     for r in results:
         if r.get("status") == "failed":

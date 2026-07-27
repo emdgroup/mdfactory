@@ -111,16 +111,27 @@ def run_simulations(
             f"Invalid checkpoint_mode: {checkpoint_mode!r}. Valid: {list(valid_modes)}"
         )
 
-    # 1. Filter: skip directories whose build did not complete
-    ready_paths = []
+    # 1. Filter: skip directories whose build did not complete.
+    # Skipped dirs are collected as result entries so callers can account for
+    # all requested simulations (succeeded + failed + skipped == requested).
+    skipped_results: list[dict] = []
+    ready_paths: list[Path] = []
     for sim_dir in sim_paths:
         missing = _missing_build_files(sim_dir, stages)
         if missing:
             logger.warning(f"Skipping {sim_dir.name}: build incomplete, missing: {missing}")
+            skipped_results.append(
+                {
+                    "hash": sim_dir.name,
+                    "status": "skipped",
+                    "directory": str(sim_dir),
+                    "reason": f"build incomplete, missing: {missing}",
+                }
+            )
         else:
             ready_paths.append(sim_dir)
 
-    n_skipped = len(sim_paths) - len(ready_paths)
+    n_skipped = len(skipped_results)
     if n_skipped:
         logger.info(
             f"Skipped {n_skipped} simulation(s) with incomplete builds; "
@@ -128,7 +139,7 @@ def run_simulations(
         )
     if not ready_paths:
         logger.warning("No simulation directories have complete builds. Nothing to run.")
-        return []
+        return skipped_results
     sim_paths = ready_paths
 
     # 2. Checkpoint detection (includes restart info for -cpi -append support)
@@ -154,7 +165,7 @@ def run_simulations(
 
     # 3. Dry-run mode
     if dry_run:
-        return _log_dry_run_plan(work_plan, config)
+        return skipped_results + _log_dry_run_plan(work_plan, config)
 
     # 4. Validate prerequisites before Parsl session
     for item in work_plan:
@@ -198,12 +209,14 @@ def run_simulations(
         # 7. Wait with progress UI (reuse from build.py)
         hashes = [h for h, _ in futures]
         parsl_futures = [fut for _, fut in futures]
-        return _wait_with_progress(
+        run_results = _wait_with_progress(
             parsl_futures,
             hashes=hashes,
             label="Simulations",
             result_transform=_bash_result_to_dict,
         )
+        # Prepend skipped-build entries so succeeded + failed + skipped == requested
+        return skipped_results + run_results
 
 
 def _missing_build_files(sim_dir: Path, stages: list[str]) -> list[str]:
