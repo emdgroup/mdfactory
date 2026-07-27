@@ -170,6 +170,15 @@ class ExecutorConfig(BaseModel):
         return cls(**data)
 
 
+#: Fields in :class:`SlurmExecutorConfig` that ``stage_overrides`` can
+#: legitimately change.  These are the mdrun-command-line knobs extracted by
+#: :func:`~mdfactory.orchestration.stages._extract_resource_hints`.  All other
+#: fields (``walltime``, ``mem``, ``nodes``, ``partition``, …) are baked into
+#: the Parsl allocation at session start and cannot vary per-stage without
+#: spawning separate executor instances.
+_HONORED_OVERRIDE_KEYS: frozenset[str] = frozenset({"cpus_per_node", "gres", "gmx_binary"})
+
+
 class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
     """SLURM executor configuration for Parsl workflows.
 
@@ -278,9 +287,18 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
     def get_stage_config(self, stage: str) -> "SlurmExecutorConfig":
         """Return a copy of this config with per-stage overrides applied.
 
-        Looks up ``stage`` in :attr:`stage_overrides` and returns a shallow
+        Looks up ``stage`` in :attr:`stage_overrides` and returns a validated
         copy of *self* with the matching fields merged in.  If no override
         exists for *stage*, *self* is returned unchanged (no copy).
+
+        Only the fields listed in :data:`_HONORED_OVERRIDE_KEYS` —
+        ``cpus_per_node``, ``gres``, and ``gmx_binary`` — are honoured at the
+        mdrun-command-line level.  All other fields (``walltime``, ``mem``,
+        ``nodes``, ``partition``, …) are baked into the Parsl allocation at
+        session-start time and **cannot** vary per-stage without separate
+        executor instances.  Passing an unhonorable key raises :exc:`ValueError`
+        immediately so the misconfiguration is caught at CLI invocation rather
+        than silently at sbatch time.
 
         Parameters
         ----------
@@ -290,7 +308,12 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
         Returns
         -------
         SlurmExecutorConfig
-            Config with stage-specific field values applied.
+            Config with stage-specific field values applied and validated.
+
+        Raises
+        ------
+        ValueError
+            If any override key is not in :data:`_HONORED_OVERRIDE_KEYS`.
 
         Examples
         --------
@@ -309,7 +332,20 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
         overrides = self.stage_overrides.get(stage, {})
         if not overrides:
             return self
-        return self.model_copy(update=overrides)
+
+        ignored = set(overrides) - _HONORED_OVERRIDE_KEYS
+        if ignored:
+            raise ValueError(
+                f"stage_overrides[{stage!r}] contains keys that are not honored "
+                f"at the mdrun-command level: {sorted(ignored)}.\n"
+                f"Only {sorted(_HONORED_OVERRIDE_KEYS)} affect per-stage mdrun execution.\n"
+                f"To change walltime / mem / nodes / partition, update the top-level config "
+                f"fields (they apply to every stage via the Parsl allocation)."
+            )
+
+        # Use model_validate instead of model_copy(update=...) so that field-level
+        # Pydantic validators run on the merged dict (typos fail fast).
+        return type(self).model_validate({**self.model_dump(), **overrides})
 
     def to_parsl_config(self) -> "parsl.Config":
         """Build a Parsl Config with HighThroughputExecutor + SlurmProvider.
