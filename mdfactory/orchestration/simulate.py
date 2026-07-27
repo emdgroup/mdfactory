@@ -355,9 +355,18 @@ def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
     # For "skip" mode, just check if output file exists (even if empty).
     # Don't validate workflow integrity - trust the user.
     if mode == "skip":
-        # Use first traj file or gro_out as the representative output for skip mode.
-        primary_output = spec.traj_files[0] if spec.traj_files else spec.gro_out
-        return _detect_skip_mode_state(sim_dir / primary_output, cpt_file, tpr_file)
+        if spec.traj_files:
+            # Mirror auto mode: accept Production complete if ANY trajectory
+            # file exists (XTC or TRR), so TRR-only runs are not re-run.
+            any_traj_exists = any((sim_dir / tf).exists() for tf in spec.traj_files)
+            if any_traj_exists:
+                return {"status": "complete", "cpt_file": None, "restart": False}
+            if cpt_file.exists() and tpr_file.exists():
+                return {"status": "partial", "cpt_file": cpt_file, "restart": True}
+            return {"status": "not_started", "cpt_file": None, "restart": False}
+        else:
+            primary_output = sim_dir / spec.gro_out
+            return _detect_skip_mode_state(primary_output, cpt_file, tpr_file)
 
     # Prerequisite checkpoint (for validating workflow integrity in auto mode)
     prereq_cpt = sim_dir / spec.prereq_cpt if spec.prereq_cpt else None
