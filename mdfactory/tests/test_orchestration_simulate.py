@@ -674,56 +674,50 @@ def test_execute_stage_list_validates_unknown_stage():
         _execute_stage_list(Path("/tmp/test"), ["Equilibration"], None, None)
 
 
-@patch("mdfactory.orchestration.simulate.run_em_stage")
-def test_execute_stage_list_em_only(mock_em):
-    """Execute stage list runs EM without dependencies."""
+@patch("mdfactory.orchestration.simulate.run_stage")
+def test_execute_stage_list_em_only(mock_run_stage):
+    """Execute stage list dispatches EM via run_stage with correct spec and no prev_future."""
     mock_future = MagicMock()
-    mock_em.return_value = mock_future
+    mock_run_stage.return_value = mock_future
 
     result = _execute_stage_list(Path("/tmp/test"), ["EM"], MagicMock(), MagicMock())
 
-    # EM should be called once
-    mock_em.assert_called_once()
+    mock_run_stage.assert_called_once()
+    call_args = mock_run_stage.call_args[0]
+    assert call_args[0].name == "EM"  # spec
+    assert call_args[2] is None  # prev_future = None for first stage
     assert result == mock_future
 
 
-@patch("mdfactory.orchestration.simulate.run_em_stage")
-@patch("mdfactory.orchestration.simulate.run_nvt_stage")
-def test_execute_stage_list_em_nvt_chain(mock_nvt, mock_em):
-    """Execute stage list chains EM → NVT dependencies."""
+@patch("mdfactory.orchestration.simulate.run_stage")
+def test_execute_stage_list_em_nvt_chain(mock_run_stage):
+    """Execute stage list chains EM → NVT: NVT receives EM's future as prev_future."""
     em_future = MagicMock()
     nvt_future = MagicMock()
-    mock_em.return_value = em_future
-    mock_nvt.return_value = nvt_future
+    mock_run_stage.side_effect = [em_future, nvt_future]
 
     grompp_app = MagicMock()
     mdrun_app = MagicMock()
+    sim_dir = Path("/tmp/test")
 
-    result = _execute_stage_list(Path("/tmp/test"), ["EM", "NVT"], grompp_app, mdrun_app)
+    result = _execute_stage_list(sim_dir, ["EM", "NVT"], grompp_app, mdrun_app)
 
-    # EM called first
-    mock_em.assert_called_once_with(Path("/tmp/test"), grompp_app, mdrun_app)
-    # NVT called with EM future as dependency
-    mock_nvt.assert_called_once_with(Path("/tmp/test"), em_future, grompp_app, mdrun_app)
-    # Returns final NVT future
+    assert mock_run_stage.call_count == 2
+    calls = mock_run_stage.call_args_list
+    # First call: EM, prev_future=None
+    assert calls[0][0][0].name == "EM"
+    assert calls[0][0][2] is None
+    # Second call: NVT, prev_future=em_future (chained)
+    assert calls[1][0][0].name == "NVT"
+    assert calls[1][0][2] is em_future
     assert result == nvt_future
 
 
-@patch("mdfactory.orchestration.simulate.run_em_stage")
-@patch("mdfactory.orchestration.simulate.run_nvt_stage")
-@patch("mdfactory.orchestration.simulate.run_npt_stage")
-@patch("mdfactory.orchestration.simulate.run_production_stage")
-def test_execute_stage_list_full_pipeline(mock_prod, mock_npt, mock_nvt, mock_em):
-    """Execute stage list chains all 4 stages correctly."""
-    em_fut = MagicMock()
-    nvt_fut = MagicMock()
-    npt_fut = MagicMock()
-    prod_fut = MagicMock()
-
-    mock_em.return_value = em_fut
-    mock_nvt.return_value = nvt_fut
-    mock_npt.return_value = npt_fut
-    mock_prod.return_value = prod_fut
+@patch("mdfactory.orchestration.simulate.run_stage")
+def test_execute_stage_list_full_pipeline(mock_run_stage):
+    """Execute stage list chains all 4 stages via run_stage with correct futures."""
+    stage_futures = [MagicMock() for _ in range(4)]
+    mock_run_stage.side_effect = stage_futures
 
     grompp_app = MagicMock()
     mdrun_app = MagicMock()
@@ -731,39 +725,39 @@ def test_execute_stage_list_full_pipeline(mock_prod, mock_npt, mock_nvt, mock_em
 
     result = _execute_stage_list(sim_dir, ["EM", "NVT", "NPT", "Production"], grompp_app, mdrun_app)
 
-    # Verify call chain
-    mock_em.assert_called_once_with(sim_dir, grompp_app, mdrun_app)
-    mock_nvt.assert_called_once_with(sim_dir, em_fut, grompp_app, mdrun_app)
-    mock_npt.assert_called_once_with(sim_dir, nvt_fut, grompp_app, mdrun_app)
-    mock_prod.assert_called_once_with(sim_dir, npt_fut, grompp_app, mdrun_app)
+    assert mock_run_stage.call_count == 4
+    calls = mock_run_stage.call_args_list
+    # Verify spec names and future chaining
+    assert calls[0][0][0].name == "EM"
+    assert calls[0][0][2] is None  # no prev for first stage
+    assert calls[1][0][0].name == "NVT"
+    assert calls[1][0][2] is stage_futures[0]
+    assert calls[2][0][0].name == "NPT"
+    assert calls[2][0][2] is stage_futures[1]
+    assert calls[3][0][0].name == "Production"
+    assert calls[3][0][2] is stage_futures[2]
+    assert result is stage_futures[3]
 
-    # Returns final production future
-    assert result == prod_fut
 
-
-@patch("mdfactory.orchestration.simulate.run_nvt_stage")
-@patch("mdfactory.orchestration.simulate.run_npt_stage")
-def test_execute_stage_list_partial_pipeline_from_checkpoint(mock_npt, mock_nvt):
-    """Execute stage list handles checkpoint resume (first stage not EM)."""
-    # Resume from NVT (EM already complete)
+@patch("mdfactory.orchestration.simulate.run_stage")
+def test_execute_stage_list_partial_pipeline_from_checkpoint(mock_run_stage):
+    """Checkpoint resume: first stage is not EM; prev_future starts as None."""
     nvt_fut = MagicMock()
     npt_fut = MagicMock()
-    mock_nvt.return_value = nvt_fut
-    mock_npt.return_value = npt_fut
+    mock_run_stage.side_effect = [nvt_fut, npt_fut]
 
     grompp_app = MagicMock()
     mdrun_app = MagicMock()
     sim_dir = Path("/tmp/test")
 
-    # Execute NVT → NPT (EM was already complete)
     result = _execute_stage_list(sim_dir, ["NVT", "NPT"], grompp_app, mdrun_app)
 
-    # NVT called with prev_future=None (checkpoint resume)
-    mock_nvt.assert_called_once_with(sim_dir, None, grompp_app, mdrun_app)
-    # NPT called with NVT's future
-    mock_npt.assert_called_once_with(sim_dir, nvt_fut, grompp_app, mdrun_app)
-    # Returns final NPT future
-    assert result == npt_fut
+    calls = mock_run_stage.call_args_list
+    assert calls[0][0][0].name == "NVT"
+    assert calls[0][0][2] is None  # no preceding future
+    assert calls[1][0][0].name == "NPT"
+    assert calls[1][0][2] is nvt_fut  # chained
+    assert result is npt_fut
 
 
 @patch("mdfactory.orchestration.simulate.parsl_session")
@@ -1203,56 +1197,45 @@ def test_get_gromacs_detect_script_prefers_gmx_over_gmx_mpi():
 # === Decision 7: Restart wiring through stage functions and execute_stage_list ===
 
 
-@patch("mdfactory.orchestration.simulate.run_nvt_stage")
-def test_execute_stage_list_passes_restart_to_stage_fn(mock_nvt):
-    """_execute_stage_list forwards stage_restarts to the stage function."""
-    mock_nvt.return_value = MagicMock()
-    grompp_app = MagicMock()
-    mdrun_app = MagicMock()
+@patch("mdfactory.orchestration.simulate.run_stage")
+def test_execute_stage_list_passes_restart_to_stage_fn(mock_run_stage):
+    """_execute_stage_list forwards stage_restarts to run_stage as restart_from_cpt."""
+    mock_run_stage.return_value = MagicMock()
     sim_dir = Path("/tmp/test")
 
     _execute_stage_list(
         sim_dir,
         ["NVT"],
-        grompp_app,
-        mdrun_app,
+        MagicMock(),
+        MagicMock(),
         stage_restarts={"NVT": "/sim/nvt.cpt"},
     )
 
-    # NVT should receive restart_from_cpt kwarg
-    mock_nvt.assert_called_once_with(
-        sim_dir, None, grompp_app, mdrun_app, restart_from_cpt="/sim/nvt.cpt"
-    )
+    mock_run_stage.assert_called_once()
+    call_kwargs = mock_run_stage.call_args[1]
+    assert call_kwargs.get("restart_from_cpt") == "/sim/nvt.cpt"
 
 
-@patch("mdfactory.orchestration.simulate.run_npt_stage")
-@patch("mdfactory.orchestration.simulate.run_nvt_stage")
-def test_execute_stage_list_restart_only_for_matching_stage(mock_nvt, mock_npt):
-    """Only the stage with a cpt entry gets restart_from_cpt; others run normally."""
-    mock_nvt.return_value = MagicMock()
-    mock_npt.return_value = MagicMock()
-    grompp_app = MagicMock()
-    mdrun_app = MagicMock()
+@patch("mdfactory.orchestration.simulate.run_stage")
+def test_execute_stage_list_restart_only_for_matching_stage(mock_run_stage):
+    """Only the stage with a cpt entry gets a non-empty restart_from_cpt."""
+    nvt_fut = MagicMock()
+    mock_run_stage.side_effect = [nvt_fut, MagicMock()]
     sim_dir = Path("/tmp/test")
 
     _execute_stage_list(
         sim_dir,
         ["NVT", "NPT"],
-        grompp_app,
-        mdrun_app,
+        MagicMock(),
+        MagicMock(),
         stage_restarts={"NPT": "/sim/npt.cpt"},
     )
 
-    # NVT runs normally (no restart kwarg)
-    mock_nvt.assert_called_once_with(sim_dir, None, grompp_app, mdrun_app)
-    # NPT gets the restart kwarg
-    mock_npt.assert_called_once_with(
-        sim_dir,
-        mock_nvt.return_value,
-        grompp_app,
-        mdrun_app,
-        restart_from_cpt="/sim/npt.cpt",
-    )
+    calls = mock_run_stage.call_args_list
+    # NVT: no restart (empty string)
+    assert calls[0][1].get("restart_from_cpt") == ""
+    # NPT: gets restart path
+    assert calls[1][1].get("restart_from_cpt") == "/sim/npt.cpt"
 
 
 def test_nvt_stage_skips_grompp_on_restart():
@@ -1326,9 +1309,9 @@ def test_production_stage_skips_grompp_on_restart():
 # === Decision 6: Per-stage resource config wiring tests ===
 
 
-@patch("mdfactory.orchestration.simulate.run_em_stage")
-def test_execute_stage_list_passes_stage_config_when_slurm(mock_em):
-    """_execute_stage_list calls get_stage_config and forwards to EM stage."""
+@patch("mdfactory.orchestration.simulate.run_stage")
+def test_execute_stage_list_passes_stage_config_when_slurm(mock_run_stage):
+    """_execute_stage_list resolves per-stage config and forwards as stage_config to run_stage."""
     from mdfactory.orchestration.config import SlurmExecutorConfig
 
     cfg = SlurmExecutorConfig(
@@ -1336,32 +1319,29 @@ def test_execute_stage_list_passes_stage_config_when_slurm(mock_em):
         cpus_per_node=12,
         stage_overrides={"EM": {"cpus_per_node": 4, "gres": None}},
     )
-    mock_em.return_value = MagicMock()
-    grompp_app = MagicMock()
-    mdrun_app = MagicMock()
+    mock_run_stage.return_value = MagicMock()
 
-    _execute_stage_list(Path("/tmp/test"), ["EM"], grompp_app, mdrun_app, config=cfg)
+    _execute_stage_list(Path("/tmp/test"), ["EM"], MagicMock(), MagicMock(), config=cfg)
 
-    # stage_config kwarg should be the EM-overridden config
-    mock_em.assert_called_once()
-    _, call_kwargs = mock_em.call_args
+    mock_run_stage.assert_called_once()
+    _, call_kwargs = mock_run_stage.call_args
     em_cfg = call_kwargs.get("stage_config")
     assert em_cfg is not None
     assert em_cfg.cpus_per_node == 4
 
 
-@patch("mdfactory.orchestration.simulate.run_em_stage")
-def test_execute_stage_list_no_stage_config_for_local(mock_em):
+@patch("mdfactory.orchestration.simulate.run_stage")
+def test_execute_stage_list_no_stage_config_for_local(mock_run_stage):
     """_execute_stage_list does not inject stage_config for LocalProvider (no overrides)."""
     from mdfactory.orchestration.config import ExecutorConfig
 
-    cfg = ExecutorConfig()  # no get_stage_config method
-    mock_em.return_value = MagicMock()
+    mock_run_stage.return_value = MagicMock()
 
-    _execute_stage_list(Path("/tmp/test"), ["EM"], MagicMock(), MagicMock(), config=cfg)
+    _execute_stage_list(
+        Path("/tmp/test"), ["EM"], MagicMock(), MagicMock(), config=ExecutorConfig()
+    )
 
-    # No stage_config kwarg should be injected
-    _, call_kwargs = mock_em.call_args
+    _, call_kwargs = mock_run_stage.call_args
     assert "stage_config" not in call_kwargs
 
 

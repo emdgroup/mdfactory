@@ -20,10 +20,7 @@ from .session import parsl_session
 from .stages import (
     STAGE_BY_NAME,
     STAGE_REGISTRY,
-    run_em_stage,
-    run_npt_stage,
-    run_nvt_stage,
-    run_production_stage,
+    run_stage,
 )
 
 # Import MDAnalysis at module level for testability
@@ -509,14 +506,6 @@ def _execute_stage_list(
 
     restarts = stage_restarts or {}
 
-    # Explicit mapping of stages to their functions
-    stage_functions = {
-        "EM": run_em_stage,
-        "NVT": run_nvt_stage,
-        "NPT": run_npt_stage,
-        "Production": run_production_stage,
-    }
-
     # Validate that stages are in dependency order (derived from STAGE_REGISTRY — single source)
     stage_order = [s.name for s in STAGE_REGISTRY]
     stage_indices = {name: idx for idx, name in enumerate(stage_order)}
@@ -531,41 +520,28 @@ def _execute_stage_list(
             raise ValueError(f"Stages must be in dependency order: {stage_order}. Got: {stages}")
         prev_idx = curr_idx
 
-    # Execute stages sequentially, chaining dependencies
+    # Execute stages sequentially, chaining futures through run_stage.
+    # STAGE_REGISTRY is the single dispatch source: a new stage added there
+    # becomes immediately executable here without further edits to this module.
+    # prev_future=None on the first iteration is handled correctly by run_stage
+    # for all stages (including non-EM checkpoint resumes).
     prev_future = None
-    for i, stage in enumerate(stages):
+    for stage in stages:
         cpt_file = restarts.get(stage, "")
         # Resolve per-stage resource overrides when a SlurmExecutorConfig is given.
         # Only inject stage_config kwarg when non-None to avoid polluting mock
         # assertions in tests that don't exercise per-stage config.
         stage_cfg = config.get_stage_config(stage) if hasattr(config, "get_stage_config") else None
         cfg_kwarg = {"stage_config": stage_cfg} if stage_cfg is not None else {}
-        if stage == "EM":
-            # EM has no dependencies and no checkpoint restart support
-            prev_future = run_em_stage(sim_dir, grompp_app, mdrun_app, **cfg_kwarg)
-        else:
-            # All other stages depend on previous stage.
-            # If this is the first stage (i==0) and it's not EM, we're resuming from
-            # checkpoint. Pass None as prev_future - stage functions handle this by
-            # not adding it to inputs=[] (files already exist, validated by prerequisites)
-            stage_fn = stage_functions[stage]
-            if cpt_file:
-                prev_future = stage_fn(
-                    sim_dir,
-                    prev_future,
-                    grompp_app,
-                    mdrun_app,
-                    restart_from_cpt=cpt_file,
-                    **cfg_kwarg,
-                )
-            else:
-                prev_future = stage_fn(
-                    sim_dir,
-                    prev_future,
-                    grompp_app,
-                    mdrun_app,
-                    **cfg_kwarg,
-                )
+        prev_future = run_stage(
+            STAGE_BY_NAME[stage],
+            sim_dir,
+            prev_future,
+            grompp_app,
+            mdrun_app,
+            restart_from_cpt=cpt_file,
+            **cfg_kwarg,
+        )
 
     return prev_future
 
