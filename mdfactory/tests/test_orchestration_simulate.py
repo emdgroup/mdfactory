@@ -1667,3 +1667,135 @@ def test_bash_result_to_dict_dict_passthrough():
 
     d = {"hash": "abc123", "status": "failed", "error": "mdrun crashed"}
     assert _bash_result_to_dict(d, "abc123") is d
+
+
+# ---------------------------------------------------------------------------
+# T2: grompp -r/-t flag generation (Finding 6)
+# ---------------------------------------------------------------------------
+
+
+def test_build_grompp_script_generates_ref_flag():
+    """_build_grompp_script emits -r flag when ref_file is provided."""
+    from mdfactory.orchestration.apps import _build_grompp_script
+
+    script = _build_grompp_script(
+        "nvt.mdp", "min.gro", "topology.top", "nvt.tpr", "/sim", ref_file="min.gro"
+    )
+    assert "-r min.gro" in script
+
+
+def test_build_grompp_script_generates_cpt_flag():
+    """_build_grompp_script emits -t flag when cpt_file is provided."""
+    from mdfactory.orchestration.apps import _build_grompp_script
+
+    script = _build_grompp_script(
+        "npt.mdp", "nvt.gro", "topology.top", "npt.tpr", "/sim", cpt_file="nvt.cpt"
+    )
+    assert "-t nvt.cpt" in script
+
+
+def test_build_grompp_script_omits_flags_by_default():
+    """_build_grompp_script omits -r and -t when no ref_file / cpt_file given."""
+    from mdfactory.orchestration.apps import _build_grompp_script
+
+    script = _build_grompp_script("em.mdp", "system.pdb", "topology.top", "em.tpr", "/sim")
+    assert "-r " not in script
+    assert "-t " not in script
+
+
+def test_build_grompp_script_can_emit_both_flags():
+    """_build_grompp_script emits both -r and -t when both are provided."""
+    from mdfactory.orchestration.apps import _build_grompp_script
+
+    script = _build_grompp_script(
+        "npt.mdp", "nvt.gro", "topology.top", "npt.tpr", "/sim",
+        ref_file="nvt.gro", cpt_file="nvt.cpt"
+    )
+    assert "-r nvt.gro" in script
+    assert "-t nvt.cpt" in script
+
+
+# ---------------------------------------------------------------------------
+# T6: gmx_binary selection in _build_mdrun_script (Finding 16)
+# ---------------------------------------------------------------------------
+
+
+def test_build_mdrun_script_auto_includes_binary_detection_preamble():
+    """gmx_binary='auto' emits the runtime binary detection if/elif block."""
+    script = _build_mdrun_script("prod", "/sim", gmx_binary="auto")
+    # The detection preamble checks for 'gmx' and 'gmx_mpi' at runtime
+    assert "command -v gmx" in script
+
+
+def test_build_mdrun_script_explicit_gmx_omits_detection_preamble():
+    """gmx_binary='gmx' uses literal 'gmx' binary, no runtime detection."""
+    script = _build_mdrun_script("prod", "/sim", gmx_binary="gmx")
+    assert "command -v gmx" not in script
+    # Literal binary name appears in the mdrun command
+    assert "gmx mdrun" in script
+
+
+def test_build_mdrun_script_explicit_gmx_mpi():
+    """gmx_binary='gmx_mpi' uses literal 'gmx_mpi' binary, no detection preamble."""
+    script = _build_mdrun_script("prod", "/sim", gmx_binary="gmx_mpi")
+    assert "command -v gmx" not in script
+    assert "gmx_mpi mdrun" in script
+
+
+# ---------------------------------------------------------------------------
+# T7: _extract_resource_hints GPU / gmx_binary branches (Finding 18)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_resource_hints_gpu_gres_disables_disable_gpu():
+    """GPU gres string → disable_gpu=False (GPU mode active)."""
+    from mdfactory.orchestration.stages import _extract_resource_hints
+
+    cfg = MagicMock(cpus_per_node=12, gres="gpu:l40s:1", gmx_binary="gmx_mpi",
+                    max_workers_per_node=1)
+    hints = _extract_resource_hints(cfg)
+
+    assert hints.disable_gpu is False
+    assert hints.gmx_binary == "gmx_mpi"
+    assert hints.ntasks == 12
+
+
+def test_extract_resource_hints_non_gpu_gres_sets_disable_gpu():
+    """Non-GPU gres string → disable_gpu=True (no GPU)."""
+    from mdfactory.orchestration.stages import _extract_resource_hints
+
+    cfg = MagicMock(cpus_per_node=4, gres="ssd:1", gmx_binary="auto", max_workers_per_node=1)
+    hints = _extract_resource_hints(cfg)
+
+    assert hints.disable_gpu is True
+
+
+def test_extract_resource_hints_none_gres_sets_disable_gpu():
+    """gres=None → disable_gpu=True (no GPU)."""
+    from mdfactory.orchestration.stages import _extract_resource_hints
+
+    cfg = MagicMock(cpus_per_node=8, gres=None, gmx_binary="auto", max_workers_per_node=1)
+    hints = _extract_resource_hints(cfg)
+
+    assert hints.disable_gpu is True
+
+
+def test_extract_resource_hints_none_stage_config_is_cpu_safe():
+    """stage_config=None → disable_gpu=True (safe default for local runs)."""
+    from mdfactory.orchestration.stages import _extract_resource_hints
+
+    hints = _extract_resource_hints(None)
+
+    assert hints.disable_gpu is True
+    assert hints.ntasks == 0
+    assert hints.gmx_binary == "auto"
+
+
+def test_extract_resource_hints_divides_by_max_workers():
+    """ntasks is divided by max_workers_per_node when >1 to avoid oversubscription."""
+    from mdfactory.orchestration.stages import _extract_resource_hints
+
+    cfg = MagicMock(cpus_per_node=12, gres=None, gmx_binary="auto", max_workers_per_node=2)
+    hints = _extract_resource_hints(cfg)
+
+    assert hints.ntasks == 6  # 12 // 2
