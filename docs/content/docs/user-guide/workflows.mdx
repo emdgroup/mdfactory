@@ -12,7 +12,7 @@ The workflow has two stages:
 1. **Build** — generate simulation-ready directories from YAML or CSV input
 2. **Simulate** — run the GROMACS pipeline (EM → NVT → NPT → Production) for each built system
 
-Both stages can run locally (sequential) or on a SLURM cluster (parallel via Parsl).
+Each stage can run locally or on a SLURM cluster. With `--slurm`, Parsl submits many systems concurrently — multiple builds run in parallel, and multiple GROMACS simulations execute simultaneously across cluster nodes.
 
 ## Prerequisites
 
