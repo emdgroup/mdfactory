@@ -30,6 +30,32 @@ class TestMatchesPhysicsPatterns:
     def test_force_not_finite(self):
         assert _matches_physics_patterns("force 1.#INF is not finite")
 
+    def test_water_molecule_starting_at(self):
+        assert _matches_physics_patterns(
+            "step 1000: Water molecule starting at (1.2, 3.4, 5.6) "
+            "cannot be settled"
+        )
+
+    def test_too_many_lincs_warnings(self):
+        assert _matches_physics_patterns("Too many LINCS warnings")
+
+    def test_can_not_continue(self):
+        assert _matches_physics_patterns("can not continue")
+
+    def test_abnormal_termination(self):
+        assert _matches_physics_patterns("Abnormal termination of GROMACS")
+
+    def test_perturbed_nonbonded_pairs(self):
+        assert _matches_physics_patterns(
+            "There are 42 perturbed non-bonded pair interactions "
+            "beyond the pair-list cutoff"
+        )
+
+    def test_atoms_too_many_constraints(self):
+        assert _matches_physics_patterns(
+            "atoms 123 and 456 are involved in more than 6 constraints"
+        )
+
     def test_normal_output_no_match(self):
         assert not _matches_physics_patterns("Step 1000, time 2.0 ps")
 

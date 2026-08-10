@@ -185,23 +185,41 @@ def run_simulations(
         mdrun_app = get_mdrun_app()
 
         # 6. Submit all pipelines (embarrassingly parallel)
+        # When rescue is active (max_rescue > 0), each simulation's
+        # pipeline may block internally while waiting for rescue-eligible
+        # stages.  Using ThreadPoolExecutor ensures cross-simulation
+        # parallelism is preserved — one simulation's rescue wait doesn't
+        # block other simulations from being submitted and executing.
+        from concurrent.futures import ThreadPoolExecutor
+
         futures = []
+        active_items = []
         for item in work_plan:
             if not item["stages"]:
                 logger.info(f"Skipping {item['hash']} (all stages complete)")
                 continue
+            active_items.append(item)
 
-            # Execute only the needed stages with explicit control
-            pipeline_fut = _execute_stage_list(
-                item["sim_dir"],
-                item["stages"],
-                grompp_app,
-                mdrun_app,
-                stage_restarts=item.get("stage_restarts"),
-                config=config,
-                max_rescue=max_rescue,
-            )
-            futures.append((item["hash"], pipeline_fut))
+        if active_items:
+
+            def _run_pipeline(item):
+                return _execute_stage_list(
+                    item["sim_dir"],
+                    item["stages"],
+                    grompp_app,
+                    mdrun_app,
+                    stage_restarts=item.get("stage_restarts"),
+                    config=config,
+                    max_rescue=max_rescue,
+                )
+
+            with ThreadPoolExecutor() as pool:
+                thread_futs = [
+                    (item["hash"], pool.submit(_run_pipeline, item))
+                    for item in active_items
+                ]
+                for h, tf in thread_futs:
+                    futures.append((h, tf.result()))
 
         logger.info(f"Submitted {len(futures)} simulation(s)")
 
@@ -632,6 +650,7 @@ def _execute_stage_list(
     # loop which waits for each stage individually.  Non-rescue stages and
     # stages with checkpoint restarts chain futures as before.
     from .mdp import RESCUE_ELIGIBLE_STAGES
+    from .rescue import execute_stage_with_rescue
 
     prev_future = None
     for stage in stages:
@@ -643,8 +662,6 @@ def _execute_stage_list(
             and stage in RESCUE_ELIGIBLE_STAGES
             and not cpt_file
         ):
-            from .rescue import execute_stage_with_rescue
-
             prev_future = execute_stage_with_rescue(
                 sim_dir,
                 stage,

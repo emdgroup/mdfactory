@@ -137,3 +137,37 @@ class TestExecuteStageWithRescue:
         with pytest.raises(RuntimeError, match="mysterious error"):
             execute_stage_with_rescue(sim_dir, "EM", None, MagicMock(), MagicMock(), max_rescue=3)
         assert mock_run_stage.call_count == 1
+
+    @patch("mdfactory.orchestration.rescue.classify_failure")
+    @patch("mdfactory.orchestration.rescue.run_stage")
+    def test_rescue_logs_warning_with_tier_and_stage(
+        self, mock_run_stage, mock_classify, sim_dir
+    ):
+        """Rescue activation emits WARNING log with tier number and stage name."""
+        from loguru import logger
+
+        fail_future = MagicMock()
+        fail_future.result.side_effect = RuntimeError("LINCS WARNING")
+        success_future = MagicMock()
+        success_future.result.return_value = None
+        mock_run_stage.side_effect = [fail_future, success_future]
+        mock_classify.return_value = FailureType.PHYSICS
+
+        warnings = []
+        handler_id = logger.add(
+            lambda msg: warnings.append(str(msg)),
+            level="WARNING",
+            format="{message}",
+        )
+        try:
+            execute_stage_with_rescue(
+                sim_dir, "EM", None, MagicMock(), MagicMock(), max_rescue=3
+            )
+        finally:
+            logger.remove(handler_id)
+
+        # Should have at least one warning mentioning rescue tier and stage
+        rescue_warnings = [w for w in warnings if "RESCUE" in w and "EM" in w]
+        assert len(rescue_warnings) >= 1
+        # Check tier info is present
+        assert any("tier 1" in w for w in rescue_warnings)

@@ -28,7 +28,7 @@ _PHYSICS_PATTERNS: list[re.Pattern] = [
         r"Too many LINCS warnings",
         r"can not continue",
         r"force .+ is not finite",
-        r"A]?norm(al termination|al end| of program)",
+        r"Abnorm(al termination|al end| of program)",
         r"There are \d+ perturbed non-bonded pair interactions",
         r"atoms .+ are involved in more than \d+ constraints",
     ]
