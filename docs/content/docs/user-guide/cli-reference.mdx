@@ -17,11 +17,21 @@ mdfactory prepare-build <input.csv> [output_dir]
 
 ### `mdfactory build`
 
-Build one simulation from a YAML file into the chosen output directory.
+Build MD system(s) from YAML, CSV, or summary input. Supports three input modes:
+
+- **Single YAML**: builds one system locally
+- **CSV file**: builds systems from each row (parallel with `--slurm`, sequential without)
+- **Summary YAML**: dispatches builds for previously prepared systems
 
 ```bash
-mdfactory build <input.yaml> [output_dir]
+mdfactory build <input> [options]
 ```
+
+Options:
+
+- `--output` — output directory (default: `.`)
+- `--slurm` — SLURM executor config: path to YAML file, or `'tui'` for interactive setup
+- `--dry-run` — print what would be built without executing
 
 ### `mdfactory check-csv`
 
@@ -29,6 +39,68 @@ Validate a CSV by converting each row into a `BuildInput` model and, for bilayer
 
 ```bash
 mdfactory check-csv <input.csv>
+```
+
+## Simulation commands
+
+### `mdfactory simulate`
+
+Run GROMACS MD simulations via Parsl. The simulation pipeline runs four stages by default: EM → NVT → NPT → Production.
+
+```bash
+mdfactory simulate <source> [options]
+```
+
+Options:
+
+- `--slurm` — SLURM config YAML or `'tui'` for interactive setup
+- `--stages` — stages to run (EM, NVT, NPT, Production); defaults to all
+- `--checkpoint` — checkpoint mode: `auto` (default), `skip`, `force`
+- `--hash` — filter by hash prefix (can specify multiple)
+- `--dry-run` — preview plan without executing
+
+Usage examples:
+
+```bash
+# Local execution (all stages)
+mdfactory simulate output_dir/
+
+# SLURM with interactive config
+mdfactory simulate output_dir/ --slurm tui
+
+# Resume from checkpoint with existing config
+mdfactory simulate output_dir/ --slurm gpu.yaml --checkpoint auto
+
+# Equilibration only
+mdfactory simulate output_dir/ --stages EM NVT NPT
+
+# Filter specific simulations
+mdfactory simulate output_dir/ --hash abc123 def456
+
+# Dry-run preview
+mdfactory simulate output_dir/ --slurm gpu.yaml --dry-run
+```
+
+## Configuration commands
+
+### `mdfactory config slurm`
+
+Interactive wizard to configure a SLURM executor and save to YAML. Queries the local SLURM scheduler for available accounts, partitions, and hardware, then walks through resource selection interactively.
+
+The result is saved to a YAML file that can be reused with `mdfactory build --slurm <file>` or `mdfactory simulate --slurm <file>`.
+
+On non-SLURM machines, falls back to manual text entry.
+
+```bash
+mdfactory config slurm
+```
+
+### `mdfactory config cluster`
+
+Show discovered SLURM cluster information. Queries the local SLURM scheduler and displays available partitions, accounts, and QOS policies. Useful for verifying autodiscovery before submitting jobs.
+
+```bash
+mdfactory config cluster [--json]
 ```
 
 ## Utility commands

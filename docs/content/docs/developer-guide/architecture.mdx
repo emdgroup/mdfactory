@@ -29,7 +29,7 @@ graph TD
 flowchart LR
     A[CSV or YAML inputs] --> B[prepare-build or build]
     B --> C[Simulation directories]
-    C --> D[Local run or Nextflow]
+    C --> D[Local run or Parsl orchestration]
     D --> E[Trajectory and output files]
     E --> F[Simulation.run_analysis / run_artifact]
     F --> G[.analysis parquet, artifacts, metadata.json]
@@ -164,12 +164,26 @@ For analysis and artifact sync, the code uses:
 
 ## Workflow orchestration
 
-The repository contains Nextflow scripts under `workflows/`. The scripts that most directly align with the current CLI are:
+The `mdfactory/orchestration/` package provides Parsl-based parallel orchestration for both building and simulating systems on local machines or SLURM clusters.
 
-- `build.nf`
-- `simulate.nf`
+### Architecture layers
 
-These scripts wrap the checked-in `mdfactory prepare-build` and `mdfactory build` commands plus a fixed GROMACS run chain.
+```mermaid
+graph TD
+    A[CLI: build --slurm / simulate --slurm] --> B[config.py: ExecutorConfig / SlurmExecutorConfig]
+    B --> C[session.py: parsl_session context manager]
+    C --> D[apps.py: Parsl python_app / bash_app definitions]
+    D --> E[stages.py: STAGE_REGISTRY + run_stage dispatch]
+    E --> F[build.py: build_systems / simulate.py: run_simulations]
+    F --> G[Rich progress UI + result collection]
+```
+
+- **`config.py`**: Pydantic models for local and SLURM execution. `ExecutorConfig` handles local runs; `SlurmExecutorConfig` adds SLURM-specific fields (account, partition, walltime, gres, per-stage overrides). Both serialize to/from YAML via `from_yaml()` and `model_dump()`.
+- **`session.py`**: `parsl_session()` context manager that owns the Parsl DataFlowKernel lifecycle. On exit it calls `parsl.clear()` and explicitly `scancel`s any lingering SLURM job IDs.
+- **`apps.py`**: Defines `get_build_app()` (python\_app for system building), `get_grompp_app()` and `get_mdrun_app()` (bash\_apps for GROMACS). All conditional logic (GPU, MPI, thread counts, restart flags) is resolved in Python before generating the bash script.
+- **`stages.py`**: `STAGE_REGISTRY` declares the canonical pipeline (EM → NVT → NPT → Production) as `StageSpec` dataclasses. `run_stage()` is the single generic dispatch function for all stages.
+- **`build.py`** / **`simulate.py`**: Top-level entry points. `build_systems()` submits parallel build tasks; `run_simulations()` chains stages sequentially per simulation with checkpoint detection and trajectory validation.
+- **`tui.py`**: Interactive SLURM configuration wizard using `questionary`. Auto-discovers cluster hardware via `sinfo`/`sacctmgr` and persists the result as a reusable YAML file.
 
 ## Extension points
 

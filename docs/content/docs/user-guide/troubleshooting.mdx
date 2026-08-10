@@ -79,14 +79,34 @@ The build code uses OpenMM-based compression or equilibration steps. For difficu
 ## Workflow issues
 
 <Accordions type="single" collapsible>
-<Accordion title="Nextflow stage-2 run cannot find files">
+<Accordion title="Simulate cannot find build files">
 
-`workflows/simulate.nf` expects:
+`mdfactory simulate` requires each simulation directory to contain the standard build outputs (`system.pdb`, `topology.top`, and `.mdp` files). Common causes:
 
-- a `--base_dir` containing the hash directories
-- a `--config_yaml` summary YAML produced by `mdfactory prepare-build` or `workflows/build.nf`
+- The build step (`mdfactory build`) did not complete successfully for some hashes.
+- The `--source` path does not point to the directory containing the hash subdirectories.
+- Use `--dry-run` to preview which directories would be simulated and which are skipped.
 
-Make sure both point to the same stage-1 output tree.
+```bash
+mdfactory simulate output_dir/ --slurm gpu.yaml --dry-run
+```
+
+</Accordion>
+<Accordion title="Checkpoint detection skips stages unexpectedly">
+
+In `--checkpoint auto` mode (the default), MDFactory validates trajectory integrity using frame counts. A stage is skipped when its output `.gro` file and prerequisite checkpoint (`.cpt`) both exist and pass validation.
+
+To force re-execution of all stages:
+
+```bash
+mdfactory simulate output_dir/ --slurm gpu.yaml --checkpoint force
+```
+
+To skip validation and rely only on file existence:
+
+```bash
+mdfactory simulate output_dir/ --slurm gpu.yaml --checkpoint skip
+```
 
 </Accordion>
 <Accordion title="Analysis SLURM submission fails immediately">
