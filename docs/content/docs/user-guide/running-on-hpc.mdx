@@ -122,7 +122,7 @@ stage_overrides:
 | `max_workers_per_node` | Parallel tasks per node | `1` |
 | `max_blocks` | Max concurrent SLURM allocations | `1` |
 | `available_accelerators` | GPU count or device IDs for `CUDA_VISIBLE_DEVICES` | `0` |
-| `retries` | Task retry count | `3` |
+| `retries` | Infrastructure retry count (OOM, timeout, preemption) | `3` |
 | `gmx_binary` | `"auto"`, `"gmx"`, or `"gmx_mpi"` | `"auto"` |
 | `worker_init` | Shell setup (module loads, etc.) | `""` |
 
@@ -137,6 +137,15 @@ mdfactory build systems.csv --output results --slurm slurm_executor.yaml
 # Run the GROMACS chain (parallel on SLURM)
 mdfactory simulate results/ --slurm slurm_executor.yaml
 ```
+
+<Callout type="info" title="Two layers of retry">
+MDFactory has two independent retry mechanisms on SLURM:
+
+- **`retries`** (executor config) — Parsl re-submits the same SLURM job on infrastructure failures (OOM, timeout, node preemption). The command is unchanged.
+- **`--max-rescue`** (CLI flag, default 3) — Automatically halves the step size and doubles `nsteps` for physics failures (LINCS errors, exploding box) in EM/NVT/NPT stages. Use `--max-rescue 0` to disable.
+
+When sizing walltime, account for potential rescue tiers — each tier roughly doubles the wall-clock cost of a rescue-eligible stage.
+</Callout>
 
 ### SLURM job wrapper
 

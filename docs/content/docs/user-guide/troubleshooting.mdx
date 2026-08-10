@@ -109,6 +109,36 @@ mdfactory simulate output_dir/ --slurm gpu.yaml --checkpoint skip
 ```
 
 </Accordion>
+<Accordion title="Simulation fails with LINCS or constraint errors">
+
+MDFactory automatically rescues EM, NVT, and NPT stages that fail with physics errors
+(LINCS warnings, exploding box, coordinate constraint failures). On each rescue tier the
+step size is halved and `nsteps` is doubled to maintain the same elapsed simulation time,
+up to 3 tiers by default.
+
+You will see log messages like:
+
+```
+WARNING — RESCUE tier 1/3 for abc123/EM: using em_rescue_t1.mdp
+WARNING — RESCUE tier 1 for EM: emstep = 0.01 → 0.005
+```
+
+If all rescue tiers are exhausted the simulation is marked as failed. To increase or
+decrease the retry budget:
+
+```bash
+# Allow up to 5 rescue tiers
+mdfactory simulate output_dir/ --max-rescue 5
+
+# Disable rescue entirely
+mdfactory simulate output_dir/ --max-rescue 0
+```
+
+Production stages are never rescued — by that point the system should be stable.
+Infrastructure failures (OOM, SLURM timeout, preemption) are handled separately by
+Parsl's built-in retry mechanism (`retries` in the executor config).
+
+</Accordion>
 <Accordion title="Analysis SLURM submission fails immediately">
 
 `mdfactory analysis ... --slurm` requires:
