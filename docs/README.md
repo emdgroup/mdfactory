@@ -4,7 +4,24 @@ This folder contains the Fumadocs + Next.js application that renders the MDFacto
 documentation. The site mixes hand-written guides with API pages generated straight from the
 Python package.
 
-## Prerequisites
+## Quick start with pixi
+
+The root `pyproject.toml` defines a `docs` environment that installs Bun, the JS
+dependencies, and `fumapy-generate` automatically:
+
+```bash
+pixi run -e docs docs-dev      # dev server with hot-reload
+pixi run -e docs docs-build    # full static build to docs/out/
+pixi run -e docs docs-generate # regenerate API docs only
+```
+
+Each command chains through `docs-install` → `docs-fumapy` automatically, so a
+single command handles all setup. On subsequent runs the dependency steps are
+fast (no-op when already satisfied).
+
+## Manual setup (without pixi)
+
+### Prerequisites
 
 - [Bun](https://bun.sh/) 1.0+ (fast JavaScript runtime and package manager)
 - Python 3.11 (to install `mdfactory` and `fumapy`)
@@ -18,7 +35,7 @@ python3.11 -m pip install -e ..                         # expose the local packa
 python3.11 -m pip install ./node_modules/fumadocs-python
 ```
 
-## Commands
+### Commands
 
 ```bash
 bun run docs:generate  # runs fumapy-generate + converts JSON into MDX
