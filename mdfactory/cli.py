@@ -564,6 +564,12 @@ def simulate_systems(
         bool,
         Parameter(help="Preview plan without executing"),
     ] = False,
+    max_rescue: Annotated[
+        int,
+        Parameter(
+            help="Max rescue tiers for physics failures (0 to disable)",
+        ),
+    ] = 3,
 ):
     """Run GROMACS MD simulations via Parsl.
 
@@ -627,6 +633,7 @@ def simulate_systems(
             stages=stages,
             checkpoint_mode=checkpoint,
             dry_run=dry_run,
+            max_rescue=max_rescue,
         )
     except ValueError as exc:
         logger.error(str(exc))

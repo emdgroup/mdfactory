@@ -198,6 +198,7 @@ def run_stage(
     mdrun_app,
     restart_from_cpt: str = "",
     stage_config: Any = None,
+    mdp_override: str | None = None,
 ) -> "AppFuture":
     """Execute a single GROMACS pipeline stage.
 
@@ -228,6 +229,10 @@ def run_stage(
     stage_config : SlurmExecutorConfig or None, optional
         Per-stage resource config.  Resource hints (thread count, GPU disable)
         are extracted and forwarded to the mdrun bash app.
+    mdp_override : str or None, optional
+        Alternative MDP filename to use instead of ``spec.mdp_file``.
+        Used by the rescue retry system to pass modified MDP files
+        (e.g. ``"em_rescue_t1.mdp"``).
 
     Returns
     -------
@@ -257,7 +262,7 @@ def run_stage(
     grompp_inputs = [prev_future] if prev_future is not None else []
 
     grompp_kwargs: dict[str, Any] = {
-        "mdp_file": spec.mdp_file,
+        "mdp_file": mdp_override if mdp_override else spec.mdp_file,
         "gro_file": spec.gro_in,
         "top_file": "topology.top",
         "tpr_file": spec.tpr_file,

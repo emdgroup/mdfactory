@@ -71,6 +71,7 @@ def run_simulations(
     wait: bool = True,
     dry_run: bool = False,
     checkpoint_mode: str = "auto",
+    max_rescue: int = 3,
 ) -> list[dict]:
     """Orchestrate GROMACS simulations via Parsl.
 
@@ -90,6 +91,10 @@ def run_simulations(
         - "auto": Skip stages with valid outputs (default)
         - "skip": Never re-run completed stages
         - "force": Overwrite all stages
+    max_rescue : int
+        Maximum number of rescue tiers for physics failures in EM/NVT/NPT
+        stages. Each tier halves the step size and doubles nsteps. Set to 0
+        to disable rescue. Default: 3.
 
     Returns
     -------
@@ -180,22 +185,53 @@ def run_simulations(
         mdrun_app = get_mdrun_app()
 
         # 6. Submit all pipelines (embarrassingly parallel)
+        # When rescue is active (max_rescue > 0), each simulation's
+        # pipeline may block internally while waiting for rescue-eligible
+        # stages.  Using ThreadPoolExecutor ensures cross-simulation
+        # parallelism is preserved — one simulation's rescue wait doesn't
+        # block other simulations from being submitted and executing.
+        from concurrent.futures import Future as StdFuture
+        from concurrent.futures import ThreadPoolExecutor
+
         futures = []
+        active_items = []
         for item in work_plan:
             if not item["stages"]:
                 logger.info(f"Skipping {item['hash']} (all stages complete)")
                 continue
+            active_items.append(item)
 
-            # Execute only the needed stages with explicit control
-            pipeline_fut = _execute_stage_list(
-                item["sim_dir"],
-                item["stages"],
-                grompp_app,
-                mdrun_app,
-                stage_restarts=item.get("stage_restarts"),
-                config=config,
-            )
-            futures.append((item["hash"], pipeline_fut))
+        if active_items:
+
+            def _run_pipeline(item):
+                return _execute_stage_list(
+                    item["sim_dir"],
+                    item["stages"],
+                    grompp_app,
+                    mdrun_app,
+                    stage_restarts=item.get("stage_restarts"),
+                    config=config,
+                    max_rescue=max_rescue,
+                )
+
+            with ThreadPoolExecutor() as pool:
+                thread_futs = [
+                    (item["hash"], pool.submit(_run_pipeline, item))
+                    for item in active_items
+                ]
+                for h, tf in thread_futs:
+                    try:
+                        futures.append((h, tf.result()))
+                    except Exception as exc:
+                        # Rescue exhaustion or other pipeline-level failure.
+                        # Wrap in a pre-failed future so _wait_with_progress
+                        # handles it per-simulation (matching pre-rescue
+                        # behavior where individual failures didn't crash
+                        # the batch).
+                        logger.error(f"Pipeline failed for {h}: {exc}")
+                        failed_fut = StdFuture()
+                        failed_fut.set_exception(exc)
+                        futures.append((h, failed_fut))
 
         logger.info(f"Submitted {len(futures)} simulation(s)")
 
@@ -551,11 +587,16 @@ def _execute_stage_list(
     mdrun_app,
     stage_restarts: "dict[str, str] | None" = None,
     config: "ExecutorConfig | None" = None,
+    max_rescue: int = 3,
 ) -> "AppFuture | None":
     """Execute a list of stages with automatic dependency chaining.
 
     Explicitly calls stage functions based on the needed_stages list,
     validating stage ordering and chaining dependencies via inputs=[].
+
+    For rescue-eligible stages (EM, NVT, NPT) with ``max_rescue > 0``,
+    physics failures trigger automatic rescue retry with halved MDP
+    parameters.  See :mod:`mdfactory.orchestration.rescue` for details.
 
     Parameters
     ----------
@@ -577,6 +618,9 @@ def _execute_stage_list(
         provided, per-stage resource overrides are applied via
         :meth:`~mdfactory.orchestration.config.SlurmExecutorConfig.get_stage_config`
         before each stage function call.
+    max_rescue : int
+        Maximum rescue tiers for physics failures in EM/NVT/NPT stages.
+        Set to 0 to disable rescue.
 
     Returns
     -------
@@ -613,23 +657,49 @@ def _execute_stage_list(
     # becomes immediately executable here without further edits to this module.
     # prev_future=None on the first iteration is handled correctly by run_stage
     # for all stages (including non-EM checkpoint resumes).
+    #
+    # Rescue-eligible stages (EM/NVT/NPT) with max_rescue > 0 use the rescue
+    # loop which waits for each stage individually.  Non-rescue stages and
+    # stages with checkpoint restarts chain futures as before.
+    from .mdp import RESCUE_ELIGIBLE_STAGES
+    from .rescue import execute_stage_with_rescue
+
     prev_future = None
     for stage in stages:
         cpt_file = restarts.get(stage, "")
-        # Resolve per-stage resource overrides when a SlurmExecutorConfig is given.
-        # Only inject stage_config kwarg when non-None to avoid polluting mock
-        # assertions in tests that don't exercise per-stage config.
-        stage_cfg = config.get_stage_config(stage) if hasattr(config, "get_stage_config") else None
-        cfg_kwarg = {"stage_config": stage_cfg} if stage_cfg is not None else {}
-        prev_future = run_stage(
-            STAGE_BY_NAME[stage],
-            sim_dir,
-            prev_future,
-            grompp_app,
-            mdrun_app,
-            restart_from_cpt=cpt_file,
-            **cfg_kwarg,
-        )
+
+        # Use rescue loop for eligible stages without checkpoint restart
+        if (
+            max_rescue > 0
+            and stage in RESCUE_ELIGIBLE_STAGES
+            and not cpt_file
+        ):
+            prev_future = execute_stage_with_rescue(
+                sim_dir,
+                stage,
+                prev_future,
+                grompp_app,
+                mdrun_app,
+                max_rescue=max_rescue,
+                config=config,
+            )
+        else:
+            # Standard execution: chain futures without waiting
+            stage_cfg = (
+                config.get_stage_config(stage)
+                if hasattr(config, "get_stage_config")
+                else None
+            )
+            cfg_kwarg = {"stage_config": stage_cfg} if stage_cfg is not None else {}
+            prev_future = run_stage(
+                STAGE_BY_NAME[stage],
+                sim_dir,
+                prev_future,
+                grompp_app,
+                mdrun_app,
+                restart_from_cpt=cpt_file,
+                **cfg_kwarg,
+            )
 
     return prev_future
 

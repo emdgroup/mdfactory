@@ -690,7 +690,7 @@ def test_stage_functions_no_hardcoded_nt():
 
 def test_execute_stage_list_empty():
     """Execute stage list returns None when no stages provided."""
-    result = _execute_stage_list(Path("/tmp/test"), [], None, None)
+    result = _execute_stage_list(Path("/tmp/test"), [], None, None, max_rescue=0)
     assert result is None
 
 
@@ -698,13 +698,13 @@ def test_execute_stage_list_validates_order():
     """Execute stage list validates stages are in dependency order."""
     with pytest.raises(ValueError, match="must be in dependency order"):
         # NPT before NVT is invalid
-        _execute_stage_list(Path("/tmp/test"), ["NPT", "NVT"], None, None)
+        _execute_stage_list(Path("/tmp/test"), ["NPT", "NVT"], None, None, max_rescue=0)
 
 
 def test_execute_stage_list_validates_unknown_stage():
     """Execute stage list rejects unknown stage names."""
     with pytest.raises(ValueError, match="Unknown stage.*Equilibration"):
-        _execute_stage_list(Path("/tmp/test"), ["Equilibration"], None, None)
+        _execute_stage_list(Path("/tmp/test"), ["Equilibration"], None, None, max_rescue=0)
 
 
 @patch("mdfactory.orchestration.simulate.run_stage")
@@ -713,7 +713,7 @@ def test_execute_stage_list_em_only(mock_run_stage):
     mock_future = MagicMock()
     mock_run_stage.return_value = mock_future
 
-    result = _execute_stage_list(Path("/tmp/test"), ["EM"], MagicMock(), MagicMock())
+    result = _execute_stage_list(Path("/tmp/test"), ["EM"], MagicMock(), MagicMock(), max_rescue=0)
 
     mock_run_stage.assert_called_once()
     call_args = mock_run_stage.call_args[0]
@@ -733,7 +733,7 @@ def test_execute_stage_list_em_nvt_chain(mock_run_stage):
     mdrun_app = MagicMock()
     sim_dir = Path("/tmp/test")
 
-    result = _execute_stage_list(sim_dir, ["EM", "NVT"], grompp_app, mdrun_app)
+    result = _execute_stage_list(sim_dir, ["EM", "NVT"], grompp_app, mdrun_app, max_rescue=0)
 
     assert mock_run_stage.call_count == 2
     calls = mock_run_stage.call_args_list
@@ -756,7 +756,9 @@ def test_execute_stage_list_full_pipeline(mock_run_stage):
     mdrun_app = MagicMock()
     sim_dir = Path("/tmp/test")
 
-    result = _execute_stage_list(sim_dir, ["EM", "NVT", "NPT", "Production"], grompp_app, mdrun_app)
+    result = _execute_stage_list(
+        sim_dir, ["EM", "NVT", "NPT", "Production"], grompp_app, mdrun_app, max_rescue=0
+    )
 
     assert mock_run_stage.call_count == 4
     calls = mock_run_stage.call_args_list
@@ -783,7 +785,7 @@ def test_execute_stage_list_partial_pipeline_from_checkpoint(mock_run_stage):
     mdrun_app = MagicMock()
     sim_dir = Path("/tmp/test")
 
-    result = _execute_stage_list(sim_dir, ["NVT", "NPT"], grompp_app, mdrun_app)
+    result = _execute_stage_list(sim_dir, ["NVT", "NPT"], grompp_app, mdrun_app, max_rescue=0)
 
     calls = mock_run_stage.call_args_list
     assert calls[0][0][0].name == "NVT"
@@ -791,6 +793,44 @@ def test_execute_stage_list_partial_pipeline_from_checkpoint(mock_run_stage):
     assert calls[1][0][0].name == "NPT"
     assert calls[1][0][2] is nvt_fut  # chained
     assert result is npt_fut
+
+
+@patch("mdfactory.orchestration.rescue.execute_stage_with_rescue")
+@patch("mdfactory.orchestration.simulate.run_stage")
+def test_execute_stage_list_routes_to_rescue_when_enabled(
+    mock_run_stage, mock_rescue
+):
+    """Rescue-eligible stages dispatch to execute_stage_with_rescue when max_rescue > 0."""
+    rescue_future = MagicMock()
+    mock_rescue.return_value = rescue_future
+    sim_dir = Path("/tmp/test")
+
+    result = _execute_stage_list(
+        sim_dir, ["EM"], MagicMock(), MagicMock(), max_rescue=3
+    )
+
+    mock_rescue.assert_called_once()
+    mock_run_stage.assert_not_called()
+    assert result is rescue_future
+
+
+@patch("mdfactory.orchestration.rescue.execute_stage_with_rescue")
+@patch("mdfactory.orchestration.simulate.run_stage")
+def test_execute_stage_list_production_bypasses_rescue(
+    mock_run_stage, mock_rescue
+):
+    """Production stage uses run_stage even when max_rescue > 0."""
+    prod_future = MagicMock()
+    mock_run_stage.return_value = prod_future
+    sim_dir = Path("/tmp/test")
+
+    result = _execute_stage_list(
+        sim_dir, ["Production"], MagicMock(), MagicMock(), max_rescue=3
+    )
+
+    mock_run_stage.assert_called_once()
+    mock_rescue.assert_not_called()
+    assert result is prod_future
 
 
 @patch("mdfactory.orchestration.simulate.parsl_session")
@@ -1264,6 +1304,7 @@ def test_execute_stage_list_restart_only_for_matching_stage(mock_run_stage):
         MagicMock(),
         MagicMock(),
         stage_restarts={"NPT": "/sim/npt.cpt"},
+        max_rescue=0,
     )
 
     calls = mock_run_stage.call_args_list
@@ -1356,7 +1397,9 @@ def test_execute_stage_list_passes_stage_config_when_slurm(mock_run_stage):
     )
     mock_run_stage.return_value = MagicMock()
 
-    _execute_stage_list(Path("/tmp/test"), ["EM"], MagicMock(), MagicMock(), config=cfg)
+    _execute_stage_list(
+        Path("/tmp/test"), ["EM"], MagicMock(), MagicMock(), config=cfg, max_rescue=0
+    )
 
     mock_run_stage.assert_called_once()
     _, call_kwargs = mock_run_stage.call_args
@@ -1373,7 +1416,8 @@ def test_execute_stage_list_no_stage_config_for_local(mock_run_stage):
     mock_run_stage.return_value = MagicMock()
 
     _execute_stage_list(
-        Path("/tmp/test"), ["EM"], MagicMock(), MagicMock(), config=ExecutorConfig()
+        Path("/tmp/test"), ["EM"], MagicMock(), MagicMock(),
+        config=ExecutorConfig(), max_rescue=0,
     )
 
     _, call_kwargs = mock_run_stage.call_args
