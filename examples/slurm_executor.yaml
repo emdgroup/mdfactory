@@ -1,0 +1,78 @@
+# SLURM executor configuration for mdfactory build/simulate.
+#
+# Generate interactively with:   mdfactory config slurm
+# Use with:                      mdfactory simulate output_dir/ --slurm slurm_executor.yaml
+#                                mdfactory build systems.csv --slurm slurm_executor.yaml
+
+# --- Provider ----------------------------------------------------------------
+# "local" runs on the current machine; "slurm" submits to a SLURM cluster.
+provider: slurm
+
+# --- SLURM account and partition ---------------------------------------------
+# Required. Use `mdfactory config cluster` to discover available options.
+account: my-account
+partition: gpu
+
+# Optional quality-of-service and node constraint.
+# qos: normal
+# constraint: a100
+
+# --- Resource requests -------------------------------------------------------
+# Wall-clock time per SLURM allocation (HH:MM:SS or shorthand like "8h").
+walltime: "8h"
+
+# Nodes per SLURM job.
+nodes: 1
+
+# CPUs per node. Sizes the Parsl worker pool and sets thread counts for mdrun.
+cpus_per_node: 16
+
+# GPU generic resource string (passed as --gres to sbatch).
+gres: "gpu:1"
+
+# Memory per node (passed as --mem to sbatch). Omit to use partition default.
+# mem: "32G"
+
+# --- Parsl tuning ------------------------------------------------------------
+# Max parallel tasks per compute node.
+max_workers_per_node: 1
+
+# Max SLURM allocations Parsl may hold at once.
+max_blocks: 4
+
+# GPU device IDs exposed to each worker via CUDA_VISIBLE_DEVICES.
+# Set to the number of GPUs per node, or list specific device IDs.
+available_accelerators: 1
+
+# Times Parsl retries a failed task before raising an error.
+retries: 3
+
+# --- GROMACS settings --------------------------------------------------------
+# "auto" detects gmx vs gmx_mpi at runtime. Override to force one.
+gmx_binary: auto
+
+# Shell commands run inside every worker before any task (module loads, etc.).
+worker_init: |
+  source ~/.bashrc
+  module load gromacs/2024
+
+# --- Per-stage overrides (optional) ------------------------------------------
+# Override cpus_per_node, gres, or gmx_binary for individual stages.
+# Stage names: EM, NVT, NPT, Production.
+# stage_overrides:
+#   EM:
+#     cpus_per_node: 4
+#     gres: null          # run minimisation on CPU only
+#   Production:
+#     cpus_per_node: 32
+#     gres: "gpu:2"
+
+# --- Advanced (rarely needed) ------------------------------------------------
+# Directory where Parsl writes runinfo logs and monitoring DB.
+# run_dir: ~/.parsl/mdfactory
+
+# Extra raw #SBATCH lines appended to the job script.
+# scheduler_options: "#SBATCH --exclusive"
+
+# Extra flags passed to srun when launching workers.
+# launch_options: "--mpi=pmix"
