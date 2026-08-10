@@ -190,6 +190,7 @@ def run_simulations(
         # stages.  Using ThreadPoolExecutor ensures cross-simulation
         # parallelism is preserved — one simulation's rescue wait doesn't
         # block other simulations from being submitted and executing.
+        from concurrent.futures import Future as StdFuture
         from concurrent.futures import ThreadPoolExecutor
 
         futures = []
@@ -219,7 +220,18 @@ def run_simulations(
                     for item in active_items
                 ]
                 for h, tf in thread_futs:
-                    futures.append((h, tf.result()))
+                    try:
+                        futures.append((h, tf.result()))
+                    except Exception as exc:
+                        # Rescue exhaustion or other pipeline-level failure.
+                        # Wrap in a pre-failed future so _wait_with_progress
+                        # handles it per-simulation (matching pre-rescue
+                        # behavior where individual failures didn't crash
+                        # the batch).
+                        logger.error(f"Pipeline failed for {h}: {exc}")
+                        failed_fut = StdFuture()
+                        failed_fut.set_exception(exc)
+                        futures.append((h, failed_fut))
 
         logger.info(f"Submitted {len(futures)} simulation(s)")
 
