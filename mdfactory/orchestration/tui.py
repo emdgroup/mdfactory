@@ -15,6 +15,7 @@ from pathlib import Path
 
 import yaml
 from rich.console import Console
+from rich.panel import Panel
 
 from mdfactory.orchestration.config import SlurmExecutorConfig
 from mdfactory.performance.cluster import ClusterInfo, Partition, discover_cluster
@@ -245,6 +246,138 @@ def _select_with_custom(
 
 
 # ---------------------------------------------------------------------------
+# Stage override prompts
+# ---------------------------------------------------------------------------
+
+#: Simulation stages that support per-stage resource overrides.
+_STAGES = ("EM", "NVT", "NPT", "Production")
+
+
+def _prompt_stage_overrides(
+    common_cpus: int,
+    common_gres: str | None,
+    common_gmx: str,
+) -> dict[str, dict]:
+    """Prompt the user for per-stage resource overrides.
+
+    When the common configuration includes a GPU (``gres`` is set), an
+    informational panel is displayed explaining that GROMACS energy
+    minimisation cannot use GPU acceleration.
+
+    Parameters
+    ----------
+    common_cpus : int
+        The ``cpus_per_node`` value from the common configuration.
+    common_gres : str or None
+        The ``gres`` value from the common configuration.
+    common_gmx : str
+        The ``gmx_binary`` value from the common configuration.
+
+    Returns
+    -------
+    dict[str, dict]
+        Stage overrides dict ready for ``SlurmExecutorConfig``.
+        Empty dict if the user declines or no deviations are entered.
+
+    Raises
+    ------
+    UserCancelledError
+        If the user cancels any prompt.
+    """
+    questionary = _import_questionary()
+    has_gpu = common_gres is not None
+
+    # --- EM/GPU information panel ---
+    if has_gpu:
+        console.print(
+            Panel(
+                "[bold]GROMACS energy minimisation (EM) does not support GPU acceleration.[/bold]\n"
+                "EM uses steepest-descent/conjugate-gradient integrators which have no GPU\n"
+                "code path. Consider configuring a CPU-only override for the EM stage with\n"
+                "more CPU cores to compensate.",
+                title="ℹ  Stage hint",
+                border_style="blue",
+            )
+        )
+
+    # --- Ask whether to configure overrides ---
+    default_configure = has_gpu
+    configure = questionary.confirm(
+        "Configure per-stage resource overrides?",
+        default=default_configure,
+    ).ask()
+    if configure is None:
+        raise UserCancelledError("Prompt cancelled at: stage overrides confirm")
+    if not configure:
+        return {}
+
+    # --- Select stages to override ---
+    stage_choices = [
+        questionary.Choice(title=stage, value=stage, checked=(stage == "EM" and has_gpu))
+        for stage in _STAGES
+    ]
+    selected_stages = questionary.checkbox(
+        "Select stages to customise:",
+        choices=stage_choices,
+    ).ask()
+    if selected_stages is None:
+        raise UserCancelledError("Prompt cancelled at: stage selection")
+    if not selected_stages:
+        return {}
+
+    # --- Prompt for each selected stage ---
+    stage_overrides: dict[str, dict] = {}
+    for stage in selected_stages:
+        console.print(f"\n  [bold]Configure {stage} stage:[/bold]")
+
+        # Suggest higher CPU count for EM when GPU is the common config
+        em_cpu_default = str(common_cpus * 2) if (stage == "EM" and has_gpu) else str(common_cpus)
+        # Suggest empty gres for EM when GPU is common
+        em_gres_default = "" if (stage == "EM" and has_gpu) else (common_gres or "")
+
+        cpus_input = _require(
+            questionary.text(
+                f"  {stage} — CPUs per node:",
+                default=em_cpu_default,
+            ).ask(),
+            f"{stage} cpus_per_node",
+        )
+        cpus_val = int(cpus_input)
+
+        gres_input = _require(
+            questionary.text(
+                f"  {stage} — GRES (leave empty for CPU-only):",
+                default=em_gres_default,
+            ).ask(),
+            f"{stage} gres",
+        )
+        gres_val: str | None = gres_input.strip() or None
+
+        gmx_input = _require(
+            questionary.text(
+                f"  {stage} — gmx_binary:",
+                default=common_gmx,
+            ).ask(),
+            f"{stage} gmx_binary",
+        )
+        gmx_val = gmx_input.strip()
+
+        # Only store fields that differ from common values
+        overrides: dict = {}
+        if cpus_val != common_cpus:
+            overrides["cpus_per_node"] = cpus_val
+        if gres_val != common_gres:
+            overrides["gres"] = gres_val
+        if gmx_val != common_gmx:
+            overrides["gmx_binary"] = gmx_val
+
+        if overrides:
+            stage_overrides[stage] = overrides
+
+    return stage_overrides
+
+
+# ---------------------------------------------------------------------------
 # Interactive prompts — cluster-assisted
 # ---------------------------------------------------------------------------
 
@@ -410,6 +543,13 @@ def _configure_with_cluster(cluster: ClusterInfo) -> SlurmExecutorConfig:
     )
     constraint: str | None = constraint_input.strip() or None
 
+    # --- Per-stage overrides ---
+    stage_overrides = _prompt_stage_overrides(
+        common_cpus=cpus_per_node,
+        common_gres=gres,
+        common_gmx="auto",
+    )
+
     return SlurmExecutorConfig(
         account=account,
         partition=partition_name,
@@ -421,6 +561,7 @@ def _configure_with_cluster(cluster: ClusterInfo) -> SlurmExecutorConfig:
         constraint=constraint,
         max_blocks=max_blocks,
         worker_init=worker_init,
+        stage_overrides=stage_overrides,
     )
 
 
@@ -484,6 +625,13 @@ def _configure_manual() -> SlurmExecutorConfig:
         "worker_init",
     )
 
+    # --- Per-stage overrides ---
+    stage_overrides = _prompt_stage_overrides(
+        common_cpus=cpus_per_node,
+        common_gres=gres,
+        common_gmx="auto",
+    )
+
     return SlurmExecutorConfig(
         account=account,
         partition=partition,
@@ -494,6 +642,7 @@ def _configure_manual() -> SlurmExecutorConfig:
         qos=qos,
         max_blocks=max_blocks,
         worker_init=worker_init,
+        stage_overrides=stage_overrides,
     )
 
 
@@ -552,6 +701,9 @@ def save_slurm_config_yaml(config: SlurmExecutorConfig, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = config.model_dump(exclude_none=True)
+    # Omit empty stage_overrides for cleaner YAML output
+    if not data.get("stage_overrides"):
+        data.pop("stage_overrides", None)
     with open(path, "w") as fh:
         yaml.dump(data, fh, default_flow_style=False, sort_keys=False)
 
