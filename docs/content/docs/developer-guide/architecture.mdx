@@ -180,7 +180,7 @@ graph TD
 
 - **`config.py`**: Pydantic models for local and SLURM execution. `ExecutorConfig` handles local runs; `SlurmExecutorConfig` adds SLURM-specific fields (account, partition, walltime, gres, per-stage overrides). Both serialize to/from YAML via `from_yaml()` and `model_dump()`.
 - **`session.py`**: `parsl_session()` context manager that owns the Parsl DataFlowKernel lifecycle. On exit it calls `parsl.clear()` and explicitly `scancel`s any lingering SLURM job IDs.
-- **`apps.py`**: Defines `get_build_app()` (python\_app for system building), `get_grompp_app()` and `get_mdrun_app()` (bash\_apps for GROMACS). All conditional logic (GPU, MPI, thread counts, restart flags) is resolved in Python before generating the bash script.
+- **`apps.py`**: Defines `get_build_app()` (python\_app for system building), `get_grompp_app()` and `get_mdrun_app()` (bash\_apps for GROMACS). Nearly all conditional logic (GPU, MPI, thread counts, restart flags) is resolved in Python before generating the bash script — the only permitted runtime branch is a small `if/elif/fi` block for binary detection when `gmx_binary` is set to `auto`.
 - **`stages.py`**: `STAGE_REGISTRY` declares the canonical pipeline (EM → NVT → NPT → Production) as `StageSpec` dataclasses. `run_stage()` is the single generic dispatch function for all stages.
 - **`build.py`** / **`simulate.py`**: Top-level entry points. `build_systems()` submits parallel build tasks; `run_simulations()` chains stages sequentially per simulation with checkpoint detection and trajectory validation.
 - **`tui.py`**: Interactive SLURM configuration wizard using `questionary`. Auto-discovers cluster hardware via `sinfo`/`sacctmgr` and persists the result as a reusable YAML file.
