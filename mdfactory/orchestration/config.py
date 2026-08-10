@@ -98,6 +98,16 @@ class ExecutorConfig(BaseModel):
             "the generated bash script."
         ),
     )
+    max_rescue: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            "Maximum rescue tiers for physics failures (overlapping atoms, "
+            "exploding box, LINCS constraint errors) in EM/NVT/NPT stages. "
+            "Each tier halves the step size and doubles nsteps. "
+            "Set to 0 to disable rescue retry."
+        ),
+    )
 
     @field_validator("run_dir", mode="before")
     @classmethod
