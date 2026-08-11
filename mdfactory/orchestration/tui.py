@@ -249,20 +249,38 @@ def _select_with_custom(
 # Stage override prompts
 # ---------------------------------------------------------------------------
 
-#: Simulation stages that support per-stage resource overrides.
-_STAGES = ("EM", "NVT", "NPT", "Production")
+def _resolve_stages(stages: tuple[str, ...] | None) -> tuple[str, ...]:
+    """Resolve *stages* to a concrete tuple of stage names.
+
+    Parameters
+    ----------
+    stages : tuple[str, ...] or None
+        Explicit stage names, or ``None`` to use the full pipeline from
+        :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY`.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Concrete stage names.
+    """
+    if stages is not None:
+        return stages
+    from mdfactory.orchestration.stages import STAGE_REGISTRY
+
+    return tuple(s.name for s in STAGE_REGISTRY)
 
 
 def _prompt_stage_overrides(
     common_cpus: int,
     common_gres: str | None,
     common_gmx: str,
+    stages: tuple[str, ...],
 ) -> dict[str, dict]:
     """Prompt the user for per-stage resource overrides.
 
-    When the common configuration includes a GPU (``gres`` is set), an
-    informational panel is displayed explaining that GROMACS energy
-    minimisation cannot use GPU acceleration.
+    Only prompts when there are multiple stages *and* per-stage
+    differentiation is meaningful (e.g. GPU selected but EM cannot use
+    it). Skipped entirely when fewer than 2 stages are configured.
 
     Parameters
     ----------
@@ -272,23 +290,32 @@ def _prompt_stage_overrides(
         The ``gres`` value from the common configuration.
     common_gmx : str
         The ``gmx_binary`` value from the common configuration.
+    stages : tuple[str, ...]
+        The stages that will actually run. Empty or single-element
+        tuples cause an early return (no overrides needed).
 
     Returns
     -------
     dict[str, dict]
         Stage overrides dict ready for ``SlurmExecutorConfig``.
-        Empty dict if the user declines or no deviations are entered.
+        Empty dict if the user declines, no deviations are entered,
+        or overrides are not applicable.
 
     Raises
     ------
     UserCancelledError
         If the user cancels any prompt.
     """
+    # No point configuring per-stage overrides for a single-stage workflow
+    if len(stages) < 2:
+        return {}
+
     questionary = _import_questionary()
     has_gpu = common_gres is not None
+    has_em = "EM" in stages
 
     # --- EM/GPU information panel ---
-    if has_gpu:
+    if has_gpu and has_em:
         console.print(
             Panel(
                 "[bold]GROMACS energy minimisation (EM) does not support GPU acceleration.[/bold]\n"
@@ -300,8 +327,8 @@ def _prompt_stage_overrides(
             )
         )
 
-    # --- Ask whether to configure overrides ---
-    default_configure = has_gpu
+    # Only proactively suggest overrides when there's a reason (GPU + EM mismatch)
+    default_configure = has_gpu and has_em
     configure = questionary.confirm(
         "Configure per-stage resource overrides?",
         default=default_configure,
@@ -314,7 +341,7 @@ def _prompt_stage_overrides(
     # --- Select stages to override ---
     stage_choices = [
         questionary.Choice(title=stage, value=stage, checked=(stage == "EM" and has_gpu))
-        for stage in _STAGES
+        for stage in stages
     ]
     selected_stages = questionary.checkbox(
         "Select stages to customise:",
@@ -382,13 +409,23 @@ def _prompt_stage_overrides(
 # ---------------------------------------------------------------------------
 
 
-def _configure_with_cluster(cluster: ClusterInfo) -> SlurmExecutorConfig:
+def _configure_with_cluster(
+    cluster: ClusterInfo,
+    *,
+    stages: tuple[str, ...] | None = None,
+) -> SlurmExecutorConfig:
     """Run the interactive wizard using autodiscovered cluster info.
 
     Parameters
     ----------
     cluster : ClusterInfo
         Cluster information from ``discover_cluster()``.
+    stages : tuple[str, ...] or None, optional
+        The simulation stages that will run. Determines whether per-stage
+        override prompts are shown and which stages are offered. Pass an
+        empty tuple to skip stage-override prompts entirely (e.g. for
+        ``build``). ``None`` (default) uses the full simulation pipeline
+        from :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY`.
 
     Returns
     -------
@@ -544,10 +581,12 @@ def _configure_with_cluster(cluster: ClusterInfo) -> SlurmExecutorConfig:
     constraint: str | None = constraint_input.strip() or None
 
     # --- Per-stage overrides ---
+    resolved_stages = _resolve_stages(stages)
     stage_overrides = _prompt_stage_overrides(
         common_cpus=cpus_per_node,
         common_gres=gres,
         common_gmx="auto",
+        stages=resolved_stages,
     )
 
     return SlurmExecutorConfig(
@@ -570,8 +609,15 @@ def _configure_with_cluster(cluster: ClusterInfo) -> SlurmExecutorConfig:
 # ---------------------------------------------------------------------------
 
 
-def _configure_manual() -> SlurmExecutorConfig:
+def _configure_manual(*, stages: tuple[str, ...] | None = None) -> SlurmExecutorConfig:
     """Run the interactive wizard with manual text entry (no cluster info).
+
+    Parameters
+    ----------
+    stages : tuple[str, ...] or None, optional
+        The simulation stages that will run. Pass an empty tuple to skip
+        stage-override prompts entirely. ``None`` (default) uses the full
+        simulation pipeline.
 
     Returns
     -------
@@ -626,10 +672,12 @@ def _configure_manual() -> SlurmExecutorConfig:
     )
 
     # --- Per-stage overrides ---
+    resolved_stages = _resolve_stages(stages)
     stage_overrides = _prompt_stage_overrides(
         common_cpus=cpus_per_node,
         common_gres=gres,
         common_gmx="auto",
+        stages=resolved_stages,
     )
 
     return SlurmExecutorConfig(
@@ -651,13 +699,26 @@ def _configure_manual() -> SlurmExecutorConfig:
 # ---------------------------------------------------------------------------
 
 
-def configure_slurm_interactive() -> SlurmExecutorConfig:
+def configure_slurm_interactive(
+    *,
+    stages: tuple[str, ...] | None = None,
+) -> SlurmExecutorConfig:
     """Interactive SLURM configuration wizard.
 
     Attempts to autodiscover the SLURM cluster. If discovery succeeds,
     the wizard presents select menus populated with real partitions,
     accounts, and hardware specs. Otherwise it falls back to free-text
     prompts.
+
+    Parameters
+    ----------
+    stages : tuple[str, ...] or None, optional
+        The simulation stages that will run. Controls whether per-stage
+        resource override prompts are shown and which stages are offered.
+        Pass an empty tuple to skip stage-override prompts entirely
+        (e.g. for ``build``). ``None`` (default) uses the full
+        simulation pipeline from
+        :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY`.
 
     Returns
     -------
@@ -678,13 +739,13 @@ def configure_slurm_interactive() -> SlurmExecutorConfig:
             f"✓ Cluster discovered: {len(cluster.partitions)} partitions, "
             f"{len(cluster.accounts)} accounts\n"
         )
-        return _configure_with_cluster(cluster)
+        return _configure_with_cluster(cluster, stages=stages)
 
     console.print("⚠ SLURM not detected (sinfo unavailable). Falling back to manual entry.\n")
     proceed = questionary.confirm("Enter SLURM configuration manually?", default=True).ask()
     if not proceed:
         raise UserCancelledError("User declined manual SLURM configuration.")
-    return _configure_manual()
+    return _configure_manual(stages=stages)
 
 
 def save_slurm_config_yaml(config: SlurmExecutorConfig, path: Path) -> None:

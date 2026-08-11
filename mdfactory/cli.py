@@ -147,7 +147,11 @@ def _prepare_system_directories(
     return dirs, summary_path
 
 
-def _resolve_slurm_flag(slurm: str | None) -> "ExecutorConfig | Path | None":
+def _resolve_slurm_flag(
+    slurm: str | None,
+    *,
+    stages: tuple[str, ...] | None = None,
+) -> "ExecutorConfig | Path | None":
     """Resolve the ``--slurm`` CLI flag to an executor config or YAML path.
 
     Parameters
@@ -156,6 +160,11 @@ def _resolve_slurm_flag(slurm: str | None) -> "ExecutorConfig | Path | None":
         Raw value from the ``--slurm`` flag.  ``"tui"`` launches the
         interactive wizard (which returns a config object directly).
         Any other non-None value is treated as a file path.
+    stages : tuple[str, ...] or None, optional
+        Simulation stages to configure overrides for. Passed through to
+        the TUI wizard. Use an empty tuple for workflows without
+        simulation stages (e.g. ``build``). ``None`` (default) uses the
+        full simulation pipeline.
 
     Returns
     -------
@@ -171,7 +180,7 @@ def _resolve_slurm_flag(slurm: str | None) -> "ExecutorConfig | Path | None":
         from mdfactory.orchestration.tui import UserCancelledError, configure_slurm_interactive
 
         try:
-            return configure_slurm_interactive()
+            return configure_slurm_interactive(stages=stages)
         except UserCancelledError:
             logger.info("SLURM configuration cancelled.")
             sys.exit(0)
@@ -250,7 +259,8 @@ def build_system(
 
     # Resolve --slurm flag: "tui" launches the interactive wizard,
     # anything else is treated as a path to a YAML config file.
-    config: "ExecutorConfig | Path | None" = _resolve_slurm_flag(slurm)
+    # Build has no simulation stages, so skip the stage-override prompts.
+    config: "ExecutorConfig | Path | None" = _resolve_slurm_flag(slurm, stages=())
 
     suffix = input.suffix.lower()
 
@@ -621,7 +631,10 @@ def simulate_systems(
 
     logger.info(f"Found {len(sim_paths)} simulation(s)")
 
-    config = _resolve_slurm_flag(slurm)
+    # Pass the user's --stages selection to the TUI so it only shows
+    # relevant stage-override prompts. None = full pipeline.
+    tui_stages = tuple(stages) if stages else None
+    config = _resolve_slurm_flag(slurm, stages=tui_stages)
     executor_config = _load_executor_config(config)
 
     from mdfactory.orchestration import run_simulations
