@@ -11,6 +11,7 @@ that can be saved as YAML and used with Parsl-based workflows.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import yaml
@@ -66,8 +67,6 @@ def _detect_gromacs_modules() -> list[str]:
         Module names that match GROMACS, e.g. ``["gromacs/2024.3-gpu"]``.
         Empty list if no modules are loaded or the variable is unset.
     """
-    import os
-
     loaded = os.environ.get("LOADEDMODULES", "")
     if not loaded:
         return []
