@@ -1,0 +1,14 @@
+; Energy minimisation — intentionally oversized emstep to trigger crash.
+; emstep = 0.5 is ~50x the normal value (0.01).
+; At this step size, forces push atoms across the box in one iteration,
+; causing LINCS/coordinate constraint failures.
+integrator  = steep
+emtol       = 1000.0
+emstep      = 0.5
+nsteps      = 5000
+nstlist     = 1
+cutoff-scheme = Verlet
+coulombtype = PME
+rcoulomb    = 0.9
+rvdw        = 0.9
+pbc         = xyz
