@@ -128,12 +128,12 @@ def build_systems(
 def _describe_failure(exc: BaseException) -> tuple[str, str]:
     """Extract ``(failure_type, error_detail)`` from a future's exception.
 
-    Parsl surfaces worker errors differently across versions: modern Parsl
-    re-raises the *original* exception (via ``RemoteExceptionWrapper.reraise()``),
-    while older versions wrapped it and exposed the underlying error on
-    ``.e_value``. Unwrap defensively so callers always see the *underlying*
-    error type — letting future retry logic distinguish, e.g., a GROMACS crash
-    (``CalledProcessError``) from an infrastructure failure (OOM / preemption).
+    Parsl surfaces worker errors differently across versions and failure
+    modes: ``DependencyError`` wraps upstream failures (e.g. grompp crash
+    prevents mdrun from launching), ``RemoteExceptionWrapper`` (legacy)
+    stores the original on ``.e_value``, and modern Parsl re-raises
+    directly. Uses :func:`~mdfactory.orchestration.errors._unwrap_parsl_exception`
+    to unwrap defensively so callers always see the *underlying* error type.
 
     Parameters
     ----------
@@ -147,7 +147,9 @@ def _describe_failure(exc: BaseException) -> tuple[str, str]:
         name and its string representation.
 
     """
-    underlying = getattr(exc, "e_value", None) or exc
+    from .errors import _unwrap_parsl_exception
+
+    underlying = _unwrap_parsl_exception(exc)
     return type(underlying).__name__, str(underlying)
 
 

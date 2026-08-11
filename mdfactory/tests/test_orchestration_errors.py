@@ -1,10 +1,11 @@
-# ABOUTME: Tests for GROMACS error classification
+# ABOUTME: Tests for GROMACS error classification and Parsl exception unwrapping
 # ABOUTME: Verifies physics vs infrastructure failure detection
 """Tests for mdfactory.orchestration.errors."""
 
 from mdfactory.orchestration.errors import (
     FailureType,
     _matches_physics_patterns,
+    _unwrap_parsl_exception,
     classify_failure,
 )
 
@@ -120,3 +121,68 @@ class TestClassifyFailure:
         exc = RuntimeError("Process returned non-zero exit code 1")
         result = classify_failure(exc, sim_dir=tmp_path, stage="EM")
         assert result == FailureType.PHYSICS
+
+    def test_unwraps_dependency_error_with_cause(self):
+        """DependencyError (via __cause__) is unwrapped to classify the root cause."""
+        root = RuntimeError("LINCS WARNING: bonds to H are constrained")
+        wrapper = RuntimeError("Dependency failure for task 5")
+        wrapper.__cause__ = root
+        assert classify_failure(wrapper) == FailureType.PHYSICS
+
+    def test_dependency_error_infra_from_root_cause(self):
+        """DependencyError wrapping an infrastructure failure is classified correctly."""
+        root = RuntimeError("slurmstepd: error: Detected 1 oom-kill event")
+        wrapper = RuntimeError("Dependency failure for task 3")
+        wrapper.__cause__ = root
+        assert classify_failure(wrapper) == FailureType.INFRASTRUCTURE
+
+    def test_dependency_error_unknown_root_cause(self):
+        """DependencyError wrapping an unrecognised error yields UNKNOWN."""
+        root = RuntimeError("Neither gmx nor gmx_mpi found in PATH")
+        wrapper = RuntimeError("Dependency failure for task 1")
+        wrapper.__cause__ = root
+        assert classify_failure(wrapper) == FailureType.UNKNOWN
+
+
+class TestUnwrapParslException:
+    """Tests for _unwrap_parsl_exception helper."""
+
+    def test_plain_exception_returned_as_is(self):
+        exc = RuntimeError("simple error")
+        assert _unwrap_parsl_exception(exc) is exc
+
+    def test_unwraps_cause(self):
+        root = ValueError("the real error")
+        wrapper = RuntimeError("Dependency failure for task 5")
+        wrapper.__cause__ = root
+        assert _unwrap_parsl_exception(wrapper) is root
+
+    def test_unwraps_legacy_e_value(self):
+        class LegacyWrapper(Exception):
+            pass
+
+        root = RuntimeError("LINCS WARNING in bonds")
+        wrapper = LegacyWrapper("wrapper message")
+        wrapper.e_value = root
+        assert _unwrap_parsl_exception(wrapper) is root
+
+    def test_cause_takes_precedence_over_e_value(self):
+        """If both __cause__ and .e_value exist, __cause__ wins."""
+        cause_exc = ValueError("from __cause__")
+        e_val_exc = RuntimeError("from e_value")
+        wrapper = RuntimeError("wrapper")
+        wrapper.__cause__ = cause_exc
+        wrapper.e_value = e_val_exc
+        assert _unwrap_parsl_exception(wrapper) is cause_exc
+
+    def test_chained_cause(self):
+        """Deeply nested __cause__ chain — returns the immediate __cause__."""
+        deepest = ValueError("deepest root")
+        middle = RuntimeError("middle")
+        middle.__cause__ = deepest
+        outer = RuntimeError("Dependency failure")
+        outer.__cause__ = middle
+        # Returns the immediate __cause__ (middle), not the deepest.
+        # Parsl's _find_any_root_cause already resolves __cause__ to
+        # the deepest, so this is the expected behaviour.
+        assert _unwrap_parsl_exception(outer) is middle

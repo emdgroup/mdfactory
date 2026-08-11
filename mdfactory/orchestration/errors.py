@@ -36,6 +36,45 @@ _PHYSICS_PATTERNS: list[re.Pattern] = [
 ]
 
 
+def _unwrap_parsl_exception(exc: BaseException) -> BaseException:
+    """Unwrap Parsl exception wrappers to find the root cause.
+
+    Parsl surfaces worker errors differently depending on the failure mode:
+
+    1. **DependencyError** (downstream task failed because an upstream
+       dependency failed): Parsl sets ``exc.__cause__`` to the deepest
+       root-cause exception via ``_find_any_root_cause()``.
+    2. **Legacy RemoteExceptionWrapper**: stores the original exception
+       on ``exc.e_value``.
+    3. **Modern Parsl** (direct re-raise): the exception is already the
+       original — return as-is.
+
+    Uses duck-typing (``__cause__``, ``e_value``) so no Parsl import is
+    needed, and works with any future exception type that follows these
+    conventions.
+
+    Parameters
+    ----------
+    exc : BaseException
+        The exception raised by ``future.result()``.
+
+    Returns
+    -------
+    BaseException
+        The unwrapped root-cause exception.
+
+    """
+    # Case 1: DependencyError / PropagatedException sets __cause__
+    if exc.__cause__ is not None:
+        return exc.__cause__
+    # Case 2: Legacy .e_value wrapper
+    underlying = getattr(exc, "e_value", None)
+    if underlying is not None:
+        return underlying
+    # Case 3: Already the real exception
+    return exc
+
+
 class FailureType(Enum):
     """Classification of a simulation stage failure.
 
@@ -84,8 +123,8 @@ def classify_failure(
         The classified failure type.
 
     """
-    # Unwrap Parsl's exception wrapping (legacy and modern)
-    underlying = getattr(exc, "e_value", None) or exc
+    # Unwrap Parsl's exception wrapping (DependencyError, legacy, modern)
+    underlying = _unwrap_parsl_exception(exc)
     error_text = str(underlying)
 
     # Check the exception message first
