@@ -140,9 +140,7 @@ class TestExecuteStageWithRescue:
 
     @patch("mdfactory.orchestration.rescue.classify_failure")
     @patch("mdfactory.orchestration.rescue.run_stage")
-    def test_rescue_logs_warning_with_tier_and_stage(
-        self, mock_run_stage, mock_classify, sim_dir
-    ):
+    def test_rescue_logs_warning_with_tier_and_stage(self, mock_run_stage, mock_classify, sim_dir):
         """Rescue activation emits WARNING log with tier number and stage name."""
         from loguru import logger
 
@@ -160,9 +158,7 @@ class TestExecuteStageWithRescue:
             format="{message}",
         )
         try:
-            execute_stage_with_rescue(
-                sim_dir, "EM", None, MagicMock(), MagicMock(), max_rescue=3
-            )
+            execute_stage_with_rescue(sim_dir, "EM", None, MagicMock(), MagicMock(), max_rescue=3)
         finally:
             logger.remove(handler_id)
 
@@ -194,9 +190,7 @@ class TestExecuteStageWithRescue:
         # Should raise the original DependencyError (not retry it),
         # since "gmx not found" is UNKNOWN, not PHYSICS.
         with pytest.raises(RuntimeError, match="Dependency failure"):
-            execute_stage_with_rescue(
-                sim_dir, "EM", None, MagicMock(), MagicMock(), max_rescue=3
-            )
+            execute_stage_with_rescue(sim_dir, "EM", None, MagicMock(), MagicMock(), max_rescue=3)
         # Should NOT retry — gmx-not-found is not a physics failure
         assert mock_run_stage.call_count == 1
 

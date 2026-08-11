@@ -459,9 +459,7 @@ def test_describe_failure_unwraps_dependency_error_cause():
     from mdfactory.orchestration.build import _describe_failure
 
     root = ValueError("grompp fatal error: atom types not found")
-    wrapper = RuntimeError(
-        "Dependency failure for task 5. The representative cause is via task 0"
-    )
+    wrapper = RuntimeError("Dependency failure for task 5. The representative cause is via task 0")
     wrapper.__cause__ = root
 
     failure_type, detail = _describe_failure(wrapper)

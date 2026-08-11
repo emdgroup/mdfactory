@@ -216,8 +216,7 @@ def run_simulations(
 
             with ThreadPoolExecutor() as pool:
                 thread_futs = [
-                    (item["hash"], pool.submit(_run_pipeline, item))
-                    for item in active_items
+                    (item["hash"], pool.submit(_run_pipeline, item)) for item in active_items
                 ]
                 for h, tf in thread_futs:
                     try:
@@ -669,11 +668,7 @@ def _execute_stage_list(
         cpt_file = restarts.get(stage, "")
 
         # Use rescue loop for eligible stages without checkpoint restart
-        if (
-            max_rescue > 0
-            and stage in RESCUE_ELIGIBLE_STAGES
-            and not cpt_file
-        ):
+        if max_rescue > 0 and stage in RESCUE_ELIGIBLE_STAGES and not cpt_file:
             prev_future = execute_stage_with_rescue(
                 sim_dir,
                 stage,
@@ -686,9 +681,7 @@ def _execute_stage_list(
         else:
             # Standard execution: chain futures without waiting
             stage_cfg = (
-                config.get_stage_config(stage)
-                if hasattr(config, "get_stage_config")
-                else None
+                config.get_stage_config(stage) if hasattr(config, "get_stage_config") else None
             )
             cfg_kwarg = {"stage_config": stage_cfg} if stage_cfg is not None else {}
             prev_future = run_stage(

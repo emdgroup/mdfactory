@@ -70,11 +70,7 @@ def _detect_gromacs_modules() -> list[str]:
     loaded = os.environ.get("LOADEDMODULES", "")
     if not loaded:
         return []
-    return [
-        mod
-        for mod in loaded.split(":")
-        if mod.lower().startswith(("gromacs", "gmx"))
-    ]
+    return [mod for mod in loaded.split(":") if mod.lower().startswith(("gromacs", "gmx"))]
 
 
 def _default_worker_init() -> str:
@@ -128,6 +124,7 @@ def _detect_gromacs_modules() -> list[str]:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         output = result.stdout + result.stderr
         # Parse module names — typical format: "gromacs/2024.4"
@@ -169,12 +166,8 @@ def _prompt_gromacs_source() -> str:
     # Try to discover modules
     modules = _detect_gromacs_modules()
 
-    console.print(
-        "\n  [yellow]⚠ GROMACS (gmx/gmx_mpi) not found in current PATH.[/yellow]"
-    )
-    console.print(
-        "  Compute workers need GROMACS to run simulations.\n"
-    )
+    console.print("\n  [yellow]⚠ GROMACS (gmx/gmx_mpi) not found in current PATH.[/yellow]")
+    console.print("  Compute workers need GROMACS to run simulations.\n")
 
     _CUSTOM = "Custom command…"
     _SKIP = "Skip (I'll include it in worker_init manually)"
@@ -384,6 +377,7 @@ def _select_with_custom(
 # ---------------------------------------------------------------------------
 # Stage override prompts
 # ---------------------------------------------------------------------------
+
 
 def _resolve_stages(stages: tuple[str, ...] | None) -> tuple[str, ...]:
     """Resolve *stages* to a concrete tuple of stage names.

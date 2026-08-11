@@ -797,17 +797,13 @@ def test_execute_stage_list_partial_pipeline_from_checkpoint(mock_run_stage):
 
 @patch("mdfactory.orchestration.rescue.execute_stage_with_rescue")
 @patch("mdfactory.orchestration.simulate.run_stage")
-def test_execute_stage_list_routes_to_rescue_when_enabled(
-    mock_run_stage, mock_rescue
-):
+def test_execute_stage_list_routes_to_rescue_when_enabled(mock_run_stage, mock_rescue):
     """Rescue-eligible stages dispatch to execute_stage_with_rescue when max_rescue > 0."""
     rescue_future = MagicMock()
     mock_rescue.return_value = rescue_future
     sim_dir = Path("/tmp/test")
 
-    result = _execute_stage_list(
-        sim_dir, ["EM"], MagicMock(), MagicMock(), max_rescue=3
-    )
+    result = _execute_stage_list(sim_dir, ["EM"], MagicMock(), MagicMock(), max_rescue=3)
 
     mock_rescue.assert_called_once()
     mock_run_stage.assert_not_called()
@@ -816,17 +812,13 @@ def test_execute_stage_list_routes_to_rescue_when_enabled(
 
 @patch("mdfactory.orchestration.rescue.execute_stage_with_rescue")
 @patch("mdfactory.orchestration.simulate.run_stage")
-def test_execute_stage_list_production_bypasses_rescue(
-    mock_run_stage, mock_rescue
-):
+def test_execute_stage_list_production_bypasses_rescue(mock_run_stage, mock_rescue):
     """Production stage uses run_stage even when max_rescue > 0."""
     prod_future = MagicMock()
     mock_run_stage.return_value = prod_future
     sim_dir = Path("/tmp/test")
 
-    result = _execute_stage_list(
-        sim_dir, ["Production"], MagicMock(), MagicMock(), max_rescue=3
-    )
+    result = _execute_stage_list(sim_dir, ["Production"], MagicMock(), MagicMock(), max_rescue=3)
 
     mock_run_stage.assert_called_once()
     mock_rescue.assert_not_called()
@@ -1416,8 +1408,12 @@ def test_execute_stage_list_no_stage_config_for_local(mock_run_stage):
     mock_run_stage.return_value = MagicMock()
 
     _execute_stage_list(
-        Path("/tmp/test"), ["EM"], MagicMock(), MagicMock(),
-        config=ExecutorConfig(), max_rescue=0,
+        Path("/tmp/test"),
+        ["EM"],
+        MagicMock(),
+        MagicMock(),
+        config=ExecutorConfig(),
+        max_rescue=0,
     )
 
     _, call_kwargs = mock_run_stage.call_args

@@ -33,8 +33,7 @@ class TestMatchesPhysicsPatterns:
 
     def test_water_molecule_starting_at(self):
         assert _matches_physics_patterns(
-            "step 1000: Water molecule starting at (1.2, 3.4, 5.6) "
-            "cannot be settled"
+            "step 1000: Water molecule starting at (1.2, 3.4, 5.6) cannot be settled"
         )
 
     def test_too_many_lincs_warnings(self):
@@ -48,8 +47,7 @@ class TestMatchesPhysicsPatterns:
 
     def test_perturbed_nonbonded_pairs(self):
         assert _matches_physics_patterns(
-            "There are 42 perturbed non-bonded pair interactions "
-            "beyond the pair-list cutoff"
+            "There are 42 perturbed non-bonded pair interactions beyond the pair-list cutoff"
         )
 
     def test_atoms_too_many_constraints(self):

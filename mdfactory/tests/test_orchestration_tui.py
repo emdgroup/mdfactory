@@ -10,7 +10,6 @@ import yaml
 from mdfactory.orchestration.config import SlurmExecutorConfig
 from mdfactory.orchestration.tui import (
     UserCancelledError,
-    _default_worker_init,
     _detect_gromacs_modules,
     _prompt_stage_overrides,
     _require,
@@ -220,7 +219,9 @@ class TestPromptStageOverrides:
         mock_q.confirm.return_value.ask.return_value = False
 
         result = _prompt_stage_overrides(
-            common_cpus=16, common_gres="gpu:a100:1", common_gmx="auto",
+            common_cpus=16,
+            common_gres="gpu:a100:1",
+            common_gmx="auto",
             stages=self._ALL_STAGES,
         )
         assert result == {}
@@ -235,7 +236,9 @@ class TestPromptStageOverrides:
         mock_q.text.return_value.ask.side_effect = ["32", "", "auto"]
 
         result = _prompt_stage_overrides(
-            common_cpus=16, common_gres="gpu:a100:1", common_gmx="auto",
+            common_cpus=16,
+            common_gres="gpu:a100:1",
+            common_gmx="auto",
             stages=self._ALL_STAGES,
         )
         assert "EM" in result
@@ -261,7 +264,9 @@ class TestPromptStageOverrides:
         ]
 
         result = _prompt_stage_overrides(
-            common_cpus=16, common_gres=None, common_gmx="auto",
+            common_cpus=16,
+            common_gres=None,
+            common_gmx="auto",
             stages=self._ALL_STAGES,
         )
         assert result["EM"] == {"cpus_per_node": 8}
@@ -277,7 +282,9 @@ class TestPromptStageOverrides:
         mock_q.text.return_value.ask.side_effect = ["16", "gpu:a100:1", "auto"]
 
         result = _prompt_stage_overrides(
-            common_cpus=16, common_gres="gpu:a100:1", common_gmx="auto",
+            common_cpus=16,
+            common_gres="gpu:a100:1",
+            common_gmx="auto",
             stages=self._ALL_STAGES,
         )
         # No actual deviations → NVT not in result
@@ -291,7 +298,9 @@ class TestPromptStageOverrides:
         mock_q.checkbox.return_value.ask.return_value = []
 
         result = _prompt_stage_overrides(
-            common_cpus=16, common_gres="gpu:a100:1", common_gmx="auto",
+            common_cpus=16,
+            common_gres="gpu:a100:1",
+            common_gmx="auto",
             stages=self._ALL_STAGES,
         )
         assert result == {}
@@ -304,7 +313,9 @@ class TestPromptStageOverrides:
 
         with pytest.raises(UserCancelledError):
             _prompt_stage_overrides(
-                common_cpus=16, common_gres=None, common_gmx="auto",
+                common_cpus=16,
+                common_gres=None,
+                common_gmx="auto",
                 stages=self._ALL_STAGES,
             )
 
@@ -317,7 +328,9 @@ class TestPromptStageOverrides:
 
         with pytest.raises(UserCancelledError):
             _prompt_stage_overrides(
-                common_cpus=16, common_gres=None, common_gmx="auto",
+                common_cpus=16,
+                common_gres=None,
+                common_gmx="auto",
                 stages=self._ALL_STAGES,
             )
 
@@ -330,7 +343,9 @@ class TestPromptStageOverrides:
         mock_q.text.return_value.ask.side_effect = ["16", "gpu:a100:1", "gmx_mpi"]
 
         result = _prompt_stage_overrides(
-            common_cpus=16, common_gres="gpu:a100:1", common_gmx="auto",
+            common_cpus=16,
+            common_gres="gpu:a100:1",
+            common_gmx="auto",
             stages=self._ALL_STAGES,
         )
         assert result["Production"] == {"gmx_binary": "gmx_mpi"}
@@ -338,7 +353,9 @@ class TestPromptStageOverrides:
     def test_single_stage_skips_overrides(self):
         """A single-stage workflow skips overrides entirely — no prompt."""
         result = _prompt_stage_overrides(
-            common_cpus=16, common_gres="gpu:a100:1", common_gmx="auto",
+            common_cpus=16,
+            common_gres="gpu:a100:1",
+            common_gmx="auto",
             stages=("Production",),
         )
         assert result == {}
@@ -346,7 +363,9 @@ class TestPromptStageOverrides:
     def test_empty_stages_skips_overrides(self):
         """Empty stages (build workflow) skips overrides entirely."""
         result = _prompt_stage_overrides(
-            common_cpus=16, common_gres="gpu:a100:1", common_gmx="auto",
+            common_cpus=16,
+            common_gres="gpu:a100:1",
+            common_gmx="auto",
             stages=(),
         )
         assert result == {}

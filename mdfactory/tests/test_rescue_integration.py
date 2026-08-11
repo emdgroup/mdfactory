@@ -66,6 +66,7 @@ def _find_gmx_topdir() -> Path | None:
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         for line in result.stdout.splitlines():
             if "Data prefix" in line:
@@ -97,10 +98,7 @@ def _detect_forcefield() -> tuple[str, str]:
             return ff_itp, water_itp
 
     available = [d.name for d in topdir.iterdir() if d.suffix == ".ff"]
-    pytest.skip(
-        f"No supported force field found in {topdir}. "
-        f"Available: {available}"
-    )
+    pytest.skip(f"No supported force field found in {topdir}. Available: {available}")
 
 
 def _write_topology(dest: Path, ff_itp: str, water_itp: str) -> None:
@@ -164,6 +162,7 @@ class TestRescueIntegrationNVT:
             capture_output=True,
             text=True,
             timeout=60,
+            check=False,
         )
 
     def _run_grompp(
@@ -173,11 +172,16 @@ class TestRescueIntegrationNVT:
         return self._run_gmx(
             [
                 "grompp",
-                "-f", mdp,
-                "-c", "system.gro",
-                "-p", "topology.top",
-                "-o", tpr,
-                "-maxwarn", "10",
+                "-f",
+                mdp,
+                "-c",
+                "system.gro",
+                "-p",
+                "topology.top",
+                "-o",
+                tpr,
+                "-maxwarn",
+                "10",
             ],
             cwd=sim_dir,
         )
@@ -192,16 +196,12 @@ class TestRescueIntegrationNVT:
     def _run_em(self, sim_dir: Path) -> subprocess.CompletedProcess:
         """Run energy minimisation to prepare a valid starting structure."""
         grompp = self._run_grompp(sim_dir, mdp="em.mdp", tpr="em.tpr")
-        assert grompp.returncode == 0, (
-            f"EM grompp failed: {grompp.stderr}"
-        )
+        assert grompp.returncode == 0, f"EM grompp failed: {grompp.stderr}"
         mdrun = self._run_gmx(
             ["mdrun", "-deffnm", "em", "-ntomp", "1"],
             cwd=sim_dir,
         )
-        assert mdrun.returncode == 0, (
-            f"EM mdrun failed: {mdrun.stderr}"
-        )
+        assert mdrun.returncode == 0, f"EM mdrun failed: {mdrun.stderr}"
         # Use EM output as starting structure for NVT
         shutil.copy(sim_dir / "em.gro", sim_dir / "system.gro")
         return mdrun
@@ -211,8 +211,7 @@ class TestRescueIntegrationNVT:
         self._run_em(sim_dir)
         result = self._run_grompp(sim_dir)
         assert result.returncode == 0, (
-            f"grompp failed — the fixture files may be invalid.\n"
-            f"stderr: {result.stderr}"
+            f"grompp failed — the fixture files may be invalid.\nstderr: {result.stderr}"
         )
         assert (sim_dir / "nvt.tpr").exists()
 
@@ -293,9 +292,7 @@ class TestRescueIntegrationNVT:
                     f.unlink()
 
             grompp = self._run_grompp(sim_dir, mdp=rescue_mdp.name)
-            assert grompp.returncode == 0, (
-                f"grompp failed at tier {tier}: {grompp.stderr}"
-            )
+            assert grompp.returncode == 0, f"grompp failed at tier {tier}: {grompp.stderr}"
 
             mdrun = self._run_mdrun(sim_dir)
             if mdrun.returncode == 0:
@@ -329,6 +326,5 @@ class TestRescueIntegrationNVT:
 
         result = classify_failure(exc, sim_dir=sim_dir, stage="NVT")
         assert result == FailureType.PHYSICS, (
-            f"Expected PHYSICS, got {result}. "
-            f"Error text (last 300 chars): ...{error_text[-300:]}"
+            f"Expected PHYSICS, got {result}. Error text (last 300 chars): ...{error_text[-300:]}"
         )
