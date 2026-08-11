@@ -109,6 +109,29 @@ mdfactory simulate output_dir/ --slurm gpu.yaml --checkpoint skip
 ```
 
 </Accordion>
+<Accordion title="Stale checkpoints after a killed job">
+
+When a SLURM job is cancelled mid-flight, checkpoint files (`.cpt`) may be left behind
+without corresponding trajectory files. Use `--clean` to reset simulation directories to
+post-build state before re-running:
+
+```bash
+# Clean all stages and re-run
+mdfactory simulate output_dir/ --clean --slurm gpu.yaml
+
+# Clean only Production and re-run it
+mdfactory simulate output_dir/ --clean --stages Production --slurm gpu.yaml
+
+# Preview what would be deleted
+mdfactory simulate output_dir/ --clean --dry-run
+```
+
+The `--clean` flag removes simulation outputs (`.tpr`, `.cpt`, `.log`, `.edr`, `.gro`,
+`.xtc`, `.trr`, rescue MDPs, GROMACS backup files) while preserving build inputs
+(`system.pdb`, `topology.top`, template `.mdp` files, `.itp`, `.yaml`). It respects
+the `--stages` filter — only files belonging to requested stages are deleted.
+
+</Accordion>
 <Accordion title="Simulation fails with LINCS or constraint errors">
 
 MDFactory automatically rescues EM, NVT, and NPT stages that fail with physics errors
