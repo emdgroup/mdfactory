@@ -73,6 +73,10 @@ mdfactory config slurm
 
 The wizard auto-discovers your cluster's partitions, accounts, and hardware (GPU types, memory, CPU counts) and walks through resource selection. The result is saved to a YAML file (default: `slurm_executor.yaml`).
 
+<Callout type="info" title="Automatic GROMACS module detection">
+When configuring for `simulate`, the wizard detects GROMACS modules loaded on the login node (from `$LOADEDMODULES`) and includes them in the default `worker_init` suggestion. This ensures compute nodes can find `gmx` / `gmx_mpi` without manual configuration. You can always edit the suggestion before confirming.
+</Callout>
+
 ### Manual configuration
 
 You can also write the YAML file directly. See [`examples/slurm_executor.yaml`](https://github.com/emdgroup/mdfactory/blob/main/examples/slurm_executor.yaml) for an annotated reference with all available fields.

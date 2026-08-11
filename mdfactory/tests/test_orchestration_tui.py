@@ -10,6 +10,8 @@ import yaml
 from mdfactory.orchestration.config import SlurmExecutorConfig
 from mdfactory.orchestration.tui import (
     UserCancelledError,
+    _default_worker_init,
+    _detect_gromacs_modules,
     _prompt_stage_overrides,
     _require,
     configure_slurm_interactive,
@@ -58,6 +60,88 @@ class TestRequire:
     def test_raises_on_none(self):
         with pytest.raises(UserCancelledError):
             _require(None, "test")
+
+
+# ---------------------------------------------------------------------------
+# _detect_gromacs_modules tests
+# ---------------------------------------------------------------------------
+
+
+class TestDetectGromacsModules:
+    """Tests for GROMACS module detection from $LOADEDMODULES."""
+
+    def test_no_env_var(self, monkeypatch):
+        monkeypatch.delenv("LOADEDMODULES", raising=False)
+        assert _detect_gromacs_modules() == []
+
+    def test_empty_env_var(self, monkeypatch):
+        monkeypatch.setenv("LOADEDMODULES", "")
+        assert _detect_gromacs_modules() == []
+
+    def test_single_gromacs_module(self, monkeypatch):
+        monkeypatch.setenv("LOADEDMODULES", "cuda/12.2:gromacs/2024.3-gpu:openmpi/4.1")
+        assert _detect_gromacs_modules() == ["gromacs/2024.3-gpu"]
+
+    def test_multiple_gromacs_modules(self, monkeypatch):
+        monkeypatch.setenv("LOADEDMODULES", "gromacs/2023.1:gromacs/2024.3-gpu")
+        assert _detect_gromacs_modules() == ["gromacs/2023.1", "gromacs/2024.3-gpu"]
+
+    def test_gmx_prefix(self, monkeypatch):
+        monkeypatch.setenv("LOADEDMODULES", "gmx/2024.3:openmpi/4.1")
+        assert _detect_gromacs_modules() == ["gmx/2024.3"]
+
+    def test_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("LOADEDMODULES", "GROMACS/2024.3:Gmx/2023.1")
+        assert _detect_gromacs_modules() == ["GROMACS/2024.3", "Gmx/2023.1"]
+
+    def test_no_gromacs_modules(self, monkeypatch):
+        monkeypatch.setenv("LOADEDMODULES", "cuda/12.2:openmpi/4.1:python/3.11")
+        assert _detect_gromacs_modules() == []
+
+
+# ---------------------------------------------------------------------------
+# _default_worker_init tests
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultWorkerInit:
+    """Tests for _default_worker_init with for_simulate flag."""
+
+    def test_without_simulate_no_modules(self, monkeypatch):
+        """Build context: no module load even if GROMACS modules present."""
+        monkeypatch.setenv("LOADEDMODULES", "gromacs/2024.3-gpu")
+        result = _default_worker_init(for_simulate=False)
+        assert "module load" not in result
+
+    def test_with_simulate_includes_modules(self, monkeypatch, tmp_path):
+        """Simulate context: module load commands are prepended."""
+        monkeypatch.setenv("LOADEDMODULES", "gromacs/2024.3-gpu")
+        # Ensure pixi env detection doesn't interfere
+        monkeypatch.setattr(
+            "mdfactory.orchestration.tui.Path",
+            lambda *a, **kw: tmp_path / "nonexistent",
+        )
+        result = _default_worker_init(for_simulate=True)
+        assert "module load gromacs/2024.3-gpu" in result
+
+    def test_with_simulate_no_modules(self, monkeypatch):
+        """Simulate context but no GROMACS modules → no module load."""
+        monkeypatch.delenv("LOADEDMODULES", raising=False)
+        result = _default_worker_init(for_simulate=True)
+        assert "module load" not in result
+
+    def test_with_simulate_multiple_modules(self, monkeypatch, tmp_path):
+        """Multiple GROMACS modules → multiple module load commands."""
+        monkeypatch.setenv("LOADEDMODULES", "gromacs/2023.1:gromacs/2024.3-gpu")
+        monkeypatch.setattr(
+            "mdfactory.orchestration.tui.Path",
+            lambda *a, **kw: tmp_path / "nonexistent",
+        )
+        result = _default_worker_init(for_simulate=True)
+        assert "module load gromacs/2023.1" in result
+        assert "module load gromacs/2024.3-gpu" in result
+        # Should be semicolon-separated
+        assert "; " in result
 
 
 # ---------------------------------------------------------------------------
