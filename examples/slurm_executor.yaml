@@ -33,6 +33,23 @@ gres: "gpu:1"
 # Memory per node (passed as --mem to sbatch). Omit to use partition default.
 # mem: "32G"
 
+# --- Execution environment ---------------------------------------------------
+# Structured environment setup for compute workers. The wizard auto-detects
+# pixi/conda/venv and GROMACS modules.
+environment:
+  # Module loads (each becomes "module load <name>")
+  modules:
+    - gromacs/2024
+
+  # Python environment activation (first match wins: pixi > conda > venv).
+  # Auto-detected by the wizard; set explicitly for manual configs.
+  pixi_manifest: /path/to/project   # generates pixi shell-hook command
+  # conda_env: gromacs_env           # alternative: conda activate
+  # venv_path: /home/user/.venvs/md  # alternative: source activate
+
+  # Extra shell commands appended after modules + activation.
+  # extra_init: "export OMP_NUM_THREADS=4"
+
 # --- Parsl tuning ------------------------------------------------------------
 # Max parallel tasks per compute node.
 max_workers_per_node: 1
@@ -50,11 +67,6 @@ retries: 3
 # --- GROMACS settings --------------------------------------------------------
 # "auto" detects gmx vs gmx_mpi at runtime. Override to force one.
 gmx_binary: auto
-
-# Shell commands run inside every worker before any task (module loads, etc.).
-worker_init: |
-  source ~/.bashrc
-  module load gromacs/2024
 
 # --- Per-stage overrides (optional) ------------------------------------------
 # Override cpus_per_node, gres, or gmx_binary for individual stages.
@@ -76,3 +88,4 @@ worker_init: |
 
 # Extra flags passed to srun when launching workers.
 # launch_options: "--mpi=pmix"
+

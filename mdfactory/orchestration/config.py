@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
+from mdfactory.orchestration.environment import EnvironmentConfig
 from mdfactory.performance.slurm_config import BaseSlurmConfig
 
 if TYPE_CHECKING:
@@ -47,8 +48,10 @@ class ExecutorConfig(BaseModel):
     ----------
     provider : str
         Execution provider type ("local" or "slurm").
-    worker_init : str
-        Shell commands to run before starting workers (module loads, activation).
+    environment : EnvironmentConfig
+        Structured execution-environment configuration. Defines module
+        loads, Python environment activation, and extra shell init for
+        compute workers.
     working_directory : Path or None
         Working directory for the executor.
     max_workers_per_node : int
@@ -81,7 +84,7 @@ class ExecutorConfig(BaseModel):
     """
 
     provider: Literal["local", "slurm"] = "local"
-    worker_init: str = ""
+    environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     working_directory: Path | None = None
     max_workers_per_node: int = 1
     max_blocks: int = 1
@@ -134,7 +137,7 @@ class ExecutorConfig(BaseModel):
         from parsl.providers import LocalProvider
 
         provider = LocalProvider(
-            worker_init=self.worker_init,
+            worker_init=self.environment.compose_worker_init(),
             min_blocks=0,
             init_blocks=1,
             max_blocks=self.max_blocks,
@@ -223,7 +226,7 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
         which Parsl uses to size the worker pool (roughly ``--ntasks`` /
         cores-per-node) — it is **not** the sbatch ``--cpus-per-task`` flag. For
         MPI+OpenMP workloads (e.g. GROMACS), OpenMP threads-per-rank must be set
-        separately via ``scheduler_options`` / ``worker_init``.
+        separately via ``scheduler_options`` / ``environment.extra_init``.
     gres : str or None
         Generic resource specification (``--gres``), e.g. ``"gpu:l40s:1"``.
     mem : str or None
@@ -258,8 +261,10 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
         gres: "gpu:l40s:1"
         max_blocks: 5
         max_workers_per_node: 1
-        worker_init: |
-          eval "$(pixi shell-hook -e default)"
+        environment:
+          modules:
+            - gromacs/2024.3-gpu
+          pixi_manifest: /path/to/project
 
     """
 
@@ -398,7 +403,7 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
             walltime=self.walltime,
             nodes_per_block=self.nodes,
             cores_per_node=self.cpus_per_node,
-            worker_init=self.worker_init,
+            worker_init=self.environment.compose_worker_init(),
             scheduler_options=scheduler_options,
             min_blocks=0,
             init_blocks=1,

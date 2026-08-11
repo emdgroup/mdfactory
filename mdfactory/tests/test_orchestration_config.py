@@ -8,13 +8,14 @@ import yaml
 pytest.importorskip("parsl", reason="parsl not installed")
 
 from mdfactory.orchestration.config import ExecutorConfig, SlurmExecutorConfig
+from mdfactory.orchestration.environment import EnvironmentConfig
 
 
 def test_executor_config_defaults():
     """ExecutorConfig has sensible defaults."""
     cfg = ExecutorConfig()
     assert cfg.provider == "local"
-    assert cfg.worker_init == ""
+    assert cfg.environment == EnvironmentConfig()
     assert cfg.working_directory is None
     assert cfg.max_workers_per_node == 1
 
@@ -81,7 +82,8 @@ def test_executor_config_from_yaml_slurm(tmp_path):
 
 def test_executor_config_to_parsl_config():
     """to_parsl_config produces a valid Parsl Config for local provider."""
-    cfg = ExecutorConfig(max_workers_per_node=2, worker_init="module load cuda/12.0")
+    env = EnvironmentConfig(modules=["cuda/12.0"])
+    cfg = ExecutorConfig(max_workers_per_node=2, environment=env)
     result = cfg.to_parsl_config()
 
     import parsl
@@ -103,13 +105,28 @@ def test_slurm_executor_config_to_parsl_config():
     assert result.executors[0].label == "slurm"
 
 
-def test_worker_init_propagation():
-    """worker_init string is passed to the SLURM provider."""
-    cfg = SlurmExecutorConfig(account="acc", worker_init="module load cuda/12.0")
+def test_environment_propagation():
+    """environment.compose_worker_init() is passed to the SLURM provider."""
+    env = EnvironmentConfig(modules=["cuda/12.0"])
+    cfg = SlurmExecutorConfig(account="acc", environment=env)
     result = cfg.to_parsl_config()
 
     provider = result.executors[0].provider
     assert "module load cuda/12.0" in provider.worker_init
+
+
+def test_environment_combined_propagation():
+    """Multiple environment fields are composed into the provider worker_init."""
+    env = EnvironmentConfig(
+        modules=["gromacs/2024.3-gpu"],
+        pixi_manifest="/project",
+    )
+    cfg = SlurmExecutorConfig(account="acc", environment=env)
+    result = cfg.to_parsl_config()
+
+    provider = result.executors[0].provider
+    assert "module load gromacs/2024.3-gpu" in provider.worker_init
+    assert "pixi shell-hook" in provider.worker_init
 
 
 def test_gres_in_scheduler_options():
@@ -247,12 +264,13 @@ def test_launch_options_roundtrip_yaml(tmp_path):
 
 def test_config_yaml_roundtrip(tmp_path):
     """Config can be written to YAML and loaded back identically."""
+    env = EnvironmentConfig(modules=["gromacs/2024"], extra_init="source activate env")
     original = SlurmExecutorConfig(
         account="test_account",
         partition="gpu-dev",
         walltime="1:00:00",
         gres="gpu:l40s:1",
-        worker_init="source activate env",
+        environment=env,
     )
     cfg_path = tmp_path / "roundtrip.yaml"
     with open(cfg_path, "w") as f:
@@ -264,7 +282,64 @@ def test_config_yaml_roundtrip(tmp_path):
     assert loaded.partition == original.partition
     assert loaded.walltime == original.walltime
     assert loaded.gres == original.gres
-    assert loaded.worker_init == original.worker_init
+    assert loaded.environment.modules == ["gromacs/2024"]
+    assert loaded.environment.extra_init == "source activate env"
+
+
+# === EnvironmentConfig integration tests ===
+
+
+def test_environment_field_defaults_to_empty():
+    """ExecutorConfig defaults environment to an empty EnvironmentConfig."""
+    cfg = ExecutorConfig()
+    assert cfg.environment == EnvironmentConfig()
+    assert cfg.environment.compose_worker_init() == ""
+
+
+def test_to_parsl_config_uses_environment():
+    """to_parsl_config passes environment-composed string to the provider."""
+    env = EnvironmentConfig(modules=["gromacs/2024.3-gpu"])
+    cfg = ExecutorConfig(environment=env)
+    result = cfg.to_parsl_config()
+    provider = result.executors[0].provider
+    assert "module load gromacs/2024.3-gpu" in provider.worker_init
+
+
+def test_from_yaml_environment_section(tmp_path):
+    """YAML with environment section loads correctly."""
+    cfg_data = {
+        "provider": "slurm",
+        "account": "acc",
+        "environment": {
+            "modules": ["gromacs/2024.3-gpu"],
+            "pixi_manifest": "/project/root",
+            "extra_init": "ulimit -s unlimited",
+        },
+    }
+    cfg_path = tmp_path / "new.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(cfg_data, f)
+
+    loaded = ExecutorConfig.from_yaml(cfg_path)
+    assert isinstance(loaded, SlurmExecutorConfig)
+    assert loaded.environment.modules == ["gromacs/2024.3-gpu"]
+    assert str(loaded.environment.pixi_manifest) == "/project/root"
+    assert loaded.environment.extra_init == "ulimit -s unlimited"
+    worker_init = loaded.environment.compose_worker_init()
+    assert "gromacs" in worker_init
+    assert "pixi shell-hook" in worker_init
+
+
+def test_from_yaml_no_environment(tmp_path):
+    """YAML without environment section gets empty EnvironmentConfig."""
+    cfg_data = {"provider": "slurm", "account": "acc"}
+    cfg_path = tmp_path / "minimal.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(cfg_data, f)
+
+    loaded = ExecutorConfig.from_yaml(cfg_path)
+    assert loaded.environment == EnvironmentConfig()
+    assert loaded.environment.compose_worker_init() == ""
 
 
 # === Decision 6: Per-stage resource config tests ===
