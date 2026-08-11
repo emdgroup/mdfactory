@@ -275,3 +275,58 @@ def test_simulate_systems_max_rescue_default_is_3(mock_slurm, mock_config, mock_
     mock_run.assert_called_once()
     _, kwargs = mock_run.call_args
     assert kwargs["max_rescue"] == 3
+
+
+@patch("mdfactory.orchestration.run_simulations", return_value=_SUCCESS_RESULTS)
+@patch("mdfactory.cli._load_executor_config", return_value=MagicMock(provider="local"))
+@patch("mdfactory.cli._resolve_slurm_flag", return_value=None)
+def test_simulate_systems_forwards_clean_flag(mock_slurm, mock_config, mock_run, tmp_path):
+    """--clean is forwarded from CLI to run_simulations."""
+    from mdfactory.cli import simulate_systems
+
+    sim_dir = tmp_path / "abc123"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").touch()
+
+    simulate_systems(source=tmp_path, clean=True)
+
+    mock_run.assert_called_once()
+    _, kwargs = mock_run.call_args
+    assert kwargs["clean"] is True
+
+
+@patch("mdfactory.orchestration.run_simulations", return_value=_SUCCESS_RESULTS)
+@patch("mdfactory.cli._load_executor_config", return_value=MagicMock(provider="local"))
+@patch("mdfactory.cli._resolve_slurm_flag", return_value=None)
+def test_simulate_systems_clean_default_is_false(mock_slurm, mock_config, mock_run, tmp_path):
+    """--clean defaults to False when not specified."""
+    from mdfactory.cli import simulate_systems
+
+    sim_dir = tmp_path / "abc123"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").touch()
+
+    simulate_systems(source=tmp_path)
+
+    mock_run.assert_called_once()
+    _, kwargs = mock_run.call_args
+    assert kwargs["clean"] is False
+
+
+@patch("mdfactory.orchestration.run_simulations", return_value=[])
+@patch("mdfactory.cli._load_executor_config", return_value=MagicMock(provider="local"))
+@patch("mdfactory.cli._resolve_slurm_flag", return_value=None)
+def test_simulate_systems_clean_with_dry_run(mock_slurm, mock_config, mock_run, tmp_path):
+    """--clean combined with --dry-run passes both flags through."""
+    from mdfactory.cli import simulate_systems
+
+    sim_dir = tmp_path / "abc123"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").touch()
+
+    simulate_systems(source=tmp_path, clean=True, dry_run=True)
+
+    mock_run.assert_called_once()
+    _, kwargs = mock_run.call_args
+    assert kwargs["clean"] is True
+    assert kwargs["dry_run"] is True

@@ -574,6 +574,10 @@ def simulate_systems(
         bool,
         Parameter(help="Preview plan without executing"),
     ] = False,
+    clean: Annotated[
+        bool,
+        Parameter(help="Remove simulation outputs before running"),
+    ] = False,
     max_rescue: Annotated[
         int,
         Parameter(
@@ -608,6 +612,10 @@ def simulate_systems(
     Dry-run preview::
 
         mdfactory simulate output_dir/ --slurm gpu.yaml --dry-run
+
+    Clean before running::
+
+        mdfactory simulate output_dir/ --clean --stages Production
 
     """
     source = source.resolve()
@@ -646,6 +654,7 @@ def simulate_systems(
             stages=stages,
             checkpoint_mode=checkpoint,
             dry_run=dry_run,
+            clean=clean,
             max_rescue=max_rescue,
         )
     except ValueError as exc:
