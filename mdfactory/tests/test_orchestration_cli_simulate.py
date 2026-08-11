@@ -239,3 +239,39 @@ def test_simulate_systems_reports_failed_results(mock_slurm, mock_config, mock_r
         results_arg = mock_report.call_args[0][0]
         failed = [r for r in results_arg if r.get("status") == "failed"]
         assert len(failed) == 1
+
+
+@patch("mdfactory.orchestration.run_simulations", return_value=_SUCCESS_RESULTS)
+@patch("mdfactory.cli._load_executor_config", return_value=MagicMock(provider="local"))
+@patch("mdfactory.cli._resolve_slurm_flag", return_value=None)
+def test_simulate_systems_forwards_max_rescue(mock_slurm, mock_config, mock_run, tmp_path):
+    """--max-rescue value is forwarded from CLI to run_simulations."""
+    from mdfactory.cli import simulate_systems
+
+    sim_dir = tmp_path / "abc123"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").touch()
+
+    simulate_systems(source=tmp_path, max_rescue=2)
+
+    mock_run.assert_called_once()
+    _, kwargs = mock_run.call_args
+    assert kwargs["max_rescue"] == 2
+
+
+@patch("mdfactory.orchestration.run_simulations", return_value=_SUCCESS_RESULTS)
+@patch("mdfactory.cli._load_executor_config", return_value=MagicMock(provider="local"))
+@patch("mdfactory.cli._resolve_slurm_flag", return_value=None)
+def test_simulate_systems_max_rescue_default_is_3(mock_slurm, mock_config, mock_run, tmp_path):
+    """--max-rescue defaults to 3 when not specified."""
+    from mdfactory.cli import simulate_systems
+
+    sim_dir = tmp_path / "abc123"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").touch()
+
+    simulate_systems(source=tmp_path)
+
+    mock_run.assert_called_once()
+    _, kwargs = mock_run.call_args
+    assert kwargs["max_rescue"] == 3
