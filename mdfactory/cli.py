@@ -208,8 +208,11 @@ def _load_executor_config(config: "ExecutorConfig | Path | None") -> "ExecutorCo
 
     """
     if config is None:
-        from mdfactory.orchestration import ExecutorConfig
+        from mdfactory.orchestration import EnvironmentConfig, ExecutorConfig
 
+        global_env = EnvironmentConfig.load_global()
+        if global_env is not None:
+            return ExecutorConfig(environment=global_env)
         return ExecutorConfig()
     if isinstance(config, Path):
         from mdfactory.orchestration import ExecutorConfig
@@ -2379,6 +2382,26 @@ def config_slurm():
         configure_and_save_slurm()
     except UserCancelledError:
         logger.info("SLURM configuration cancelled.")
+
+
+@config_app.command(name="environment")
+def config_environment():
+    """Interactive wizard to configure the execution environment.
+
+    Detects the current Python environment (pixi, conda, or virtualenv),
+    prompts for GROMACS modules and additional init commands, then saves
+    the result to the global config directory.
+
+    The saved environment config is automatically used by SLURM executor
+    YAMLs that don't include an ``environment:`` section, so you only
+    need to configure this once per machine.
+    """
+    from mdfactory.orchestration.tui import UserCancelledError, configure_and_save_environment
+
+    try:
+        configure_and_save_environment()
+    except UserCancelledError:
+        logger.info("Environment configuration cancelled.")
 
 
 @config_app.command(name="cluster")

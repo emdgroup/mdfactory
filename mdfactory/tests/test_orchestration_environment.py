@@ -251,3 +251,85 @@ class TestSerialization:
         assert "pixi_manifest" not in dumped
         assert "venv_path" not in dumped
         assert "conda_env" not in dumped
+
+
+class TestSaveLoadYaml:
+    """Tests for EnvironmentConfig.save_yaml() and from_yaml()."""
+
+    def test_save_and_load_roundtrip(self, tmp_path):
+        """save_yaml then from_yaml produces equivalent config."""
+        env = EnvironmentConfig(
+            modules=["gromacs/2024.3-gpu"],
+            pixi_manifest=Path("/project"),
+            extra_init="export OMP_NUM_THREADS=4",
+        )
+        path = tmp_path / "env.yaml"
+        env.save_yaml(path)
+        loaded = EnvironmentConfig.from_yaml(path)
+        assert loaded.modules == env.modules
+        assert loaded.pixi_manifest == env.pixi_manifest
+        assert loaded.extra_init == env.extra_init
+        assert loaded.compose_worker_init() == env.compose_worker_init()
+
+    def test_save_omits_empty_fields(self, tmp_path):
+        """Empty modules and extra_init are not written to YAML."""
+        env = EnvironmentConfig(conda_env="gromacs")
+        path = tmp_path / "env.yaml"
+        env.save_yaml(path)
+        data = yaml.safe_load(path.read_text())
+        assert "modules" not in data
+        assert "extra_init" not in data
+        assert data["conda_env"] == "gromacs"
+
+    def test_save_creates_parent_directories(self, tmp_path):
+        """save_yaml creates parent directories if they don't exist."""
+        path = tmp_path / "deep" / "nested" / "env.yaml"
+        env = EnvironmentConfig(modules=["mod1"])
+        env.save_yaml(path)
+        assert path.is_file()
+
+    def test_from_yaml_file_not_found(self, tmp_path):
+        """from_yaml raises FileNotFoundError for missing file."""
+        import pytest
+
+        with pytest.raises(FileNotFoundError):
+            EnvironmentConfig.from_yaml(tmp_path / "nope.yaml")
+
+    def test_from_yaml_invalid_content(self, tmp_path):
+        """from_yaml raises ValueError for non-mapping YAML."""
+        import pytest
+
+        path = tmp_path / "bad.yaml"
+        path.write_text("- item1\n- item2\n")
+        with pytest.raises(ValueError, match="empty or invalid"):
+            EnvironmentConfig.from_yaml(path)
+
+
+class TestLoadGlobal:
+    """Tests for EnvironmentConfig.load_global()."""
+
+    def test_returns_none_when_no_file(self, tmp_path, monkeypatch):
+        """load_global returns None when no global config exists."""
+        monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path))
+        result = EnvironmentConfig.load_global()
+        assert result is None
+
+    def test_loads_existing_global_config(self, tmp_path, monkeypatch):
+        """load_global returns config when global file exists."""
+        monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path))
+        env = EnvironmentConfig(
+            modules=["gromacs/2024"],
+            conda_env="md",
+        )
+        env.save_yaml(tmp_path / "environment.yaml")
+        result = EnvironmentConfig.load_global()
+        assert result is not None
+        assert result.modules == ["gromacs/2024"]
+        assert result.conda_env == "md"
+
+    def test_returns_none_on_corrupt_file(self, tmp_path, monkeypatch):
+        """load_global returns None if file cannot be parsed."""
+        monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path))
+        (tmp_path / "environment.yaml").write_text("- not a mapping\n")
+        result = EnvironmentConfig.load_global()
+        assert result is None

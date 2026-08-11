@@ -961,3 +961,43 @@ def configure_and_save_slurm() -> SlurmExecutorConfig:
 
     save_slurm_config_yaml(config, Path(save_path))
     return config
+
+
+def configure_and_save_environment() -> EnvironmentConfig:
+    """Run the environment wizard and save to the global config location.
+
+    Prompts for execution environment (modules, pixi/conda/venv, extra init)
+    and saves the result to ``~/.config/mdfactory/environment.yaml`` (or the
+    platform-appropriate config directory).
+
+    This global environment config is automatically loaded by
+    :meth:`~mdfactory.orchestration.config.ExecutorConfig.from_yaml` when a
+    SLURM executor YAML does not contain an ``environment:`` section.
+
+    Returns
+    -------
+    EnvironmentConfig
+        The environment config that was saved.
+
+    Raises
+    ------
+    UserCancelledError
+        If the user cancels any prompt.
+    """
+    from mdfactory.orchestration.environment import get_global_environment_path
+
+    console.print(Rule("Execution Environment", style="bold green"))
+
+    try:
+        env = _prompt_environment(stages=None)
+    except UserCancelledError:
+        console.print("Configuration cancelled.")
+        raise
+
+    save_path = get_global_environment_path()
+    env.save_yaml(save_path)
+    console.print(f"✓ Environment config written to {save_path}")
+    console.print(
+        "  This will be used automatically when SLURM configs don't include an environment section."
+    )
+    return env

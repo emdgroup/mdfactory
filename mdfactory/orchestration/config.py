@@ -160,6 +160,11 @@ class ExecutorConfig(BaseModel):
     def from_yaml(cls, path: Path) -> "ExecutorConfig | SlurmExecutorConfig":
         """Load executor configuration from a YAML file.
 
+        If the YAML does not contain an ``environment:`` section, the
+        global environment config (from ``mdfactory config environment``)
+        is loaded automatically.  This allows environment setup to be
+        configured once per machine and reused across SLURM configs.
+
         Parameters
         ----------
         path : Path
@@ -177,6 +182,13 @@ class ExecutorConfig(BaseModel):
             raise ValueError(
                 f"Executor config YAML is empty or invalid (expected a mapping): {path}"
             )
+
+        # Auto-load global environment when YAML has no environment section
+        if "environment" not in data:
+            global_env = EnvironmentConfig.load_global()
+            if global_env is not None:
+                data["environment"] = global_env.model_dump(exclude_none=True)
+
         provider = data.get("provider", "local")
         if provider == "slurm":
             return SlurmExecutorConfig(**data)

@@ -330,8 +330,10 @@ def test_from_yaml_environment_section(tmp_path):
     assert "pixi shell-hook" in worker_init
 
 
-def test_from_yaml_no_environment(tmp_path):
-    """YAML without environment section gets empty EnvironmentConfig."""
+def test_from_yaml_no_environment(tmp_path, monkeypatch):
+    """YAML without environment section gets empty EnvironmentConfig when no global exists."""
+    # Point config dir to an empty tmp dir so no global file is found
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path / "config"))
     cfg_data = {"provider": "slurm", "account": "acc"}
     cfg_path = tmp_path / "minimal.yaml"
     with open(cfg_path, "w") as f:
@@ -340,6 +342,54 @@ def test_from_yaml_no_environment(tmp_path):
     loaded = ExecutorConfig.from_yaml(cfg_path)
     assert loaded.environment == EnvironmentConfig()
     assert loaded.environment.compose_worker_init() == ""
+
+
+def test_from_yaml_auto_loads_global_environment(tmp_path, monkeypatch):
+    """YAML without environment section auto-loads from global config."""
+    # Create a global environment config
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(config_dir))
+    global_env = EnvironmentConfig(
+        modules=["gromacs/2024"],
+        conda_env="md",
+    )
+    global_env.save_yaml(config_dir / "environment.yaml")
+
+    # Load a SLURM YAML with no environment section
+    cfg_data = {"provider": "slurm", "account": "acc"}
+    cfg_path = tmp_path / "slurm.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(cfg_data, f)
+
+    loaded = ExecutorConfig.from_yaml(cfg_path)
+    assert loaded.environment.modules == ["gromacs/2024"]
+    assert loaded.environment.conda_env == "md"
+    assert "gromacs/2024" in loaded.environment.compose_worker_init()
+
+
+def test_from_yaml_explicit_environment_overrides_global(tmp_path, monkeypatch):
+    """YAML with explicit environment section ignores global config."""
+    # Create a global environment config
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(config_dir))
+    global_env = EnvironmentConfig(modules=["gromacs/2024"])
+    global_env.save_yaml(config_dir / "environment.yaml")
+
+    # Load a YAML that has its own environment section
+    cfg_data = {
+        "provider": "slurm",
+        "account": "acc",
+        "environment": {"modules": ["gromacs/2025"], "conda_env": "custom"},
+    }
+    cfg_path = tmp_path / "slurm.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(cfg_data, f)
+
+    loaded = ExecutorConfig.from_yaml(cfg_path)
+    assert loaded.environment.modules == ["gromacs/2025"]
+    assert loaded.environment.conda_env == "custom"
 
 
 # === Decision 6: Per-stage resource config tests ===

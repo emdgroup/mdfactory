@@ -10,11 +10,15 @@ are separated from SLURM allocation and per-stage tuning.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
+import yaml
 from pydantic import BaseModel, field_serializer
+
+logger = logging.getLogger(__name__)
 
 
 class EnvironmentConfig(BaseModel):
@@ -167,3 +171,99 @@ class EnvironmentConfig(BaseModel):
         # Apply overrides last
         kwargs.update(overrides)
         return cls(**kwargs)
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save_yaml(self, path: Path) -> None:
+        """Write this environment config to a YAML file.
+
+        Empty/default fields are omitted for cleaner output.
+
+        Parameters
+        ----------
+        path : Path
+            Destination file path.  Parent directories are created if
+            needed.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        data = self.model_dump(exclude_none=True)
+        if not data.get("modules"):
+            data.pop("modules", None)
+        if not data.get("extra_init"):
+            data.pop("extra_init", None)
+
+        with open(path, "w") as fh:
+            yaml.dump(data, fh, default_flow_style=False, sort_keys=False)
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> EnvironmentConfig:
+        """Load environment config from a YAML file.
+
+        Parameters
+        ----------
+        path : Path
+            Path to a YAML file with environment fields.
+
+        Returns
+        -------
+        EnvironmentConfig
+            Parsed environment configuration.
+
+        Raises
+        ------
+        FileNotFoundError
+            If *path* does not exist.
+        ValueError
+            If the file is empty or not a YAML mapping.
+        """
+        path = Path(path)
+        with open(path) as fh:
+            data = yaml.safe_load(fh)
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Environment config YAML is empty or invalid (expected a mapping): {path}"
+            )
+        return cls(**data)
+
+    @classmethod
+    def load_global(cls) -> EnvironmentConfig | None:
+        """Load the global environment config, if it exists.
+
+        The global config lives at
+        ``<config-dir>/environment.yaml`` (see
+        :func:`get_global_environment_path`).
+
+        Returns
+        -------
+        EnvironmentConfig or None
+            The loaded config, or ``None`` if the file does not exist
+            or cannot be parsed.
+        """
+        path = get_global_environment_path()
+        if not path.is_file():
+            return None
+        try:
+            env = cls.from_yaml(path)
+            logger.debug("Loaded global environment config from %s", path)
+            return env
+        except Exception:
+            logger.warning("Failed to load global environment config from %s", path, exc_info=True)
+            return None
+
+
+def get_global_environment_path() -> Path:
+    """Return the path to the global environment config file.
+
+    Returns
+    -------
+    Path
+        ``<user-config-dir>/environment.yaml``, where the config dir
+        is determined by :func:`~mdfactory.settings.get_config_dir`.
+    """
+    from mdfactory.settings import get_config_dir
+
+    return get_config_dir() / "environment.yaml"
