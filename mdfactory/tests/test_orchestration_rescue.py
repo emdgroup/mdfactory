@@ -171,3 +171,50 @@ class TestExecuteStageWithRescue:
         assert len(rescue_warnings) >= 1
         # Check tier info is present
         assert any("tier 1" in w for w in rescue_warnings)
+
+    @patch("mdfactory.orchestration.rescue.run_stage")
+    def test_dependency_error_surfaces_root_cause(self, mock_run_stage, sim_dir):
+        """A grompp DependencyError is unwrapped to classify the real root cause.
+
+        When grompp fails, mdrun receives a DependencyError with __cause__
+        pointing to the actual grompp exception. The rescue loop must
+        unwrap this to classify correctly and show an actionable message.
+        """
+        # Simulate Parsl DependencyError wrapping a grompp failure
+        root_cause = RuntimeError("Neither gmx nor gmx_mpi found in PATH")
+        dependency_error = RuntimeError(
+            "Dependency failure for task 5. The representative cause is via task 0"
+        )
+        dependency_error.__cause__ = root_cause
+
+        fail_future = MagicMock()
+        fail_future.result.side_effect = dependency_error
+        mock_run_stage.return_value = fail_future
+
+        # Should raise the original DependencyError (not retry it),
+        # since "gmx not found" is UNKNOWN, not PHYSICS.
+        with pytest.raises(RuntimeError, match="Dependency failure"):
+            execute_stage_with_rescue(
+                sim_dir, "EM", None, MagicMock(), MagicMock(), max_rescue=3
+            )
+        # Should NOT retry — gmx-not-found is not a physics failure
+        assert mock_run_stage.call_count == 1
+
+    @patch("mdfactory.orchestration.rescue.run_stage")
+    def test_dependency_error_with_physics_root_is_rescued(self, mock_run_stage, sim_dir):
+        """A DependencyError wrapping a physics failure IS rescued."""
+        root_cause = RuntimeError("LINCS WARNING: bonds to H are constrained")
+        dependency_error = RuntimeError("Dependency failure for task 5")
+        dependency_error.__cause__ = root_cause
+
+        fail_future = MagicMock()
+        fail_future.result.side_effect = dependency_error
+        success_future = MagicMock()
+        success_future.result.return_value = None
+        mock_run_stage.side_effect = [fail_future, success_future]
+
+        result = execute_stage_with_rescue(
+            sim_dir, "EM", None, MagicMock(), MagicMock(), max_rescue=3
+        )
+        assert result is success_future
+        assert mock_run_stage.call_count == 2
