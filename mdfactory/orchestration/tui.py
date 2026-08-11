@@ -77,7 +77,7 @@ def _detect_gromacs_modules() -> list[str]:
     ]
 
 
-def _default_worker_init(*, for_simulate: bool = False) -> str:
+def _default_worker_init() -> str:
     """Auto-detect the pixi environment and return an appropriate worker_init.
 
     On HPC clusters with a shared filesystem, workers need the same pixi
@@ -85,43 +85,133 @@ def _default_worker_init(*, for_simulate: bool = False) -> str:
     project root via ``mdfactory.__file__`` and returns a pixi shell-hook
     command if the environment exists.
 
-    When *for_simulate* is ``True``, detected GROMACS modules from
-    ``$LOADEDMODULES`` are prepended so that compute nodes can find
-    ``gmx`` / ``gmx_mpi``.
-
-    Parameters
-    ----------
-    for_simulate : bool, optional
-        If ``True``, prepend ``module load`` commands for any detected
-        GROMACS modules.  Default is ``False`` (build context).
-
     Returns
     -------
     str
-        A shell command to activate the pixi environment (and optionally
-        load GROMACS modules), or ``""`` if no pixi environment is
-        detected.
+        A shell command to activate the pixi environment, or ``""`` if
+        no pixi environment is detected.
     """
-    parts: list[str] = []
-
-    if for_simulate:
-        gromacs_modules = _detect_gromacs_modules()
-        for mod in gromacs_modules:
-            parts.append(f"module load {mod}")
-
     try:
         import mdfactory as _mdf
 
         project_root = Path(_mdf.__file__).parent.parent
         pixi_env = project_root / ".pixi" / "envs" / "default"
         if pixi_env.exists():
-            parts.append(
-                f'eval "$(pixi shell-hook --manifest-path {project_root} -e default)"'
-            )
+            return f'eval "$(pixi shell-hook --manifest-path {project_root} -e default)"'
     except Exception:
         pass
+    return ""
 
-    return "; ".join(parts) if parts else ""
+
+def _detect_gromacs_modules() -> list[str]:
+    """Discover available GROMACS modules via ``module avail``.
+
+    Returns
+    -------
+    list[str]
+        Module names (e.g. ``["gromacs/2024.4", "gromacs/2023.5"]``),
+        or an empty list if ``module`` is not available or no GROMACS
+        modules are found.
+    """
+    import shutil
+    import subprocess
+
+    # module is typically a shell function; invoke via bash -l
+    if shutil.which("modulecmd") is None and shutil.which("module") is None:
+        # Try invoking anyway — module is often a bash function, not a binary
+        pass
+
+    try:
+        # 'module avail' writes to stderr (by design)
+        result = subprocess.run(
+            ["bash", "-lc", "module avail gromacs 2>&1"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        output = result.stdout + result.stderr
+        # Parse module names — typical format: "gromacs/2024.4"
+        modules = []
+        for token in output.split():
+            # Strip trailing markers like "(default)", "(D)", or "*"
+            clean = token.strip().rstrip("*")
+            if "(" in clean:
+                clean = clean[: clean.index("(")]
+            # Match patterns like "gromacs/2024" or "gromacs/2024.4-gpu"
+            if clean.lower().startswith("gromacs/") and "/" in clean:
+                if clean not in modules:
+                    modules.append(clean)
+        return modules
+    except Exception:
+        return []
+
+
+def _prompt_gromacs_source() -> str:
+    """Prompt the user for how to load GROMACS on compute workers.
+
+    Only prompts if ``gmx``/``gmx_mpi`` is not on the current PATH.
+    If GROMACS is already available, returns ``""``.
+
+    Returns
+    -------
+    str
+        A shell command to prepend to worker_init (e.g.
+        ``"module load gromacs/2024.4; "``), or ``""`` if not needed.
+    """
+    import shutil
+
+    # If gmx is already on PATH, no action needed
+    if shutil.which("gmx") or shutil.which("gmx_mpi"):
+        return ""
+
+    questionary = _import_questionary()
+
+    # Try to discover modules
+    modules = _detect_gromacs_modules()
+
+    console.print(
+        "\n  [yellow]⚠ GROMACS (gmx/gmx_mpi) not found in current PATH.[/yellow]"
+    )
+    console.print(
+        "  Compute workers need GROMACS to run simulations.\n"
+    )
+
+    _CUSTOM = "Custom command…"
+    _SKIP = "Skip (I'll include it in worker_init manually)"
+
+    if modules:
+        choices = [*modules, _CUSTOM, _SKIP]
+        selected = _require(
+            questionary.select(
+                "How should workers load GROMACS?",
+                choices=choices,
+                default=modules[0],
+            ).ask(),
+            "gromacs source",
+        )
+    else:
+        # No modules found — offer manual entry or skip
+        selected = _require(
+            questionary.select(
+                "How should workers load GROMACS?",
+                choices=[_CUSTOM, _SKIP],
+            ).ask(),
+            "gromacs source",
+        )
+
+    if selected == _SKIP:
+        return ""
+    elif selected == _CUSTOM:
+        cmd = _require(
+            questionary.text(
+                "Command to make GROMACS available (e.g. 'module load gromacs/2024'):",
+            ).ask(),
+            "gromacs command",
+        )
+        return f"{cmd.strip()}; " if cmd.strip() else ""
+    else:
+        # User selected a module
+        return f"module load {selected}; "
 
 
 class UserCancelledError(Exception):
@@ -594,8 +684,9 @@ def _configure_with_cluster(
         )
     )
 
-    # --- Worker init ---
-    default_init = _default_worker_init(for_simulate=stages is None or len(stages) > 0)
+    # --- GROMACS detection + Worker init ---
+    gmx_prefix = _prompt_gromacs_source() if stages != () else ""
+    default_init = gmx_prefix + _default_worker_init()
     worker_init = _require(
         questionary.text(
             "Worker init script (activates environment on compute nodes):",
@@ -708,7 +799,8 @@ def _configure_manual(*, stages: tuple[str, ...] | None = None) -> SlurmExecutor
         )
     )
 
-    default_init = _default_worker_init(for_simulate=stages is None or len(stages) > 0)
+    gmx_prefix = _prompt_gromacs_source() if stages != () else ""
+    default_init = gmx_prefix + _default_worker_init()
     worker_init = _require(
         questionary.text(
             "Worker init script (activates environment on compute nodes):",

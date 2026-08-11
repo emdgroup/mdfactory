@@ -68,80 +68,46 @@ class TestRequire:
 
 
 class TestDetectGromacsModules:
-    """Tests for GROMACS module detection from $LOADEDMODULES."""
+    """Tests for GROMACS module detection via ``module avail``."""
 
-    def test_no_env_var(self, monkeypatch):
-        monkeypatch.delenv("LOADEDMODULES", raising=False)
-        assert _detect_gromacs_modules() == []
-
-    def test_empty_env_var(self, monkeypatch):
-        monkeypatch.setenv("LOADEDMODULES", "")
-        assert _detect_gromacs_modules() == []
-
-    def test_single_gromacs_module(self, monkeypatch):
-        monkeypatch.setenv("LOADEDMODULES", "cuda/12.2:gromacs/2024.3-gpu:openmpi/4.1")
-        assert _detect_gromacs_modules() == ["gromacs/2024.3-gpu"]
-
-    def test_multiple_gromacs_modules(self, monkeypatch):
-        monkeypatch.setenv("LOADEDMODULES", "gromacs/2023.1:gromacs/2024.3-gpu")
-        assert _detect_gromacs_modules() == ["gromacs/2023.1", "gromacs/2024.3-gpu"]
-
-    def test_gmx_prefix(self, monkeypatch):
-        monkeypatch.setenv("LOADEDMODULES", "gmx/2024.3:openmpi/4.1")
-        assert _detect_gromacs_modules() == ["gmx/2024.3"]
-
-    def test_case_insensitive(self, monkeypatch):
-        monkeypatch.setenv("LOADEDMODULES", "GROMACS/2024.3:Gmx/2023.1")
-        assert _detect_gromacs_modules() == ["GROMACS/2024.3", "Gmx/2023.1"]
-
-    def test_no_gromacs_modules(self, monkeypatch):
-        monkeypatch.setenv("LOADEDMODULES", "cuda/12.2:openmpi/4.1:python/3.11")
-        assert _detect_gromacs_modules() == []
-
-
-# ---------------------------------------------------------------------------
-# _default_worker_init tests
-# ---------------------------------------------------------------------------
-
-
-class TestDefaultWorkerInit:
-    """Tests for _default_worker_init with for_simulate flag."""
-
-    def test_without_simulate_no_modules(self, monkeypatch):
-        """Build context: no module load even if GROMACS modules present."""
-        monkeypatch.setenv("LOADEDMODULES", "gromacs/2024.3-gpu")
-        result = _default_worker_init(for_simulate=False)
-        assert "module load" not in result
-
-    def test_with_simulate_includes_modules(self, monkeypatch, tmp_path):
-        """Simulate context: module load commands are prepended."""
-        monkeypatch.setenv("LOADEDMODULES", "gromacs/2024.3-gpu")
-        # Ensure pixi env detection doesn't interfere
-        monkeypatch.setattr(
-            "mdfactory.orchestration.tui.Path",
-            lambda *a, **kw: tmp_path / "nonexistent",
+    def test_parses_gromacs_modules(self, monkeypatch):
+        """Standard 'module avail gromacs' output is parsed correctly."""
+        fake_output = (
+            "---- /usr/share/modules ----\n"
+            "gromacs/2023.5  gromacs/2024.4(default)  gromacs/2024.4-gpu\n"
         )
-        result = _default_worker_init(for_simulate=True)
-        assert "module load gromacs/2024.3-gpu" in result
-
-    def test_with_simulate_no_modules(self, monkeypatch):
-        """Simulate context but no GROMACS modules → no module load."""
-        monkeypatch.delenv("LOADEDMODULES", raising=False)
-        result = _default_worker_init(for_simulate=True)
-        assert "module load" not in result
-
-    def test_with_simulate_multiple_modules(self, monkeypatch, tmp_path):
-        """Multiple GROMACS modules → multiple module load commands."""
-        monkeypatch.setenv("LOADEDMODULES", "gromacs/2023.1:gromacs/2024.3-gpu")
         monkeypatch.setattr(
-            "mdfactory.orchestration.tui.Path",
-            lambda *a, **kw: tmp_path / "nonexistent",
+            "subprocess.run",
+            lambda *a, **kw: type("R", (), {"stdout": fake_output, "stderr": ""})(),
         )
-        result = _default_worker_init(for_simulate=True)
-        assert "module load gromacs/2023.1" in result
-        assert "module load gromacs/2024.3-gpu" in result
-        # Should be semicolon-separated
-        assert "; " in result
+        result = _detect_gromacs_modules()
+        assert "gromacs/2023.5" in result
+        assert "gromacs/2024.4" in result
+        assert "gromacs/2024.4-gpu" in result
+
+    def test_no_modules_available(self, monkeypatch):
+        """Empty output from module avail returns empty list."""
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **kw: type("R", (), {"stdout": "", "stderr": ""})(),
+        )
+        assert _detect_gromacs_modules() == []
+
+    def test_subprocess_failure(self, monkeypatch):
+        """Subprocess error returns empty list gracefully."""
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **kw: (_ for _ in ()).throw(OSError("no bash")),
+        )
+        assert _detect_gromacs_modules() == []
+
+    def test_non_gromacs_modules_ignored(self, monkeypatch):
+        """Modules that don't start with gromacs/ are ignored."""
+        fake_output = "cuda/12.2  openmpi/4.1  python/3.11\n"
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **kw: type("R", (), {"stdout": fake_output, "stderr": ""})(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -152,9 +118,10 @@ class TestDefaultWorkerInit:
 class TestConfigureManualFallback:
     """When discover_cluster returns None, wizard uses manual entry."""
 
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_source", return_value="")
     @patch("mdfactory.orchestration.tui.discover_cluster", return_value=None)
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_configure_manual_fallback(self, mock_iq, _discover):
+    def test_configure_manual_fallback(self, mock_iq, _discover, _gmx):
         mock_q = mock_iq.return_value
         # confirm prompts: proceed with manual? → True, stage overrides? → False
         mock_q.confirm.return_value.ask.side_effect = [True, False]
@@ -185,9 +152,10 @@ class TestConfigureManualFallback:
 class TestConfigureWithCluster:
     """When cluster is discovered, wizard uses select menus."""
 
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_source", return_value="")
     @patch("mdfactory.orchestration.tui.discover_cluster")
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_configure_with_cluster(self, mock_iq, mock_discover):
+    def test_configure_with_cluster(self, mock_iq, mock_discover, _gmx):
         mock_q = mock_iq.return_value
         mock_discover.return_value = _make_cluster()
 
@@ -387,9 +355,10 @@ class TestPromptStageOverrides:
 class TestStageOverridesIntegration:
     """Tests that stage overrides flow through the full wizard paths."""
 
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_source", return_value="")
     @patch("mdfactory.orchestration.tui.discover_cluster", return_value=None)
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_stage_overrides_manual_path(self, mock_iq, _discover):
+    def test_stage_overrides_manual_path(self, mock_iq, _discover, _gmx):
         """Manual fallback path produces config with stage overrides."""
         mock_q = mock_iq.return_value
         # confirm: proceed with manual → True, stage overrides → True
@@ -418,9 +387,10 @@ class TestStageOverridesIntegration:
             "EM": {"cpus_per_node": 32, "gres": None},
         }
 
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_source", return_value="")
     @patch("mdfactory.orchestration.tui.discover_cluster")
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_stage_overrides_cluster_path(self, mock_iq, mock_discover):
+    def test_stage_overrides_cluster_path(self, mock_iq, mock_discover, _gmx):
         """Cluster-assisted path produces config with stage overrides."""
         mock_q = mock_iq.return_value
         mock_discover.return_value = _make_cluster()
