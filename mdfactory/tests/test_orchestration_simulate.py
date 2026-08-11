@@ -1845,3 +1845,283 @@ def test_extract_resource_hints_divides_by_max_workers():
     hints = _extract_resource_hints(cfg)
 
     assert hints.ntasks == 6  # 12 // 2
+
+
+# --- clean_simulation_outputs tests ---
+
+
+def _populate_sim_dir(sim_dir):
+    """Create a fake simulation directory with build inputs and all stage outputs."""
+    # Build inputs (must be preserved)
+    (sim_dir / "system.pdb").write_bytes(b"pdb")
+    (sim_dir / "topology.top").write_bytes(b"top")
+    (sim_dir / "em.mdp").write_bytes(b"mdp")
+    (sim_dir / "nvt.mdp").write_bytes(b"mdp")
+    (sim_dir / "npt.mdp").write_bytes(b"mdp")
+    (sim_dir / "md.mdp").write_bytes(b"mdp")
+    (sim_dir / "posres.itp").write_bytes(b"itp")
+    (sim_dir / "config.yaml").write_bytes(b"yaml")
+
+    # Simulation outputs per stage
+    for deffnm in ("min", "nvt", "npt", "prod"):
+        for ext in ("tpr", "cpt", "log", "edr"):
+            (sim_dir / f"{deffnm}.{ext}").write_bytes(b"x")
+
+    # Structure outputs (EM/NVT/NPT)
+    for deffnm in ("min", "nvt", "npt"):
+        (sim_dir / f"{deffnm}.gro").write_bytes(b"x")
+
+    # Trajectory outputs (Production)
+    (sim_dir / "prod.xtc").write_bytes(b"x")
+    (sim_dir / "prod.trr").write_bytes(b"x")
+
+    # Rescue MDPs
+    (sim_dir / "em_rescue_t1.mdp").write_bytes(b"x")
+    (sim_dir / "em_rescue_t2.mdp").write_bytes(b"x")
+    (sim_dir / "nvt_rescue_t1.mdp").write_bytes(b"x")
+
+    # GROMACS backup files
+    (sim_dir / "#min.tpr.1#").write_bytes(b"x")
+    (sim_dir / "#prod.xtc.1#").write_bytes(b"x")
+
+    # grompp output
+    (sim_dir / "mdout.mdp").write_bytes(b"x")
+
+
+def test_clean_simulation_outputs_all_stages(tmp_path):
+    """All stage outputs removed; build inputs preserved."""
+    from mdfactory.orchestration.simulate import clean_simulation_outputs
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    _populate_sim_dir(sim_dir)
+
+    all_stages = ["EM", "NVT", "NPT", "Production"]
+    deleted = clean_simulation_outputs(sim_dir, all_stages)
+
+    # Build inputs must survive
+    assert (sim_dir / "system.pdb").exists()
+    assert (sim_dir / "topology.top").exists()
+    assert (sim_dir / "em.mdp").exists()
+    assert (sim_dir / "nvt.mdp").exists()
+    assert (sim_dir / "npt.mdp").exists()
+    assert (sim_dir / "md.mdp").exists()
+    assert (sim_dir / "posres.itp").exists()
+    assert (sim_dir / "config.yaml").exists()
+
+    # Simulation outputs must be gone
+    for deffnm in ("min", "nvt", "npt", "prod"):
+        for ext in ("tpr", "cpt", "log", "edr"):
+            assert not (sim_dir / f"{deffnm}.{ext}").exists()
+
+    for deffnm in ("min", "nvt", "npt"):
+        assert not (sim_dir / f"{deffnm}.gro").exists()
+
+    assert not (sim_dir / "prod.xtc").exists()
+    assert not (sim_dir / "prod.trr").exists()
+
+    # Rescue MDPs and backups must be gone
+    assert not (sim_dir / "em_rescue_t1.mdp").exists()
+    assert not (sim_dir / "em_rescue_t2.mdp").exists()
+    assert not (sim_dir / "nvt_rescue_t1.mdp").exists()
+    assert not (sim_dir / "#min.tpr.1#").exists()
+    assert not (sim_dir / "#prod.xtc.1#").exists()
+    assert not (sim_dir / "mdout.mdp").exists()
+
+    assert len(deleted) > 0
+
+
+def test_clean_simulation_outputs_filtered_stages(tmp_path):
+    """Clean only Production: prod.* removed; min/nvt/npt files preserved."""
+    from mdfactory.orchestration.simulate import clean_simulation_outputs
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    _populate_sim_dir(sim_dir)
+
+    deleted = clean_simulation_outputs(sim_dir, ["Production"])
+
+    # Production outputs must be gone
+    assert not (sim_dir / "prod.tpr").exists()
+    assert not (sim_dir / "prod.cpt").exists()
+    assert not (sim_dir / "prod.log").exists()
+    assert not (sim_dir / "prod.edr").exists()
+    assert not (sim_dir / "prod.xtc").exists()
+    assert not (sim_dir / "prod.trr").exists()
+    assert not (sim_dir / "#prod.xtc.1#").exists()
+
+    # Other stages must survive
+    assert (sim_dir / "min.tpr").exists()
+    assert (sim_dir / "min.gro").exists()
+    assert (sim_dir / "nvt.cpt").exists()
+    assert (sim_dir / "npt.gro").exists()
+
+    # EM rescue MDPs must survive (not in requested stages)
+    assert (sim_dir / "em_rescue_t1.mdp").exists()
+    assert (sim_dir / "em_rescue_t2.mdp").exists()
+
+    # mdout.mdp is always deleted
+    assert not (sim_dir / "mdout.mdp").exists()
+
+    deleted_names = {p.name for p in deleted}
+    assert "prod.tpr" in deleted_names
+    assert "min.tpr" not in deleted_names
+
+
+def test_clean_simulation_outputs_missing_files(tmp_path):
+    """Partial outputs (some absent) — no errors, remaining files cleaned."""
+    from mdfactory.orchestration.simulate import clean_simulation_outputs
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    # Only create a subset of files
+    (sim_dir / "system.pdb").write_bytes(b"pdb")
+    (sim_dir / "topology.top").write_bytes(b"top")
+    (sim_dir / "min.tpr").write_bytes(b"x")
+    # min.cpt, min.gro, etc. intentionally absent
+
+    deleted = clean_simulation_outputs(sim_dir, ["EM"])
+
+    assert not (sim_dir / "min.tpr").exists()
+    assert (sim_dir / "system.pdb").exists()
+    assert len(deleted) == 1
+
+
+def test_clean_simulation_outputs_preserves_build_inputs(tmp_path):
+    """Explicitly verify all build input types survive cleaning."""
+    from mdfactory.orchestration.simulate import clean_simulation_outputs
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    _populate_sim_dir(sim_dir)
+
+    clean_simulation_outputs(sim_dir, ["EM", "NVT", "NPT", "Production"])
+
+    # Every build input must still exist
+    for name in (
+        "system.pdb",
+        "topology.top",
+        "em.mdp",
+        "nvt.mdp",
+        "npt.mdp",
+        "md.mdp",
+        "posres.itp",
+        "config.yaml",
+    ):
+        assert (sim_dir / name).exists(), f"{name} should be preserved"
+
+
+def test_clean_simulation_outputs_dry_run(tmp_path):
+    """Dry-run mode returns files that would be deleted but doesn't remove them."""
+    from mdfactory.orchestration.simulate import clean_simulation_outputs
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    _populate_sim_dir(sim_dir)
+
+    would_delete = clean_simulation_outputs(
+        sim_dir, ["EM", "NVT", "NPT", "Production"], dry_run=True
+    )
+
+    # Files must still exist
+    assert (sim_dir / "min.tpr").exists()
+    assert (sim_dir / "prod.xtc").exists()
+    assert (sim_dir / "mdout.mdp").exists()
+
+    # But the return value should list them
+    assert len(would_delete) > 0
+    deleted_names = {p.name for p in would_delete}
+    assert "min.tpr" in deleted_names
+    assert "prod.xtc" in deleted_names
+
+
+# --- _detect_stage_state trajectory stale-cpt fix tests ---
+
+
+def test_detect_stage_state_trajectory_stale_cpt(tmp_path):
+    """Production with cpt+tpr but no trajectory → not_started (stale-cpt fix)."""
+    from mdfactory.orchestration.simulate import _detect_stage_state
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    (sim_dir / "prod.cpt").write_bytes(b"x")
+    (sim_dir / "prod.tpr").write_bytes(b"x")
+    # prod.xtc / prod.trr intentionally absent
+
+    state = _detect_stage_state(sim_dir, "Production", "auto")
+
+    assert state["status"] == "not_started"
+    assert state["restart"] is False
+    assert state["cpt_file"] is None
+
+
+def test_detect_stage_state_structure_partial_cpt_unchanged(tmp_path):
+    """EM with cpt+tpr but no gro → still partial (structure stages unchanged)."""
+    from mdfactory.orchestration.simulate import _detect_stage_state
+
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    (sim_dir / "min.cpt").write_bytes(b"x")
+    (sim_dir / "min.tpr").write_bytes(b"x")
+    # min.gro intentionally absent
+
+    state = _detect_stage_state(sim_dir, "EM", "auto")
+
+    assert state["status"] == "partial"
+    assert state["restart"] is True
+    assert state["cpt_file"] == sim_dir / "min.cpt"
+
+
+# --- run_simulations clean integration tests ---
+
+
+@patch("mdfactory.orchestration.simulate.parsl_session")
+@patch("mdfactory.orchestration.simulate._execute_stage_list")
+def test_run_simulations_clean_deletes_before_checkpoint_detection(
+    mock_execute, mock_session, tmp_path
+):
+    """run_simulations(clean=True) deletes outputs then detects all stages needed."""
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    _populate_sim_dir(sim_dir)
+
+    mock_future = MagicMock()
+    mock_future.done.return_value = True
+    mock_future.result.return_value = {"status": "success"}
+    mock_execute.return_value = mock_future
+    mock_session.return_value.__enter__.return_value = MagicMock()
+
+    config = ExecutorConfig()
+    run_simulations([sim_dir], config, clean=True)
+
+    # Verify files were actually deleted before execution
+    assert not (sim_dir / "min.tpr").exists()
+    assert not (sim_dir / "prod.xtc").exists()
+    assert not (sim_dir / "mdout.mdp").exists()
+    # Build inputs preserved
+    assert (sim_dir / "system.pdb").exists()
+    assert (sim_dir / "topology.top").exists()
+
+    # All stages should have been submitted (clean removed all outputs)
+    mock_execute.assert_called_once()
+    stages_arg = mock_execute.call_args[0][1]
+    assert set(stages_arg) == {"EM", "NVT", "NPT", "Production"}
+
+
+def test_run_simulations_clean_dry_run_preserves_files(tmp_path):
+    """run_simulations(clean=True, dry_run=True) previews without removing files."""
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    _populate_sim_dir(sim_dir)
+
+    config = ExecutorConfig()
+    results = run_simulations([sim_dir], config, clean=True, dry_run=True)
+
+    # dry_run=True propagates to clean_simulation_outputs — files NOT deleted
+    assert (sim_dir / "min.gro").exists()
+    assert (sim_dir / "min.tpr").exists()
+    assert (sim_dir / "prod.xtc").exists()
+
+    # Still returns a work plan (dry-run shows what would run)
+    plan_items = [r for r in results if "sim_dir" in r]
+    assert len(plan_items) == 1

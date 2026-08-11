@@ -70,6 +70,7 @@ def run_simulations(
     stages: list[str] | None = None,
     wait: bool = True,
     dry_run: bool = False,
+    clean: bool = False,
     checkpoint_mode: str = "auto",
     max_rescue: int = 3,
 ) -> list[dict]:
@@ -87,6 +88,11 @@ def run_simulations(
         Wait for completion (default: True).
     dry_run : bool
         Preview plan without executing (default: False).
+    clean : bool
+        Remove simulation outputs before running (default: False).
+        Respects ``stages`` filter — only files belonging to requested
+        stages are deleted.  Combined with ``dry_run``, previews what
+        would be deleted without acting.
     checkpoint_mode : str
         - "auto": Skip stages with valid outputs (default)
         - "skip": Never re-run completed stages
@@ -147,6 +153,20 @@ def run_simulations(
         logger.warning("No simulation directories have complete builds. Nothing to run.")
         return skipped_results
     sim_paths = ready_paths
+
+    # 1b. Clean outputs (if requested) before checkpoint detection.
+    if clean:
+        for sim_dir in sim_paths:
+            deleted = clean_simulation_outputs(sim_dir, stages, dry_run=dry_run)
+            if dry_run and deleted:
+                logger.info(
+                    f"Would delete {len(deleted)} file(s) from {sim_dir.name}: "
+                    + ", ".join(p.name for p in deleted)
+                )
+        if dry_run:
+            # After previewing deletions, still show the dry-run execution plan
+            # (which will report all stages as needed since nothing was deleted).
+            pass
 
     # 2. Checkpoint detection (includes restart info for -cpi -append support)
     work_plan = []
@@ -276,6 +296,81 @@ def _missing_build_files(sim_dir: Path, stages: list[str]) -> list[str]:
     """
     required = ["system.pdb", "topology.top"] + [STAGE_BY_NAME[s].mdp_file for s in stages]
     return [f for f in required if not (sim_dir / f).exists()]
+
+
+def clean_simulation_outputs(
+    sim_dir: Path,
+    stages: list[str],
+    *,
+    dry_run: bool = False,
+) -> list[Path]:
+    """Remove simulation outputs for the given stages, preserving build inputs.
+
+    Derives deletable files from :data:`STAGE_BY_NAME` (tpr, cpt, log, edr,
+    gro, trr, xtc) plus ``mdout.mdp``, rescue-tier MDPs, and GROMACS backup
+    files (``#*#``).
+
+    Parameters
+    ----------
+    sim_dir : Path
+        Simulation directory.
+    stages : list[str]
+        Stage names whose outputs should be removed.
+    dry_run : bool
+        If ``True``, collect and return the list of files that *would* be
+        deleted without actually removing them.
+
+    Returns
+    -------
+    list[Path]
+        Paths that were deleted (or would be deleted in dry-run mode).
+
+    """
+    to_delete: list[Path] = []
+
+    for stage_name in stages:
+        spec = STAGE_BY_NAME[stage_name]
+        deffnm = spec.deffnm
+
+        # Named output files: tpr, cpt, log, edr
+        for ext in ("tpr", "cpt", "log", "edr"):
+            to_delete.append(sim_dir / f"{deffnm}.{ext}")
+
+        # Structure output (EM/NVT/NPT)
+        if spec.gro_out:
+            to_delete.append(sim_dir / spec.gro_out)
+
+        # Trajectory outputs (Production)
+        for traj in spec.traj_files:
+            to_delete.append(sim_dir / traj)
+
+        # Rescue-tier MDPs (e.g. em_rescue_t1.mdp, em_rescue_t2.mdp)
+        mdp_stem = spec.mdp_file.rsplit(".", 1)[0]
+        to_delete.extend(sim_dir.glob(f"{mdp_stem}_rescue_t*.mdp"))
+
+        # GROMACS backup files (#deffnm.*#)
+        to_delete.extend(sim_dir.glob(f"#{deffnm}.*#"))
+
+    # mdout.mdp — grompp output, always regenerated
+    to_delete.append(sim_dir / "mdout.mdp")
+
+    # Deduplicate (glob results may overlap with named files) and filter to
+    # files that actually exist.
+    seen: set[Path] = set()
+    existing: list[Path] = []
+    for p in to_delete:
+        if p not in seen and p.exists():
+            seen.add(p)
+            existing.append(p)
+
+    if not dry_run:
+        for p in existing:
+            p.unlink()
+            logger.debug(f"Deleted {p}")
+        if existing:
+            logger.info(f"Cleaned {len(existing)} file(s) from {sim_dir.name}")
+
+    return existing
 
 
 def _validate_simulation_dir(sim_dir: Path, stages: list[str]) -> None:
@@ -495,6 +590,11 @@ def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
 
     # Check partial progress (checkpoint exists, output doesn't).
     if cpt_file.exists() and tpr_file.exists():
+        if spec.traj_files:
+            # Trajectory stage (Production): stale checkpoint without a
+            # trajectory file cannot use -append — GROMACS would crash.
+            # Treat as not_started so grompp+mdrun run from scratch.
+            return {"status": "not_started", "cpt_file": None, "restart": False}
         return {"status": "partial", "cpt_file": cpt_file, "restart": True}
 
     return {"status": "not_started", "cpt_file": None, "restart": False}

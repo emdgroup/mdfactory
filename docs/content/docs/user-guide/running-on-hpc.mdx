@@ -205,6 +205,14 @@ Simulations automatically resume from checkpoints. If a job is interrupted, re-r
 mdfactory simulate results/ --slurm slurm_executor.yaml --checkpoint auto
 ```
 
+If a job was killed mid-flight and left stale checkpoints (e.g. `.cpt` files without matching trajectory files), use `--clean` to reset before re-running:
+
+```bash
+mdfactory simulate results/ --clean --slurm slurm_executor.yaml
+```
+
+This removes simulation outputs while preserving build inputs. Use `--clean --dry-run` to preview what would be deleted. The `--stages` filter is respected — `--clean --stages Production` only cleans Production files.
+
 ## Submit analyses with submitit
 
 For a full walkthrough of running analyses, see the
