@@ -11,6 +11,7 @@ from mdfactory.orchestration.config import SlurmExecutorConfig
 from mdfactory.orchestration.tui import (
     UserCancelledError,
     _detect_gromacs_modules,
+    _prompt_environment,
     _prompt_stage_overrides,
     _require,
     configure_slurm_interactive,
@@ -455,6 +456,68 @@ class TestStageOverridesIntegration:
         assert cfg.stage_overrides == {
             "EM": {"cpus_per_node": 32, "gres": None},
         }
+
+
+# ---------------------------------------------------------------------------
+# _prompt_environment tests
+# ---------------------------------------------------------------------------
+
+
+class TestPromptEnvironment:
+    """Tests for the _prompt_environment helper."""
+
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_stages_empty_skips_gromacs_prompts(self, mock_iq, mock_detect, mock_gmx):
+        """build workflow (stages=()) skips GROMACS module prompts."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        mock_detect.return_value = EnvironmentConfig()
+        mock_q = mock_iq.return_value
+        # extra_init prompt
+        mock_q.text.return_value.ask.return_value = ""
+
+        result = _prompt_environment(stages=())
+
+        mock_gmx.assert_not_called()
+        assert result.modules == []
+
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_stages_none_calls_gromacs_prompts(self, mock_iq, mock_detect, mock_gmx):
+        """simulate workflow (stages=None) does prompt for GROMACS modules."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        mock_detect.return_value = EnvironmentConfig()
+        mock_gmx.return_value = ["gromacs/2024.4"]
+        mock_q = mock_iq.return_value
+        # extra_init prompt
+        mock_q.text.return_value.ask.return_value = ""
+
+        result = _prompt_environment(stages=None)
+
+        mock_gmx.assert_called_once()
+        assert result.modules == ["gromacs/2024.4"]
+
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_detected_pixi_flows_through(self, mock_iq, mock_detect, mock_gmx):
+        """Auto-detected pixi_manifest is preserved in returned config."""
+        from pathlib import Path
+
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        mock_detect.return_value = EnvironmentConfig(pixi_manifest=Path("/project"))
+        mock_gmx.return_value = []
+        mock_q = mock_iq.return_value
+        mock_q.text.return_value.ask.return_value = ""
+
+        result = _prompt_environment(stages=None)
+
+        assert result.pixi_manifest == Path("/project")
 
 
 # ---------------------------------------------------------------------------
