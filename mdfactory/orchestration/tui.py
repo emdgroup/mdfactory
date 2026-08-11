@@ -52,7 +52,33 @@ def _import_questionary():
     return questionary
 
 
-def _default_worker_init() -> str:
+def _detect_gromacs_modules() -> list[str]:
+    """Detect loaded GROMACS modules from ``$LOADEDMODULES``.
+
+    The ``LOADEDMODULES`` environment variable is a colon-separated list
+    of currently loaded modules (set by the ``module`` system on HPC
+    clusters).  This function returns module names that look like
+    GROMACS (case-insensitive prefix match on ``gromacs`` or ``gmx``).
+
+    Returns
+    -------
+    list[str]
+        Module names that match GROMACS, e.g. ``["gromacs/2024.3-gpu"]``.
+        Empty list if no modules are loaded or the variable is unset.
+    """
+    import os
+
+    loaded = os.environ.get("LOADEDMODULES", "")
+    if not loaded:
+        return []
+    return [
+        mod
+        for mod in loaded.split(":")
+        if mod.lower().startswith(("gromacs", "gmx"))
+    ]
+
+
+def _default_worker_init(*, for_simulate: bool = False) -> str:
     """Auto-detect the pixi environment and return an appropriate worker_init.
 
     On HPC clusters with a shared filesystem, workers need the same pixi
@@ -60,22 +86,43 @@ def _default_worker_init() -> str:
     project root via ``mdfactory.__file__`` and returns a pixi shell-hook
     command if the environment exists.
 
+    When *for_simulate* is ``True``, detected GROMACS modules from
+    ``$LOADEDMODULES`` are prepended so that compute nodes can find
+    ``gmx`` / ``gmx_mpi``.
+
+    Parameters
+    ----------
+    for_simulate : bool, optional
+        If ``True``, prepend ``module load`` commands for any detected
+        GROMACS modules.  Default is ``False`` (build context).
+
     Returns
     -------
     str
-        A shell command to activate the pixi environment, or ``""`` if
-        no pixi environment is detected.
+        A shell command to activate the pixi environment (and optionally
+        load GROMACS modules), or ``""`` if no pixi environment is
+        detected.
     """
+    parts: list[str] = []
+
+    if for_simulate:
+        gromacs_modules = _detect_gromacs_modules()
+        for mod in gromacs_modules:
+            parts.append(f"module load {mod}")
+
     try:
         import mdfactory as _mdf
 
         project_root = Path(_mdf.__file__).parent.parent
         pixi_env = project_root / ".pixi" / "envs" / "default"
         if pixi_env.exists():
-            return f'eval "$(pixi shell-hook --manifest-path {project_root} -e default)"'
+            parts.append(
+                f'eval "$(pixi shell-hook --manifest-path {project_root} -e default)"'
+            )
     except Exception:
         pass
-    return ""
+
+    return "; ".join(parts) if parts else ""
 
 
 class UserCancelledError(Exception):
@@ -549,7 +596,7 @@ def _configure_with_cluster(
     )
 
     # --- Worker init ---
-    default_init = _default_worker_init()
+    default_init = _default_worker_init(for_simulate=stages is None or len(stages) > 0)
     worker_init = _require(
         questionary.text(
             "Worker init script (activates environment on compute nodes):",
@@ -662,7 +709,7 @@ def _configure_manual(*, stages: tuple[str, ...] | None = None) -> SlurmExecutor
         )
     )
 
-    default_init = _default_worker_init()
+    default_init = _default_worker_init(for_simulate=stages is None or len(stages) > 0)
     worker_init = _require(
         questionary.text(
             "Worker init script (activates environment on compute nodes):",
