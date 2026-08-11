@@ -2066,3 +2066,58 @@ def test_detect_stage_state_structure_partial_cpt_unchanged(tmp_path):
     assert state["status"] == "partial"
     assert state["restart"] is True
     assert state["cpt_file"] == sim_dir / "min.cpt"
+
+
+# --- run_simulations clean integration tests ---
+
+
+@patch("mdfactory.orchestration.simulate.parsl_session")
+@patch("mdfactory.orchestration.simulate._execute_stage_list")
+def test_run_simulations_clean_deletes_before_checkpoint_detection(
+    mock_execute, mock_session, tmp_path
+):
+    """run_simulations(clean=True) deletes outputs then detects all stages needed."""
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    _populate_sim_dir(sim_dir)
+
+    mock_future = MagicMock()
+    mock_future.done.return_value = True
+    mock_future.result.return_value = {"status": "success"}
+    mock_execute.return_value = mock_future
+    mock_session.return_value.__enter__.return_value = MagicMock()
+
+    config = ExecutorConfig()
+    run_simulations([sim_dir], config, clean=True)
+
+    # Verify files were actually deleted before execution
+    assert not (sim_dir / "min.tpr").exists()
+    assert not (sim_dir / "prod.xtc").exists()
+    assert not (sim_dir / "mdout.mdp").exists()
+    # Build inputs preserved
+    assert (sim_dir / "system.pdb").exists()
+    assert (sim_dir / "topology.top").exists()
+
+    # All stages should have been submitted (clean removed all outputs)
+    mock_execute.assert_called_once()
+    stages_arg = mock_execute.call_args[0][1]
+    assert set(stages_arg) == {"EM", "NVT", "NPT", "Production"}
+
+
+def test_run_simulations_clean_dry_run_preserves_files(tmp_path):
+    """run_simulations(clean=True, dry_run=True) previews without removing files."""
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    _populate_sim_dir(sim_dir)
+
+    config = ExecutorConfig()
+    results = run_simulations([sim_dir], config, clean=True, dry_run=True)
+
+    # dry_run=True propagates to clean_simulation_outputs — files NOT deleted
+    assert (sim_dir / "min.gro").exists()
+    assert (sim_dir / "min.tpr").exists()
+    assert (sim_dir / "prod.xtc").exists()
+
+    # Still returns a work plan (dry-run shows what would run)
+    plan_items = [r for r in results if "sim_dir" in r]
+    assert len(plan_items) == 1
