@@ -27,6 +27,7 @@ _PHYSICS_PATTERNS: list[re.Pattern] = [
         r"step \d+.*: Water molecule starting at",
         r"Too many LINCS warnings",
         r"can not continue",
+        r"can not be settled",
         r"force .+ is not finite",
         r"Abnorm(al termination|al end| of program)",
         r"There are \d+ perturbed non-bonded pair interactions",
