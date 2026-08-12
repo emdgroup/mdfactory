@@ -228,9 +228,10 @@ def test_log_dry_run_plan_format(mock_sim_dir):
     assert result == work_plan
 
 
+@patch("mdfactory.orchestration.progress.display_stage_progress")
 @patch("mdfactory.orchestration.simulate.parsl_session")
 @patch("mdfactory.orchestration.simulate._execute_stage_list")
-def test_parallel_submission(mock_execute, mock_session, tmp_path):
+def test_parallel_submission(mock_execute, mock_session, mock_display, tmp_path):
     """Multiple simulations submit in parallel."""
     # Create 10 mock simulations
     sim_dirs = []
@@ -825,9 +826,10 @@ def test_execute_stage_list_production_bypasses_rescue(mock_run_stage, mock_resc
     assert result is prod_future
 
 
+@patch("mdfactory.orchestration.progress.display_stage_progress")
 @patch("mdfactory.orchestration.simulate.parsl_session")
 @patch("mdfactory.orchestration.simulate._execute_stage_list")
-def test_run_simulations_uses_execute_stage_list(mock_execute, mock_session, mock_sim_dir):
+def test_run_simulations_uses_execute_stage_list(mock_execute, mock_session, mock_display, mock_sim_dir):
     """run_simulations dispatcher now uses _execute_stage_list."""
     mock_future = MagicMock()
     mock_future.done.return_value = True
@@ -2075,10 +2077,11 @@ def test_detect_stage_state_structure_partial_cpt_unchanged(tmp_path):
 # --- run_simulations clean integration tests ---
 
 
+@patch("mdfactory.orchestration.progress.display_stage_progress")
 @patch("mdfactory.orchestration.simulate.parsl_session")
 @patch("mdfactory.orchestration.simulate._execute_stage_list")
 def test_run_simulations_clean_deletes_before_checkpoint_detection(
-    mock_execute, mock_session, tmp_path
+    mock_execute, mock_session, mock_display, tmp_path
 ):
     """run_simulations(clean=True) deletes outputs then detects all stages needed."""
     sim_dir = tmp_path / "sim"

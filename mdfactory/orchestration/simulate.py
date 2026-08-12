@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from .apps import get_grompp_app, get_mdrun_app
-from .build import _wait_with_progress
 from .session import parsl_session
 from .stages import (
     STAGE_BY_NAME,
@@ -34,6 +33,7 @@ if TYPE_CHECKING:
     from parsl import AppFuture
 
     from .config import ExecutorConfig
+    from .progress import StageProgressTracker
 
 
 def _bash_result_to_dict(raw: object, sim_hash: str) -> dict:
@@ -199,31 +199,31 @@ def run_simulations(
             # Validate first stage has required inputs
             _validate_stage_prerequisites(item["sim_dir"], item["stages"][0])
 
-    # 5. Parsl session
+    # 5. Filter active items (stages still needed)
+    active_items = []
+    for item in work_plan:
+        if not item["stages"]:
+            logger.info(f"Skipping {item['hash']} (all stages complete)")
+            continue
+        active_items.append(item)
+
+    if not active_items:
+        logger.info("All simulations already complete.")
+        return skipped_results
+
+    # 6. Parsl session
     with parsl_session(config) as session:
         grompp_app = get_grompp_app()
         mdrun_app = get_mdrun_app()
 
-        # 6. Submit all pipelines (embarrassingly parallel)
-        # When rescue is active (max_rescue > 0), each simulation's
-        # pipeline may block internally while waiting for rescue-eligible
-        # stages.  Using ThreadPoolExecutor ensures cross-simulation
-        # parallelism is preserved — one simulation's rescue wait doesn't
-        # block other simulations from being submitted and executing.
-        from concurrent.futures import Future as StdFuture
-        from concurrent.futures import ThreadPoolExecutor
+        # wait=False: legacy path returning raw futures (no progress display)
+        if not wait:
+            from concurrent.futures import Future as StdFuture
+            from concurrent.futures import ThreadPoolExecutor
 
-        futures = []
-        active_items = []
-        for item in work_plan:
-            if not item["stages"]:
-                logger.info(f"Skipping {item['hash']} (all stages complete)")
-                continue
-            active_items.append(item)
+            futures: list[tuple[str, object]] = []
 
-        if active_items:
-
-            def _run_pipeline(item):
+            def _run_pipeline_nowait(item):
                 return _execute_stage_list(
                     item["sim_dir"],
                     item["stages"],
@@ -236,25 +236,19 @@ def run_simulations(
 
             with ThreadPoolExecutor() as pool:
                 thread_futs = [
-                    (item["hash"], pool.submit(_run_pipeline, item)) for item in active_items
+                    (item["hash"], pool.submit(_run_pipeline_nowait, item))
+                    for item in active_items
                 ]
                 for h, tf in thread_futs:
                     try:
                         futures.append((h, tf.result()))
                     except Exception as exc:
-                        # Rescue exhaustion or other pipeline-level failure.
-                        # Wrap in a pre-failed future so _wait_with_progress
-                        # handles it per-simulation (matching pre-rescue
-                        # behavior where individual failures didn't crash
-                        # the batch).
                         logger.error(f"Pipeline failed for {h}: {exc}")
                         failed_fut = StdFuture()
                         failed_fut.set_exception(exc)
                         futures.append((h, failed_fut))
 
-        logger.info(f"Submitted {len(futures)} simulation(s)")
-
-        if not wait:
+            logger.info(f"Submitted {len(futures)} simulation(s)")
             logger.warning(
                 "Returning raw AppFuture objects — futures resolve to None (bash_app exit), "
                 "not status dicts.  Caller must call parsl.clear() when done."
@@ -262,16 +256,80 @@ def run_simulations(
             session.detach()
             return [fut for _, fut in futures]
 
-        # 7. Wait with progress UI (reuse from build.py)
-        hashes = [h for h, _ in futures]
-        parsl_futures = [fut for _, fut in futures]
-        run_results = _wait_with_progress(
-            parsl_futures,
-            hashes=hashes,
-            label="Simulations",
-            result_transform=_bash_result_to_dict,
-        )
-        # Prepend skipped-build entries so succeeded + failed + skipped == requested
+        # 7. wait=True: tracked execution with per-stage progress display
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        from .build import _describe_failure
+        from .progress import StageProgressTracker, display_stage_progress
+
+        all_hashes = [item["hash"] for item in active_items]
+        tracker = StageProgressTracker(stages=stages, sim_hashes=all_hashes)
+
+        # Pre-mark stages already completed by checkpoint detection
+        for item in active_items:
+            for stage in stages:
+                if stage not in item["stages"]:
+                    tracker.mark_succeeded(stage, item["hash"])
+
+        def _run_pipeline(item):
+            sim_hash = item["hash"]
+            try:
+                final_future = _execute_stage_list(
+                    item["sim_dir"],
+                    item["stages"],
+                    grompp_app,
+                    mdrun_app,
+                    stage_restarts=item.get("stage_restarts"),
+                    config=config,
+                    max_rescue=max_rescue,
+                    tracker=tracker,
+                )
+                # Wait for the terminal future (Production) to collect its result
+                if final_future is not None:
+                    try:
+                        raw = final_future.result()
+                        result = _bash_result_to_dict(raw, sim_hash)
+                    except Exception as exc:
+                        failure_type, error_detail = _describe_failure(exc)
+                        result = {
+                            "hash": sim_hash,
+                            "status": "failed",
+                            "error": error_detail,
+                            "failure_type": failure_type,
+                            "error_detail": error_detail,
+                        }
+                else:
+                    result = {"hash": sim_hash, "status": "success"}
+                tracker.store_result(sim_hash, result)
+            except Exception as exc:
+                failure_type, error_detail = _describe_failure(exc)
+                tracker.store_result(sim_hash, {
+                    "hash": sim_hash,
+                    "status": "failed",
+                    "error": error_detail,
+                    "failure_type": failure_type,
+                    "error_detail": error_detail,
+                })
+
+        logger.info(f"Submitted {len(active_items)} simulation(s)")
+
+        # Launch worker threads without blocking the main thread
+        pool = ThreadPoolExecutor()
+        thread_futures = [pool.submit(_run_pipeline, item) for item in active_items]
+        pool.shutdown(wait=False)
+
+        # Main thread: display progress until all stages complete
+        display_stage_progress(tracker)
+
+        # Ensure all worker threads have finished (no-op in normal usage
+        # since display blocks until all_done, but needed for test mocks)
+        from concurrent.futures import wait as futures_wait
+
+        futures_wait(thread_futures)
+
+        # Collect results
+        run_results = tracker.collect_results()
         return skipped_results + run_results
 
 
@@ -687,6 +745,7 @@ def _execute_stage_list(
     stage_restarts: "dict[str, str] | None" = None,
     config: "ExecutorConfig | None" = None,
     max_rescue: int = 3,
+    tracker: "StageProgressTracker | None" = None,
 ) -> "AppFuture | None":
     """Execute a list of stages with automatic dependency chaining.
 
@@ -720,6 +779,10 @@ def _execute_stage_list(
     max_rescue : int
         Maximum rescue tiers for physics failures in EM/NVT/NPT stages.
         Set to 0 to disable rescue.
+    tracker : StageProgressTracker or None, optional
+        Thread-safe progress tracker.  When provided, each stage is reported
+        as running/succeeded/failed.  On failure, remaining stages are marked
+        skipped.
 
     Returns
     -------
@@ -736,6 +799,7 @@ def _execute_stage_list(
         return None
 
     restarts = stage_restarts or {}
+    sim_hash = sim_dir.name
 
     # Validate that stages are in dependency order (derived from STAGE_REGISTRY — single source)
     stage_order = [s.name for s in STAGE_REGISTRY]
@@ -751,48 +815,64 @@ def _execute_stage_list(
             raise ValueError(f"Stages must be in dependency order: {stage_order}. Got: {stages}")
         prev_idx = curr_idx
 
-    # Execute stages sequentially, chaining futures through run_stage.
-    # STAGE_REGISTRY is the single dispatch source: a new stage added there
-    # becomes immediately executable here without further edits to this module.
-    # prev_future=None on the first iteration is handled correctly by run_stage
-    # for all stages (including non-EM checkpoint resumes).
-    #
-    # Rescue-eligible stages (EM/NVT/NPT) with max_rescue > 0 use the rescue
-    # loop which waits for each stage individually.  Non-rescue stages and
-    # stages with checkpoint restarts chain futures as before.
     from .mdp import RESCUE_ELIGIBLE_STAGES
     from .rescue import execute_stage_with_rescue
 
     prev_future = None
-    for stage in stages:
+    for i, stage in enumerate(stages):
         cpt_file = restarts.get(stage, "")
 
-        # Use rescue loop for eligible stages without checkpoint restart
-        if max_rescue > 0 and stage in RESCUE_ELIGIBLE_STAGES and not cpt_file:
-            prev_future = execute_stage_with_rescue(
-                sim_dir,
-                stage,
-                prev_future,
-                grompp_app,
-                mdrun_app,
-                max_rescue=max_rescue,
-                config=config,
-            )
-        else:
-            # Standard execution: chain futures without waiting
-            stage_cfg = (
-                config.get_stage_config(stage) if hasattr(config, "get_stage_config") else None
-            )
-            cfg_kwarg = {"stage_config": stage_cfg} if stage_cfg is not None else {}
-            prev_future = run_stage(
-                STAGE_BY_NAME[stage],
-                sim_dir,
-                prev_future,
-                grompp_app,
-                mdrun_app,
-                restart_from_cpt=cpt_file,
-                **cfg_kwarg,
-            )
+        if tracker is not None:
+            tracker.mark_running(stage, sim_hash)
+
+        try:
+            if max_rescue > 0 and stage in RESCUE_ELIGIBLE_STAGES and not cpt_file:
+                prev_future = execute_stage_with_rescue(
+                    sim_dir,
+                    stage,
+                    prev_future,
+                    grompp_app,
+                    mdrun_app,
+                    max_rescue=max_rescue,
+                    config=config,
+                )
+                # Rescue stages block — if we get here, it succeeded
+                if tracker is not None:
+                    tracker.mark_succeeded(stage, sim_hash)
+            else:
+                stage_cfg = (
+                    config.get_stage_config(stage)
+                    if hasattr(config, "get_stage_config")
+                    else None
+                )
+                cfg_kwarg = {"stage_config": stage_cfg} if stage_cfg is not None else {}
+                prev_future = run_stage(
+                    STAGE_BY_NAME[stage],
+                    sim_dir,
+                    prev_future,
+                    grompp_app,
+                    mdrun_app,
+                    restart_from_cpt=cpt_file,
+                    **cfg_kwarg,
+                )
+                # Non-rescue stages return immediately — track via callback
+                if tracker is not None:
+                    _s, _h, _t = stage, sim_hash, tracker
+
+                    def _on_done(fut, s=_s, h=_h, t=_t):
+                        if fut.exception() is not None:
+                            t.mark_failed(s, h)
+                        else:
+                            t.mark_succeeded(s, h)
+
+                    prev_future.add_done_callback(_on_done)
+
+        except Exception:
+            if tracker is not None:
+                tracker.mark_failed(stage, sim_hash)
+                for skip_stage in stages[i + 1 :]:
+                    tracker.mark_skipped(skip_stage, sim_hash)
+            raise
 
     return prev_future
 
