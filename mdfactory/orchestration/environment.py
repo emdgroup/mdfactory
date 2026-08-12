@@ -240,19 +240,21 @@ class EnvironmentConfig(BaseModel):
         Returns
         -------
         EnvironmentConfig or None
-            The loaded config, or ``None`` if the file does not exist
-            or cannot be parsed.
+            The loaded config, or ``None`` if the file does not exist.
+
+        Raises
+        ------
+        ValueError
+            If the file exists but cannot be parsed.  This fails fast
+            so a corrupt config is caught immediately rather than
+            silently submitting jobs with no environment.
         """
         path = get_global_environment_path()
         if not path.is_file():
             return None
-        try:
-            env = cls.from_yaml(path)
-            logger.debug("Loaded global environment config from %s", path)
-            return env
-        except Exception:
-            logger.warning("Failed to load global environment config from %s", path, exc_info=True)
-            return None
+        env = cls.from_yaml(path)
+        logger.debug("Loaded global environment config from %s", path)
+        return env
 
 
 def get_global_environment_path() -> Path:

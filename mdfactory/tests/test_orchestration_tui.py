@@ -14,6 +14,7 @@ from mdfactory.orchestration.tui import (
     _prompt_environment,
     _prompt_stage_overrides,
     _require,
+    configure_and_save_environment,
     configure_slurm_interactive,
     save_slurm_config_yaml,
 )
@@ -470,9 +471,7 @@ class TestPromptEnvironment:
     @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
     @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_stages_empty_skips_gromacs_prompts(
-        self, mock_iq, mock_detect, mock_gmx, _load_global
-    ):
+    def test_stages_empty_skips_gromacs_prompts(self, mock_iq, mock_detect, mock_gmx, _load_global):
         """build workflow (stages=()) skips GROMACS module prompts."""
         from mdfactory.orchestration.environment import EnvironmentConfig
 
@@ -490,9 +489,7 @@ class TestPromptEnvironment:
     @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
     @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_stages_none_calls_gromacs_prompts(
-        self, mock_iq, mock_detect, mock_gmx, _load_global
-    ):
+    def test_stages_none_calls_gromacs_prompts(self, mock_iq, mock_detect, mock_gmx, _load_global):
         """simulate workflow (stages=None) does prompt for GROMACS modules."""
         from mdfactory.orchestration.environment import EnvironmentConfig
 
@@ -638,3 +635,71 @@ class TestSaveYaml:
         data = yaml.safe_load(out.read_text())
         # An empty environment section should be cleaned up
         assert "environment" not in data
+
+
+# ---------------------------------------------------------------------------
+# configure_and_save_environment tests
+# ---------------------------------------------------------------------------
+
+
+class TestConfigureAndSaveEnvironment:
+    """Tests for configure_and_save_environment."""
+
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_saves_environment_to_global_path(
+        self, mock_iq, mock_detect, mock_gmx, tmp_path, monkeypatch
+    ):
+        """configure_and_save_environment runs wizard and saves result."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path))
+        mock_detect.return_value = EnvironmentConfig()
+        mock_gmx.return_value = ["gromacs/2024.3-gpu"]
+        mock_q = mock_iq.return_value
+        mock_q.text.return_value.ask.return_value = ""
+
+        env = configure_and_save_environment()
+
+        assert env.modules == ["gromacs/2024.3-gpu"]
+        saved_path = tmp_path / "environment.yaml"
+        assert saved_path.is_file()
+        loaded = EnvironmentConfig.from_yaml(saved_path)
+        assert loaded.modules == ["gromacs/2024.3-gpu"]
+
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_ignores_existing_global_config(
+        self, mock_iq, mock_detect, mock_gmx, tmp_path, monkeypatch
+    ):
+        """configure_and_save_environment always runs wizard even if global exists."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path))
+        # Write an existing global config
+        old_env = EnvironmentConfig(modules=["old/module"])
+        old_env.save_yaml(tmp_path / "environment.yaml")
+
+        # The wizard should run (ignore_global=True) and produce new config
+        mock_detect.return_value = EnvironmentConfig()
+        mock_gmx.return_value = ["new/module"]
+        mock_q = mock_iq.return_value
+        mock_q.text.return_value.ask.return_value = ""
+
+        env = configure_and_save_environment()
+
+        assert env.modules == ["new/module"]
+        loaded = EnvironmentConfig.from_yaml(tmp_path / "environment.yaml")
+        assert loaded.modules == ["new/module"]
+
+    def test_cancellation_raises(self, tmp_path, monkeypatch):
+        """configure_and_save_environment propagates UserCancelledError."""
+        monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path))
+        with patch(
+            "mdfactory.orchestration.tui._prompt_environment",
+            side_effect=UserCancelledError("cancelled"),
+        ):
+            with pytest.raises(UserCancelledError):
+                configure_and_save_environment()

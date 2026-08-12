@@ -392,6 +392,45 @@ def test_from_yaml_explicit_environment_overrides_global(tmp_path, monkeypatch):
     assert loaded.environment.conda_env == "custom"
 
 
+# === _load_executor_config tests ===
+
+
+def test_load_executor_config_none_without_global(tmp_path, monkeypatch):
+    """_load_executor_config(None) returns default ExecutorConfig when no global env exists."""
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path / "no-config"))
+    from mdfactory.cli import _load_executor_config
+
+    cfg = _load_executor_config(None)
+    assert cfg.environment == EnvironmentConfig()
+    assert cfg.environment.compose_worker_init() == ""
+
+
+def test_load_executor_config_none_with_global(tmp_path, monkeypatch):
+    """_load_executor_config(None) loads global env config when it exists."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(config_dir))
+    global_env = EnvironmentConfig(modules=["gromacs/2024"], conda_env="md")
+    global_env.save_yaml(config_dir / "environment.yaml")
+    from mdfactory.cli import _load_executor_config
+
+    cfg = _load_executor_config(None)
+    assert cfg.environment.modules == ["gromacs/2024"]
+    assert cfg.environment.conda_env == "md"
+
+
+def test_load_executor_config_none_with_corrupt_global(tmp_path, monkeypatch):
+    """_load_executor_config(None) raises ValueError on corrupt global env config."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(config_dir))
+    (config_dir / "environment.yaml").write_text("- not a mapping\n")
+    from mdfactory.cli import _load_executor_config
+
+    with pytest.raises(ValueError, match="empty or invalid"):
+        _load_executor_config(None)
+
+
 # === Decision 6: Per-stage resource config tests ===
 
 
@@ -492,6 +531,26 @@ def test_get_stage_config_multiple_stages():
     assert nvt is cfg  # no override, returns self
     assert prod.cpus_per_node == 24
     assert prod.gres == "gpu:l40s:1"  # inherited
+
+
+def test_get_stage_config_rejects_unhonored_keys():
+    """Invalid override keys (e.g. walltime, mem) raise ValueError immediately."""
+    cfg = SlurmExecutorConfig(
+        account="acct",
+        stage_overrides={"EM": {"walltime": "1:00:00"}},
+    )
+    with pytest.raises(ValueError, match="walltime"):
+        cfg.get_stage_config("EM")
+
+
+def test_get_stage_config_rejects_multiple_unhonored_keys():
+    """Multiple invalid keys are all reported in the error message."""
+    cfg = SlurmExecutorConfig(
+        account="acct",
+        stage_overrides={"NVT": {"walltime": "2:00:00", "mem": "64G"}},
+    )
+    with pytest.raises(ValueError, match="walltime|mem"):
+        cfg.get_stage_config("NVT")
 
 
 # === gmx_binary field tests ===

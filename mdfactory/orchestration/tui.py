@@ -493,7 +493,9 @@ def _prompt_stage_overrides(
 # ---------------------------------------------------------------------------
 
 
-def _prompt_environment(*, stages: tuple[str, ...] | None = None) -> EnvironmentConfig:
+def _prompt_environment(
+    *, stages: tuple[str, ...] | None = None, ignore_global: bool = False
+) -> EnvironmentConfig:
     """Prompt the user for execution-environment configuration.
 
     If a global environment config exists (written by
@@ -507,6 +509,10 @@ def _prompt_environment(*, stages: tuple[str, ...] | None = None) -> Environment
     stages : tuple[str, ...] or None, optional
         The simulation stages. Pass ``()`` to skip GROMACS prompts
         (e.g. for ``build``). ``None`` uses the full pipeline.
+    ignore_global : bool, optional
+        If True, skip loading the global config and always run the
+        interactive wizard. Used by ``configure_and_save_environment``
+        so users can update an existing global config.
 
     Returns
     -------
@@ -515,7 +521,10 @@ def _prompt_environment(*, stages: tuple[str, ...] | None = None) -> Environment
     """
     from mdfactory.orchestration.environment import get_global_environment_path
 
-    global_env = EnvironmentConfig.load_global()
+    if not ignore_global:
+        global_env = EnvironmentConfig.load_global()
+    else:
+        global_env = None
     if global_env is not None:
         path = get_global_environment_path()
         console.print(f"  ✓ Using saved environment config from {path}")
@@ -1006,7 +1015,7 @@ def configure_and_save_environment() -> EnvironmentConfig:
     console.print(Rule("Execution Environment", style="bold green"))
 
     try:
-        env = _prompt_environment(stages=None)
+        env = _prompt_environment(stages=None, ignore_global=True)
     except UserCancelledError:
         console.print("Configuration cancelled.")
         raise

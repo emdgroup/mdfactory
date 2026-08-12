@@ -4,6 +4,7 @@
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from mdfactory.orchestration.environment import EnvironmentConfig
@@ -290,15 +291,11 @@ class TestSaveLoadYaml:
 
     def test_from_yaml_file_not_found(self, tmp_path):
         """from_yaml raises FileNotFoundError for missing file."""
-        import pytest
-
         with pytest.raises(FileNotFoundError):
             EnvironmentConfig.from_yaml(tmp_path / "nope.yaml")
 
     def test_from_yaml_invalid_content(self, tmp_path):
         """from_yaml raises ValueError for non-mapping YAML."""
-        import pytest
-
         path = tmp_path / "bad.yaml"
         path.write_text("- item1\n- item2\n")
         with pytest.raises(ValueError, match="empty or invalid"):
@@ -327,9 +324,9 @@ class TestLoadGlobal:
         assert result.modules == ["gromacs/2024"]
         assert result.conda_env == "md"
 
-    def test_returns_none_on_corrupt_file(self, tmp_path, monkeypatch):
-        """load_global returns None if file cannot be parsed."""
+    def test_raises_on_corrupt_file(self, tmp_path, monkeypatch):
+        """load_global raises ValueError if file exists but cannot be parsed."""
         monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path))
         (tmp_path / "environment.yaml").write_text("- not a mapping\n")
-        result = EnvironmentConfig.load_global()
-        assert result is None
+        with pytest.raises(ValueError, match="empty or invalid"):
+            EnvironmentConfig.load_global()
