@@ -1018,6 +1018,10 @@ def _extract_expected_frames_from_mdp(sim_dir: Path, stage: str) -> int | None:
 def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[dict]:
     """Log what would be executed without running.
 
+    Prints a summary of the work plan (simulations, stages, executor) plus
+    the resolved ``gmx grompp`` and ``gmx mdrun`` commands that *would* be
+    submitted for each stage.
+
     Parameters
     ----------
     work_plan : list[dict]
@@ -1031,6 +1035,9 @@ def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[d
         The work plan (for testing).
 
     """
+    from .apps import _build_grompp_script, _build_mdrun_script
+    from .stages import _extract_resource_hints
+
     logger.info("=" * 60)
     logger.info("DRY RUN - No jobs will be submitted")
     logger.info("=" * 60)
@@ -1045,6 +1052,50 @@ def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[d
                 label = f"{s} (resume from {restarts[s]})" if s in restarts else s
                 stage_parts.append(label)
             logger.info(f"  Stages: {', '.join(stage_parts)}")
+
+            # Resolve and display actual commands per stage
+            work_dir = str(Path(item["sim_dir"]).resolve())
+            stage_config = (
+                config.get_stage_config(item["stages"][0])
+                if hasattr(config, "get_stage_config")
+                else None
+            )
+            hints = _extract_resource_hints(stage_config)
+
+            for stage_name in item["stages"]:
+                spec = STAGE_BY_NAME[stage_name]
+                restart_cpt = restarts.get(stage_name, "")
+
+                logger.info(f"  [{spec.name}]")
+
+                if restart_cpt:
+                    # Restart: skip grompp, resume mdrun from checkpoint
+                    logger.info(f"    grompp: skipped (restart from {restart_cpt})")
+                else:
+                    grompp_script = _build_grompp_script(
+                        mdp_file=spec.mdp_file,
+                        gro_file=spec.gro_in,
+                        top_file="topology.top",
+                        tpr_file=spec.tpr_file,
+                        work_dir=work_dir,
+                        ref_file=spec.ref_file or "",
+                        cpt_file=spec.prereq_cpt or "",
+                        maxwarn=spec.maxwarn,
+                    )
+                    _log_resolved_script(grompp_script, label="grompp")
+
+                mdrun_script = _build_mdrun_script(
+                    deffnm=spec.deffnm,
+                    work_dir=work_dir,
+                    restart_from_cpt=restart_cpt,
+                    ntasks=hints.ntasks,
+                    disable_gpu=hints.disable_gpu,
+                    pme_gpu=spec.supports_pme_gpu,
+                    gro_out=spec.gro_out,
+                    traj_files=spec.traj_files,
+                    gmx_binary=hints.gmx_binary,
+                )
+                _log_resolved_script(mdrun_script, label="mdrun")
         else:
             logger.info("  Stages: None (all complete)")
 
@@ -1055,3 +1106,29 @@ def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[d
         logger.info(f"SLURM Partition: {config.partition}")
 
     return work_plan
+
+
+def _log_resolved_script(script: str, *, label: str) -> None:
+    """Extract and log the core gmx command from a generated bash script.
+
+    Parameters
+    ----------
+    script : str
+        Full bash script from ``_build_grompp_script`` or
+        ``_build_mdrun_script``.
+    label : str
+        Display label (e.g. ``"grompp"`` or ``"mdrun"``).
+
+    """
+    # Extract the actual gmx command line(s) — lines starting with $GMX_BIN
+    # or containing "gmx" invocations, skipping boilerplate (set, cd, echo, if)
+    for line in script.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("$GMX_BIN"):
+            # Remove trailing shell continuation characters for display
+            cmd = stripped.rstrip("\\").strip()
+            logger.info(f"    {label}: {cmd}")
+            return
+
+    # Fallback: show the label with an indicator that resolution failed
+    logger.info(f"    {label}: <could not resolve command>")
