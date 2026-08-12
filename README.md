@@ -19,7 +19,7 @@ MDFactory is a high-throughput library for setting up molecular dynamics (MD) si
 
 - **System building** — Mixedbox, bilayer, and LNP build types from YAML or CSV input
 - **Parametrization** — OpenFF/SMIRNOFF and CGenFF with automatic per-molecule caching
-- **Batch processing** — CSV-driven Nextflow pipelines for parallel builds and GROMACS runs on HPC
+- **Batch processing** — CSV-driven Parsl pipelines for parallel builds and GROMACS runs on HPC
 - **Analysis** — Registered analysis and artifact types with parquet output, local or SLURM execution
 - **Data integration** — Push/pull/sync across SQLite, CSV, and Palantir Foundry backends
 
@@ -83,7 +83,7 @@ pip install -e .[dev]
    mdfactory build system.yaml simulation_dir
    ```
 
-See the [Quick Start guide](https://emdgroup.github.io/mdfactory/docs/quick-start) for details on bulk CSV input and Nextflow pipelines.
+See the [Quick Start guide](https://emdgroup.github.io/mdfactory/docs/quick-start) for details on bulk CSV input and running simulations.
 
 ## Configuration
 

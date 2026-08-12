@@ -125,30 +125,7 @@ def build_systems(
         return _wait_with_progress(futures, hashes=input_hashes, label="Parsl Builds")
 
 
-def _describe_failure(exc: BaseException) -> tuple[str, str]:
-    """Extract ``(failure_type, error_detail)`` from a future's exception.
-
-    Parsl surfaces worker errors differently across versions: modern Parsl
-    re-raises the *original* exception (via ``RemoteExceptionWrapper.reraise()``),
-    while older versions wrapped it and exposed the underlying error on
-    ``.e_value``. Unwrap defensively so callers always see the *underlying*
-    error type — letting future retry logic distinguish, e.g., a GROMACS crash
-    (``CalledProcessError``) from an infrastructure failure (OOM / preemption).
-
-    Parameters
-    ----------
-    exc : BaseException
-        The exception raised by ``future.result()``.
-
-    Returns
-    -------
-    tuple[str, str]
-        ``(failure_type, error_detail)`` — the underlying exception's class
-        name and its string representation.
-
-    """
-    underlying = getattr(exc, "e_value", None) or exc
-    return type(underlying).__name__, str(underlying)
+from .errors import _describe_failure  # noqa: E402
 
 
 def _collect_results(results: list, hashes: list[str]) -> list[dict]:
@@ -187,17 +164,92 @@ def _collect_results(results: list, hashes: list[str]) -> list[dict]:
     return list(results)
 
 
+from .progress import _get_block_status  # noqa: E402
+
+
+def _is_running(future) -> bool:
+    """Return ``True`` when a Parsl future is actively executing.
+
+    Parameters
+    ----------
+    future : AppFuture
+        Parsl future to inspect.
+
+    Returns
+    -------
+    bool
+
+    """
+    try:
+        return future.task_status() in ("launched", "running", "running_ended")
+    except Exception:
+        return False
+
+
+def _poll_future(future, display_hash: str, result_transform) -> "tuple[dict, object]":
+    """Collect the result (or error dict) from a completed future.
+
+    Separates per-future result extraction from the polling loop, making
+    both independently testable.
+
+    Parameters
+    ----------
+    future : AppFuture
+        A *completed* Parsl future (caller must check ``future.done()``).
+    display_hash : str
+        Short identifier used in the activity-log line.
+    result_transform : callable or None
+        ``(raw_result, display_hash) -> dict`` applied on success.
+
+    Returns
+    -------
+    result : dict
+        Result dict (success or failure).
+    line : rich.text.Text
+        Activity-log line to append to the live display.
+
+    """
+    from rich.text import Text
+
+    try:
+        raw = future.result()
+        result = result_transform(raw, display_hash) if result_transform is not None else raw
+        line = Text()
+        line.append("  ✓ ", style="bold green")
+        line.append(display_hash[:12], style="cyan")
+        line.append("  done", style="dim")
+        return result, line
+    except Exception as exc:
+        failure_type, error_detail = _describe_failure(exc)
+        result = {
+            "hash": display_hash,
+            "status": "failed",
+            "error": error_detail,
+            "failure_type": failure_type,
+            "error_detail": error_detail,
+        }
+        line = Text()
+        line.append("  ✗ ", style="bold red")
+        line.append(display_hash[:12], style="cyan")
+        line.append(f"  {error_detail}", style="red")
+        return result, line
+
+
 def _wait_with_progress(
     futures: list,
     *,
     hashes: list[str] | None = None,
     label: str = "Parsl Builds",
+    result_transform=None,
     poll_interval: float = 2.0,
 ) -> list[dict]:
     """Wait for futures with a live terminal progress display.
 
     Shows a progress bar with summary counts and a scrolling activity log
     of recent completions/failures. Scales to any number of builds.
+
+    Per-future result handling is delegated to :func:`_poll_future`; SLURM
+    block status querying to :func:`_get_block_status`.
 
     Parameters
     ----------
@@ -206,8 +258,10 @@ def _wait_with_progress(
     hashes : list[str], optional
         Known hashes for each build (displayed in activity log).
     label : str
-        Heading shown next to the progress bar. Defaults to ``"Parsl Builds"``;
-        pass e.g. ``"Simulations"`` to reuse this display for other workflows.
+        Heading shown next to the progress bar.
+    result_transform : callable or None, optional
+        ``(raw_result, display_hash) -> dict`` applied to each successful
+        future's return value before it is stored.
     poll_interval : float
         Seconds between status polls.
 
@@ -229,14 +283,11 @@ def _wait_with_progress(
     display_hashes = hashes or [f"build-{i}" for i in range(total)]
     console = Console()
 
-    # Track counts
     succeeded = 0
     failed = 0
-    # Activity log (last N events)
     max_activity = 12
     activity: list[Text] = []
 
-    # Progress bar
     progress = Progress(
         TextColumn(f"⚒ [bold]{label}[/]"),
         BarColumn(bar_width=40),
@@ -250,39 +301,6 @@ def _wait_with_progress(
     )
     task_id = progress.add_task("builds", total=total, succeeded=0, failed=0, running=0)
 
-    def _get_block_status() -> str:
-        """Query Parsl for SLURM block (job) statuses."""
-        try:
-            import parsl  # type: ignore[import-not-found]
-
-            dfk = parsl.dfk()
-            counts: dict[str, int] = {}
-            for executor in dfk.executors.values():
-                if not hasattr(executor, "status"):
-                    continue
-                block_statuses = executor.status()
-                for _block_id, job_status in block_statuses.items():
-                    state = str(job_status.state.name).lower()
-                    counts[state] = counts.get(state, 0) + 1
-            if not counts:
-                return ""
-            parts = []
-            if counts.get("running", 0):
-                parts.append(f"[green]{counts['running']} running[/]")
-            if counts.get("pending", 0):
-                parts.append(f"[yellow]{counts['pending']} pending[/]")
-            if counts.get("completed", 0):
-                parts.append(f"[dim]{counts['completed']} completed[/]")
-            if counts.get("failed", 0):
-                parts.append(f"[red]{counts['failed']} failed[/]")
-            # Catch-all for other states
-            for state, count in counts.items():
-                if state not in ("running", "pending", "completed", "failed"):
-                    parts.append(f"[dim]{count} {state}[/]")
-            return " · ".join(parts)
-        except Exception:
-            return ""
-
     def _render():
         done_count = succeeded + failed
         running = sum(1 for i, f in enumerate(futures) if results[i] is None and _is_running(f))
@@ -293,23 +311,15 @@ def _wait_with_progress(
             failed=failed,
             running=running,
         )
-        # Combine progress bar + SLURM status + activity log
         parts = [progress]
         block_info = _get_block_status()
         if block_info:
             parts.append(Text.from_markup(f"  ▸ SLURM: {block_info}"))
         if activity:
-            parts.append(Text(""))  # blank line
+            parts.append(Text(""))
             for line in activity[-max_activity:]:
                 parts.append(line)
         return Group(*parts)
-
-    def _is_running(future) -> bool:
-        try:
-            status = future.task_status()
-            return status in ("launched", "running", "running_ended")
-        except Exception:
-            return False
 
     try:
         with Live(_render(), console=console, refresh_per_second=2) as live:
@@ -320,30 +330,13 @@ def _wait_with_progress(
                         done_count += 1
                         continue
                     if future.done():
-                        try:
-                            result = future.result()
-                            results[i] = result
-                            succeeded += 1
-                            line = Text()
-                            line.append("  ✓ ", style="bold green")
-                            line.append(display_hashes[i][:12], style="cyan")
-                            line.append("  done", style="dim")
-                            activity.append(line)
-                        except Exception as exc:
-                            failure_type, error_detail = _describe_failure(exc)
-                            results[i] = {
-                                "hash": display_hashes[i],
-                                "status": "failed",
-                                "error": error_detail,
-                                "failure_type": failure_type,
-                                "error_detail": error_detail,
-                            }
+                        result, line = _poll_future(future, display_hashes[i], result_transform)
+                        results[i] = result
+                        activity.append(line)
+                        if result.get("status") == "failed":
                             failed += 1
-                            line = Text()
-                            line.append("  ✗ ", style="bold red")
-                            line.append(display_hashes[i][:12], style="cyan")
-                            line.append(f"  {error_detail}", style="red")
-                            activity.append(line)
+                        else:
+                            succeeded += 1
                         done_count += 1
 
                 live.update(_render())
@@ -354,8 +347,7 @@ def _wait_with_progress(
                 time.sleep(poll_interval)
 
     except KeyboardInterrupt:
-        console.print("\n[bold yellow]Interrupted — cancelling SLURM jobs...[/]")
-        # Don't call _shutdown_parsl() here — build_systems' finally block owns cleanup
+        console.print("\n[bold yellow]Interrupted[/]")
         raise
 
     return _collect_results(results, display_hashes)

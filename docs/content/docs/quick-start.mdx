@@ -78,29 +78,29 @@ This writes GROMACS-ready build output into `simulation_dir`.
 </Step>
 <Step>
 
-## Run with Nextflow (optional)
+## Run simulations (optional)
 
-For high-throughput runs, use the checked-in workflows:
-
-Build many systems from CSV:
+Run the GROMACS simulation chain (EM → NVT → NPT → Production) locally:
 
 ```bash
-nextflow run workflows/build.nf \
-  --csv_file sample_input.csv \
-  --output_dir output_systems
+mdfactory simulate output_systems/
 ```
 
-Run the GROMACS chain using the generated summary YAML:
+For high-throughput runs on a SLURM cluster, generate a config interactively and pass it:
 
 ```bash
-nextflow run workflows/simulate.nf \
-  -c workflows/simulate.config \
-  --base_dir output_systems \
-  --config_yaml output_systems/sample_input.yaml
+mdfactory config slurm              # interactive wizard → saves slurm_executor.yaml
+mdfactory simulate output_systems/ --slurm slurm_executor.yaml
 ```
 
-<Callout type="warn" title="Cluster-specific configuration">
-The shipped `simulate.config` contains SLURM settings tuned for a specific cluster. Edit this file to match your HPC environment before running. See [Running on HPC Clusters](/docs/user-guide/running-on-hpc) for details.
+Or use `--slurm tui` to launch the wizard inline:
+
+```bash
+mdfactory simulate output_systems/ --slurm tui
+```
+
+<Callout type="info" title="Parsl dependency">
+SLURM orchestration requires the `parsl` extra: `pip install "mdfactory[parsl]"`. See [Running on HPC Clusters](/docs/user-guide/running-on-hpc) for details.
 </Callout>
 
 </Step>

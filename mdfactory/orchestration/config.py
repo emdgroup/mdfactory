@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
+from mdfactory.orchestration.environment import EnvironmentConfig
 from mdfactory.performance.slurm_config import BaseSlurmConfig
 
 if TYPE_CHECKING:
@@ -47,8 +48,10 @@ class ExecutorConfig(BaseModel):
     ----------
     provider : str
         Execution provider type ("local" or "slurm").
-    worker_init : str
-        Shell commands to run before starting workers (module loads, activation).
+    environment : EnvironmentConfig
+        Structured execution-environment configuration. Defines module
+        loads, Python environment activation, and extra shell init for
+        compute workers.
     working_directory : Path or None
         Working directory for the executor.
     max_workers_per_node : int
@@ -67,16 +70,47 @@ class ExecutorConfig(BaseModel):
         Defaults to ``~/.parsl/mdfactory`` so logs land in a predictable,
         controllable location instead of scattering ``runinfo/`` into the
         current working directory (typically the login-node home on HPC).
+    retries : int
+        Number of times Parsl re-runs a failed app before propagating the
+        exception. Defaults to 3 to handle transient SLURM / network faults.
+        Set to 0 to disable retries.
+    gmx_binary : str
+        GROMACS binary selection for mdrun: ``"gmx"`` (thread-MPI build),
+        ``"gmx_mpi"`` (pure MPI build), or ``"auto"`` (detect at runtime,
+        default).  Setting an explicit value eliminates all runtime if-blocks
+        from the generated bash script.  Can be overridden per-stage via
+        ``stage_overrides`` on :class:`SlurmExecutorConfig`.
 
     """
 
     provider: Literal["local", "slurm"] = "local"
-    worker_init: str = ""
+    environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     working_directory: Path | None = None
     max_workers_per_node: int = 1
     max_blocks: int = 1
     available_accelerators: int | list[str] = 0
     run_dir: Path = Field(default_factory=lambda: Path("~/.parsl/mdfactory").expanduser())
+    retries: int = Field(default=3, ge=0, description="Number of times Parsl retries a failed app.")
+    gmx_binary: Literal["auto", "gmx", "gmx_mpi"] = Field(
+        default="auto",
+        description=(
+            "GROMACS binary selection for mdrun. "
+            "``'gmx'`` — thread-MPI build; ``'gmx_mpi'`` — pure MPI build; "
+            "``'auto'`` — detect at runtime (default, backward compatible). "
+            "Setting an explicit value eliminates all runtime if-blocks from "
+            "the generated bash script."
+        ),
+    )
+    max_rescue: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            "Maximum rescue tiers for physics failures (overlapping atoms, "
+            "exploding box, LINCS constraint errors) in EM/NVT/NPT stages. "
+            "Each tier halves the step size and doubles nsteps. "
+            "Set to 0 to disable rescue retry."
+        ),
+    )
 
     @field_validator("run_dir", mode="before")
     @classmethod
@@ -103,7 +137,7 @@ class ExecutorConfig(BaseModel):
         from parsl.providers import LocalProvider
 
         provider = LocalProvider(
-            worker_init=self.worker_init,
+            worker_init=self.environment.compose_worker_init(),
             min_blocks=0,
             init_blocks=1,
             max_blocks=self.max_blocks,
@@ -116,11 +150,20 @@ class ExecutorConfig(BaseModel):
             available_accelerators=self.available_accelerators,
             working_dir=str(self.working_directory) if self.working_directory else None,
         )
-        return parsl.Config(executors=[executor], run_dir=str(self.run_dir))
+        return parsl.Config(
+            executors=[executor],
+            run_dir=str(self.run_dir),
+            retries=self.retries,
+        )
 
     @classmethod
     def from_yaml(cls, path: Path) -> "ExecutorConfig | SlurmExecutorConfig":
         """Load executor configuration from a YAML file.
+
+        If the YAML does not contain an ``environment:`` section, the
+        global environment config (from ``mdfactory config environment``)
+        is loaded automatically.  This allows environment setup to be
+        configured once per machine and reused across SLURM configs.
 
         Parameters
         ----------
@@ -139,10 +182,26 @@ class ExecutorConfig(BaseModel):
             raise ValueError(
                 f"Executor config YAML is empty or invalid (expected a mapping): {path}"
             )
+
+        # Auto-load global environment when YAML has no environment section
+        if "environment" not in data:
+            global_env = EnvironmentConfig.load_global()
+            if global_env is not None:
+                data["environment"] = global_env.model_dump(exclude_none=True)
+
         provider = data.get("provider", "local")
         if provider == "slurm":
             return SlurmExecutorConfig(**data)
         return cls(**data)
+
+
+#: Fields in :class:`SlurmExecutorConfig` that ``stage_overrides`` can
+#: legitimately change.  These are the mdrun-command-line knobs extracted by
+#: :func:`~mdfactory.orchestration.stages._extract_resource_hints`.  All other
+#: fields (``walltime``, ``mem``, ``nodes``, ``partition``, …) are baked into
+#: the Parsl allocation at session start and cannot vary per-stage without
+#: spawning separate executor instances.
+_HONORED_OVERRIDE_KEYS: frozenset[str] = frozenset({"cpus_per_node", "gres", "gmx_binary"})
 
 
 class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
@@ -179,7 +238,7 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
         which Parsl uses to size the worker pool (roughly ``--ntasks`` /
         cores-per-node) — it is **not** the sbatch ``--cpus-per-task`` flag. For
         MPI+OpenMP workloads (e.g. GROMACS), OpenMP threads-per-rank must be set
-        separately via ``scheduler_options`` / ``worker_init``.
+        separately via ``scheduler_options`` / ``environment.extra_init``.
     gres : str or None
         Generic resource specification (``--gres``), e.g. ``"gpu:l40s:1"``.
     mem : str or None
@@ -214,8 +273,10 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
         gres: "gpu:l40s:1"
         max_blocks: 5
         max_workers_per_node: 1
-        worker_init: |
-          eval "$(pixi shell-hook -e default)"
+        environment:
+          modules:
+            - gromacs/2024.3-gpu
+          pixi_manifest: /path/to/project
 
     """
 
@@ -232,6 +293,15 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
     mem: str | None = None
     scheduler_options: str = ""
     launch_options: str = ""
+    stage_overrides: dict[str, dict] = Field(
+        default_factory=dict,
+        description=(
+            "Per-stage resource overrides.  Keys are stage names "
+            "(``'EM'``, ``'NVT'``, ``'NPT'``, ``'Production'``); values are "
+            "dicts of :class:`SlurmExecutorConfig` field overrides, e.g. "
+            "``{'EM': {'cpus_per_node': 8, 'gres': None}}``."
+        ),
+    )
 
     @field_validator("walltime", mode="before")
     @classmethod
@@ -240,6 +310,69 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
         from mdfactory.performance.slurm_config import normalize_slurm_time
 
         return normalize_slurm_time(v)
+
+    def get_stage_config(self, stage: str) -> "SlurmExecutorConfig":
+        """Return a copy of this config with per-stage overrides applied.
+
+        Looks up ``stage`` in :attr:`stage_overrides` and returns a validated
+        copy of *self* with the matching fields merged in.  If no override
+        exists for *stage*, *self* is returned unchanged (no copy).
+
+        Only the fields listed in :data:`_HONORED_OVERRIDE_KEYS` —
+        ``cpus_per_node``, ``gres``, and ``gmx_binary`` — are honoured at the
+        mdrun-command-line level.  All other fields (``walltime``, ``mem``,
+        ``nodes``, ``partition``, …) are baked into the Parsl allocation at
+        session-start time and **cannot** vary per-stage without separate
+        executor instances.  Passing an unhonorable key raises :exc:`ValueError`
+        immediately so the misconfiguration is caught at CLI invocation rather
+        than silently at sbatch time.
+
+        Parameters
+        ----------
+        stage : str
+            Stage name, e.g. ``'EM'``, ``'NVT'``, ``'NPT'``, ``'Production'``.
+
+        Returns
+        -------
+        SlurmExecutorConfig
+            Config with stage-specific field values applied and validated.
+
+        Raises
+        ------
+        ValueError
+            If any override key is not in :data:`_HONORED_OVERRIDE_KEYS`.
+
+        Examples
+        --------
+        >>> cfg = SlurmExecutorConfig(cpus_per_node=12, gres="gpu:1",
+        ...     stage_overrides={"EM": {"cpus_per_node": 4, "gres": None}})
+        >>> em_cfg = cfg.get_stage_config("EM")
+        >>> em_cfg.cpus_per_node
+        4
+        >>> em_cfg.gres is None
+        True
+        >>> prod_cfg = cfg.get_stage_config("Production")
+        >>> prod_cfg.cpus_per_node   # unchanged
+        12
+
+        """
+        overrides = self.stage_overrides.get(stage, {})
+        if not overrides:
+            return self
+
+        ignored = set(overrides) - _HONORED_OVERRIDE_KEYS
+        if ignored:
+            raise ValueError(
+                f"stage_overrides[{stage!r}] contains keys that are not honored "
+                f"at the mdrun-command level: {sorted(ignored)}.\n"
+                f"Only {sorted(_HONORED_OVERRIDE_KEYS)} affect per-stage mdrun execution.\n"
+                f"To change walltime / mem / nodes / partition, update the top-level config "
+                f"fields (they apply to every stage via the Parsl allocation)."
+            )
+
+        # Use model_validate instead of model_copy(update=...) so that field-level
+        # Pydantic validators run on the merged dict (typos fail fast).
+        return type(self).model_validate({**self.model_dump(), **overrides})
 
     def to_parsl_config(self) -> "parsl.Config":
         """Build a Parsl Config with HighThroughputExecutor + SlurmProvider.
@@ -282,7 +415,7 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
             walltime=self.walltime,
             nodes_per_block=self.nodes,
             cores_per_node=self.cpus_per_node,
-            worker_init=self.worker_init,
+            worker_init=self.environment.compose_worker_init(),
             scheduler_options=scheduler_options,
             min_blocks=0,
             init_blocks=1,
@@ -297,4 +430,15 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
             available_accelerators=self.available_accelerators,
             working_dir=str(self.working_directory) if self.working_directory else None,
         )
-        return parsl.Config(executors=[executor], run_dir=str(self.run_dir))
+        return parsl.Config(
+            executors=[executor],
+            run_dir=str(self.run_dir),
+            retries=self.retries,
+        )
+
+
+def get_stage_config_or_none(config: "ExecutorConfig | None", stage: str):
+    """Return per-stage config if the config supports it, else None."""
+    if config is not None and hasattr(config, "get_stage_config"):
+        return config.get_stage_config(stage)
+    return None

@@ -61,6 +61,12 @@ def parsl_session(config: "ExecutorConfig") -> Iterator[ParslSession]:
     yields a :class:`ParslSession`, and guarantees shutdown on exit unless the
     session was detached via :meth:`ParslSession.detach`.
 
+    Sessions must be **sequential, never nested**.  :func:`_guard_no_active_dfk`
+    raises :class:`RuntimeError` if a DFK is already loaded when this context
+    manager is entered.  On exit, :func:`_shutdown_parsl` calls ``parsl.clear()``
+    so the DFK is fully released before the next session can open.  Do not open
+    a second :func:`parsl_session` from inside an active one.
+
     Examples
     --------
     >>> with parsl_session(config) as session:  # doctest: +SKIP
@@ -84,9 +90,15 @@ def parsl_session(config: "ExecutorConfig") -> Iterator[ParslSession]:
         If a Parsl ``DataFlowKernel`` is already active.
 
     """
+    import signal
+
     parsl = _import_parsl()
     _guard_no_active_dfk(parsl)
+    # Ignore SIGINT during load so child processes (interchange, workers)
+    # inherit SIG_IGN and don't print tracebacks on Ctrl+C.
+    prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
     parsl.load(config.to_parsl_config())
+    signal.signal(signal.SIGINT, prev_handler)
     session = ParslSession(parsl=parsl)
     try:
         yield session
@@ -138,9 +150,40 @@ def _shutdown_parsl():
     except Exception as exc:
         logger.warning(f"Parsl shutdown failed — DFK may still be loaded: {exc}")
 
-    # Always attempt scancel if we found job IDs
+    # Cancel jobs found via DFK tracking
     if job_ids:
         _scancel_jobs(job_ids)
+
+    # Safety net: query squeue for any Parsl jobs the DFK missed
+    missed = _find_parsl_jobs_via_squeue(exclude=set(job_ids))
+    if missed:
+        _scancel_jobs(missed)
+
+
+def _find_parsl_jobs_via_squeue(*, exclude: set[str] | None = None) -> list[str]:
+    """Query squeue for running/pending Parsl jobs owned by the current user."""
+    exclude = exclude or set()
+    try:
+        result = subprocess.run(
+            ["squeue", "--me", "--noheader", "--states=R,PD", "--format=%i %j"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        job_ids = []
+        for line in result.stdout.strip().splitlines():
+            parts = line.split(None, 1)
+            if len(parts) >= 2 and "parsl" in parts[1].lower():
+                if parts[0] not in exclude:
+                    job_ids.append(parts[0])
+        return job_ids
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    except Exception:
+        return []
 
 
 def _get_slurm_job_ids(dfk) -> list[str]:

@@ -1,0 +1,20 @@
+; NVT equilibration — intentionally oversized dt to trigger LINCS failure.
+; dt = 0.1 ps is ~50x the normal value (0.002 ps).
+; At this timestep, constraint violations blow up immediately.
+integrator  = md
+dt          = 0.1
+nsteps      = 100
+nstlist     = 1
+cutoff-scheme = Verlet
+coulombtype = PME
+rcoulomb    = 0.4
+rvdw        = 0.4
+pbc         = xyz
+tcoupl      = v-rescale
+tc-grps     = System
+tau-t       = 0.1
+ref-t       = 300
+gen-vel     = yes
+gen-temp    = 300
+constraints = h-bonds
+constraint-algorithm = LINCS

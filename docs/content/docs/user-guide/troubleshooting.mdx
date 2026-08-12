@@ -79,14 +79,87 @@ The build code uses OpenMM-based compression or equilibration steps. For difficu
 ## Workflow issues
 
 <Accordions type="single" collapsible>
-<Accordion title="Nextflow stage-2 run cannot find files">
+<Accordion title="Simulate cannot find build files">
 
-`workflows/simulate.nf` expects:
+`mdfactory simulate` requires each simulation directory to contain the standard build outputs (`system.pdb`, `topology.top`, and `.mdp` files). Common causes:
 
-- a `--base_dir` containing the hash directories
-- a `--config_yaml` summary YAML produced by `mdfactory prepare-build` or `workflows/build.nf`
+- The build step (`mdfactory build`) did not complete successfully for some hashes.
+- The `--source` path does not point to the directory containing the hash subdirectories.
+- Use `--dry-run` to preview which directories would be simulated and which are skipped.
 
-Make sure both point to the same stage-1 output tree.
+```bash
+mdfactory simulate output_dir/ --slurm gpu.yaml --dry-run
+```
+
+</Accordion>
+<Accordion title="Checkpoint detection skips stages unexpectedly">
+
+In `--checkpoint auto` mode (the default), MDFactory validates trajectory integrity using frame counts. A stage is skipped when its output `.gro` file and prerequisite checkpoint (`.cpt`) both exist and pass validation.
+
+To force re-execution of all stages:
+
+```bash
+mdfactory simulate output_dir/ --slurm gpu.yaml --checkpoint force
+```
+
+To skip validation and rely only on file existence:
+
+```bash
+mdfactory simulate output_dir/ --slurm gpu.yaml --checkpoint skip
+```
+
+</Accordion>
+<Accordion title="Stale checkpoints after a killed job">
+
+When a SLURM job is cancelled mid-flight, checkpoint files (`.cpt`) may be left behind
+without corresponding trajectory files. Use `--clean` to reset simulation directories to
+post-build state before re-running:
+
+```bash
+# Clean all stages and re-run
+mdfactory simulate output_dir/ --clean --slurm gpu.yaml
+
+# Clean only Production and re-run it
+mdfactory simulate output_dir/ --clean --stages Production --slurm gpu.yaml
+
+# Preview what would be deleted
+mdfactory simulate output_dir/ --clean --dry-run
+```
+
+The `--clean` flag removes simulation outputs (`.tpr`, `.cpt`, `.log`, `.edr`, `.gro`,
+`.xtc`, `.trr`, rescue MDPs, GROMACS backup files) while preserving build inputs
+(`system.pdb`, `topology.top`, template `.mdp` files, `.itp`, `.yaml`). It respects
+the `--stages` filter — only files belonging to requested stages are deleted.
+
+</Accordion>
+<Accordion title="Simulation fails with LINCS or constraint errors">
+
+MDFactory automatically rescues EM, NVT, and NPT stages that fail with physics errors
+(LINCS warnings, exploding box, coordinate constraint failures). On each rescue tier the
+step size is halved and `nsteps` is doubled to maintain the same elapsed simulation time,
+up to 3 tiers by default.
+
+You will see log messages like:
+
+```
+WARNING — RESCUE tier 1/3 for abc123/EM: using em_rescue_t1.mdp
+WARNING — RESCUE tier 1 for EM: emstep = 0.01 → 0.005
+```
+
+If all rescue tiers are exhausted the simulation is marked as failed. To increase or
+decrease the retry budget:
+
+```bash
+# Allow up to 5 rescue tiers
+mdfactory simulate output_dir/ --max-rescue 5
+
+# Disable rescue entirely
+mdfactory simulate output_dir/ --max-rescue 0
+```
+
+Production stages are never rescued — by that point the system should be stable.
+Infrastructure failures (OOM, SLURM timeout, preemption) are handled separately by
+Parsl's built-in retry mechanism (`retries` in the executor config).
 
 </Accordion>
 <Accordion title="Analysis SLURM submission fails immediately">

@@ -454,6 +454,19 @@ def test_describe_failure_unwraps_legacy_e_value():
     assert detail == "real GROMACS crash"
 
 
+def test_describe_failure_unwraps_dependency_error_cause():
+    """_describe_failure unwraps DependencyError via __cause__ to show root cause."""
+    from mdfactory.orchestration.build import _describe_failure
+
+    root = ValueError("grompp fatal error: atom types not found")
+    wrapper = RuntimeError("Dependency failure for task 5. The representative cause is via task 0")
+    wrapper.__cause__ = root
+
+    failure_type, detail = _describe_failure(wrapper)
+    assert failure_type == "ValueError"
+    assert "grompp fatal error" in detail
+
+
 # --- Finding 12: completeness guard ---
 
 

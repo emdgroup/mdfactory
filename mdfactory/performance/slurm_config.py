@@ -222,7 +222,13 @@ class BaseSlurmConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    account: str
+    # TODO(follow-up): decide whether account="" should be validated non-empty
+    # for SLURM configs.  The current default allows autodiscovery scenarios
+    # (some clusters inherit the account from the user's environment), but it
+    # means a missing account fails only at sbatch time rather than at config
+    # load.  If explicit validation is desired, add a @field_validator that
+    # rejects empty strings when provider=="slurm".
+    account: str = ""
     partition: str = "cpu"
     qos: str | None = None
     constraint: str | None = None
