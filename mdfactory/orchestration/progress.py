@@ -221,5 +221,5 @@ def display_stage_progress(
                 live.update(_render())
             live.update(_render())
     except KeyboardInterrupt:
-        console.print("\n[bold yellow]Interrupted — cancelling SLURM jobs...[/]")
+        console.print("\n[bold yellow]Interrupted[/]")
         raise

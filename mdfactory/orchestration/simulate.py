@@ -314,8 +314,12 @@ def run_simulations(
         thread_futures = [pool.submit(_run_pipeline, item) for item in active_items]
         pool.shutdown(wait=False)
 
-        # Main thread: display progress until all stages complete
-        display_stage_progress(tracker)
+        try:
+            # Main thread: display progress until all stages complete
+            display_stage_progress(tracker)
+        except KeyboardInterrupt:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
 
         # Ensure all worker threads have finished (no-op in normal usage
         # since display blocks until all_done, but needed for test mocks)
