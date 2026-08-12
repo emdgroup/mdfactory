@@ -23,7 +23,6 @@ from mdfactory.orchestration.simulate import (
     _execute_stage_list,
     _log_dry_run_plan,
     _missing_build_files,
-    _validate_simulation_dir,
     _validate_stage_prerequisites,
     _validate_trajectory_complete,
     run_simulations,
@@ -45,28 +44,6 @@ def mock_sim_dir(tmp_path):
     (sim_dir / "md.mdp").write_text("FAKE MDP")
 
     return sim_dir
-
-
-def test_validate_simulation_dir_success(mock_sim_dir):
-    """Validation passes when all files present."""
-    _validate_simulation_dir(mock_sim_dir, ["EM", "NVT", "NPT", "Production"])
-
-
-def test_validate_simulation_dir_missing_files(tmp_path):
-    """Validation raises when files missing."""
-    sim_dir = tmp_path / "sim"
-    sim_dir.mkdir()
-
-    with pytest.raises(FileNotFoundError, match="Missing files"):
-        _validate_simulation_dir(sim_dir, ["EM"])
-
-
-def test_validate_simulation_dir_missing_mdp(mock_sim_dir):
-    """Validation raises when MDP file missing."""
-    (mock_sim_dir / "em.mdp").unlink()
-
-    with pytest.raises(FileNotFoundError, match="Missing files.*em.mdp"):
-        _validate_simulation_dir(mock_sim_dir, ["EM"])
 
 
 # ---------------------------------------------------------------------------
@@ -672,18 +649,14 @@ def test_mdrun_app_slurm_priority():
 
 
 def test_stage_functions_no_hardcoded_nt():
-    """Stage functions don't pass hardcoded nt parameter to mdrun."""
+    """run_stage doesn't pass hardcoded nt parameter to mdrun."""
     import inspect
 
-    from mdfactory.orchestration import stages
+    from mdfactory.orchestration.stages import run_stage
 
-    # Check all stage functions
-    for name in ["run_em_stage", "run_nvt_stage", "run_npt_stage", "run_production_stage"]:
-        func = getattr(stages, name)
-        source = inspect.getsource(func)
-        # Should NOT have nt=12 anywhere
-        assert "nt=12" not in source, f"{name} still has hardcoded nt=12"
-        assert "nt=24" not in source, f"{name} has hardcoded nt"
+    source = inspect.getsource(run_stage)
+    assert "nt=12" not in source, "run_stage still has hardcoded nt=12"
+    assert "nt=24" not in source, "run_stage has hardcoded nt"
 
 
 # === Decision 1: Explicit Stage Execution Tests ===
@@ -1309,42 +1282,42 @@ def test_execute_stage_list_restart_only_for_matching_stage(mock_run_stage):
 
 
 def test_nvt_stage_skips_grompp_on_restart():
-    """run_nvt_stage skips grompp and passes restart_from_cpt to mdrun_app."""
-    from mdfactory.orchestration.stages import run_nvt_stage
+    """run_stage for NVT skips grompp and passes restart_from_cpt to mdrun_app."""
+    from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
 
     grompp_app = MagicMock()
     mdrun_app = MagicMock()
     mdrun_app.return_value = MagicMock()
 
-    run_nvt_stage(
+    run_stage(
+        STAGE_BY_NAME["NVT"],
         Path("/sim"),
-        em_future=None,
-        grompp_app=grompp_app,
-        mdrun_app=mdrun_app,
+        None,
+        grompp_app,
+        mdrun_app,
         restart_from_cpt="/sim/nvt.cpt",
     )
 
-    # grompp must NOT be called
     grompp_app.assert_not_called()
-    # mdrun called with restart kwarg
     mdrun_app.assert_called_once()
     call_kwargs = mdrun_app.call_args[1]
     assert call_kwargs.get("restart_from_cpt") == "/sim/nvt.cpt"
 
 
 def test_npt_stage_skips_grompp_on_restart():
-    """run_npt_stage skips grompp and passes restart_from_cpt to mdrun_app."""
-    from mdfactory.orchestration.stages import run_npt_stage
+    """run_stage for NPT skips grompp and passes restart_from_cpt to mdrun_app."""
+    from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
 
     grompp_app = MagicMock()
     mdrun_app = MagicMock()
     mdrun_app.return_value = MagicMock()
 
-    run_npt_stage(
+    run_stage(
+        STAGE_BY_NAME["NPT"],
         Path("/sim"),
-        nvt_future=None,
-        grompp_app=grompp_app,
-        mdrun_app=mdrun_app,
+        None,
+        grompp_app,
+        mdrun_app,
         restart_from_cpt="/sim/npt.cpt",
     )
 
@@ -1355,18 +1328,19 @@ def test_npt_stage_skips_grompp_on_restart():
 
 
 def test_production_stage_skips_grompp_on_restart():
-    """run_production_stage skips grompp and passes restart_from_cpt to mdrun_app."""
-    from mdfactory.orchestration.stages import run_production_stage
+    """run_stage for Production skips grompp and passes restart_from_cpt to mdrun_app."""
+    from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
 
     grompp_app = MagicMock()
     mdrun_app = MagicMock()
     mdrun_app.return_value = MagicMock()
 
-    run_production_stage(
+    run_stage(
+        STAGE_BY_NAME["Production"],
         Path("/sim"),
-        npt_future=None,
-        grompp_app=grompp_app,
-        mdrun_app=mdrun_app,
+        None,
+        grompp_app,
+        mdrun_app,
         restart_from_cpt="/sim/prod.cpt",
     )
 
@@ -1447,9 +1421,9 @@ def test_mdrun_app_cpu_mode_forced_when_disable_gpu():
 
 
 def test_em_stage_passes_resource_hints_to_mdrun():
-    """run_em_stage extracts resource hints from stage_config and passes to mdrun_app."""
+    """run_stage for EM extracts resource hints from stage_config and passes to mdrun_app."""
     from mdfactory.orchestration.config import SlurmExecutorConfig
-    from mdfactory.orchestration.stages import run_em_stage
+    from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
 
     cfg = SlurmExecutorConfig(account="acct", cpus_per_node=4, gres=None)
 
@@ -1458,7 +1432,7 @@ def test_em_stage_passes_resource_hints_to_mdrun():
     mdrun_app = MagicMock()
     mdrun_app.return_value = MagicMock()
 
-    run_em_stage(Path("/sim"), grompp_app, mdrun_app, stage_config=cfg)
+    run_stage(STAGE_BY_NAME["EM"], Path("/sim"), None, grompp_app, mdrun_app, stage_config=cfg)
 
     mdrun_app.assert_called_once()
     _, call_kwargs = mdrun_app.call_args

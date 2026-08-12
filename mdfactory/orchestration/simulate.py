@@ -10,11 +10,12 @@ and progress monitoring.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 from loguru import logger
 
 from .apps import get_grompp_app, get_mdrun_app
+from .config import get_stage_config_or_none
 from .session import parsl_session
 from .stages import (
     STAGE_BY_NAME,
@@ -36,28 +37,21 @@ if TYPE_CHECKING:
     from .progress import StageProgressTracker
 
 
+class _StageState(TypedDict):
+    """Checkpoint detection result for a single stage."""
+
+    status: str  # "complete" | "partial" | "not_started"
+    cpt_file: "Path | None"
+    restart: bool
+
+
+def _has_restart_pair(cpt_file: Path, tpr_file: Path) -> bool:
+    """Return True if both checkpoint and TPR files exist (restartable state)."""
+    return cpt_file.exists() and tpr_file.exists()
+
+
 def _bash_result_to_dict(raw: object, sim_hash: str) -> dict:
-    """Normalise a bash_app result to a status dict.
-
-    Parsl ``@bash_app`` futures resolve to ``None`` or an integer exit code
-    on success — neither of which satisfies the ``dict`` contract expected by
-    :func:`_report_simulation_results`.  This transform converts any non-dict
-    value to ``{"hash": sim_hash, "status": "success"}``.  Dict values (e.g.
-    from ``@python_app`` callers) are passed through unchanged.
-
-    Parameters
-    ----------
-    raw : object
-        Raw value from ``AppFuture.result()``.
-    sim_hash : str
-        Display identifier for the simulation (used as ``hash`` key).
-
-    Returns
-    -------
-    dict
-        Result dict with at minimum ``hash`` and ``status`` keys.
-
-    """
+    """Normalise a bash_app result to a ``{"hash": ..., "status": ...}`` dict."""
     if isinstance(raw, dict):
         return raw
     return {"hash": sim_hash, "status": "success"}
@@ -260,7 +254,7 @@ def run_simulations(
         import threading
         from concurrent.futures import ThreadPoolExecutor
 
-        from .build import _describe_failure
+        from .errors import _describe_failure
         from .progress import StageProgressTracker, display_stage_progress
 
         all_hashes = [item["hash"] for item in active_items]
@@ -334,24 +328,7 @@ def run_simulations(
 
 
 def _missing_build_files(sim_dir: Path, stages: list[str]) -> list[str]:
-    """Return the names of required build output files that are absent.
-
-    Checks for ``system.pdb``, ``topology.top``, and the MDP file for every
-    requested stage.  Returns an empty list when the build is complete.
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    stages : list[str]
-        Stages to run (determines which MDP files are required).
-
-    Returns
-    -------
-    list[str]
-        Names of missing files, or ``[]`` when the build is complete.
-
-    """
+    """Return names of required build output files that are absent from *sim_dir*."""
     required = ["system.pdb", "topology.top"] + [STAGE_BY_NAME[s].mdp_file for s in stages]
     return [f for f in required if not (sim_dir / f).exists()]
 
@@ -431,48 +408,12 @@ def clean_simulation_outputs(
     return existing
 
 
-def _validate_simulation_dir(sim_dir: Path, stages: list[str]) -> None:
-    """Raise if any required build output files are missing.
 
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    stages : list[str]
-        Stages to run.
-
-    Raises
-    ------
-    FileNotFoundError
-        If required files are missing.
-
-    """
-    missing = _missing_build_files(sim_dir, stages)
-    if missing:
-        raise FileNotFoundError(f"Missing files in {sim_dir}: {missing}")
-
-
-def _detect_skip_mode_state(output_file: Path, cpt_file: Path, tpr_file: Path) -> dict:
-    """Return stage state dict for 'skip' checkpoint mode (no integrity checks).
-
-    Parameters
-    ----------
-    output_file : Path
-        Primary output file (gro or trajectory).
-    cpt_file : Path
-        Stage checkpoint file.
-    tpr_file : Path
-        Stage TPR run-input file.
-
-    Returns
-    -------
-    dict
-        Stage state dict with ``status``, ``cpt_file``, and ``restart`` keys.
-
-    """
+def _detect_skip_mode_state(output_file: Path, cpt_file: Path, tpr_file: Path) -> _StageState:
+    """Return stage state for 'skip' mode: complete if output exists, partial if cpt+tpr exist."""
     if output_file.exists():
         return {"status": "complete", "cpt_file": None, "restart": False}
-    if cpt_file.exists() and tpr_file.exists():
+    if _has_restart_pair(cpt_file, tpr_file):
         return {"status": "partial", "cpt_file": cpt_file, "restart": True}
     return {"status": "not_started", "cpt_file": None, "restart": False}
 
@@ -482,37 +423,13 @@ def _detect_production_output_state(
     cpt_file: Path,
     tpr_file: Path,
     traj_files: "tuple[str, ...]",
-) -> dict:
-    """Return stage state dict for Production when trajectory output exists.
-
-    Validates frame count; falls back to partial restart if every trajectory
-    file is incomplete and a checkpoint/TPR pair exists.
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory (must contain prod.mdp).
-    cpt_file : Path
-        Production checkpoint file.
-    tpr_file : Path
-        Production TPR file.
-    traj_files : tuple of str
-        Accepted trajectory output filenames from :attr:`StageSpec.traj_files`
-        (e.g. ``("prod.xtc", "prod.trr")``).  The stage is marked *complete*
-        when **any** of these passes :func:`_validate_trajectory_complete`,
-        covering both XTC-only and TRR-only MDP configurations.
-
-    Returns
-    -------
-    dict
-        Stage state dict with ``status``, ``cpt_file``, and ``restart`` keys.
-
-    """
+) -> _StageState:
+    """Check Production trajectory completeness; restart from cpt if incomplete."""
     expected_frames = _extract_expected_frames_from_mdp(sim_dir, "Production")
     for traj_file in traj_files:
         if _validate_trajectory_complete(sim_dir, traj_file, expected_frames):
             return {"status": "complete", "cpt_file": None, "restart": False}
-    if cpt_file.exists() and tpr_file.exists():
+    if _has_restart_pair(cpt_file, tpr_file):
         return {"status": "partial", "cpt_file": cpt_file, "restart": True}
     # All trajectory files incomplete and no checkpoint to restart from
     return {"status": "partial", "cpt_file": None, "restart": False}
@@ -523,35 +440,13 @@ def _detect_skip_stage_state(
     spec: "StageSpec",
     cpt_file: Path,
     tpr_file: Path,
-) -> dict:
-    """Return stage state for 'skip' checkpoint mode.
-
-    Checks file existence only — no integrity validation, no frame counting.
-    Trajectory stages accept completion if *any* expected trajectory file exists
-    (mirrors auto mode so TRR-only runs are not repeated).
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    spec : StageSpec
-        Stage descriptor from :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY`.
-    cpt_file : Path
-        Stage checkpoint file path.
-    tpr_file : Path
-        Stage TPR run-input file path.
-
-    Returns
-    -------
-    dict
-        Stage state dict with ``status``, ``cpt_file``, and ``restart`` keys.
-
-    """
+) -> _StageState:
+    """Return stage state for 'skip' mode: file-existence only, no integrity checks."""
     if spec.traj_files:
         # Mirror auto mode: complete if ANY trajectory file exists (XTC or TRR).
         if any((sim_dir / tf).exists() for tf in spec.traj_files):
             return {"status": "complete", "cpt_file": None, "restart": False}
-        if cpt_file.exists() and tpr_file.exists():
+        if _has_restart_pair(cpt_file, tpr_file):
             return {"status": "partial", "cpt_file": cpt_file, "restart": True}
         return {"status": "not_started", "cpt_file": None, "restart": False}
     return _detect_skip_mode_state(sim_dir / spec.gro_out, cpt_file, tpr_file)
@@ -564,34 +459,8 @@ def _detect_auto_output_state(
     cpt_file: Path,
     tpr_file: Path,
     prereq_cpt: "Path | None",
-) -> dict:
-    """Return stage state for 'auto' mode when output files already exist.
-
-    Validates workflow integrity (prerequisite checkpoint must exist) before
-    accepting the stage as complete.  Production stages additionally validate
-    frame count via :func:`_detect_production_output_state`.
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    stage : str
-        Stage name (e.g. ``"Production"``).
-    spec : StageSpec
-        Stage descriptor.
-    cpt_file : Path
-        Stage checkpoint file path.
-    tpr_file : Path
-        Stage TPR run-input file path.
-    prereq_cpt : Path or None
-        Prerequisite checkpoint path (``None`` for stages with no prereq).
-
-    Returns
-    -------
-    dict
-        Stage state dict with ``status``, ``cpt_file``, and ``restart`` keys.
-
-    """
+) -> _StageState:
+    """Return stage state for 'auto' mode; validates prerequisite integrity before accepting."""
     # Workflow integrity: prerequisite checkpoint must exist for the output to
     # be trustworthy (e.g. npt.gro is only valid if nvt.cpt is present).
     if prereq_cpt and not prereq_cpt.exists():
@@ -601,28 +470,8 @@ def _detect_auto_output_state(
     return {"status": "complete", "cpt_file": None, "restart": False}
 
 
-def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
-    """Detect completion or partial progress of a stage.
-
-    In "auto" mode, validates workflow integrity by checking both output AND prerequisite
-    checkpoint files. This ensures scientific correctness - we can't trust npt.gro if
-    nvt.cpt is missing, as we can't verify NPT used correct initial conditions.
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    stage : str
-        Stage name.
-    mode : str
-        Checkpoint mode: "auto", "skip", or "force".
-
-    Returns
-    -------
-    dict
-        {"status": "complete"|"partial"|"not_started", "cpt_file": Path|None}
-
-    """
+def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> _StageState:
+    """Detect completion or partial progress of a stage given checkpoint *mode*."""
     spec = STAGE_BY_NAME[stage]
     cpt_file = sim_dir / spec.cpt_file
     tpr_file = sim_dir / spec.tpr_file
@@ -647,7 +496,7 @@ def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
         return _detect_auto_output_state(sim_dir, stage, spec, cpt_file, tpr_file, prereq_cpt)
 
     # Check partial progress (checkpoint exists, output doesn't).
-    if cpt_file.exists() and tpr_file.exists():
+    if _has_restart_pair(cpt_file, tpr_file):
         if spec.traj_files:
             # Trajectory stage (Production): stale checkpoint without a
             # trajectory file cannot use -append — GROMACS would crash.
@@ -659,26 +508,7 @@ def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> dict:
 
 
 def _detect_needed_stages(sim_dir: Path, stages: list[str], mode: str) -> list[str]:
-    """Determine which stages need to run based on checkpoint mode.
-
-    Thin wrapper around :func:`_detect_needed_stages_with_restart_info` that
-    returns only stage names, discarding restart metadata.
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    stages : list[str]
-        Requested stages.
-    mode : str
-        Checkpoint mode: "auto", "skip", or "force".
-
-    Returns
-    -------
-    list[str]
-        Stages that need to run.
-
-    """
+    """Return stage names that still need to run (discards restart metadata)."""
     return [
         item["stage"] for item in _detect_needed_stages_with_restart_info(sim_dir, stages, mode)
     ]
@@ -687,25 +517,7 @@ def _detect_needed_stages(sim_dir: Path, stages: list[str], mode: str) -> list[s
 def _detect_needed_stages_with_restart_info(
     sim_dir: Path, stages: list[str], mode: str
 ) -> list[dict]:
-    """Determine which stages need to run with checkpoint restart information.
-
-    Extended version that returns restart info for -cpi -append support (Phase 2).
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    stages : list[str]
-        Requested stages.
-    mode : str
-        Checkpoint mode: "auto", "skip", or "force".
-
-    Returns
-    -------
-    list[dict]
-        List of stage work items: [{"stage": "NPT", "restart": True, "cpt_file": Path}, ...]
-
-    """
+    """Return stage work items ``[{"stage", "restart", "cpt_file"}, ...]`` for incomplete stages."""
     if mode == "force":
         return [{"stage": s, "restart": False, "cpt_file": None} for s in stages]
 
@@ -747,54 +559,7 @@ def _execute_stage_list(
     max_rescue: int = 3,
     tracker: "StageProgressTracker | None" = None,
 ) -> "AppFuture | None":
-    """Execute a list of stages with automatic dependency chaining.
-
-    Explicitly calls stage functions based on the needed_stages list,
-    validating stage ordering and chaining dependencies via inputs=[].
-
-    For rescue-eligible stages (EM, NVT, NPT) with ``max_rescue > 0``,
-    physics failures trigger automatic rescue retry with halved MDP
-    parameters.  See :mod:`mdfactory.orchestration.rescue` for details.
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    stages : list[str]
-        Ordered stages to execute (e.g., ["EM", "NVT"], ["NPT", "Production"]).
-    grompp_app : callable
-        Grompp app from get_grompp_app().
-    mdrun_app : callable
-        Mdrun app from get_mdrun_app().
-    stage_restarts : dict[str, str] or None, optional
-        Maps stage name → absolute path of checkpoint file to resume from.
-        When a stage has an entry here, grompp is skipped and mdrun is called
-        with ``-cpi <file> -append``.  Stages absent from the dict (or when
-        the dict is ``None``) run normally from scratch.
-    config : ExecutorConfig or None, optional
-        Executor configuration.  When a :class:`SlurmExecutorConfig` is
-        provided, per-stage resource overrides are applied via
-        :meth:`~mdfactory.orchestration.config.SlurmExecutorConfig.get_stage_config`
-        before each stage function call.
-    max_rescue : int
-        Maximum rescue tiers for physics failures in EM/NVT/NPT stages.
-        Set to 0 to disable rescue.
-    tracker : StageProgressTracker or None, optional
-        Thread-safe progress tracker.  When provided, each stage is reported
-        as running/succeeded/failed.  On failure, remaining stages are marked
-        skipped.
-
-    Returns
-    -------
-    AppFuture or None
-        Final future from last stage, or None if no stages to run.
-
-    Raises
-    ------
-    ValueError
-        If stage dependencies are not met or stages are out of order.
-
-    """
+    """Chain and submit stages in dependency order, with rescue retry and progress tracking."""
     if not stages:
         return None
 
@@ -840,11 +605,7 @@ def _execute_stage_list(
                 if tracker is not None:
                     tracker.mark_succeeded(stage, sim_hash)
             else:
-                stage_cfg = (
-                    config.get_stage_config(stage)
-                    if hasattr(config, "get_stage_config")
-                    else None
-                )
+                stage_cfg = get_stage_config_or_none(config, stage)
                 cfg_kwarg = {"stage_config": stage_cfg} if stage_cfg is not None else {}
                 prev_future = run_stage(
                     STAGE_BY_NAME[stage],
@@ -878,24 +639,7 @@ def _execute_stage_list(
 
 
 def _validate_stage_prerequisites(sim_dir: Path, first_stage: str) -> None:
-    """Validate that all prerequisite files exist for the first stage.
-
-    Fails fast on login node with clear error message before SLURM submission.
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    first_stage : str
-        First stage to run (e.g., "NPT" when resuming from checkpoint).
-
-    Raises
-    ------
-    FileNotFoundError
-        If required input files are missing. Error message includes
-        actionable guidance with fix commands.
-
-    """
+    """Fail fast if prerequisite files for *first_stage* are missing."""
     # Prerequisites: files needed BEFORE this stage can start.
     # Derived from StageSpec: the input .gro file and, when present, the
     # prerequisite checkpoint (which is also the grompp -t velocity input).
@@ -922,25 +666,7 @@ def _validate_stage_prerequisites(sim_dir: Path, first_stage: str) -> None:
 def _validate_trajectory_complete(
     sim_dir: Path, traj_file: str, expected_frames: int | None = None
 ) -> bool:
-    """Check if trajectory file is complete and readable.
-
-    Uses MDAnalysis to count frames. Falls back to size heuristic if MDAnalysis fails.
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    traj_file : str
-        Trajectory filename (e.g., "prod.xtc").
-    expected_frames : int, optional
-        Expected number of frames. If None, checks readability only.
-
-    Returns
-    -------
-    bool
-        True if trajectory is complete and readable.
-
-    """
+    """Return True if *traj_file* exists, is readable via MDAnalysis, and has enough frames."""
     traj_path = sim_dir / traj_file
 
     if not traj_path.exists():
@@ -1035,86 +761,31 @@ def find_structure_file(sim_dir: Path) -> Path | None:
 
 
 def _extract_expected_frames_from_mdp(sim_dir: Path, stage: str) -> int | None:
-    """Extract expected frame count from MDP file.
+    """Extract expected frame count from MDP file (nsteps / output_frequency)."""
+    from .mdp import get_mdp_value, parse_mdp
 
-    Reads ``nsteps`` and the output-frequency key from the MDP file to compute
-    the expected frame count.  Both XTC (``nstxout-compressed``) and TRR
-    (``nstxout``) variants are recognised.  Keys are matched after lowercasing
-    and dash/underscore normalisation so ``NSTXOUT_COMPRESSED`` and
-    ``nstxout-compressed`` are treated identically.
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-    stage : str
-        Stage name (EM, NVT, NPT, Production).
-
-    Returns
-    -------
-    int or None
-        Expected number of frames, or ``None`` when the value cannot be
-        determined (MDP absent, keys missing, zero output frequency, or any
-        parse error).
-
-    """
     mdp_path = sim_dir / STAGE_BY_NAME.get(stage, STAGE_BY_NAME["Production"]).mdp_file
-
     if not mdp_path.exists():
         return None
-
     try:
-        content = mdp_path.read_text()
-        nsteps = None
-        nstxout = None
-
-        for raw_line in content.split("\n"):
-            line = raw_line.split(";")[0].strip()  # Remove comments
-            if "=" not in line:
-                continue
-            raw_key, val = line.split("=", 1)
-            # Normalise: lowercase + unify dashes and underscores
-            norm_key = raw_key.strip().lower().replace("-", "_")
-            val = val.strip()
-
-            if norm_key == "nsteps":
-                nsteps = int(val)
-            elif norm_key == "nstxout_compressed":
-                # XTC output frequency — preferred over TRR when both declared
-                nstxout = int(val)
-            elif norm_key == "nstxout" and nstxout is None:
-                # TRR output frequency — only used when XTC key absent
-                nstxout = int(val)
-
-        # Guard against zero output-frequency (trajectory writing disabled)
-        if nsteps and nstxout:
-            return nsteps // nstxout
+        parsed = parse_mdp(mdp_path)
+        nsteps_val = get_mdp_value(parsed, "nsteps")
+        # XTC frequency preferred; fall back to TRR
+        nstxout_val = get_mdp_value(parsed, "nstxout_compressed") or get_mdp_value(
+            parsed, "nstxout"
+        )
+        if nsteps_val and nstxout_val:
+            nsteps = int(nsteps_val)
+            nstxout = int(nstxout_val)
+            if nstxout > 0:
+                return nsteps // nstxout
     except Exception as e:
         logger.debug(f"Could not parse MDP file: {e}")
-
     return None
 
 
 def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[dict]:
-    """Log what would be executed without running.
-
-    Prints a summary of the work plan (simulations, stages, executor) plus
-    the resolved ``gmx grompp`` and ``gmx mdrun`` commands that *would* be
-    submitted for each stage.
-
-    Parameters
-    ----------
-    work_plan : list[dict]
-        Work plan with sim_dir, hash, and stages.
-    config : ExecutorConfig
-        Executor configuration.
-
-    Returns
-    -------
-    list[dict]
-        The work plan (for testing).
-
-    """
+    """Log the dry-run work plan with resolved gmx commands per stage."""
     from .apps import _build_grompp_script, _build_mdrun_script
     from .stages import _extract_resource_hints
 
@@ -1135,11 +806,7 @@ def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[d
 
             # Resolve and display actual commands per stage
             work_dir = str(Path(item["sim_dir"]).resolve())
-            stage_config = (
-                config.get_stage_config(item["stages"][0])
-                if hasattr(config, "get_stage_config")
-                else None
-            )
+            stage_config = get_stage_config_or_none(config, item["stages"][0])
             hints = _extract_resource_hints(stage_config)
 
             for stage_name in item["stages"]:
@@ -1189,17 +856,7 @@ def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[d
 
 
 def _log_resolved_script(script: str, *, label: str) -> None:
-    """Extract and log the core gmx command from a generated bash script.
-
-    Parameters
-    ----------
-    script : str
-        Full bash script from ``_build_grompp_script`` or
-        ``_build_mdrun_script``.
-    label : str
-        Display label (e.g. ``"grompp"`` or ``"mdrun"``).
-
-    """
+    """Extract and log the ``$GMX_BIN`` command line from a generated bash script."""
     # Extract the actual gmx command line(s) — lines starting with $GMX_BIN
     # or containing "gmx" invocations, skipping boilerplate (set, cd, echo, if)
     for line in script.splitlines():

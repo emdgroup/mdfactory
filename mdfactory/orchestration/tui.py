@@ -263,25 +263,6 @@ def _suggest_mem(partition: Partition) -> str:
     return "16G"
 
 
-def _default_walltime(partition: Partition) -> str:
-    """Pick a sensible default walltime from the partition.
-
-    Parameters
-    ----------
-    partition : Partition
-        Selected partition.
-
-    Returns
-    -------
-    str
-        Walltime string (falls back to ``"2:00:00"``).
-    """
-    mt = partition.max_time
-    if mt and mt not in ("unknown", "infinite"):
-        return mt
-    return "2:00:00"
-
-
 # ---------------------------------------------------------------------------
 # Selection helpers
 # ---------------------------------------------------------------------------

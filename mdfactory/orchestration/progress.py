@@ -112,6 +112,42 @@ class StageProgressTracker:
             ]
 
 
+def _get_block_status() -> str:
+    """Query the active Parsl DFK for SLURM executor block statuses.
+
+    Returns a Rich-markup string summarising block counts, or ``""``
+    when no executor exposes status.
+    """
+    try:
+        import parsl  # type: ignore[import-not-found]
+
+        dfk = parsl.dfk()
+        counts: dict[str, int] = {}
+        for executor in dfk.executors.values():
+            if not hasattr(executor, "status"):
+                continue
+            for _block_id, job_status in executor.status().items():
+                state = str(job_status.state.name).lower()
+                counts[state] = counts.get(state, 0) + 1
+        if not counts:
+            return ""
+        parts = []
+        if counts.get("running", 0):
+            parts.append(f"[green]{counts['running']} running[/]")
+        if counts.get("pending", 0):
+            parts.append(f"[yellow]{counts['pending']} pending[/]")
+        if counts.get("completed", 0):
+            parts.append(f"[dim]{counts['completed']} completed[/]")
+        if counts.get("failed", 0):
+            parts.append(f"[red]{counts['failed']} failed[/]")
+        for state, count in counts.items():
+            if state not in ("running", "pending", "completed", "failed"):
+                parts.append(f"[dim]{count} {state}[/]")
+        return " · ".join(parts)
+    except Exception:
+        return ""
+
+
 def display_stage_progress(
     tracker: StageProgressTracker,
     *,
@@ -135,7 +171,6 @@ def display_stage_progress(
     from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
     from rich.text import Text
 
-    from .build import _get_block_status
 
     console = Console()
     total = len(tracker.sim_hashes)

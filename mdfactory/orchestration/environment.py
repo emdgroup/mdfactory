@@ -10,15 +10,13 @@ are separated from SLURM allocation and per-stage tuning.
 
 from __future__ import annotations
 
-import logging
 import os
 from pathlib import Path
 from typing import Any
 
 import yaml
+from loguru import logger
 from pydantic import BaseModel, field_serializer
-
-logger = logging.getLogger(__name__)
 
 
 class EnvironmentConfig(BaseModel):

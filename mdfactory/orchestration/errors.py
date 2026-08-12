@@ -215,3 +215,19 @@ def _read_stage_log(sim_dir: Path, stage: str) -> str:
     except Exception as e:
         logger.debug(f"Could not read log file {log_file}: {e}")
         return ""
+
+
+def _describe_failure(exc: BaseException) -> tuple[str, str]:
+    """Extract ``(failure_type, error_detail)`` from a future's exception.
+
+    Unwraps Parsl exception wrappers to surface the underlying error type.
+
+    Returns
+    -------
+    tuple[str, str]
+        ``(failure_type, error_detail)`` — the underlying exception's class
+        name and its string representation.
+
+    """
+    underlying = _unwrap_parsl_exception(exc)
+    return type(underlying).__name__, str(underlying)

@@ -125,32 +125,7 @@ def build_systems(
         return _wait_with_progress(futures, hashes=input_hashes, label="Parsl Builds")
 
 
-def _describe_failure(exc: BaseException) -> tuple[str, str]:
-    """Extract ``(failure_type, error_detail)`` from a future's exception.
-
-    Parsl surfaces worker errors differently across versions and failure
-    modes: ``DependencyError`` wraps upstream failures (e.g. grompp crash
-    prevents mdrun from launching), ``RemoteExceptionWrapper`` (legacy)
-    stores the original on ``.e_value``, and modern Parsl re-raises
-    directly. Uses :func:`~mdfactory.orchestration.errors._unwrap_parsl_exception`
-    to unwrap defensively so callers always see the *underlying* error type.
-
-    Parameters
-    ----------
-    exc : BaseException
-        The exception raised by ``future.result()``.
-
-    Returns
-    -------
-    tuple[str, str]
-        ``(failure_type, error_detail)`` — the underlying exception's class
-        name and its string representation.
-
-    """
-    from .errors import _unwrap_parsl_exception
-
-    underlying = _unwrap_parsl_exception(exc)
-    return type(underlying).__name__, str(underlying)
+from .errors import _describe_failure as _describe_failure  # noqa: F401, E402
 
 
 def _collect_results(results: list, hashes: list[str]) -> list[dict]:
@@ -189,44 +164,7 @@ def _collect_results(results: list, hashes: list[str]) -> list[dict]:
     return list(results)
 
 
-def _get_block_status() -> str:
-    """Query the active Parsl DFK for SLURM executor block statuses.
-
-    Returns
-    -------
-    str
-        Rich-markup string summarising running/pending/completed/failed
-        block counts, or an empty string when no executor exposes status.
-
-    """
-    try:
-        import parsl  # type: ignore[import-not-found]
-
-        dfk = parsl.dfk()
-        counts: dict[str, int] = {}
-        for executor in dfk.executors.values():
-            if not hasattr(executor, "status"):
-                continue
-            for _block_id, job_status in executor.status().items():
-                state = str(job_status.state.name).lower()
-                counts[state] = counts.get(state, 0) + 1
-        if not counts:
-            return ""
-        parts = []
-        if counts.get("running", 0):
-            parts.append(f"[green]{counts['running']} running[/]")
-        if counts.get("pending", 0):
-            parts.append(f"[yellow]{counts['pending']} pending[/]")
-        if counts.get("completed", 0):
-            parts.append(f"[dim]{counts['completed']} completed[/]")
-        if counts.get("failed", 0):
-            parts.append(f"[red]{counts['failed']} failed[/]")
-        for state, count in counts.items():
-            if state not in ("running", "pending", "completed", "failed"):
-                parts.append(f"[dim]{count} {state}[/]")
-        return " · ".join(parts)
-    except Exception:
-        return ""
+from .progress import _get_block_status as _get_block_status  # noqa: F401, E402
 
 
 def _is_running(future) -> bool:

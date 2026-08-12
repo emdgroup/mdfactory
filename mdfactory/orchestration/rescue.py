@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from .config import get_stage_config_or_none
 from .errors import FailureType, classify_failure
 from .mdp import apply_rescue_tier
 from .stages import STAGE_BY_NAME, run_stage
@@ -103,7 +104,7 @@ def execute_stage_with_rescue(
 
     """
     spec = STAGE_BY_NAME[stage]
-    stage_cfg = config.get_stage_config(stage) if hasattr(config, "get_stage_config") else None
+    stage_cfg = get_stage_config_or_none(config, stage)
     cfg_kwarg: dict[str, Any] = {"stage_config": stage_cfg} if stage_cfg is not None else {}
 
     for tier in range(max_rescue + 1):

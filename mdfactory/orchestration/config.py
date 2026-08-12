@@ -435,3 +435,10 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
             run_dir=str(self.run_dir),
             retries=self.retries,
         )
+
+
+def get_stage_config_or_none(config: "ExecutorConfig | None", stage: str):
+    """Return per-stage config if the config supports it, else None."""
+    if config is not None and hasattr(config, "get_stage_config"):
+        return config.get_stage_config(stage)
+    return None
