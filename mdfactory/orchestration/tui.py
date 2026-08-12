@@ -496,8 +496,11 @@ def _prompt_stage_overrides(
 def _prompt_environment(*, stages: tuple[str, ...] | None = None) -> EnvironmentConfig:
     """Prompt the user for execution-environment configuration.
 
-    Auto-detects pixi/conda/venv, prompts for GROMACS modules (if needed
-    for simulate workflows), and offers an extra_init escape hatch.
+    If a global environment config exists (written by
+    ``mdfactory config environment``), it is used directly without
+    prompting.  Otherwise, auto-detects pixi/conda/venv, prompts for
+    GROMACS modules (if needed for simulate workflows), and offers an
+    extra_init escape hatch.
 
     Parameters
     ----------
@@ -510,6 +513,20 @@ def _prompt_environment(*, stages: tuple[str, ...] | None = None) -> Environment
     EnvironmentConfig
         Structured environment configuration.
     """
+    from mdfactory.orchestration.environment import get_global_environment_path
+
+    global_env = EnvironmentConfig.load_global()
+    if global_env is not None:
+        path = get_global_environment_path()
+        console.print(f"  ✓ Using saved environment config from {path}")
+        if global_env.modules:
+            console.print(f"    modules: {', '.join(global_env.modules)}")
+        if global_env.pixi_manifest:
+            console.print(f"    pixi: {global_env.pixi_manifest}")
+        elif global_env.conda_env:
+            console.print(f"    conda: {global_env.conda_env}")
+        return global_env
+
     questionary = _import_questionary()
 
     # Start with auto-detection

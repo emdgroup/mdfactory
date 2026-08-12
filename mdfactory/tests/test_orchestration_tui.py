@@ -466,10 +466,13 @@ class TestStageOverridesIntegration:
 class TestPromptEnvironment:
     """Tests for the _prompt_environment helper."""
 
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.load_global", return_value=None)
     @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
     @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_stages_empty_skips_gromacs_prompts(self, mock_iq, mock_detect, mock_gmx):
+    def test_stages_empty_skips_gromacs_prompts(
+        self, mock_iq, mock_detect, mock_gmx, _load_global
+    ):
         """build workflow (stages=()) skips GROMACS module prompts."""
         from mdfactory.orchestration.environment import EnvironmentConfig
 
@@ -483,10 +486,13 @@ class TestPromptEnvironment:
         mock_gmx.assert_not_called()
         assert result.modules == []
 
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.load_global", return_value=None)
     @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
     @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_stages_none_calls_gromacs_prompts(self, mock_iq, mock_detect, mock_gmx):
+    def test_stages_none_calls_gromacs_prompts(
+        self, mock_iq, mock_detect, mock_gmx, _load_global
+    ):
         """simulate workflow (stages=None) does prompt for GROMACS modules."""
         from mdfactory.orchestration.environment import EnvironmentConfig
 
@@ -501,10 +507,11 @@ class TestPromptEnvironment:
         mock_gmx.assert_called_once()
         assert result.modules == ["gromacs/2024.4"]
 
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.load_global", return_value=None)
     @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
     @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_detected_pixi_flows_through(self, mock_iq, mock_detect, mock_gmx):
+    def test_detected_pixi_flows_through(self, mock_iq, mock_detect, mock_gmx, _load_global):
         """Auto-detected pixi_manifest is preserved in returned config."""
         from pathlib import Path
 
@@ -517,6 +524,25 @@ class TestPromptEnvironment:
 
         result = _prompt_environment(stages=None)
 
+        assert result.pixi_manifest == Path("/project")
+
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.load_global")
+    def test_global_config_skips_prompts(self, mock_load_global):
+        """When global environment.yaml exists, prompts are skipped entirely."""
+        from pathlib import Path
+
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        saved_env = EnvironmentConfig(
+            modules=["gromacs/2024.3-gpu"],
+            pixi_manifest=Path("/project"),
+        )
+        mock_load_global.return_value = saved_env
+
+        result = _prompt_environment(stages=None)
+
+        assert result is saved_env
+        assert result.modules == ["gromacs/2024.3-gpu"]
         assert result.pixi_manifest == Path("/project")
 
 
