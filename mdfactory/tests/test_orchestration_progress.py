@@ -4,9 +4,7 @@
 
 import threading
 
-import pytest
-
-from mdfactory.orchestration.progress import SimState, StageProgressTracker
+from mdfactory.orchestration.progress import StageProgressTracker
 
 
 class TestStageProgressTracker:

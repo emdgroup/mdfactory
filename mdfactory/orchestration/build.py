@@ -125,7 +125,7 @@ def build_systems(
         return _wait_with_progress(futures, hashes=input_hashes, label="Parsl Builds")
 
 
-from .errors import _describe_failure as _describe_failure  # noqa: F401, E402
+from .errors import _describe_failure  # noqa: E402
 
 
 def _collect_results(results: list, hashes: list[str]) -> list[dict]:
@@ -164,7 +164,7 @@ def _collect_results(results: list, hashes: list[str]) -> list[dict]:
     return list(results)
 
 
-from .progress import _get_block_status as _get_block_status  # noqa: F401, E402
+from .progress import _get_block_status  # noqa: E402
 
 
 def _is_running(future) -> bool:

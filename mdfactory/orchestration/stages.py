@@ -286,5 +286,3 @@ def run_stage(
         traj_files=spec.traj_files,
         inputs=[grompp_fut],
     )
-
-

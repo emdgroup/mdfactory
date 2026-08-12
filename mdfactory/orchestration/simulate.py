@@ -230,8 +230,7 @@ def run_simulations(
 
             with ThreadPoolExecutor() as pool:
                 thread_futs = [
-                    (item["hash"], pool.submit(_run_pipeline_nowait, item))
-                    for item in active_items
+                    (item["hash"], pool.submit(_run_pipeline_nowait, item)) for item in active_items
                 ]
                 for h, tf in thread_futs:
                     try:
@@ -251,7 +250,6 @@ def run_simulations(
             return [fut for _, fut in futures]
 
         # 7. wait=True: tracked execution with per-stage progress display
-        import threading
         from concurrent.futures import ThreadPoolExecutor
 
         from .errors import _describe_failure
@@ -298,13 +296,16 @@ def run_simulations(
                 tracker.store_result(sim_hash, result)
             except Exception as exc:
                 failure_type, error_detail = _describe_failure(exc)
-                tracker.store_result(sim_hash, {
-                    "hash": sim_hash,
-                    "status": "failed",
-                    "error": error_detail,
-                    "failure_type": failure_type,
-                    "error_detail": error_detail,
-                })
+                tracker.store_result(
+                    sim_hash,
+                    {
+                        "hash": sim_hash,
+                        "status": "failed",
+                        "error": error_detail,
+                        "failure_type": failure_type,
+                        "error_detail": error_detail,
+                    },
+                )
 
         logger.info(f"Submitted {len(active_items)} simulation(s)")
 
@@ -406,7 +407,6 @@ def clean_simulation_outputs(
             logger.info(f"Cleaned {len(existing)} file(s) from {sim_dir.name}")
 
     return existing
-
 
 
 def _detect_skip_mode_state(output_file: Path, cpt_file: Path, tpr_file: Path) -> _StageState:

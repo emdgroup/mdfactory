@@ -802,7 +802,9 @@ def test_execute_stage_list_production_bypasses_rescue(mock_run_stage, mock_resc
 @patch("mdfactory.orchestration.progress.display_stage_progress")
 @patch("mdfactory.orchestration.simulate.parsl_session")
 @patch("mdfactory.orchestration.simulate._execute_stage_list")
-def test_run_simulations_uses_execute_stage_list(mock_execute, mock_session, mock_display, mock_sim_dir):
+def test_run_simulations_uses_execute_stage_list(
+    mock_execute, mock_session, mock_display, mock_sim_dir
+):
     """run_simulations dispatcher now uses _execute_stage_list."""
     mock_future = MagicMock()
     mock_future.done.return_value = True

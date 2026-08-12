@@ -107,9 +107,7 @@ class StageProgressTracker:
     def collect_results(self) -> list[dict]:
         """Return stored result dicts in ``sim_hashes`` order."""
         with self._lock:
-            return [
-                self._results.get(h, {"hash": h, "status": "unknown"}) for h in self.sim_hashes
-            ]
+            return [self._results.get(h, {"hash": h, "status": "unknown"}) for h in self.sim_hashes]
 
 
 def _get_block_status() -> str:
@@ -170,7 +168,6 @@ def display_stage_progress(
     from rich.live import Live
     from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
     from rich.text import Text
-
 
     console = Console()
     total = len(tracker.sim_hashes)
