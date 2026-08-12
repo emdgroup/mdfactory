@@ -7,18 +7,25 @@ Provides a terminal-based wizard that queries the local SLURM cluster
 the user through selecting accounts, partitions, and resource limits.
 The result is a :class:`~mdfactory.orchestration.config.SlurmExecutorConfig`
 that can be saved as YAML and used with Parsl-based workflows.
+
+The wizard is structured into three distinct sections:
+
+1. **SLURM Allocation** — cluster infrastructure (account, partition, resources)
+2. **Execution Environment** — project/tool setup (modules, pixi, extra init)
+3. **Per-Stage Tuning** — simulation-specific overrides (cpus, gres, gmx_binary)
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import yaml
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 
 from mdfactory.orchestration.config import SlurmExecutorConfig
+from mdfactory.orchestration.environment import EnvironmentConfig
 from mdfactory.performance.cluster import ClusterInfo, Partition, discover_cluster
 
 console = Console()
@@ -54,52 +61,6 @@ def _import_questionary():
 
 
 def _detect_gromacs_modules() -> list[str]:
-    """Detect loaded GROMACS modules from ``$LOADEDMODULES``.
-
-    The ``LOADEDMODULES`` environment variable is a colon-separated list
-    of currently loaded modules (set by the ``module`` system on HPC
-    clusters).  This function returns module names that look like
-    GROMACS (case-insensitive prefix match on ``gromacs`` or ``gmx``).
-
-    Returns
-    -------
-    list[str]
-        Module names that match GROMACS, e.g. ``["gromacs/2024.3-gpu"]``.
-        Empty list if no modules are loaded or the variable is unset.
-    """
-    loaded = os.environ.get("LOADEDMODULES", "")
-    if not loaded:
-        return []
-    return [mod for mod in loaded.split(":") if mod.lower().startswith(("gromacs", "gmx"))]
-
-
-def _default_worker_init() -> str:
-    """Auto-detect the pixi environment and return an appropriate worker_init.
-
-    On HPC clusters with a shared filesystem, workers need the same pixi
-    environment as the submitting process.  This function locates the
-    project root via ``mdfactory.__file__`` and returns a pixi shell-hook
-    command if the environment exists.
-
-    Returns
-    -------
-    str
-        A shell command to activate the pixi environment, or ``""`` if
-        no pixi environment is detected.
-    """
-    try:
-        import mdfactory as _mdf
-
-        project_root = Path(_mdf.__file__).parent.parent
-        pixi_env = project_root / ".pixi" / "envs" / "default"
-        if pixi_env.exists():
-            return f'eval "$(pixi shell-hook --manifest-path {project_root} -e default)"'
-    except Exception:
-        pass
-    return ""
-
-
-def _detect_gromacs_modules() -> list[str]:
     """Discover available GROMACS modules via ``module avail``.
 
     Returns
@@ -109,13 +70,7 @@ def _detect_gromacs_modules() -> list[str]:
         or an empty list if ``module`` is not available or no GROMACS
         modules are found.
     """
-    import shutil
     import subprocess
-
-    # module is typically a shell function; invoke via bash -l
-    if shutil.which("modulecmd") is None and shutil.which("module") is None:
-        # Try invoking anyway — module is often a bash function, not a binary
-        pass
 
     try:
         # 'module avail' writes to stderr (by design)
@@ -143,23 +98,22 @@ def _detect_gromacs_modules() -> list[str]:
         return []
 
 
-def _prompt_gromacs_source() -> str:
-    """Prompt the user for how to load GROMACS on compute workers.
+def _prompt_gromacs_modules() -> list[str]:
+    """Prompt the user to select GROMACS modules for compute workers.
 
     Only prompts if ``gmx``/``gmx_mpi`` is not on the current PATH.
-    If GROMACS is already available, returns ``""``.
+    If GROMACS is already available, returns an empty list.
 
     Returns
     -------
-    str
-        A shell command to prepend to worker_init (e.g.
-        ``"module load gromacs/2024.4; "``), or ``""`` if not needed.
+    list[str]
+        Module names to load (e.g. ``["gromacs/2024.4"]``), or ``[]``.
     """
     import shutil
 
     # If gmx is already on PATH, no action needed
     if shutil.which("gmx") or shutil.which("gmx_mpi"):
-        return ""
+        return []
 
     questionary = _import_questionary()
 
@@ -169,42 +123,42 @@ def _prompt_gromacs_source() -> str:
     console.print("\n  [yellow]⚠ GROMACS (gmx/gmx_mpi) not found in current PATH.[/yellow]")
     console.print("  Compute workers need GROMACS to run simulations.\n")
 
-    _CUSTOM = "Custom command…"
-    _SKIP = "Skip (I'll include it in worker_init manually)"
+    _CUSTOM = "Custom module name…"
+    _SKIP = "Skip (I'll handle it in extra_init or PATH)"
 
     if modules:
         choices = [*modules, _CUSTOM, _SKIP]
         selected = _require(
             questionary.select(
-                "How should workers load GROMACS?",
+                "GROMACS module to load on workers:",
                 choices=choices,
                 default=modules[0],
             ).ask(),
-            "gromacs source",
+            "gromacs module",
         )
     else:
         # No modules found — offer manual entry or skip
         selected = _require(
             questionary.select(
-                "How should workers load GROMACS?",
+                "GROMACS module to load on workers:",
                 choices=[_CUSTOM, _SKIP],
             ).ask(),
-            "gromacs source",
+            "gromacs module",
         )
 
     if selected == _SKIP:
-        return ""
+        return []
     elif selected == _CUSTOM:
-        cmd = _require(
+        mod_name = _require(
             questionary.text(
-                "Command to make GROMACS available (e.g. 'module load gromacs/2024'):",
+                "Module name (e.g. 'gromacs/2024.4-gpu'):",
             ).ask(),
-            "gromacs command",
+            "gromacs module name",
         )
-        return f"{cmd.strip()}; " if cmd.strip() else ""
+        return [mod_name.strip()] if mod_name.strip() else []
     else:
-        # User selected a module
-        return f"module load {selected}; "
+        # User selected a discovered module
+        return [selected]
 
 
 class UserCancelledError(Exception):
@@ -535,6 +489,93 @@ def _prompt_stage_overrides(
 
 
 # ---------------------------------------------------------------------------
+# Environment section prompts
+# ---------------------------------------------------------------------------
+
+
+def _prompt_environment(
+    *, stages: tuple[str, ...] | None = None, ignore_global: bool = False
+) -> EnvironmentConfig:
+    """Prompt the user for execution-environment configuration.
+
+    If a global environment config exists (written by
+    ``mdfactory config environment``), it is used directly without
+    prompting.  Otherwise, auto-detects pixi/conda/venv, prompts for
+    GROMACS modules (if needed for simulate workflows), and offers an
+    extra_init escape hatch.
+
+    Parameters
+    ----------
+    stages : tuple[str, ...] or None, optional
+        The simulation stages. Pass ``()`` to skip GROMACS prompts
+        (e.g. for ``build``). ``None`` uses the full pipeline.
+    ignore_global : bool, optional
+        If True, skip loading the global config and always run the
+        interactive wizard. Used by ``configure_and_save_environment``
+        so users can update an existing global config.
+
+    Returns
+    -------
+    EnvironmentConfig
+        Structured environment configuration.
+    """
+    from mdfactory.orchestration.environment import get_global_environment_path
+
+    if not ignore_global:
+        global_env = EnvironmentConfig.load_global()
+    else:
+        global_env = None
+    if global_env is not None:
+        path = get_global_environment_path()
+        console.print(f"  ✓ Using saved environment config from {path}")
+        if global_env.modules:
+            console.print(f"    modules: {', '.join(global_env.modules)}")
+        if global_env.pixi_manifest:
+            console.print(f"    pixi: {global_env.pixi_manifest}")
+        elif global_env.conda_env:
+            console.print(f"    conda: {global_env.conda_env}")
+        return global_env
+
+    questionary = _import_questionary()
+
+    # Start with auto-detection
+    env = EnvironmentConfig.detect()
+
+    # Show what was detected
+    if env.pixi_manifest:
+        console.print(f"  ✓ Detected pixi environment at {env.pixi_manifest}")
+    elif env.conda_env:
+        console.print(f"  ✓ Detected conda environment: {env.conda_env}")
+    elif env.venv_path:
+        console.print(f"  ✓ Detected virtualenv at {env.venv_path}")
+    else:
+        console.print("  ℹ No Python environment auto-detected.")
+
+    # GROMACS module prompts (skip for build workflows)
+    modules: list[str] = []
+    if stages != ():
+        modules = _prompt_gromacs_modules()
+
+    # Extra init commands
+    extra_init = _require(
+        questionary.text(
+            "Additional init commands (leave empty to skip):",
+            default="",
+        ).ask(),
+        "extra_init",
+    )
+
+    # Build the final config, merging auto-detected + user input
+    return EnvironmentConfig(
+        modules=modules,
+        pixi_manifest=env.pixi_manifest,
+        conda_env=env.conda_env if not env.pixi_manifest else None,
+        venv_path=env.venv_path if not env.pixi_manifest and not env.conda_env else None,
+        extra_init=extra_init.strip(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Interactive prompts — cluster-assisted
 # ---------------------------------------------------------------------------
 
@@ -568,6 +609,10 @@ def _configure_with_cluster(
         If the user cancels any prompt.
     """
     questionary = _import_questionary()
+
+    # ━━━ Section 1: SLURM Allocation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("SLURM Allocation", style="bold cyan"))
+
     # --- Account ---
     if cluster.accounts:
         account = _require(
@@ -678,17 +723,6 @@ def _configure_with_cluster(
         )
     )
 
-    # --- GROMACS detection + Worker init ---
-    gmx_prefix = _prompt_gromacs_source() if stages != () else ""
-    default_init = gmx_prefix + _default_worker_init()
-    worker_init = _require(
-        questionary.text(
-            "Worker init script (activates environment on compute nodes):",
-            default=default_init,
-        ).ask(),
-        "worker_init",
-    )
-
     # --- QOS ---
     qos: str | None = None
     if cluster.qos_policies:
@@ -711,7 +745,14 @@ def _configure_with_cluster(
     )
     constraint: str | None = constraint_input.strip() or None
 
-    # --- Per-stage overrides ---
+    # ━━━ Section 2: Execution Environment ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("Execution Environment", style="bold green"))
+
+    environment = _prompt_environment(stages=stages)
+
+    # ━━━ Section 3: Per-Stage Tuning ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("Per-Stage Tuning", style="bold yellow"))
+
     resolved_stages = _resolve_stages(stages)
     stage_overrides = _prompt_stage_overrides(
         common_cpus=cpus_per_node,
@@ -730,7 +771,7 @@ def _configure_with_cluster(
         qos=qos,
         constraint=constraint,
         max_blocks=max_blocks,
-        worker_init=worker_init,
+        environment=environment,
         stage_overrides=stage_overrides,
     )
 
@@ -761,6 +802,10 @@ def _configure_manual(*, stages: tuple[str, ...] | None = None) -> SlurmExecutor
         If the user cancels any prompt.
     """
     questionary = _import_questionary()
+
+    # ━━━ Section 1: SLURM Allocation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("SLURM Allocation", style="bold cyan"))
+
     account = _require(questionary.text("SLURM account:").ask(), "account")
     partition = _require(questionary.text("SLURM partition:", default="gpu").ask(), "partition")
     walltime = _require(questionary.text("Walltime (--time):", default="2:00:00").ask(), "walltime")
@@ -793,17 +838,14 @@ def _configure_manual(*, stages: tuple[str, ...] | None = None) -> SlurmExecutor
         )
     )
 
-    gmx_prefix = _prompt_gromacs_source() if stages != () else ""
-    default_init = gmx_prefix + _default_worker_init()
-    worker_init = _require(
-        questionary.text(
-            "Worker init script (activates environment on compute nodes):",
-            default=default_init,
-        ).ask(),
-        "worker_init",
-    )
+    # ━━━ Section 2: Execution Environment ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("Execution Environment", style="bold green"))
 
-    # --- Per-stage overrides ---
+    environment = _prompt_environment(stages=stages)
+
+    # ━━━ Section 3: Per-Stage Tuning ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("Per-Stage Tuning", style="bold yellow"))
+
     resolved_stages = _resolve_stages(stages)
     stage_overrides = _prompt_stage_overrides(
         common_cpus=cpus_per_node,
@@ -821,7 +863,7 @@ def _configure_manual(*, stages: tuple[str, ...] | None = None) -> SlurmExecutor
         mem=mem,
         qos=qos,
         max_blocks=max_blocks,
-        worker_init=worker_init,
+        environment=environment,
         stage_overrides=stage_overrides,
     )
 
@@ -894,9 +936,22 @@ def save_slurm_config_yaml(config: SlurmExecutorConfig, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = config.model_dump(exclude_none=True)
+
+    # Clean up empty fields in environment section
+    if "environment" in data:
+        env_data = data["environment"]
+        if not env_data.get("modules"):
+            env_data.pop("modules", None)
+        if not env_data.get("extra_init"):
+            env_data.pop("extra_init", None)
+        # Remove environment section entirely if empty after cleanup
+        if not env_data:
+            data.pop("environment")
+
     # Omit empty stage_overrides for cleaner YAML output
     if not data.get("stage_overrides"):
         data.pop("stage_overrides", None)
+
     with open(path, "w") as fh:
         yaml.dump(data, fh, default_flow_style=False, sort_keys=False)
 
@@ -932,3 +987,43 @@ def configure_and_save_slurm() -> SlurmExecutorConfig:
 
     save_slurm_config_yaml(config, Path(save_path))
     return config
+
+
+def configure_and_save_environment() -> EnvironmentConfig:
+    """Run the environment wizard and save to the global config location.
+
+    Prompts for execution environment (modules, pixi/conda/venv, extra init)
+    and saves the result to ``~/.config/mdfactory/environment.yaml`` (or the
+    platform-appropriate config directory).
+
+    This global environment config is automatically loaded by
+    :meth:`~mdfactory.orchestration.config.ExecutorConfig.from_yaml` when a
+    SLURM executor YAML does not contain an ``environment:`` section.
+
+    Returns
+    -------
+    EnvironmentConfig
+        The environment config that was saved.
+
+    Raises
+    ------
+    UserCancelledError
+        If the user cancels any prompt.
+    """
+    from mdfactory.orchestration.environment import get_global_environment_path
+
+    console.print(Rule("Execution Environment", style="bold green"))
+
+    try:
+        env = _prompt_environment(stages=None, ignore_global=True)
+    except UserCancelledError:
+        console.print("Configuration cancelled.")
+        raise
+
+    save_path = get_global_environment_path()
+    env.save_yaml(save_path)
+    console.print(f"✓ Environment config written to {save_path}")
+    console.print(
+        "  This will be used automatically when SLURM configs don't include an environment section."
+    )
+    return env

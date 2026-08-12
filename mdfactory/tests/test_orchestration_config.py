@@ -8,13 +8,14 @@ import yaml
 pytest.importorskip("parsl", reason="parsl not installed")
 
 from mdfactory.orchestration.config import ExecutorConfig, SlurmExecutorConfig
+from mdfactory.orchestration.environment import EnvironmentConfig
 
 
 def test_executor_config_defaults():
     """ExecutorConfig has sensible defaults."""
     cfg = ExecutorConfig()
     assert cfg.provider == "local"
-    assert cfg.worker_init == ""
+    assert cfg.environment == EnvironmentConfig()
     assert cfg.working_directory is None
     assert cfg.max_workers_per_node == 1
 
@@ -81,7 +82,8 @@ def test_executor_config_from_yaml_slurm(tmp_path):
 
 def test_executor_config_to_parsl_config():
     """to_parsl_config produces a valid Parsl Config for local provider."""
-    cfg = ExecutorConfig(max_workers_per_node=2, worker_init="module load cuda/12.0")
+    env = EnvironmentConfig(modules=["cuda/12.0"])
+    cfg = ExecutorConfig(max_workers_per_node=2, environment=env)
     result = cfg.to_parsl_config()
 
     import parsl
@@ -103,13 +105,28 @@ def test_slurm_executor_config_to_parsl_config():
     assert result.executors[0].label == "slurm"
 
 
-def test_worker_init_propagation():
-    """worker_init string is passed to the SLURM provider."""
-    cfg = SlurmExecutorConfig(account="acc", worker_init="module load cuda/12.0")
+def test_environment_propagation():
+    """environment.compose_worker_init() is passed to the SLURM provider."""
+    env = EnvironmentConfig(modules=["cuda/12.0"])
+    cfg = SlurmExecutorConfig(account="acc", environment=env)
     result = cfg.to_parsl_config()
 
     provider = result.executors[0].provider
     assert "module load cuda/12.0" in provider.worker_init
+
+
+def test_environment_combined_propagation():
+    """Multiple environment fields are composed into the provider worker_init."""
+    env = EnvironmentConfig(
+        modules=["gromacs/2024.3-gpu"],
+        pixi_manifest="/project",
+    )
+    cfg = SlurmExecutorConfig(account="acc", environment=env)
+    result = cfg.to_parsl_config()
+
+    provider = result.executors[0].provider
+    assert "module load gromacs/2024.3-gpu" in provider.worker_init
+    assert "pixi shell-hook" in provider.worker_init
 
 
 def test_gres_in_scheduler_options():
@@ -247,12 +264,13 @@ def test_launch_options_roundtrip_yaml(tmp_path):
 
 def test_config_yaml_roundtrip(tmp_path):
     """Config can be written to YAML and loaded back identically."""
+    env = EnvironmentConfig(modules=["gromacs/2024"], extra_init="source activate env")
     original = SlurmExecutorConfig(
         account="test_account",
         partition="gpu-dev",
         walltime="1:00:00",
         gres="gpu:l40s:1",
-        worker_init="source activate env",
+        environment=env,
     )
     cfg_path = tmp_path / "roundtrip.yaml"
     with open(cfg_path, "w") as f:
@@ -264,7 +282,153 @@ def test_config_yaml_roundtrip(tmp_path):
     assert loaded.partition == original.partition
     assert loaded.walltime == original.walltime
     assert loaded.gres == original.gres
-    assert loaded.worker_init == original.worker_init
+    assert loaded.environment.modules == ["gromacs/2024"]
+    assert loaded.environment.extra_init == "source activate env"
+
+
+# === EnvironmentConfig integration tests ===
+
+
+def test_environment_field_defaults_to_empty():
+    """ExecutorConfig defaults environment to an empty EnvironmentConfig."""
+    cfg = ExecutorConfig()
+    assert cfg.environment == EnvironmentConfig()
+    assert cfg.environment.compose_worker_init() == ""
+
+
+def test_to_parsl_config_uses_environment():
+    """to_parsl_config passes environment-composed string to the provider."""
+    env = EnvironmentConfig(modules=["gromacs/2024.3-gpu"])
+    cfg = ExecutorConfig(environment=env)
+    result = cfg.to_parsl_config()
+    provider = result.executors[0].provider
+    assert "module load gromacs/2024.3-gpu" in provider.worker_init
+
+
+def test_from_yaml_environment_section(tmp_path):
+    """YAML with environment section loads correctly."""
+    cfg_data = {
+        "provider": "slurm",
+        "account": "acc",
+        "environment": {
+            "modules": ["gromacs/2024.3-gpu"],
+            "pixi_manifest": "/project/root",
+            "extra_init": "ulimit -s unlimited",
+        },
+    }
+    cfg_path = tmp_path / "new.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(cfg_data, f)
+
+    loaded = ExecutorConfig.from_yaml(cfg_path)
+    assert isinstance(loaded, SlurmExecutorConfig)
+    assert loaded.environment.modules == ["gromacs/2024.3-gpu"]
+    assert str(loaded.environment.pixi_manifest) == "/project/root"
+    assert loaded.environment.extra_init == "ulimit -s unlimited"
+    worker_init = loaded.environment.compose_worker_init()
+    assert "gromacs" in worker_init
+    assert "pixi shell-hook" in worker_init
+
+
+def test_from_yaml_no_environment(tmp_path, monkeypatch):
+    """YAML without environment section gets empty EnvironmentConfig when no global exists."""
+    # Point config dir to an empty tmp dir so no global file is found
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path / "config"))
+    cfg_data = {"provider": "slurm", "account": "acc"}
+    cfg_path = tmp_path / "minimal.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(cfg_data, f)
+
+    loaded = ExecutorConfig.from_yaml(cfg_path)
+    assert loaded.environment == EnvironmentConfig()
+    assert loaded.environment.compose_worker_init() == ""
+
+
+def test_from_yaml_auto_loads_global_environment(tmp_path, monkeypatch):
+    """YAML without environment section auto-loads from global config."""
+    # Create a global environment config
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(config_dir))
+    global_env = EnvironmentConfig(
+        modules=["gromacs/2024"],
+        conda_env="md",
+    )
+    global_env.save_yaml(config_dir / "environment.yaml")
+
+    # Load a SLURM YAML with no environment section
+    cfg_data = {"provider": "slurm", "account": "acc"}
+    cfg_path = tmp_path / "slurm.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(cfg_data, f)
+
+    loaded = ExecutorConfig.from_yaml(cfg_path)
+    assert loaded.environment.modules == ["gromacs/2024"]
+    assert loaded.environment.conda_env == "md"
+    assert "gromacs/2024" in loaded.environment.compose_worker_init()
+
+
+def test_from_yaml_explicit_environment_overrides_global(tmp_path, monkeypatch):
+    """YAML with explicit environment section ignores global config."""
+    # Create a global environment config
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(config_dir))
+    global_env = EnvironmentConfig(modules=["gromacs/2024"])
+    global_env.save_yaml(config_dir / "environment.yaml")
+
+    # Load a YAML that has its own environment section
+    cfg_data = {
+        "provider": "slurm",
+        "account": "acc",
+        "environment": {"modules": ["gromacs/2025"], "conda_env": "custom"},
+    }
+    cfg_path = tmp_path / "slurm.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(cfg_data, f)
+
+    loaded = ExecutorConfig.from_yaml(cfg_path)
+    assert loaded.environment.modules == ["gromacs/2025"]
+    assert loaded.environment.conda_env == "custom"
+
+
+# === _load_executor_config tests ===
+
+
+def test_load_executor_config_none_without_global(tmp_path, monkeypatch):
+    """_load_executor_config(None) returns default ExecutorConfig when no global env exists."""
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path / "no-config"))
+    from mdfactory.cli import _load_executor_config
+
+    cfg = _load_executor_config(None)
+    assert cfg.environment == EnvironmentConfig()
+    assert cfg.environment.compose_worker_init() == ""
+
+
+def test_load_executor_config_none_with_global(tmp_path, monkeypatch):
+    """_load_executor_config(None) loads global env config when it exists."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(config_dir))
+    global_env = EnvironmentConfig(modules=["gromacs/2024"], conda_env="md")
+    global_env.save_yaml(config_dir / "environment.yaml")
+    from mdfactory.cli import _load_executor_config
+
+    cfg = _load_executor_config(None)
+    assert cfg.environment.modules == ["gromacs/2024"]
+    assert cfg.environment.conda_env == "md"
+
+
+def test_load_executor_config_none_with_corrupt_global(tmp_path, monkeypatch):
+    """_load_executor_config(None) raises ValueError on corrupt global env config."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(config_dir))
+    (config_dir / "environment.yaml").write_text("- not a mapping\n")
+    from mdfactory.cli import _load_executor_config
+
+    with pytest.raises(ValueError, match="empty or invalid"):
+        _load_executor_config(None)
 
 
 # === Decision 6: Per-stage resource config tests ===
@@ -367,6 +531,26 @@ def test_get_stage_config_multiple_stages():
     assert nvt is cfg  # no override, returns self
     assert prod.cpus_per_node == 24
     assert prod.gres == "gpu:l40s:1"  # inherited
+
+
+def test_get_stage_config_rejects_unhonored_keys():
+    """Invalid override keys (e.g. walltime, mem) raise ValueError immediately."""
+    cfg = SlurmExecutorConfig(
+        account="acct",
+        stage_overrides={"EM": {"walltime": "1:00:00"}},
+    )
+    with pytest.raises(ValueError, match="walltime"):
+        cfg.get_stage_config("EM")
+
+
+def test_get_stage_config_rejects_multiple_unhonored_keys():
+    """Multiple invalid keys are all reported in the error message."""
+    cfg = SlurmExecutorConfig(
+        account="acct",
+        stage_overrides={"NVT": {"walltime": "2:00:00", "mem": "64G"}},
+    )
+    with pytest.raises(ValueError, match="walltime|mem"):
+        cfg.get_stage_config("NVT")
 
 
 # === gmx_binary field tests ===

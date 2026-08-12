@@ -122,8 +122,9 @@ gres: "gpu:1"
 max_workers_per_node: 1
 max_blocks: 4
 gmx_binary: auto
-worker_init: |
-  module load gromacs/2024
+environment:
+  modules:
+    - gromacs/2024
 ```
 
 ### Per-stage resource overrides

@@ -73,15 +73,21 @@ mdfactory config slurm
 
 The wizard auto-discovers your cluster's partitions, accounts, and hardware (GPU types, memory, CPU counts) and walks through resource selection. The result is saved to a YAML file (default: `slurm_executor.yaml`).
 
-<Callout type="info" title="Automatic GROMACS module detection">
-When configuring for `simulate`, the wizard detects GROMACS modules loaded on the login node (from `$LOADEDMODULES`) and includes them in the default `worker_init` suggestion. This ensures compute nodes can find `gmx` / `gmx_mpi` without manual configuration. You can always edit the suggestion before confirming.
+<Callout type="info" title="Three-section wizard">
+The wizard is organized into three distinct sections:
+
+1. **SLURM Allocation** — account, partition, walltime, CPUs, GPUs, memory
+2. **Execution Environment** — auto-detected pixi/conda activation, GROMACS modules
+3. **Per-Stage Tuning** — resource overrides for individual simulation stages (EM, NVT, etc.)
+
+GROMACS modules are discovered via `module avail` on the login node and offered as a selection. The pixi/conda environment is auto-detected from the filesystem.
 </Callout>
 
 ### Manual configuration
 
 You can also write the YAML file directly. See [`examples/slurm_executor.yaml`](https://github.com/emdgroup/mdfactory/blob/main/examples/slurm_executor.yaml) for an annotated reference with all available fields.
 
-A minimal GPU configuration:
+A minimal GPU configuration with the structured `environment` section:
 
 ```yaml
 provider: slurm
@@ -92,10 +98,13 @@ cpus_per_node: 16
 gres: "gpu:1"
 max_workers_per_node: 1
 max_blocks: 4
-worker_init: |
-  source ~/.bashrc
-  module load gromacs/2024
+environment:
+  modules:
+    - gromacs/2024
+  pixi_manifest: /path/to/project
 ```
+
+
 
 ### Per-stage resource overrides
 
@@ -128,7 +137,10 @@ stage_overrides:
 | `available_accelerators` | GPU count or device IDs for `CUDA_VISIBLE_DEVICES` | `0` |
 | `retries` | Infrastructure retry count (OOM, timeout, preemption) | `3` |
 | `gmx_binary` | `"auto"`, `"gmx"`, or `"gmx_mpi"` | `"auto"` |
-| `worker_init` | Shell setup (module loads, etc.) | `""` |
+| `environment.modules` | Module loads for workers (e.g. `["gromacs/2024"]`) | `[]` |
+| `environment.pixi_manifest` | Path to pixi project root | auto-detected |
+| `environment.conda_env` | Conda env name to activate | — |
+| `environment.extra_init` | Custom shell commands | `""` |
 
 ## Running simulations on SLURM
 

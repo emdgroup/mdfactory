@@ -11,8 +11,10 @@ from mdfactory.orchestration.config import SlurmExecutorConfig
 from mdfactory.orchestration.tui import (
     UserCancelledError,
     _detect_gromacs_modules,
+    _prompt_environment,
     _prompt_stage_overrides,
     _require,
+    configure_and_save_environment,
     configure_slurm_interactive,
     save_slurm_config_yaml,
 )
@@ -107,6 +109,7 @@ class TestDetectGromacsModules:
             "subprocess.run",
             lambda *a, **kw: type("R", (), {"stdout": fake_output, "stderr": ""})(),
         )
+        assert _detect_gromacs_modules() == []
 
 
 # ---------------------------------------------------------------------------
@@ -117,15 +120,19 @@ class TestDetectGromacsModules:
 class TestConfigureManualFallback:
     """When discover_cluster returns None, wizard uses manual entry."""
 
-    @patch("mdfactory.orchestration.tui._prompt_gromacs_source", return_value="")
+    @patch("mdfactory.orchestration.tui._prompt_environment")
     @patch("mdfactory.orchestration.tui.discover_cluster", return_value=None)
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_configure_manual_fallback(self, mock_iq, _discover, _gmx):
+    def test_configure_manual_fallback(self, mock_iq, _discover, mock_prompt_env):
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
         mock_q = mock_iq.return_value
+        mock_prompt_env.return_value = EnvironmentConfig()
+
         # confirm prompts: proceed with manual? → True, stage overrides? → False
         mock_q.confirm.return_value.ask.side_effect = [True, False]
         # text prompts in order: account, partition, walltime, cpus,
-        # gres, mem, qos, max_blocks, worker_init
+        # gres, mem, qos, max_blocks
         mock_q.text.return_value.ask.side_effect = [
             "manual_acc",
             "gpu",
@@ -135,7 +142,6 @@ class TestConfigureManualFallback:
             "64G",
             "",
             "4",
-            "",
         ]
 
         cfg = configure_slurm_interactive()
@@ -145,18 +151,22 @@ class TestConfigureManualFallback:
         assert cfg.cpus_per_node == 24
         assert cfg.gres == "gpu:a100:1"
         assert cfg.mem == "64G"
+        assert cfg.environment is not None
         assert cfg.stage_overrides == {}
 
 
 class TestConfigureWithCluster:
     """When cluster is discovered, wizard uses select menus."""
 
-    @patch("mdfactory.orchestration.tui._prompt_gromacs_source", return_value="")
+    @patch("mdfactory.orchestration.tui._prompt_environment")
     @patch("mdfactory.orchestration.tui.discover_cluster")
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_configure_with_cluster(self, mock_iq, mock_discover, _gmx):
+    def test_configure_with_cluster(self, mock_iq, mock_discover, mock_prompt_env):
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
         mock_q = mock_iq.return_value
         mock_discover.return_value = _make_cluster()
+        mock_prompt_env.return_value = EnvironmentConfig(modules=["gromacs/2024.4"])
 
         # select prompts: account, partition, walltime, cpus, mem, max_blocks
         mock_q.select.return_value.ask.side_effect = [
@@ -167,10 +177,9 @@ class TestConfigureWithCluster:
             "50G",
             "4",
         ]
-        # text prompts: gres, worker_init, constraint
+        # text prompts: gres, constraint
         mock_q.text.return_value.ask.side_effect = [
             "gpu:a100:1",
-            "",
             "a100",
         ]
         # confirm: QOS → False, stage overrides → False
@@ -184,6 +193,8 @@ class TestConfigureWithCluster:
         assert cfg.mem == "50G"
         assert cfg.max_blocks == 4
         assert cfg.constraint == "a100"
+        assert cfg.environment is not None
+        assert cfg.environment.modules == ["gromacs/2024.4"]
         assert cfg.stage_overrides == {}
 
 
@@ -374,16 +385,20 @@ class TestPromptStageOverrides:
 class TestStageOverridesIntegration:
     """Tests that stage overrides flow through the full wizard paths."""
 
-    @patch("mdfactory.orchestration.tui._prompt_gromacs_source", return_value="")
+    @patch("mdfactory.orchestration.tui._prompt_environment")
     @patch("mdfactory.orchestration.tui.discover_cluster", return_value=None)
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_stage_overrides_manual_path(self, mock_iq, _discover, _gmx):
+    def test_stage_overrides_manual_path(self, mock_iq, _discover, mock_prompt_env):
         """Manual fallback path produces config with stage overrides."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
         mock_q = mock_iq.return_value
+        mock_prompt_env.return_value = EnvironmentConfig()
+
         # confirm: proceed with manual → True, stage overrides → True
         mock_q.confirm.return_value.ask.side_effect = [True, True]
         # text prompts: account, partition, walltime, cpus, gres, mem, qos,
-        # max_blocks, worker_init, then stage override prompts for EM
+        # max_blocks, then stage override prompts for EM
         mock_q.text.return_value.ask.side_effect = [
             "acc",
             "gpu",
@@ -393,7 +408,6 @@ class TestStageOverridesIntegration:
             "32G",
             "",
             "4",
-            "",
             # EM stage prompts: cpus, gres, gmx
             "32",
             "",
@@ -406,13 +420,16 @@ class TestStageOverridesIntegration:
             "EM": {"cpus_per_node": 32, "gres": None},
         }
 
-    @patch("mdfactory.orchestration.tui._prompt_gromacs_source", return_value="")
+    @patch("mdfactory.orchestration.tui._prompt_environment")
     @patch("mdfactory.orchestration.tui.discover_cluster")
     @patch("mdfactory.orchestration.tui._import_questionary")
-    def test_stage_overrides_cluster_path(self, mock_iq, mock_discover, _gmx):
+    def test_stage_overrides_cluster_path(self, mock_iq, mock_discover, mock_prompt_env):
         """Cluster-assisted path produces config with stage overrides."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
         mock_q = mock_iq.return_value
         mock_discover.return_value = _make_cluster()
+        mock_prompt_env.return_value = EnvironmentConfig()
 
         # select prompts: account, partition, walltime, cpus, mem, max_blocks
         mock_q.select.return_value.ask.side_effect = [
@@ -423,10 +440,9 @@ class TestStageOverridesIntegration:
             "50G",
             "4",
         ]
-        # text prompts: gres, worker_init, constraint, then stage prompts
+        # text prompts: gres, constraint, then stage prompts
         mock_q.text.return_value.ask.side_effect = [
             "gpu:a100:1",
-            "",
             "",
             # EM stage prompts: cpus, gres, gmx
             "32",
@@ -441,6 +457,90 @@ class TestStageOverridesIntegration:
         assert cfg.stage_overrides == {
             "EM": {"cpus_per_node": 32, "gres": None},
         }
+
+
+# ---------------------------------------------------------------------------
+# _prompt_environment tests
+# ---------------------------------------------------------------------------
+
+
+class TestPromptEnvironment:
+    """Tests for the _prompt_environment helper."""
+
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.load_global", return_value=None)
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_stages_empty_skips_gromacs_prompts(self, mock_iq, mock_detect, mock_gmx, _load_global):
+        """build workflow (stages=()) skips GROMACS module prompts."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        mock_detect.return_value = EnvironmentConfig()
+        mock_q = mock_iq.return_value
+        # extra_init prompt
+        mock_q.text.return_value.ask.return_value = ""
+
+        result = _prompt_environment(stages=())
+
+        mock_gmx.assert_not_called()
+        assert result.modules == []
+
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.load_global", return_value=None)
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_stages_none_calls_gromacs_prompts(self, mock_iq, mock_detect, mock_gmx, _load_global):
+        """simulate workflow (stages=None) does prompt for GROMACS modules."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        mock_detect.return_value = EnvironmentConfig()
+        mock_gmx.return_value = ["gromacs/2024.4"]
+        mock_q = mock_iq.return_value
+        # extra_init prompt
+        mock_q.text.return_value.ask.return_value = ""
+
+        result = _prompt_environment(stages=None)
+
+        mock_gmx.assert_called_once()
+        assert result.modules == ["gromacs/2024.4"]
+
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.load_global", return_value=None)
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_detected_pixi_flows_through(self, mock_iq, mock_detect, mock_gmx, _load_global):
+        """Auto-detected pixi_manifest is preserved in returned config."""
+        from pathlib import Path
+
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        mock_detect.return_value = EnvironmentConfig(pixi_manifest=Path("/project"))
+        mock_gmx.return_value = []
+        mock_q = mock_iq.return_value
+        mock_q.text.return_value.ask.return_value = ""
+
+        result = _prompt_environment(stages=None)
+
+        assert result.pixi_manifest == Path("/project")
+
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.load_global")
+    def test_global_config_skips_prompts(self, mock_load_global):
+        """When global environment.yaml exists, prompts are skipped entirely."""
+        from pathlib import Path
+
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        saved_env = EnvironmentConfig(
+            modules=["gromacs/2024.3-gpu"],
+            pixi_manifest=Path("/project"),
+        )
+        mock_load_global.return_value = saved_env
+
+        result = _prompt_environment(stages=None)
+
+        assert result is saved_env
+        assert result.modules == ["gromacs/2024.3-gpu"]
+        assert result.pixi_manifest == Path("/project")
 
 
 # ---------------------------------------------------------------------------
@@ -505,3 +605,101 @@ class TestSaveYaml:
         assert data["stage_overrides"]["EM"]["cpus_per_node"] == 32
         assert data["stage_overrides"]["EM"]["gres"] is None
         assert data["stage_overrides"]["Production"]["cpus_per_node"] == 64
+
+    def test_save_yaml_with_environment(self, tmp_path):
+        """Environment section is written to YAML."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        env = EnvironmentConfig(
+            modules=["gromacs/2024.3-gpu"],
+            pixi_manifest="/project/root",
+        )
+        cfg = SlurmExecutorConfig(account="acc", environment=env)
+        out = tmp_path / "slurm.yaml"
+        save_slurm_config_yaml(cfg, out)
+
+        data = yaml.safe_load(out.read_text())
+        assert "environment" in data
+        assert data["environment"]["modules"] == ["gromacs/2024.3-gpu"]
+        assert data["environment"]["pixi_manifest"] == "/project/root"
+
+    def test_save_yaml_empty_environment_excluded(self, tmp_path):
+        """Empty EnvironmentConfig (all defaults) is excluded from YAML."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        env = EnvironmentConfig()
+        cfg = SlurmExecutorConfig(account="acc", environment=env)
+        out = tmp_path / "slurm.yaml"
+        save_slurm_config_yaml(cfg, out)
+
+        data = yaml.safe_load(out.read_text())
+        # An empty environment section should be cleaned up
+        assert "environment" not in data
+
+
+# ---------------------------------------------------------------------------
+# configure_and_save_environment tests
+# ---------------------------------------------------------------------------
+
+
+class TestConfigureAndSaveEnvironment:
+    """Tests for configure_and_save_environment."""
+
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_saves_environment_to_global_path(
+        self, mock_iq, mock_detect, mock_gmx, tmp_path, monkeypatch
+    ):
+        """configure_and_save_environment runs wizard and saves result."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path))
+        mock_detect.return_value = EnvironmentConfig()
+        mock_gmx.return_value = ["gromacs/2024.3-gpu"]
+        mock_q = mock_iq.return_value
+        mock_q.text.return_value.ask.return_value = ""
+
+        env = configure_and_save_environment()
+
+        assert env.modules == ["gromacs/2024.3-gpu"]
+        saved_path = tmp_path / "environment.yaml"
+        assert saved_path.is_file()
+        loaded = EnvironmentConfig.from_yaml(saved_path)
+        assert loaded.modules == ["gromacs/2024.3-gpu"]
+
+    @patch("mdfactory.orchestration.tui._prompt_gromacs_modules")
+    @patch("mdfactory.orchestration.tui.EnvironmentConfig.detect")
+    @patch("mdfactory.orchestration.tui._import_questionary")
+    def test_ignores_existing_global_config(
+        self, mock_iq, mock_detect, mock_gmx, tmp_path, monkeypatch
+    ):
+        """configure_and_save_environment always runs wizard even if global exists."""
+        from mdfactory.orchestration.environment import EnvironmentConfig
+
+        monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path))
+        # Write an existing global config
+        old_env = EnvironmentConfig(modules=["old/module"])
+        old_env.save_yaml(tmp_path / "environment.yaml")
+
+        # The wizard should run (ignore_global=True) and produce new config
+        mock_detect.return_value = EnvironmentConfig()
+        mock_gmx.return_value = ["new/module"]
+        mock_q = mock_iq.return_value
+        mock_q.text.return_value.ask.return_value = ""
+
+        env = configure_and_save_environment()
+
+        assert env.modules == ["new/module"]
+        loaded = EnvironmentConfig.from_yaml(tmp_path / "environment.yaml")
+        assert loaded.modules == ["new/module"]
+
+    def test_cancellation_raises(self, tmp_path, monkeypatch):
+        """configure_and_save_environment propagates UserCancelledError."""
+        monkeypatch.setenv("MDFACTORY_CONFIG_DIR", str(tmp_path))
+        with patch(
+            "mdfactory.orchestration.tui._prompt_environment",
+            side_effect=UserCancelledError("cancelled"),
+        ):
+            with pytest.raises(UserCancelledError):
+                configure_and_save_environment()
