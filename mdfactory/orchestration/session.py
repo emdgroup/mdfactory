@@ -90,9 +90,15 @@ def parsl_session(config: "ExecutorConfig") -> Iterator[ParslSession]:
         If a Parsl ``DataFlowKernel`` is already active.
 
     """
+    import signal
+
     parsl = _import_parsl()
     _guard_no_active_dfk(parsl)
+    # Ignore SIGINT during load so child processes (interchange, workers)
+    # inherit SIG_IGN and don't print tracebacks on Ctrl+C.
+    prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
     parsl.load(config.to_parsl_config())
+    signal.signal(signal.SIGINT, prev_handler)
     session = ParslSession(parsl=parsl)
     try:
         yield session

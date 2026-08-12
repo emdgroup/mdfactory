@@ -347,7 +347,7 @@ def _wait_with_progress(
                 time.sleep(poll_interval)
 
     except KeyboardInterrupt:
-        console.print("\n[bold yellow]Interrupted — cancelling SLURM jobs...[/]")
+        console.print("\n[bold yellow]Interrupted[/]")
         raise
 
     return _collect_results(results, display_hashes)
