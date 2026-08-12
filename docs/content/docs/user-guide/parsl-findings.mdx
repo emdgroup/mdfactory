@@ -1,0 +1,78 @@
+---
+title: "Parsl Investigation: Findings"
+description: Summary of the Parsl proof-of-concept for build and simulation orchestration
+---
+
+This document summarises the investigation of [Parsl](https://parsl-project.org/) as a Python-native workflow manager for MDFactory, replacing the legacy Nextflow orchestration layer. The work was tracked in [Issue #16](https://github.com/emdgroup/mdfactory/issues/16) and delivered across [PR #17](https://github.com/emdgroup/mdfactory/pull/17) (build orchestration) and [PR #25](https://github.com/emdgroup/mdfactory/pull/25) (simulation orchestration).
+
+## What works
+
+### Build orchestration (PR #17)
+
+- **`@python_app` for system builds**: `run_build_from_dict()` is wrapped as a Parsl `python_app`. Heavy imports happen inside the worker — only plain dicts cross the serialisation boundary.
+- **Embarrassingly parallel CSV campaigns**: `mdfactory build systems.csv --slurm config.yaml` dispatches all systems in parallel via Parsl's `HighThroughputExecutor` + `SlurmProvider`.
+- **Rich progress TUI**: real-time progress bar with success/fail counts and SLURM block status.
+- **Ctrl+C → scancel**: `KeyboardInterrupt` triggers explicit `scancel` of SLURM jobs + `parsl.clear()`.
+- **`min_blocks=0`**: idle SLURM allocations are released — no wasted GPU-hours.
+
+### Simulation orchestration (PR #25)
+
+- **`@bash_app` for grompp + mdrun**: pure-Python script builders (`_build_grompp_script`, `_build_mdrun_script`) resolve all conditional logic (GPU flags, thread counts, restart parameters) at build time. The generated bash has no branching apart from an optional runtime `gmx` binary detection preamble.
+- **Stage chaining via futures**: EM → NVT → NPT → Production chained with `inputs=[prev_future]`. Independent simulations run in parallel.
+- **Checkpoint/restart**: three modes (`auto`/`skip`/`force`). `auto` detects stage completion from disk state (output `.gro` files, trajectory frame counts, checkpoint files) and resumes from the last incomplete stage with `gmx mdrun -cpi <cpt> -append`.
+- **Adaptive rescue retry**: physics failures (e.g. EM crashes from oversized `emstep`) are automatically retried with progressively conservative MDP parameters (halved step size, doubled step count) up to `--max-rescue` tiers.
+- **Per-stage resource overrides**: `stage_overrides` in `SlurmExecutorConfig` allows different `cpus_per_node`, `gres`, and `gmx_binary` per stage (e.g. CPU-only EM, GPU Production). Walltime/mem/nodes/partition are validated at config time with actionable error messages pointing to the top-level config.
+- **Dry-run with resolved commands**: `--dry-run` prints the work plan *and* the resolved `gmx grompp`/`gmx mdrun` command lines that would be submitted, without opening a Parsl session or loading the DFK.
+- **Partial campaigns**: simulations with missing build files are skipped with a warning and reported as `status="skipped"` in the results summary (succeeded + failed + skipped = requested).
+
+### Infrastructure
+
+- **`parsl_session()` context manager**: guards against nested DFKs, guarantees `parsl.clear()` on exit, best-effort `scancel` of lingering SLURM jobs.
+- **`EnvironmentConfig`**: structured model for compute-node environment setup (modules, pixi/conda/venv activation, extra init commands). Replaces the opaque `worker_init` string. Persists globally to `~/.config/mdfactory/environment.yaml` and auto-loads into SLURM configs that lack an `environment:` section.
+- **SLURM autodiscovery**: `SlurmExecutorConfig.from_cluster()` with 3-tier precedence (explicit kwargs → config.ini → live `sinfo`/`sacctmgr`).
+- **Interactive TUI wizard**: `mdfactory config slurm` and `--slurm tui` for interactive SLURM executor setup with partition/account/hardware discovery.
+- **Optional dependency**: `pip install 'mdfactory[parsl]'`; importing `mdfactory` without Parsl does not error.
+
+## What doesn't work (or has limitations)
+
+### Per-stage SLURM allocations
+
+Parsl builds one SLURM allocation per `HighThroughputExecutor`. Per-stage `walltime`, `mem`, `nodes`, and `partition` overrides are **not honoured at the SLURM level** — they would require separate executors per stage, which conflicts with Parsl's sequential-DFK model. The `stage_overrides` field is restricted to `cpus_per_node`, `gres`, and `gmx_binary` (which affect the mdrun command line, not the SLURM job). Invalid override keys raise `ValueError` at config time.
+
+### Custom node packing (multi-sim per bash_app)
+
+The investigation sketched a pattern of packing multiple `gmx mdrun` invocations into a single `bash_app` with `&`/`wait` for full node utilisation. This was **not implemented** — instead, Parsl's `max_workers_per_node` + `available_accelerators` achieve multi-task-per-node execution natively. Explicit node packing via `bash_app` may still be relevant for GPU MPS scenarios ([Issue #10](https://github.com/emdgroup/mdfactory/issues/10)) where multiple simulations share a single GPU.
+
+### Monitoring
+
+Parsl's `MonitoringHub` (SQLite-backed job tracking) is supported via the `run_dir` config field, but no MDFactory-specific status command (`mdfactory status`) has been implemented. Status is visible through `showdb` and the Rich progress TUI during execution.
+
+## Gaps vs. requirements matrix
+
+| Requirement | Status | Notes |
+|---|---|---|
+| Python-native orchestration | ✅ Delivered | `@bash_app`/`@python_app` + futures DAG |
+| CLI integration | ✅ Delivered | `mdfactory build/simulate --slurm` |
+| System builds on GPU nodes | ✅ Delivered | PR #17 |
+| Simulation stage chaining | ✅ Delivered | PR #25 |
+| SLURM submission | ✅ Delivered | `SlurmProvider` + `HighThroughputExecutor` |
+| Embarrassingly parallel execution | ✅ Delivered | Validated on cluster with tutorial campaign |
+| Custom workflow composition | ⚠️ Partial | Via `max_workers_per_node`, not explicit bash packing. Tracked in [Issue #10](https://github.com/emdgroup/mdfactory/issues/10) |
+| Retry behaviour | ✅ Delivered | `Config(retries=N)` + adaptive rescue retry |
+| Checkpoint/restart | ✅ Delivered | Disk-state detection + `gmx mdrun -cpi -append` |
+| Integration with building blocks | ✅ Delivered | Reuses `run_build_from_dict`, Pydantic models, MDP templates |
+| Dry-run mode | ✅ Delivered | Plan summary + resolved `gmx` commands |
+| Nextflow removal | ✅ Delivered | Removed in [PR #29](https://github.com/emdgroup/mdfactory/pull/29) |
+
+## Architecture decisions
+
+1. **Pure script builders**: all bash generation happens in pure Python functions (`_build_grompp_script`, `_build_mdrun_script`) that are fully testable without a Parsl DFK. The generated scripts have no conditional logic — all branching is resolved at generation time.
+2. **`StageSpec` registry**: a frozen dataclass per stage (`STAGE_REGISTRY`) is the single source of truth for file names, dependencies, and flags. Adding a new stage means adding one `StageSpec` entry.
+3. **Sequential DFK sessions**: `parsl.clear()` on exit ensures a clean DFK for subsequent sessions (e.g. benchmark → production pattern).
+4. **Fail-fast prerequisite validation**: input files are checked on the login node *before* opening a Parsl session, with actionable error messages.
+
+## Test coverage
+
+- **PR #17**: 68 tests (build orchestration, config, TUI, CLI integration)
+- **PR #25**: 227 tests (stages at 100% coverage, simulate, apps, CLI, rescue retry, config)
+- **Integration**: rescue retry validated with real GROMACS execution (3-water system fixture)

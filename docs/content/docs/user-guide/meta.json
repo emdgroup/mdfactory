@@ -14,6 +14,7 @@
     "workflows",
     "executing-analyses",
     "running-on-hpc",
+    "parsl-findings",
     "troubleshooting"
   ]
 }
