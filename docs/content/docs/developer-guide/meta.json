@@ -2,6 +2,7 @@
   "title": "Developer Guide",
   "pages": [
     "architecture",
+    "parsl-findings",
     "ai-development",
     "adding-parametrization",
     "extending-engines",
