@@ -250,7 +250,7 @@ def run_simulations(
             return [fut for _, fut in futures]
 
         # 7. wait=True: tracked execution with per-stage progress display
-        from concurrent.futures import ThreadPoolExecutor
+        import threading
 
         from .errors import _describe_failure
         from .progress import StageProgressTracker, display_stage_progress
@@ -309,23 +309,19 @@ def run_simulations(
 
         logger.info(f"Submitted {len(active_items)} simulation(s)")
 
-        # Launch worker threads without blocking the main thread
-        pool = ThreadPoolExecutor()
-        thread_futures = [pool.submit(_run_pipeline, item) for item in active_items]
-        pool.shutdown(wait=False)
+        # Launch daemon threads — they won't block process exit on Ctrl+C
+        workers = []
+        for item in active_items:
+            t = threading.Thread(target=_run_pipeline, args=(item,), daemon=True)
+            t.start()
+            workers.append(t)
 
-        try:
-            # Main thread: display progress until all stages complete
-            display_stage_progress(tracker)
-        except KeyboardInterrupt:
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
+        # Main thread: display progress until all stages complete
+        display_stage_progress(tracker)
 
-        # Ensure all worker threads have finished (no-op in normal usage
-        # since display blocks until all_done, but needed for test mocks)
-        from concurrent.futures import wait as futures_wait
-
-        futures_wait(thread_futures)
+        # Ensure all worker threads have stored results before collecting
+        for t in workers:
+            t.join()
 
         # Collect results
         run_results = tracker.collect_results()
