@@ -44,11 +44,11 @@ class TestProteinSpecies:
         spec = ProteinSpecies(
             resname="LYZ",
             pdb_path=pdb,
-            disulfide_bonds=[(6, 127), (30, 115)],
+            disulfide_bonds=[("CYS6", "CYS127"), ("CYS30", "CYS115")],
             protonation_states={"HIS15": "HIE", "GLU35": "GLH"},
         )
         assert len(spec.disulfide_bonds) == 2
-        assert spec.disulfide_bonds[0] == (6, 127)
+        assert spec.disulfide_bonds[0] == ("CYS6", "CYS127")
         assert spec.protonation_states["HIS15"] == "HIE"
 
     def test_charge_not_precomputable(self, tmp_path):
@@ -71,9 +71,9 @@ class TestProteinBoxComposition:
         pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
         comp = ProteinBoxComposition(
             protein=ProteinSpecies(resname="LYZ", pdb_path=pdb),
-            box_padding=12.0,
+            padding=12.0,
         )
-        assert comp.box_padding == 12.0
+        assert comp.padding == 12.0
         assert comp.ionization.neutralize is True
         assert comp.ionization.concentration == 0.15
 
@@ -92,7 +92,7 @@ class TestPdb2gmxConfig:
         config = Pdb2gmxConfig()
         assert config.forcefield == "charmm36m"
         assert config.water_model == "tip3p"
-        assert config.ignh is True
+        assert config.ignore_hydrogens is True
         assert config.merge_all is False
 
     def test_custom(self):
@@ -159,18 +159,18 @@ parametrization_config:
   type: pdb2gmx
   forcefield: charmm36m
   water_model: tip3p
-  ignh: true
+  ignore_hydrogens: true
 system:
   protein:
     resname: LYZ
     count: 1
     pdb_path: {pdb}
     disulfide_bonds:
-      - [6, 127]
-      - [30, 115]
+      - [CYS6, CYS127]
+      - [CYS30, CYS115]
     protonation_states:
       HIS15: HIE
-  box_padding: 12.0
+  padding: 12.0
   ionization:
     neutralize: true
     concentration: 0.15
@@ -286,7 +286,7 @@ class TestTopologyParsing:
                 ]
             )
         )
-        assert _build_disulfide_prompt_input(pdb, [(2, 3)]) == "n\ny\n"
+        assert _build_disulfide_prompt_input(pdb, [("CYS2", "CYS3")]) == "n\ny\n"
 
     def test_build_disulfide_prompt_input_rejects_missing_pair(self, tmp_path):
         pdb = tmp_path / "input.pdb"
@@ -299,7 +299,7 @@ class TestTopologyParsing:
             )
         )
         with pytest.raises(ValueError, match="not detected as close CYS SG pairs"):
-            _build_disulfide_prompt_input(pdb, [(6, 127)])
+            _build_disulfide_prompt_input(pdb, [("CYS6", "CYS127")])
 
     def test_run_pdb2gmx_passes_disulfide_answers_to_subprocess(self, tmp_path, monkeypatch):
         pdb = tmp_path / "input.pdb"
@@ -346,7 +346,7 @@ class TestTopologyParsing:
         run_pdb2gmx(
             pdb_path=pdb,
             config=Pdb2gmxConfig(forcefield="amber99sb-ildn", water_model="tip3p"),
-            disulfide_bonds=[(2, 3)],
+            disulfide_bonds=[("CYS2", "CYS3")],
             protonation_states={},
             output_dir=tmp_path / "pdb2gmx_output",
         )
@@ -368,12 +368,12 @@ class TestMetadata:
             "parametrization": "pdb2gmx",
             "system": {
                 "protein": {"resname": "LYZ", "count": 1, "pdb_path": str(pdb)},
-                "box_padding": 12.0,
+                "padding": 12.0,
             },
         }
         inp = BuildInput(**data)
         meta = inp.metadata
         assert meta["simulation_type"] == "proteinbox"
         assert meta["total_count"] == 1
-        assert "box_padding" in meta["system_specific"]
-        assert meta["system_specific"]["box_padding"] == 12.0
+        assert "padding" in meta["system_specific"]
+        assert meta["system_specific"]["padding"] == 12.0

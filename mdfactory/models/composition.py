@@ -383,7 +383,7 @@ class ProteinBoxComposition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     protein: ProteinSpecies
-    box_padding: float = Field(
+    padding: float = Field(
         10.0, description="Minimum distance from protein to box edge in Angstroms.", ge=0.0
     )
     ionization: IonizationConfig = Field(

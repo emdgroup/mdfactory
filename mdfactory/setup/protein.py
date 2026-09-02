@@ -3,6 +3,7 @@
 """Protein preparation utilities for the proteinbox simulation type."""
 
 import io
+import re
 import shutil
 import subprocess
 import tarfile
@@ -14,6 +15,7 @@ from loguru import logger
 from ..models.parametrization import GromacsProteinParameterSet, Pdb2gmxConfig
 
 _DISULFIDE_CUTOFF_ANGSTROM = 2.2
+_CYSTEINE_RESNAMES = {"CYS", "CYM", "CYX"}
 
 FORCEFIELD_REGISTRY: dict[str, dict[str, str]] = {
     "charmm36m": {
@@ -78,7 +80,7 @@ def _read_cysteine_sg_atoms(pdb_path: Path) -> dict[int, tuple[float, float, flo
 
             atom_name = line[12:16].strip()
             resname = line[17:20].strip()
-            if atom_name != "SG" or resname not in {"CYS", "CYM", "CYX"}:
+            if atom_name != "SG" or resname not in _CYSTEINE_RESNAMES:
                 continue
 
             resid = int(line[22:26].strip())
@@ -99,13 +101,33 @@ def _read_cysteine_sg_atoms(pdb_path: Path) -> dict[int, tuple[float, float, flo
     return atoms
 
 
+def _parse_cysteine_reference(reference: str) -> int:
+    """Parse a cysteine residue reference like 'CYS6' into its residue id."""
+    match = re.fullmatch(r"([A-Za-z]+)(\d+)", reference)
+    if not match:
+        raise ValueError(
+            f"Invalid disulfide residue reference '{reference}'. "
+            "Expected format: RESNAME<resid>, e.g. 'CYS6'."
+        )
+    resname = match.group(1).upper()
+    if resname not in _CYSTEINE_RESNAMES:
+        raise ValueError(
+            f"Disulfide residue reference '{reference}' must be a cysteine "
+            f"(one of {sorted(_CYSTEINE_RESNAMES)})."
+        )
+    return int(match.group(2))
+
+
 def _build_disulfide_prompt_input(
     pdb_path: Path,
-    disulfide_bonds: list[tuple[int, int]],
+    disulfide_bonds: list[tuple[str, str]],
     cutoff_angstrom: float = _DISULFIDE_CUTOFF_ANGSTROM,
 ) -> str:
     """Build deterministic yes/no input for pdb2gmx disulfide prompts."""
-    requested = {tuple(sorted(pair)) for pair in disulfide_bonds}
+    requested = {
+        tuple(sorted((_parse_cysteine_reference(a), _parse_cysteine_reference(b))))
+        for a, b in disulfide_bonds
+    }
     for pair in requested:
         if pair[0] == pair[1]:
             raise ValueError(f"Invalid disulfide bond with identical residues: {pair}")
@@ -170,8 +192,6 @@ def _apply_protonation_states(
         Path to the modified PDB file.
 
     """
-    import re
-
     output_pdb = output_dir / "protonation_adjusted.pdb"
 
     # Parse overrides: "HIS15" -> (original_resname_prefix="HIS", resid=15, new_name="HID")
@@ -427,7 +447,7 @@ def clean_pdb(pdb_path: Path, output_path: Path) -> Path:
 def run_pdb2gmx(
     pdb_path: Path,
     config: Pdb2gmxConfig,
-    disulfide_bonds: list[tuple[int, int]],
+    disulfide_bonds: list[tuple[str, str]],
     protonation_states: dict[str, str],
     output_dir: Path,
 ) -> GromacsProteinParameterSet:
@@ -439,8 +459,8 @@ def run_pdb2gmx(
         Cleaned PDB file.
     config : Pdb2gmxConfig
         Force field and water model configuration.
-    disulfide_bonds : list[tuple[int, int]]
-        Residue ID pairs for disulfide bonds.
+    disulfide_bonds : list[tuple[str, str]]
+        Cysteine residue pairs for disulfide bonds, e.g. [("CYS6", "CYS127")].
     protonation_states : dict[str, str]
         Residue-specific protonation state overrides.
     output_dir : Path
@@ -483,7 +503,7 @@ def run_pdb2gmx(
         config.water_model,
     ]
 
-    if config.ignh:
+    if config.ignore_hydrogens:
         cmd.append("-ignh")
 
     if config.merge_all:

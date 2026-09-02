@@ -737,7 +737,7 @@ def build_proteinbox(inp: BuildInput):
     # 4. Center protein in cubic box
     u = mda.Universe(str(params.structure_file))
     extent = u.atoms.positions.max(axis=0) - u.atoms.positions.min(axis=0)
-    box_size = extent.max() + 2 * inp.system.box_padding
+    box_size = extent.max() + 2 * inp.system.padding
     u.dimensions = [box_size, box_size, box_size, 90, 90, 90]
     center = np.array([box_size / 2, box_size / 2, box_size / 2])
     u.atoms.translate(-u.atoms.center_of_geometry() + center)

@@ -205,9 +205,12 @@ class ProteinSpecies(Species):
     count: Optional[int] = Field(1, description="Number of protein copies (always 1).")
     fraction: Optional[float] = Field(1.0, description="Fraction (always 1.0 for protein).")
     pdb_path: Path = Field(..., description="Path to the input PDB file.")
-    disulfide_bonds: list[tuple[int, int]] = Field(
+    disulfide_bonds: list[tuple[str, str]] = Field(
         default_factory=list,
-        description="Pairs of residue IDs forming disulfide bonds, e.g. [(6, 127), (30, 115)].",
+        description=(
+            "Pairs of cysteine residues forming disulfide bonds, "
+            "e.g. [('CYS6', 'CYS127'), ('CYS30', 'CYS115')]."
+        ),
     )
     protonation_states: dict[str, str] = Field(
         default_factory=dict,
