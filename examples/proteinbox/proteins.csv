@@ -1,0 +1,3 @@
+simulation_type,engine,parametrization,parametrization_config.type,parametrization_config.forcefield,parametrization_config.water_model,parametrization_config.ignore_hydrogens,system.protein.resname,system.protein.pdb_path,system.protein.chains,system.protein.disulfide_bonds,system.protein.protonation_states.HIS15,system.padding,system.ionization.neutralize,system.ionization.concentration,system.relax_steps
+proteinbox,gromacs,pdb2gmx,pdb2gmx,charmm36m,tip3p,True,LYZ,1aki.pdb,A,CYS6-CYS127;CYS30-CYS115;CYS64-CYS80;CYS76-CYS94,HIE,12.0,True,0.15,100
+proteinbox,gromacs,pdb2gmx,pdb2gmx,charmm36m,tip3p,True,INS,1zni.pdb,A;B;C;D,,,12.0,True,0.15,100

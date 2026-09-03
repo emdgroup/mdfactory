@@ -139,7 +139,9 @@ def _prepare_system_directories(
         yml_path = build_dir / f"{model.hash}.yaml"
         if not yml_path.exists():
             with open(yml_path, "w") as f:
-                yaml.safe_dump(model.model_dump(), f)
+                # mode="json" so Path and tuple fields (e.g. proteinbox pdb_path and
+                # disulfide_bonds) serialize to plain str/list that yaml.safe_dump can write.
+                yaml.safe_dump(model.model_dump(mode="json"), f)
         dirs.append(str(build_dir.resolve()))
 
     summary_path = output / f"{input_path.stem}.yaml"

@@ -837,11 +837,11 @@ def build_proteinbox(inp: BuildInput):
     if em_mdp.is_file():
         validate_with_grompp(topology_dest, Path("system.pdb"), em_mdp, Path.cwd())
 
-    # Remove build intermediates so the output directory holds only the final
-    # artifacts (topology.top, system.pdb, per-chain includes, the bundled force
-    # field, run files), matching how the small-molecule builds leave their output
-    # dir. Only runs on success; a failure earlier keeps the intermediates for
-    # debugging.
+    # Remove the pdb2gmx-specific loose intermediates, which have no counterpart in
+    # the small-molecule builds. solvated.pdb and the relaxation/ working dir are
+    # left in place, matching how the bilayer build leaves solvated.pdb and its
+    # bilayer_squeeze/ dir. Only runs on success; a failure earlier keeps the
+    # intermediates for debugging.
     Path(cleaned_pdb).unlink(missing_ok=True)
     pre_relax_structure.unlink(missing_ok=True)
     shutil.rmtree(pdb2gmx_dir, ignore_errors=True)
