@@ -45,23 +45,46 @@ def get_gromacs_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     return settings.gromacs_env(base_env)
 
 
+# AMBER-style protonation residue names mapped to their CHARMM equivalents.
+# Histidine tautomers map to 3-character names pdb2gmx accepts; protonated
+# GLU/ASP map to 4-character CHARMM names that cannot fit a PDB residue-name
+# column and are rejected below.
+_CHARMM_PROTONATION_ALIASES = {
+    "HID": "HSD",
+    "HIE": "HSE",
+    "HIP": "HSP",
+    "GLH": "GLUP",
+    "ASH": "ASPP",
+    "LYN": "LSN",
+}
+
+# Histidine tautomers share a titratable identity but not a common name prefix,
+# so a "HIS<n>" override must still match a residue already named HID/HSE/etc.
+_HISTIDINE_RESNAMES = {"HIS", "HID", "HIE", "HIP", "HSD", "HSE", "HSP"}
+
+
 def _resolve_protonation_residue_name(residue_name: str, forcefield: str | None) -> str:
     """Return the residue name to write into the PDB for a protonation override."""
     residue_name = residue_name.upper()
     if forcefield and forcefield.lower().startswith("charmm"):
-        residue_name = {
-            "HID": "HSD",
-            "HIE": "HSE",
-            "HIP": "HSP",
-        }.get(residue_name, residue_name)
+        residue_name = _CHARMM_PROTONATION_ALIASES.get(residue_name, residue_name)
 
     if len(residue_name) != 3:
         raise ValueError(
-            f"Protonation residue name '{residue_name}' cannot be written to PDB "
-            "without shifting columns. Use a 3-character residue name supported by "
-            "the selected force field."
+            f"Protonation residue name '{residue_name}' cannot be written to a PDB "
+            "residue-name column (needs exactly 3 characters). Protonated GLU/ASP in "
+            "CHARMM use 4-character names (GLUP/ASPP) that cannot be set by residue "
+            "renaming; only 3-character states such as histidine tautomers "
+            "(HID/HIE/HIP -> HSD/HSE/HSP) or neutral lysine (LYN -> LSN) are supported."
         )
     return residue_name
+
+
+def _override_matches_residue(resname_prefix: str, current_resname: str) -> bool:
+    """Return True if a protonation override applies to the residue currently present."""
+    if current_resname.startswith(resname_prefix):
+        return True
+    return resname_prefix in _HISTIDINE_RESNAMES and current_resname in _HISTIDINE_RESNAMES
 
 
 def _distance(coords_a: tuple[float, float, float], coords_b: tuple[float, float, float]) -> float:
@@ -171,8 +194,11 @@ def _apply_protonation_states(
 
     pdb2gmx selects protonation states based on residue names. This function renames
     matching residues in the PDB so pdb2gmx applies the requested 3-character residue
-    names without interactive prompts. Common AMBER histidine names are translated to
-    CHARMM names when a CHARMM force field is selected.
+    names without interactive prompts. AMBER-style names are translated to CHARMM
+    names when a CHARMM force field is selected (e.g. HIE -> HSE). Histidine tautomers
+    are matched as a family, so a "HIS<n>" override still applies when the residue is
+    already named HID/HSE/etc. An override that matches no residue raises rather than
+    being silently dropped.
 
     Parameters
     ----------
@@ -180,7 +206,8 @@ def _apply_protonation_states(
         Input PDB file (absolute path).
     protonation_states : dict[str, str]
         Mapping of "RESNAME<resid>" to target residue name, e.g.
-        {"HIS15": "HID", "GLU35": "GLH"}.
+        {"HIS15": "HIE"}. For CHARMM only 3-character states are expressible
+        (histidine tautomers, neutral lysine).
     output_dir : Path
         Directory for the modified PDB.
     forcefield : str | None
@@ -194,7 +221,7 @@ def _apply_protonation_states(
     """
     output_pdb = output_dir / "protonation_adjusted.pdb"
 
-    # Parse overrides: "HIS15" -> (original_resname_prefix="HIS", resid=15, new_name="HID")
+    # Parse overrides: "HIS15" -> (key, resname_prefix="HIS", resid=15, new_name="HSE")
     overrides = []
     for key, new_name in protonation_states.items():
         match = re.fullmatch(r"([A-Za-z]+)(\d+)", key)
@@ -206,8 +233,11 @@ def _apply_protonation_states(
         resname_prefix = match.group(1).upper()
         resid = int(match.group(2))
         overrides.append(
-            (resname_prefix, resid, _resolve_protonation_residue_name(new_name, forcefield))
+            (key, resname_prefix, resid, _resolve_protonation_residue_name(new_name, forcefield))
         )
+
+    matched_keys: set[str] = set()
+    resids_present: set[int] = set()
 
     with open(pdb_path) as f_in, open(output_pdb, "w") as f_out:
         for line in f_in:
@@ -220,12 +250,29 @@ def _apply_protonation_states(
                     f_out.write(output_line)
                     continue
 
-                for prefix, target_resid, new_name in overrides:
-                    if current_resname.startswith(prefix) and current_resid == target_resid:
+                resids_present.add(current_resid)
+                for key, prefix, target_resid, new_name in overrides:
+                    if current_resid == target_resid and _override_matches_residue(
+                        prefix, current_resname
+                    ):
                         padded = f"{new_name:<3s}"
                         output_line = output_line[:17] + padded + output_line[20:]
+                        matched_keys.add(key)
                         break
             f_out.write(output_line)
+
+    unmatched = [(key, resid) for key, _, resid, _ in overrides if key not in matched_keys]
+    if unmatched:
+        details = ", ".join(
+            f"'{key}' (resid {resid} "
+            + ("present but not a matching residue" if resid in resids_present else "not found")
+            + ")"
+            for key, resid in unmatched
+        )
+        raise ValueError(
+            f"Protonation state override(s) matched no residue: {details}. "
+            "Check the residue numbers and names against the input PDB."
+        )
 
     logger.info(f"Protonation states applied: {protonation_states}")
     return output_pdb
@@ -444,12 +491,48 @@ def clean_pdb(pdb_path: Path, output_path: Path) -> Path:
     return output_path
 
 
+def _parse_protein_molecule_names(top_path: Path) -> list[str]:
+    """Return protein moleculetype names from a topology's [ molecules ] section.
+
+    pdb2gmx names each protein moleculetype ``Protein_chain_<ID>`` (or ``Protein``
+    when chains are merged), listing each once. Water and ion entries are ignored.
+    """
+    names: list[str] = []
+    in_molecules = False
+    with open(top_path) as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith(";"):
+                continue
+            if stripped.startswith("["):
+                in_molecules = stripped.strip("[] ").lower() == "molecules"
+                continue
+            if in_molecules and stripped.split()[0].startswith("Protein"):
+                names.append(stripped.split()[0])
+    return names
+
+
+def _collect_topology_include_files(output_dir: Path) -> list[Path]:
+    """Return the local .itp files a pdb2gmx topology includes alongside topol.top.
+
+    Covers per-chain moleculetype files (``topol_Protein_chain_*.itp``) and position
+    restraint files (``posre*.itp``); for a single-chain build this is just
+    ``posre.itp``. Force-field library includes live inside the bundled .ff directory
+    and are handled separately.
+    """
+    includes: list[Path] = []
+    for pattern in ("topol_Protein_chain_*.itp", "posre*.itp"):
+        includes.extend(sorted(output_dir.glob(pattern)))
+    return includes
+
+
 def run_pdb2gmx(
     pdb_path: Path,
     config: Pdb2gmxConfig,
     disulfide_bonds: list[tuple[str, str]],
     protonation_states: dict[str, str],
     output_dir: Path,
+    chains: list[str] | None = None,
 ) -> GromacsProteinParameterSet:
     """Run gmx pdb2gmx to generate GROMACS topology from a protein PDB.
 
@@ -465,13 +548,17 @@ def run_pdb2gmx(
         Residue-specific protonation state overrides.
     output_dir : Path
         Directory for output files.
+    chains : list[str] | None
+        Declared chain identifiers. When given, the chains pdb2gmx produces must
+        match exactly. When omitted, the PDB must yield a single protein chain.
 
     Returns
     -------
     GromacsProteinParameterSet
-        Paths to generated topology, structure, and position restraint files.
+        Paths to the generated topology, structure, and per-chain include files.
 
     """
+    chains = chains or []
     gmx_bin = str(check_gmx_available())
     check_forcefield_available(config.forcefield)
     resolved_ff = resolve_forcefield(config.forcefield)
@@ -548,8 +635,10 @@ def run_pdb2gmx(
 
     logger.info("pdb2gmx completed successfully.")
 
-    # Verify expected outputs exist
-    for path in [structure_file, topology_file, posre_file]:
+    # Verify expected outputs exist. The position-restraint file is named per chain
+    # for multi-chain inputs, so it is checked via the include collection below
+    # rather than by a fixed name here.
+    for path in [structure_file, topology_file]:
         if not path.is_file():
             raise FileNotFoundError(
                 f"Expected pdb2gmx output not found: {path}\n"
@@ -557,13 +646,39 @@ def run_pdb2gmx(
                 f"stderr:\n{result.stderr}"
             )
 
+    # Each chain becomes its own Protein_chain_<ID> moleculetype, listed once in
+    # [ molecules ]. Declared chains must match exactly; an undeclared multi-chain
+    # PDB is an error so subunits are never silently dropped or merged.
+    produced_names = _parse_protein_molecule_names(topology_file)
+    produced_chains = [
+        name[len("Protein_chain_") :]
+        for name in produced_names
+        if name.startswith("Protein_chain_")
+    ]
+
+    if chains:
+        if set(produced_chains) != set(chains):
+            raise ValueError(
+                f"Declared protein chains {sorted(chains)} do not match the chains "
+                f"pdb2gmx produced {sorted(produced_chains)}. Update protein.chains to "
+                "list exactly the chain identifiers present in the PDB."
+            )
+    elif len(produced_names) > 1:
+        raise ValueError(
+            f"pdb2gmx produced multiple protein chains {sorted(produced_chains)}, but "
+            "none were declared. List each subunit explicitly via protein.chains."
+        )
+
+    include_files = _collect_topology_include_files(output_dir)
+
     total_charge = extract_charge_from_topology(topology_file)
     logger.info(f"Protein net charge from topology: {total_charge}")
 
     return GromacsProteinParameterSet(
         topology_file=topology_file,
         structure_file=structure_file,
-        position_restraint_file=posre_file,
+        topology_include_files=include_files,
+        chains=produced_chains,
         forcefield=config.forcefield,
         water_model=config.water_model,
         total_charge=total_charge,
@@ -697,6 +812,7 @@ def bundle_forcefield_into_topology(top_path: Path) -> str | None:
     """
     lines = top_path.read_text().splitlines(keepends=True)
     ff_dir_name: str | None = None
+    copied_sources: set[Path] = set()
     changed = False
 
     for i, line in enumerate(lines):
@@ -713,7 +829,11 @@ def bundle_forcefield_into_topology(top_path: Path) -> str | None:
         ff_dir_name = parts[ff_index]
         remainder = "/".join(parts[ff_index + 1 :])
 
-        shutil.copytree(ff_source, top_path.parent / ff_dir_name, dirs_exist_ok=True)
+        # A topology has several includes into the same .ff directory
+        # (forcefield.itp, water, ions); copy the directory only once.
+        if ff_source not in copied_sources:
+            shutil.copytree(ff_source, top_path.parent / ff_dir_name, dirs_exist_ok=True)
+            copied_sources.add(ff_source)
         lines[i] = line.replace(include_path, f"{ff_dir_name}/{remainder}")
         changed = True
 

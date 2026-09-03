@@ -35,6 +35,36 @@ def _pdb_atom(serial, atom_name, resname, resid, x, y, z):
     )
 
 
+def _patch_pdb2gmx_env(monkeypatch):
+    """Stub the gmx binary, force-field, and environment lookups for run_pdb2gmx."""
+    monkeypatch.setattr("mdfactory.setup.protein.check_gmx_available", lambda: Path("/mock/gmx"))
+    monkeypatch.setattr("mdfactory.setup.protein.check_forcefield_available", lambda ff: None)
+    monkeypatch.setattr(
+        "mdfactory.setup.protein.get_gromacs_env", lambda: {"GMXLIB": "/mock/forcefields"}
+    )
+
+
+def _make_pdb2gmx_run(molecule_names, extra_files=()):
+    """Build a fake subprocess.run writing a topology listing the given molecules."""
+
+    def fake_run(cmd, cwd, text, input, capture_output, timeout, env=None, check=None):
+        output_dir = Path(cwd)
+        (output_dir / "processed.gro").write_text("mock gro\n")
+        molecules = "".join(f"{name} 1\n" for name in molecule_names)
+        (output_dir / "topol.top").write_text(f"[ molecules ]\n{molecules}")
+        for name in extra_files:
+            (output_dir / name).write_text(f"; {name}\n")
+
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Result()
+
+    return fake_run
+
+
 class TestProteinSpecies:
     def test_basic_creation(self, tmp_path):
         pdb = tmp_path / "test.pdb"
@@ -63,6 +93,13 @@ class TestProteinSpecies:
         spec = ProteinSpecies(resname="LYZ", pdb_path=pdb)
         with pytest.raises(NotImplementedError, match="pdb2gmx"):
             _ = spec.charge
+
+    def test_chains_default_empty_and_declared(self, tmp_path):
+        pdb = tmp_path / "test.pdb"
+        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+        assert ProteinSpecies(resname="LYZ", pdb_path=pdb).chains == []
+        spec = ProteinSpecies(resname="LYZ", pdb_path=pdb, chains=["H", "L", "Y"])
+        assert spec.chains == ["H", "L", "Y"]
 
     def test_resname_validation(self, tmp_path):
         pdb = tmp_path / "test.pdb"
@@ -312,8 +349,31 @@ class TestTopologyParsing:
     def test_apply_protonation_states_rejects_four_character_names(self, tmp_path):
         pdb = tmp_path / "input.pdb"
         pdb.write_text(_pdb_atom(1, "N", "GLU", 35, 1.0, 2.0, 3.0))
-        with pytest.raises(ValueError, match="cannot be written to PDB"):
+        with pytest.raises(ValueError, match="cannot be written to a PDB"):
             _apply_protonation_states(pdb, {"GLU35": "GLUP"}, tmp_path)
+
+    def test_apply_protonation_states_rejects_charmm_acid_protonation(self, tmp_path):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(_pdb_atom(1, "N", "GLU", 35, 1.0, 2.0, 3.0))
+        # GLH aliases to CHARMM GLUP (4 chars), which cannot fit a PDB column.
+        with pytest.raises(ValueError, match="cannot be written to a PDB"):
+            _apply_protonation_states(pdb, {"GLU35": "GLH"}, tmp_path, forcefield="charmm36m")
+
+    def test_apply_protonation_states_matches_existing_histidine_tautomer(self, tmp_path):
+        # Residue 15 is already an HID tautomer; a "HIS15" key must still match it
+        # instead of silently doing nothing.
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(_pdb_atom(1, "N", "HID", 15, 1.0, 2.0, 3.0))
+        result = _apply_protonation_states(pdb, {"HIS15": "HIE"}, tmp_path, forcefield="charmm36m")
+        content = result.read_text()
+        assert "HSE" in content
+        assert "HID" not in content
+
+    def test_apply_protonation_states_raises_on_unmatched_override(self, tmp_path):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(_pdb_atom(1, "N", "HIS", 15, 1.0, 2.0, 3.0))
+        with pytest.raises(ValueError, match="matched no residue"):
+            _apply_protonation_states(pdb, {"HIS99": "HIE"}, tmp_path)
 
     def test_build_disulfide_prompt_input_answers_exact_requested_pairs(self, tmp_path):
         pdb = tmp_path / "input.pdb"
@@ -364,7 +424,9 @@ class TestTopologyParsing:
             calls["check"] = check
             output_dir = Path(cwd)
             (output_dir / "processed.gro").write_text("mock gro\n")
-            (output_dir / "topol.top").write_text("[ atoms ]\n")
+            (output_dir / "topol.top").write_text(
+                "[ moleculetype ]\nProtein_chain_A 3\n[ atoms ]\n[ molecules ]\nProtein_chain_A 1\n"
+            )
             (output_dir / "posre.itp").write_text("mock posre\n")
 
             class Result:
@@ -375,14 +437,7 @@ class TestTopologyParsing:
             return Result()
 
         monkeypatch.setattr("mdfactory.setup.protein.subprocess.run", fake_run)
-        monkeypatch.setattr(
-            "mdfactory.setup.protein.check_gmx_available", lambda: Path("/mock/gmx")
-        )
-        monkeypatch.setattr("mdfactory.setup.protein.check_forcefield_available", lambda ff: None)
-        monkeypatch.setattr(
-            "mdfactory.setup.protein.get_gromacs_env",
-            lambda: {"GMXLIB": "/mock/forcefields"},
-        )
+        _patch_pdb2gmx_env(monkeypatch)
 
         run_pdb2gmx(
             pdb_path=pdb,
@@ -398,6 +453,68 @@ class TestTopologyParsing:
         assert calls["cwd"] == str((tmp_path / "pdb2gmx_output").resolve())
         assert calls["env"] == {"GMXLIB": "/mock/forcefields"}
         assert calls["check"] is False
+
+    def test_run_pdb2gmx_multichain_collects_chain_includes(self, tmp_path, monkeypatch):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(_pdb_atom(1, "N", "ALA", 1, 0.0, 0.0, 0.0))
+        chains = ["H", "L", "Y"]
+        extra = [f"topol_Protein_chain_{c}.itp" for c in chains] + [
+            f"posre_Protein_chain_{c}.itp" for c in chains
+        ]
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.subprocess.run",
+            _make_pdb2gmx_run([f"Protein_chain_{c}" for c in chains], extra_files=extra),
+        )
+        _patch_pdb2gmx_env(monkeypatch)
+
+        params = run_pdb2gmx(
+            pdb_path=pdb,
+            config=Pdb2gmxConfig(forcefield="charmm36m", water_model="tip3p"),
+            disulfide_bonds=[],
+            protonation_states={},
+            output_dir=tmp_path / "out",
+            chains=chains,
+        )
+
+        assert params.chains == chains
+        assert sorted(p.name for p in params.topology_include_files) == sorted(extra)
+
+    def test_run_pdb2gmx_multichain_without_declaration_raises(self, tmp_path, monkeypatch):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(_pdb_atom(1, "N", "ALA", 1, 0.0, 0.0, 0.0))
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.subprocess.run",
+            _make_pdb2gmx_run(["Protein_chain_H", "Protein_chain_L"]),
+        )
+        _patch_pdb2gmx_env(monkeypatch)
+
+        with pytest.raises(ValueError, match="none were declared"):
+            run_pdb2gmx(
+                pdb_path=pdb,
+                config=Pdb2gmxConfig(forcefield="charmm36m", water_model="tip3p"),
+                disulfide_bonds=[],
+                protonation_states={},
+                output_dir=tmp_path / "out",
+            )
+
+    def test_run_pdb2gmx_chain_mismatch_raises(self, tmp_path, monkeypatch):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(_pdb_atom(1, "N", "ALA", 1, 0.0, 0.0, 0.0))
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.subprocess.run",
+            _make_pdb2gmx_run(["Protein_chain_H", "Protein_chain_L", "Protein_chain_Y"]),
+        )
+        _patch_pdb2gmx_env(monkeypatch)
+
+        with pytest.raises(ValueError, match="do not match"):
+            run_pdb2gmx(
+                pdb_path=pdb,
+                config=Pdb2gmxConfig(forcefield="charmm36m", water_model="tip3p"),
+                disulfide_bonds=[],
+                protonation_states={},
+                output_dir=tmp_path / "out",
+                chains=["H", "L"],
+            )
 
 
 class TestBundleForcefield:
@@ -433,6 +550,41 @@ class TestBundleForcefield:
         assert '#include "posre.itp"' in content
         # No absolute paths remain.
         assert str(ff_source) not in content
+
+    def test_copies_ff_dir_once_for_multiple_includes(self, tmp_path, monkeypatch):
+        ff_source = tmp_path / "ffsource" / "charmm36-feb2026_cgenff-5.0.ff"
+        ff_source.mkdir(parents=True)
+        for name in ("forcefield.itp", "tip3p.itp", "ions.itp"):
+            (ff_source / name).write_text(f"; {name}\n")
+
+        build_dir = tmp_path / "build"
+        build_dir.mkdir()
+        top = build_dir / "topology.top"
+        top.write_text(
+            textwrap.dedent(f"""\
+            #include "{ff_source / "forcefield.itp"}"
+            #include "{ff_source / "tip3p.itp"}"
+            #include "{ff_source / "ions.itp"}"
+            """)
+        )
+
+        import mdfactory.setup.protein as protein_module
+
+        calls = []
+        real_copytree = protein_module.shutil.copytree
+
+        def counting_copytree(src, dst, *args, **kwargs):
+            calls.append((src, dst))
+            return real_copytree(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(protein_module.shutil, "copytree", counting_copytree)
+
+        bundle_forcefield_into_topology(top)
+
+        # Three includes into the same .ff directory, copied exactly once.
+        assert len(calls) == 1
+        content = top.read_text()
+        assert '#include "charmm36-feb2026_cgenff-5.0.ff/ions.itp"' in content
 
     def test_no_absolute_ff_include_returns_none(self, tmp_path):
         top = tmp_path / "topology.top"

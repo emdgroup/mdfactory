@@ -12,6 +12,7 @@ system:
     resname: LYZ
     count: 1
     pdb_path: ./1aki.pdb
+    chains: [A]
     disulfide_bonds:
       - [CYS6, CYS127]
       - [CYS30, CYS115]

@@ -154,7 +154,8 @@ class GromacsProteinParameterSet(BaseModel):
 
     topology_file: Path
     structure_file: Path
-    position_restraint_file: Path
+    topology_include_files: list[Path]
+    chains: list[str]
     forcefield: str
     water_model: str
     total_charge: int

@@ -750,6 +750,7 @@ def build_proteinbox(inp: BuildInput):
         disulfide_bonds=protein.disulfide_bonds,
         protonation_states=protein.protonation_states,
         output_dir=pdb2gmx_dir,
+        chains=protein.chains,
     )
     logger.info(f"pdb2gmx output: {params.structure_file}")
 
@@ -779,7 +780,10 @@ def build_proteinbox(inp: BuildInput):
     # 7. Update topology [ molecules ] section
     topology_dest = Path("topology.top")
     shutil.copy(params.topology_file, topology_dest)
-    shutil.copy(params.position_restraint_file, Path("posre.itp"))
+    # topol.top references its per-chain and posre .itp files by bare name, so they
+    # must sit alongside it.
+    for include_file in params.topology_include_files:
+        shutil.copy(include_file, Path(include_file.name))
     ff_dir_name = bundle_forcefield_into_topology(topology_dest)
     update_topology_molecules(topology_dest, n_water_final, num_na, num_cl)
 
@@ -791,12 +795,13 @@ def build_proteinbox(inp: BuildInput):
     protein_atoms = u_ionized.select_atoms("protein and not name H*")
     protein_indices = protein_atoms.indices.tolist()
     topology_dest = topology_dest.resolve()
-    position_restraint_file = Path("posre.itp").resolve()
+    include_files = [f.resolve() for f in params.topology_include_files]
 
     with working_directory("relaxation", create=True, cleanup=True) as wd:
         shutil.copy(pre_relax_structure, wd / "system.pdb")
         shutil.copy(topology_dest, wd / "topology.top")
-        shutil.copy(position_restraint_file, wd / "posre.itp")
+        for include_file in include_files:
+            shutil.copy(include_file, wd / include_file.name)
 
         # OpenMM's GromacsTopFile resolves #includes relative to the topology's
         # directory, so bundle the force field next to the copied topology.

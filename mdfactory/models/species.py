@@ -205,6 +205,14 @@ class ProteinSpecies(Species):
     count: Optional[int] = Field(1, description="Number of protein copies (always 1).")
     fraction: Optional[float] = Field(1.0, description="Fraction (always 1.0 for protein).")
     pdb_path: Path = Field(..., description="Path to the input PDB file.")
+    chains: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Chain identifiers to build, e.g. ['A'] or ['H', 'L', 'Y']. Required for "
+            "multi-chain structures and validated against the chains pdb2gmx produces; "
+            "optional for a single-chain structure."
+        ),
+    )
     disulfide_bonds: list[tuple[str, str]] = Field(
         default_factory=list,
         description=(
@@ -214,7 +222,10 @@ class ProteinSpecies(Species):
     )
     protonation_states: dict[str, str] = Field(
         default_factory=dict,
-        description="Residue-specific protonation states, e.g. {'HIS15': 'HIE', 'GLU35': 'GLH'}.",
+        description=(
+            "Residue-specific protonation states, e.g. {'HIS15': 'HIE'}. For CHARMM "
+            "only 3-character states are expressible (histidine tautomers, neutral lysine)."
+        ),
     )
 
     @property
