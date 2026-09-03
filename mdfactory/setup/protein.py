@@ -488,7 +488,8 @@ def run_pdb2gmx(
 
     # pdb2gmx runs with cwd=output_dir; pass output filenames relative so the
     # generated topology contains a relative `#include "posre.itp"` rather than an
-    # absolute path, keeping the build directory portable.
+    # absolute path. The force-field #includes it writes are absolute and are made
+    # relative later by bundle_forcefield_into_topology.
     cmd = [
         gmx_bin,
         "pdb2gmx",
@@ -670,6 +671,57 @@ def update_topology_molecules(
             f.write(f"{'CL':<20s} {num_cl}\n")
 
     logger.info(f"Topology updated: {n_water} water, {num_na} Na+, {num_cl} Cl-")
+
+
+def bundle_forcefield_into_topology(top_path: Path) -> str | None:
+    """Copy the force field referenced by absolute #includes next to the topology.
+
+    pdb2gmx writes force-field ``#include`` lines pointing at the absolute location
+    where it found the force field (its GMXLIB entry). Copy that ``.ff`` directory
+    next to the topology and rewrite those includes to reference the bundled copy,
+    so the topology resolves them from its own directory without GMXLIB and the
+    build directory stays portable. Mirrors the CGenFF strategy in
+    ``generate_gromacs_topology``.
+
+    Parameters
+    ----------
+    top_path : Path
+        Path to the GROMACS .top file (modified in-place).
+
+    Returns
+    -------
+    str or None
+        Name of the bundled force-field directory (e.g. "charmm36-....ff"), or
+        None if the topology has no absolute force-field includes.
+
+    """
+    lines = top_path.read_text().splitlines(keepends=True)
+    ff_dir_name: str | None = None
+    changed = False
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("#include") or '"' not in stripped:
+            continue
+        include_path = stripped.split('"')[1]
+        if ".ff/" not in include_path or not Path(include_path).is_absolute():
+            continue
+
+        parts = Path(include_path).parts
+        ff_index = next(idx for idx, part in enumerate(parts) if part.endswith(".ff"))
+        ff_source = Path(*parts[: ff_index + 1])
+        ff_dir_name = parts[ff_index]
+        remainder = "/".join(parts[ff_index + 1 :])
+
+        shutil.copytree(ff_source, top_path.parent / ff_dir_name, dirs_exist_ok=True)
+        lines[i] = line.replace(include_path, f"{ff_dir_name}/{remainder}")
+        changed = True
+
+    if changed:
+        top_path.write_text("".join(lines))
+        logger.info(f"Bundled force field '{ff_dir_name}' into {top_path.parent}")
+
+    return ff_dir_name
 
 
 def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) -> None:

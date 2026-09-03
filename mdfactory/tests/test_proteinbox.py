@@ -5,9 +5,13 @@
 import textwrap
 from pathlib import Path
 
+import MDAnalysis as mda
+import numpy as np
 import pytest
 import yaml
 
+from mdfactory import workflows
+from mdfactory.build import _center_in_cubic_box
 from mdfactory.models.composition import ProteinBoxComposition
 from mdfactory.models.input import BuildInput
 from mdfactory.models.parametrization import Pdb2gmxConfig
@@ -16,10 +20,12 @@ from mdfactory.setup.protein import (
     _apply_protonation_states,
     _build_disulfide_prompt_input,
     _sum_charges_from_itp,
+    bundle_forcefield_into_topology,
     check_forcefield_available,
     run_pdb2gmx,
     update_topology_molecules,
 )
+from mdfactory.workflows import _resolve_proteinbox_pdb_path
 
 
 def _pdb_atom(serial, atom_name, resname, resid, x, y, z):
@@ -112,6 +118,10 @@ class TestPdb2gmxConfig:
     def test_rejects_non_three_site_water(self):
         with pytest.raises(ValueError, match="3-site"):
             Pdb2gmxConfig(water_model="tip4p")
+
+    def test_rejects_ljpme_forcefield(self):
+        with pytest.raises(ValueError, match="LJ-PME"):
+            Pdb2gmxConfig(forcefield="charmm36m-ljpme")
 
 
 class TestForceFieldCheck:
@@ -390,6 +400,49 @@ class TestTopologyParsing:
         assert calls["check"] is False
 
 
+class TestBundleForcefield:
+    def test_copies_ff_dir_and_rewrites_absolute_includes(self, tmp_path):
+        ff_source = tmp_path / "ffsource" / "charmm36-feb2026_cgenff-5.0.ff"
+        ff_source.mkdir(parents=True)
+        (ff_source / "forcefield.itp").write_text("; forcefield\n")
+        (ff_source / "tip3p.itp").write_text("; water\n")
+
+        build_dir = tmp_path / "build"
+        build_dir.mkdir()
+        top = build_dir / "topology.top"
+        top.write_text(
+            textwrap.dedent(f"""\
+            #include "{ff_source / "forcefield.itp"}"
+            #include "protein.itp"
+            #include "{ff_source / "tip3p.itp"}"
+            #include "posre.itp"
+            """)
+        )
+
+        ff_name = bundle_forcefield_into_topology(top)
+
+        assert ff_name == "charmm36-feb2026_cgenff-5.0.ff"
+        assert (build_dir / ff_name / "forcefield.itp").is_file()
+        assert (build_dir / ff_name / "tip3p.itp").is_file()
+
+        content = top.read_text()
+        assert '#include "charmm36-feb2026_cgenff-5.0.ff/forcefield.itp"' in content
+        assert '#include "charmm36-feb2026_cgenff-5.0.ff/tip3p.itp"' in content
+        # Relative includes are left untouched.
+        assert '#include "protein.itp"' in content
+        assert '#include "posre.itp"' in content
+        # No absolute paths remain.
+        assert str(ff_source) not in content
+
+    def test_no_absolute_ff_include_returns_none(self, tmp_path):
+        top = tmp_path / "topology.top"
+        top.write_text('#include "protein.itp"\n#include "posre.itp"\n')
+        original = top.read_text()
+
+        assert bundle_forcefield_into_topology(top) is None
+        assert top.read_text() == original
+
+
 class TestMetadata:
     def test_proteinbox_metadata(self, tmp_path):
         pdb = tmp_path / "test.pdb"
@@ -412,8 +465,6 @@ class TestMetadata:
 
 class TestPdbPathResolution:
     def test_relative_pdb_path_resolved_against_yaml_dir(self, tmp_path):
-        from mdfactory.workflows import _resolve_proteinbox_pdb_path
-
         base = tmp_path / "specs"
         base.mkdir()
         dct = {
@@ -424,8 +475,6 @@ class TestPdbPathResolution:
         assert dct["system"]["protein"]["pdb_path"] == str((base / "1aki.pdb").resolve())
 
     def test_absolute_pdb_path_unchanged(self, tmp_path):
-        from mdfactory.workflows import _resolve_proteinbox_pdb_path
-
         abs_path = str((tmp_path / "abs.pdb").resolve())
         dct = {
             "simulation_type": "proteinbox",
@@ -435,15 +484,11 @@ class TestPdbPathResolution:
         assert dct["system"]["protein"]["pdb_path"] == abs_path
 
     def test_non_proteinbox_untouched(self, tmp_path):
-        from mdfactory.workflows import _resolve_proteinbox_pdb_path
-
         dct = {"simulation_type": "mixedbox", "system": {"foo": "bar"}}
         _resolve_proteinbox_pdb_path(dct, tmp_path)
         assert dct == {"simulation_type": "mixedbox", "system": {"foo": "bar"}}
 
     def test_run_build_from_file_resolves_relative_path(self, tmp_path, monkeypatch):
-        from mdfactory import workflows
-
         pdb = tmp_path / "1aki.pdb"
         pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
         yaml_file = tmp_path / "build.yaml"
@@ -467,11 +512,6 @@ class TestPdbPathResolution:
 
 class TestCenterInCubicBox:
     def test_padding_guaranteed_on_every_face(self):
-        import MDAnalysis as mda
-        import numpy as np
-
-        from mdfactory.build import _center_in_cubic_box
-
         # Asymmetric molecule: long in x, short in y/z, offset from the origin.
         positions = np.array(
             [

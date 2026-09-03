@@ -713,6 +713,7 @@ def build_proteinbox(inp: BuildInput):
     from .models.composition import ProteinBoxComposition
     from .models.parametrization import Pdb2gmxConfig
     from .setup.protein import (
+        bundle_forcefield_into_topology,
         check_gmx_available,
         clean_pdb,
         run_pdb2gmx,
@@ -779,6 +780,7 @@ def build_proteinbox(inp: BuildInput):
     topology_dest = Path("topology.top")
     shutil.copy(params.topology_file, topology_dest)
     shutil.copy(params.position_restraint_file, Path("posre.itp"))
+    ff_dir_name = bundle_forcefield_into_topology(topology_dest)
     update_topology_molecules(topology_dest, n_water_final, num_na, num_cl)
 
     # 8. Write coordinates for OpenMM relaxation
@@ -796,9 +798,13 @@ def build_proteinbox(inp: BuildInput):
         shutil.copy(topology_dest, wd / "topology.top")
         shutil.copy(position_restraint_file, wd / "posre.itp")
 
-        # Copy forcefield directory if referenced by topology
-        # pdb2gmx topologies use #include from the GROMACS data dir, so OpenMM
-        # needs the GromacsTopFile to resolve them via GMXLIB or local copies
+        # OpenMM's GromacsTopFile resolves #includes relative to the topology's
+        # directory, so bundle the force field next to the copied topology.
+        if ff_dir_name is not None:
+            shutil.copytree(
+                topology_dest.parent / ff_dir_name, wd / ff_dir_name, dirs_exist_ok=True
+            )
+
         from .simulation.openmm_utils import relax_with_protein_restraints
 
         u_relaxed = relax_with_protein_restraints(

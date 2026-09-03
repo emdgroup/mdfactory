@@ -87,6 +87,12 @@ class Pdb2gmxConfig(BaseModel):
                 "pipeline uses CHARMM Force-switch LJ settings, so only CHARMM force "
                 "fields (e.g. charmm36m, charmm36, charmm27) are supported."
             )
+        if "ljpme" in self.forcefield.lower():
+            raise ValueError(
+                f"Force field '{self.forcefield}' is not supported. The proteinbox "
+                "run schedule uses cutoff/Force-switch LJ, which is incompatible with "
+                "an LJ-PME force field. Use the standard CHARMM variant (e.g. charmm36m)."
+            )
         if self.water_model.lower() not in SUPPORTED_WATER_MODELS:
             raise ValueError(
                 f"Water model '{self.water_model}' is not supported. Solvation uses "
