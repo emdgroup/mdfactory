@@ -87,12 +87,11 @@ class TestProteinSpecies:
         assert spec.disulfide_bonds[0] == ("CYS6", "CYS127")
         assert spec.protonation_states["HIS15"] == "HIE"
 
-    def test_charge_not_precomputable(self, tmp_path):
+    def test_charge_is_none(self, tmp_path):
         pdb = tmp_path / "test.pdb"
         pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
         spec = ProteinSpecies(resname="LYZ", pdb_path=pdb)
-        with pytest.raises(NotImplementedError, match="pdb2gmx"):
-            _ = spec.charge
+        assert spec.charge is None
 
     def test_chains_default_empty_and_declared(self, tmp_path):
         pdb = tmp_path / "test.pdb"

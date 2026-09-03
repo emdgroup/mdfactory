@@ -229,7 +229,6 @@ class ProteinSpecies(Species):
     )
 
     @property
-    def charge(self) -> int:
-        raise NotImplementedError(
-            "Protein charge is determined by pdb2gmx topology output, not pre-computable."
-        )
+    def charge(self) -> int | None:
+        """Return None; protein charge comes from the pdb2gmx topology, not the species."""
+        return None
