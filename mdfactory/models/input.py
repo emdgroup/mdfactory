@@ -206,3 +206,21 @@ class BuildInput(BaseModel):
                 f"parametrization '{self.parametrization}'."
             )
         return self
+
+    @model_validator(mode="after")
+    def validate_proteinbox_chain_config(self) -> "BuildInput":
+        """Reject declaring chains while also merging them into one moleculetype.
+
+        merge_all fuses every chain into a single ``Protein`` moleculetype, which
+        contradicts protein.chains declaring subunits to build separately. Catching
+        this here avoids a confusing chain-mismatch failure deep inside pdb2gmx.
+        """
+        if self.simulation_type != "proteinbox":
+            return self
+        if getattr(self.parametrization_config, "merge_all", False) and self.system.protein.chains:
+            raise ValueError(
+                "protein.chains declares subunits to build as separate moleculetypes, but "
+                "parametrization_config.merge_all merges all chains into one. Set "
+                "merge_all=false to keep per-chain subunits, or drop protein.chains to merge."
+            )
+        return self

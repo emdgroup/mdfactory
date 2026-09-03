@@ -817,7 +817,7 @@ def build_proteinbox(inp: BuildInput):
             wd / "system.pdb",
             wd / "topology.top",
             protein_indices=protein_indices,
-            steps=10000,
+            steps=inp.system.relax_steps,
         )
 
     logger.info("OpenMM relaxation complete.")
@@ -836,5 +836,14 @@ def build_proteinbox(inp: BuildInput):
     em_mdp = Path("em.mdp")
     if em_mdp.is_file():
         validate_with_grompp(topology_dest, Path("system.pdb"), em_mdp, Path.cwd())
+
+    # Remove build intermediates so the output directory holds only the final
+    # artifacts (topology.top, system.pdb, per-chain includes, the bundled force
+    # field, run files), matching how the small-molecule builds leave their output
+    # dir. Only runs on success; a failure earlier keeps the intermediates for
+    # debugging.
+    Path(cleaned_pdb).unlink(missing_ok=True)
+    pre_relax_structure.unlink(missing_ok=True)
+    shutil.rmtree(pdb2gmx_dir, ignore_errors=True)
 
     logger.info("Proteinbox build complete.")

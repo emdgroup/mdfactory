@@ -386,6 +386,11 @@ class ProteinBoxComposition(BaseModel):
     padding: float = Field(
         10.0, description="Minimum distance from protein to box edge in Angstroms.", ge=0.0
     )
+    relax_steps: int = Field(
+        10000,
+        description="OpenMM steps for the position-restrained relaxation of the solvated system.",
+        ge=0,
+    )
     ionization: IonizationConfig = Field(
         default_factory=IonizationConfig, description="Configuration for ionization."
     )

@@ -274,6 +274,33 @@ system:
         with pytest.raises(ValueError, match="does not match"):
             BuildInput(**data)
 
+    def test_rejects_merge_all_with_declared_chains(self, tmp_path):
+        pdb = tmp_path / "test.pdb"
+        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+        data = {
+            "simulation_type": "proteinbox",
+            "parametrization": "pdb2gmx",
+            "parametrization_config": {"type": "pdb2gmx", "merge_all": True},
+            "system": {
+                "protein": {"resname": "INS", "pdb_path": str(pdb), "chains": ["A", "B"]},
+            },
+        }
+        with pytest.raises(ValueError, match="merge_all"):
+            BuildInput(**data)
+
+    def test_merge_all_without_chains_allowed(self, tmp_path):
+        pdb = tmp_path / "test.pdb"
+        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+        data = {
+            "simulation_type": "proteinbox",
+            "parametrization": "pdb2gmx",
+            "parametrization_config": {"type": "pdb2gmx", "merge_all": True},
+            "system": {"protein": {"resname": "INS", "pdb_path": str(pdb)}},
+        }
+        inp = BuildInput(**data)
+        assert inp.parametrization_config.merge_all is True
+        assert inp.system.protein.chains == []
+
 
 class TestTopologyParsing:
     def test_sum_charges_from_itp(self, tmp_path):
