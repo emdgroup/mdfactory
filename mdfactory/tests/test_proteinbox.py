@@ -96,14 +96,22 @@ class TestPdb2gmxConfig:
         assert config.merge_all is False
 
     def test_custom(self):
-        config = Pdb2gmxConfig(forcefield="amber99sb-ildn", water_model="spc")
-        assert config.forcefield == "amber99sb-ildn"
-        assert config.water_model == "spc"
+        config = Pdb2gmxConfig(forcefield="charmm36", water_model="spce")
+        assert config.forcefield == "charmm36"
+        assert config.water_model == "spce"
 
     def test_frozen(self):
         config = Pdb2gmxConfig()
         with pytest.raises(Exception):
             config.forcefield = "other"
+
+    def test_rejects_non_charmm_forcefield(self):
+        with pytest.raises(ValueError, match="CHARMM"):
+            Pdb2gmxConfig(forcefield="amber99sb-ildn")
+
+    def test_rejects_non_three_site_water(self):
+        with pytest.raises(ValueError, match="3-site"):
+            Pdb2gmxConfig(water_model="tip4p")
 
 
 class TestForceFieldCheck:
@@ -196,6 +204,29 @@ system:
         inp = BuildInput(**data)
         assert isinstance(inp.parametrization_config, Pdb2gmxConfig)
         assert inp.parametrization_config.forcefield == "charmm36m"
+
+    def test_rejects_cgenff_parametrization(self, tmp_path):
+        pdb = tmp_path / "test.pdb"
+        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+        data = {
+            "simulation_type": "proteinbox",
+            "parametrization": "cgenff",
+            "system": {"protein": {"resname": "LYZ", "count": 1, "pdb_path": str(pdb)}},
+        }
+        with pytest.raises(ValueError, match="not valid for simulation type"):
+            BuildInput(**data)
+
+    def test_rejects_mismatched_config_type(self, tmp_path):
+        pdb = tmp_path / "test.pdb"
+        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+        data = {
+            "simulation_type": "proteinbox",
+            "parametrization": "pdb2gmx",
+            "parametrization_config": {"type": "cgenff"},
+            "system": {"protein": {"resname": "LYZ", "count": 1, "pdb_path": str(pdb)}},
+        }
+        with pytest.raises(ValueError, match="does not match"):
+            BuildInput(**data)
 
 
 class TestTopologyParsing:
@@ -345,7 +376,7 @@ class TestTopologyParsing:
 
         run_pdb2gmx(
             pdb_path=pdb,
-            config=Pdb2gmxConfig(forcefield="amber99sb-ildn", water_model="tip3p"),
+            config=Pdb2gmxConfig(forcefield="charmm36m", water_model="tip3p"),
             disulfide_bonds=[("CYS2", "CYS3")],
             protonation_states={},
             output_dir=tmp_path / "pdb2gmx_output",
@@ -377,3 +408,91 @@ class TestMetadata:
         assert meta["total_count"] == 1
         assert "padding" in meta["system_specific"]
         assert meta["system_specific"]["padding"] == 12.0
+
+
+class TestPdbPathResolution:
+    def test_relative_pdb_path_resolved_against_yaml_dir(self, tmp_path):
+        from mdfactory.workflows import _resolve_proteinbox_pdb_path
+
+        base = tmp_path / "specs"
+        base.mkdir()
+        dct = {
+            "simulation_type": "proteinbox",
+            "system": {"protein": {"pdb_path": "1aki.pdb"}},
+        }
+        _resolve_proteinbox_pdb_path(dct, base)
+        assert dct["system"]["protein"]["pdb_path"] == str((base / "1aki.pdb").resolve())
+
+    def test_absolute_pdb_path_unchanged(self, tmp_path):
+        from mdfactory.workflows import _resolve_proteinbox_pdb_path
+
+        abs_path = str((tmp_path / "abs.pdb").resolve())
+        dct = {
+            "simulation_type": "proteinbox",
+            "system": {"protein": {"pdb_path": abs_path}},
+        }
+        _resolve_proteinbox_pdb_path(dct, tmp_path / "other")
+        assert dct["system"]["protein"]["pdb_path"] == abs_path
+
+    def test_non_proteinbox_untouched(self, tmp_path):
+        from mdfactory.workflows import _resolve_proteinbox_pdb_path
+
+        dct = {"simulation_type": "mixedbox", "system": {"foo": "bar"}}
+        _resolve_proteinbox_pdb_path(dct, tmp_path)
+        assert dct == {"simulation_type": "mixedbox", "system": {"foo": "bar"}}
+
+    def test_run_build_from_file_resolves_relative_path(self, tmp_path, monkeypatch):
+        from mdfactory import workflows
+
+        pdb = tmp_path / "1aki.pdb"
+        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+        yaml_file = tmp_path / "build.yaml"
+        yaml_file.write_text(
+            textwrap.dedent("""\
+            simulation_type: proteinbox
+            parametrization: pdb2gmx
+            system:
+              protein:
+                resname: LYZ
+                count: 1
+                pdb_path: 1aki.pdb
+              padding: 12.0
+            """)
+        )
+        captured = {}
+        monkeypatch.setattr(workflows, "run_build_from_dict", captured.update)
+        workflows.run_build_from_file(yaml_file)
+        assert captured["system"]["protein"]["pdb_path"] == str(pdb.resolve())
+
+
+class TestCenterInCubicBox:
+    def test_padding_guaranteed_on_every_face(self):
+        import MDAnalysis as mda
+        import numpy as np
+
+        from mdfactory.build import _center_in_cubic_box
+
+        # Asymmetric molecule: long in x, short in y/z, offset from the origin.
+        positions = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [40.0, 5.0, 2.0],
+                [10.0, -3.0, 8.0],
+            ],
+            dtype=float,
+        )
+        u = mda.Universe.empty(len(positions), trajectory=True)
+        u.atoms.positions = positions
+        padding = 12.0
+        box_size = _center_in_cubic_box(u, padding)
+
+        pos = u.atoms.positions
+        bbox_min = pos.min(axis=0)
+        bbox_max = pos.max(axis=0)
+        # Every face is at least `padding` from the protein.
+        assert bbox_min.min() >= padding - 1e-3
+        assert (box_size - bbox_max.max()) >= padding - 1e-3
+        # The longest-extent axis sits exactly `padding` from both faces.
+        long_axis = int(np.argmax(bbox_max - bbox_min))
+        assert abs(bbox_min[long_axis] - padding) < 1e-3
+        assert abs((box_size - bbox_max[long_axis]) - padding) < 1e-3

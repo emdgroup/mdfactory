@@ -486,17 +486,20 @@ def run_pdb2gmx(
     topology_file = output_dir / "topol.top"
     posre_file = output_dir / "posre.itp"
 
+    # pdb2gmx runs with cwd=output_dir; pass output filenames relative so the
+    # generated topology contains a relative `#include "posre.itp"` rather than an
+    # absolute path, keeping the build directory portable.
     cmd = [
         gmx_bin,
         "pdb2gmx",
         "-f",
         str(pdb_path),
         "-o",
-        str(structure_file),
+        structure_file.name,
         "-p",
-        str(topology_file),
+        topology_file.name,
         "-i",
-        str(posre_file),
+        posre_file.name,
         "-ff",
         resolved_ff,
         "-water",

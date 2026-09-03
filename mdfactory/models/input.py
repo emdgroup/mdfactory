@@ -30,6 +30,15 @@ type_mapping = {
     "proteinbox": ProteinBoxComposition,
 }
 
+# Parametrizations each simulation type accepts. Proteins are parametrized with
+# gmx pdb2gmx; small-molecule systems use CGenFF or SMIRNOFF.
+allowed_parametrizations = {
+    "mixedbox": {"cgenff", "smirnoff"},
+    "bilayer": {"cgenff", "smirnoff"},
+    "lnp": {"cgenff", "smirnoff"},
+    "proteinbox": {"pdb2gmx"},
+}
+
 
 class BuildInput(BaseModel):
     """Represent a complete simulation build specification with composition and parametrization."""
@@ -179,4 +188,21 @@ class BuildInput(BaseModel):
                 object.__setattr__(self, "parametrization_config", CgenffConfig())
             elif self.parametrization == "pdb2gmx":
                 object.__setattr__(self, "parametrization_config", Pdb2gmxConfig())
+        return self
+
+    @model_validator(mode="after")
+    def validate_parametrization_consistency(self) -> "BuildInput":
+        """Ensure simulation type, parametrization, and config discriminator agree."""
+        allowed = allowed_parametrizations[self.simulation_type]
+        if self.parametrization not in allowed:
+            raise ValueError(
+                f"Parametrization '{self.parametrization}' is not valid for "
+                f"simulation type '{self.simulation_type}'. Allowed: {sorted(allowed)}."
+            )
+        config_type = self.parametrization_config.type
+        if config_type != self.parametrization:
+            raise ValueError(
+                f"Parametrization config type '{config_type}' does not match "
+                f"parametrization '{self.parametrization}'."
+            )
         return self

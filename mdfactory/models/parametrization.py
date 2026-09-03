@@ -6,7 +6,20 @@ import json
 from pathlib import Path
 from typing import Annotated, Literal, Optional
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Discriminator, Field, FilePath, Tag
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    FilePath,
+    Tag,
+    model_validator,
+)
+
+# The proteinbox pipeline solvates with 3-site spc216 coordinates and uses
+# CHARMM Force-switch LJ in every mdp, so only these combinations are supported.
+SUPPORTED_WATER_MODELS = frozenset({"tip3p", "spc", "spce"})
 
 
 def validate_absolute_path(path: Path):
@@ -64,6 +77,23 @@ class Pdb2gmxConfig(BaseModel):
         True, description="Ignore hydrogens in input PDB (regenerate with pdb2gmx)."
     )
     merge_all: bool = Field(False, description="Merge all chains into a single moleculetype.")
+
+    @model_validator(mode="after")
+    def check_supported_forcefield_and_water(self) -> "Pdb2gmxConfig":
+        """Reject force fields and water models the proteinbox pipeline cannot honor."""
+        if not self.forcefield.lower().startswith("charmm"):
+            raise ValueError(
+                f"Force field '{self.forcefield}' is not supported. The proteinbox "
+                "pipeline uses CHARMM Force-switch LJ settings, so only CHARMM force "
+                "fields (e.g. charmm36m, charmm36, charmm27) are supported."
+            )
+        if self.water_model.lower() not in SUPPORTED_WATER_MODELS:
+            raise ValueError(
+                f"Water model '{self.water_model}' is not supported. Solvation uses "
+                "3-site spc216 coordinates, so only 3-site water models are supported: "
+                f"{sorted(SUPPORTED_WATER_MODELS)}."
+            )
+        return self
 
 
 ParametrizationConfig = Annotated[

@@ -685,6 +685,24 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge):
     return u_ionized, [na_spec, cl_spec]
 
 
+def _center_in_cubic_box(u: mda.Universe, padding: float) -> float:
+    """Center atoms in a cubic box leaving at least ``padding`` on every face.
+
+    The box is centered on the atoms' bounding-box center (not the center of
+    geometry), so an asymmetric molecule keeps the requested clearance to each
+    face. Returns the cubic box edge length in Angstroms.
+    """
+    bbox_min = u.atoms.positions.min(axis=0)
+    bbox_max = u.atoms.positions.max(axis=0)
+    extent = bbox_max - bbox_min
+    box_size = float(extent.max() + 2 * padding)
+    u.dimensions = [box_size, box_size, box_size, 90, 90, 90]
+    box_center = np.array([box_size / 2, box_size / 2, box_size / 2])
+    bbox_center = (bbox_min + bbox_max) / 2
+    u.atoms.translate(box_center - bbox_center)
+    return box_size
+
+
 @validate_call
 def build_proteinbox(inp: BuildInput):
     """Build a protein-in-waterbox system: clean, parametrize, solvate, ionize, relax."""
@@ -736,11 +754,7 @@ def build_proteinbox(inp: BuildInput):
 
     # 4. Center protein in cubic box
     u = mda.Universe(str(params.structure_file))
-    extent = u.atoms.positions.max(axis=0) - u.atoms.positions.min(axis=0)
-    box_size = extent.max() + 2 * inp.system.padding
-    u.dimensions = [box_size, box_size, box_size, 90, 90, 90]
-    center = np.array([box_size / 2, box_size / 2, box_size / 2])
-    u.atoms.translate(-u.atoms.center_of_geometry() + center)
+    box_size = _center_in_cubic_box(u, inp.system.padding)
     logger.info(f"Protein centered in cubic box: {box_size:.1f} A")
 
     # 5. Solvate (reuse existing solvation)
@@ -810,9 +824,6 @@ def build_proteinbox(inp: BuildInput):
 
     em_mdp = Path("em.mdp")
     if em_mdp.is_file():
-        try:
-            validate_with_grompp(topology_dest, Path("system.pdb"), em_mdp, Path.cwd())
-        except RuntimeError as e:
-            logger.warning(f"grompp validation failed (non-fatal): {e}")
+        validate_with_grompp(topology_dest, Path("system.pdb"), em_mdp, Path.cwd())
 
     logger.info("Proteinbox build complete.")
