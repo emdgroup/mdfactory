@@ -38,8 +38,8 @@ def _parse_delimited_protein_fields(nested: dict) -> None:
     bonds = protein.get("disulfide_bonds")
     if isinstance(bonds, str):
         parsed = []
-        for token in bonds.split(";"):
-            token = token.strip()
+        for raw_token in bonds.split(";"):
+            token = raw_token.strip()
             if not token:
                 continue
             first, sep, second = token.partition("-")
@@ -124,9 +124,7 @@ def df_to_build_input_models(
     """
     # Optional protein list/dict fields may legitimately be blank for some proteins,
     # so exclude them from the strict NaN check and drop them per row when empty.
-    required_cols = [
-        c for c in df.columns if not c.startswith(OPTIONAL_PROTEIN_FIELD_PREFIXES)
-    ]
+    required_cols = [c for c in df.columns if not c.startswith(OPTIONAL_PROTEIN_FIELD_PREFIXES)]
     if df[required_cols].isnull().values.any():
         raise ValueError("Cannot process data frame with NaN values.")
     if df.duplicated(keep=False).any():

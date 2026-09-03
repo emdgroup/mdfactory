@@ -2,6 +2,7 @@
 # ABOUTME: Wraps PDBFixer for cleaning and gmx pdb2gmx for topology generation
 """Protein preparation utilities for the proteinbox simulation type."""
 
+import hashlib
 import io
 import re
 import shutil
@@ -19,13 +20,15 @@ _CYSTEINE_RESNAMES = {"CYS", "CYM", "CYX"}
 
 FORCEFIELD_REGISTRY: dict[str, dict[str, str]] = {
     "charmm36m": {
-        "url": "http://mackerell.umaryland.edu/download.php?filename=CHARMM_ff_params_files/charmm36-feb2026_cgenff-5.0.ff.tgz",
+        "url": "https://mackerell.umaryland.edu/download.php?filename=CHARMM_ff_params_files/charmm36-feb2026_cgenff-5.0.ff.tgz",
         "dirname": "charmm36-feb2026_cgenff-5.0.ff",
+        "sha256": "c2b0c70e21cced150528ee25d205e5bd3367a5e55e85c2ff0403911980528151",
         "description": "CHARMM36m protein + CGenFF 5.0 (Feb 2026)",
     },
     "charmm36m-ljpme": {
-        "url": "http://mackerell.umaryland.edu/download.php?filename=CHARMM_ff_params_files/charmm36-feb2026_ljpme_cgenff-5.0.ff.tgz",
+        "url": "https://mackerell.umaryland.edu/download.php?filename=CHARMM_ff_params_files/charmm36-feb2026_ljpme_cgenff-5.0.ff.tgz",
         "dirname": "charmm36-feb2026_ljpme_cgenff-5.0.ff",
+        "sha256": "b2221dcba73066b6b5c30a52b9894216d03ea6c3e68206d9ce43857dd8116c21",
         "description": "CHARMM36m + CGenFF 5.0, LJ-PME variant (Feb 2026)",
     },
 }
@@ -91,10 +94,37 @@ def _distance(coords_a: tuple[float, float, float], coords_b: tuple[float, float
     return sum((a - b) ** 2 for a, b in zip(coords_a, coords_b, strict=True)) ** 0.5
 
 
-def _read_cysteine_sg_atoms(pdb_path: Path) -> dict[int, tuple[float, float, float]]:
-    """Read cysteine SG atom coordinates keyed by residue id."""
-    atoms: dict[int, tuple[float, float, float]] = {}
-    duplicate_resids = set()
+_ResidueKey = tuple[str, int, str]
+
+
+def _parse_residue_reference(reference: str) -> tuple[str | None, str, int, str]:
+    """Parse a possibly chain-qualified PDB residue reference.
+
+    References have the form ``RESNAME<resid>`` or
+    ``CHAIN:RESNAME<resid><insertion-code>``. For example, ``HIS15``,
+    ``A:HIS15``, and ``H:HIS100A`` are valid.
+    """
+    match = re.fullmatch(r"(?:([A-Za-z0-9]):)?([A-Za-z]+)(\d+)([A-Za-z]?)", reference)
+    if not match:
+        raise ValueError(
+            f"Invalid residue reference '{reference}'. Expected format "
+            "RESNAME<resid> or CHAIN:RESNAME<resid><insertion-code>, "
+            "e.g. 'HIS15', 'A:HIS15', or 'H:HIS100A'."
+        )
+    insertion_code = match.group(4)
+    return match.group(1), match.group(2).upper(), int(match.group(3)), insertion_code
+
+
+def _format_residue_key(key: _ResidueKey, resname: str) -> str:
+    """Format a concrete PDB residue key as a configuration reference."""
+    chain, resid, insertion_code = key
+    residue = f"{resname}{resid}{insertion_code}"
+    return f"{chain}:{residue}" if chain else residue
+
+
+def _read_cysteine_sg_atoms(pdb_path: Path) -> dict[_ResidueKey, tuple[float, float, float]]:
+    """Read cysteine SG atoms in PDB encounter order, keyed by residue identity."""
+    atoms: dict[_ResidueKey, tuple[float, float, float]] = {}
 
     with open(pdb_path) as f:
         for line in f:
@@ -106,39 +136,59 @@ def _read_cysteine_sg_atoms(pdb_path: Path) -> dict[int, tuple[float, float, flo
             if atom_name != "SG" or resname not in _CYSTEINE_RESNAMES:
                 continue
 
+            chain = line[21].strip()
             resid = int(line[22:26].strip())
+            insertion_code = line[26].strip()
             coords = (
                 float(line[30:38].strip()),
                 float(line[38:46].strip()),
                 float(line[46:54].strip()),
             )
-            if resid in atoms:
-                duplicate_resids.add(resid)
-            atoms[resid] = coords
+            key = (chain, resid, insertion_code)
+            if key in atoms:
+                raise ValueError(
+                    "Multiple cysteine SG atoms share the residue identifier "
+                    f"'{_format_residue_key(key, resname)}' in {pdb_path}."
+                )
+            atoms[key] = coords
 
-    if duplicate_resids:
-        raise ValueError(
-            "Disulfide bond overrides use residue ids only and cannot disambiguate "
-            f"duplicate cysteine residue ids: {sorted(duplicate_resids)}."
-        )
     return atoms
 
 
-def _parse_cysteine_reference(reference: str) -> int:
-    """Parse a cysteine residue reference like 'CYS6' into its residue id."""
-    match = re.fullmatch(r"([A-Za-z]+)(\d+)", reference)
-    if not match:
-        raise ValueError(
-            f"Invalid disulfide residue reference '{reference}'. "
-            "Expected format: RESNAME<resid>, e.g. 'CYS6'."
-        )
-    resname = match.group(1).upper()
+def _resolve_cysteine_reference(
+    reference: str,
+    sg_atoms: dict[_ResidueKey, tuple[float, float, float]],
+    pdb_path: Path,
+) -> _ResidueKey:
+    """Resolve a cysteine reference to a concrete PDB residue key.
+
+    References without a chain are accepted only when they identify exactly one
+    cysteine. An omitted insertion code means the residue has no insertion code.
+    """
+    chain, resname, resid, insertion_code = _parse_residue_reference(reference)
     if resname not in _CYSTEINE_RESNAMES:
         raise ValueError(
             f"Disulfide residue reference '{reference}' must be a cysteine "
             f"(one of {sorted(_CYSTEINE_RESNAMES)})."
         )
-    return int(match.group(2))
+
+    not_found = (
+        f"Disulfide residue reference '{reference}' is not a cysteine SG atom in {pdb_path}."
+    )
+    candidates = [
+        key
+        for key in sg_atoms
+        if key[1] == resid and (chain is None or key[0] == chain) and key[2] == insertion_code
+    ]
+    if not candidates:
+        raise ValueError(not_found)
+    if len(candidates) > 1:
+        choices = sorted(_format_residue_key(key, resname) for key in candidates)
+        raise ValueError(
+            f"Disulfide residue reference '{reference}' is ambiguous across chains or "
+            f"insertion codes. Use one of these fully qualified references: {choices}."
+        )
+    return candidates[0]
 
 
 def _build_disulfide_prompt_input(
@@ -147,41 +197,91 @@ def _build_disulfide_prompt_input(
     cutoff_angstrom: float = _DISULFIDE_CUTOFF_ANGSTROM,
 ) -> str:
     """Build deterministic yes/no input for pdb2gmx disulfide prompts."""
-    requested = {
-        tuple(sorted((_parse_cysteine_reference(a), _parse_cysteine_reference(b))))
-        for a, b in disulfide_bonds
-    }
-    for pair in requested:
-        if pair[0] == pair[1]:
-            raise ValueError(f"Invalid disulfide bond with identical residues: {pair}")
-
     sg_atoms = _read_cysteine_sg_atoms(pdb_path)
-    missing_resids = sorted(
-        {resid for pair in requested for resid in pair if resid not in sg_atoms}
-    )
-    if missing_resids:
-        raise ValueError(
-            f"Requested disulfide residues are not cysteine SG atoms in {pdb_path}: "
-            f"{missing_resids}"
-        )
 
-    candidate_pairs = []
-    resids = sorted(sg_atoms)
-    for i, resid_a in enumerate(resids):
-        for resid_b in resids[i + 1 :]:
-            if _distance(sg_atoms[resid_a], sg_atoms[resid_b]) <= cutoff_angstrom:
-                candidate_pairs.append((resid_a, resid_b))
+    requested: set[frozenset[_ResidueKey]] = set()
+    for a, b in disulfide_bonds:
+        key_a = _resolve_cysteine_reference(a, sg_atoms, pdb_path)
+        key_b = _resolve_cysteine_reference(b, sg_atoms, pdb_path)
+        if key_a == key_b:
+            raise ValueError(f"Invalid disulfide bond with identical residues: {a}-{b}")
+        requested.add(frozenset((key_a, key_b)))
 
-    missing_pairs = sorted(requested - set(candidate_pairs))
+    # pdb2gmx presents -ss prompts in PDB atom encounter order. Do not sort these
+    # keys: doing so can attach each y/n answer to a different chain's prompt.
+    candidate_pairs: list[tuple[_ResidueKey, _ResidueKey]] = []
+    keys = list(sg_atoms)
+    for i, key_a in enumerate(keys):
+        for key_b in keys[i + 1 :]:
+            if _distance(sg_atoms[key_a], sg_atoms[key_b]) <= cutoff_angstrom:
+                candidate_pairs.append((key_a, key_b))
+
+    candidate_identities = {frozenset(pair) for pair in candidate_pairs}
+    missing_pairs = requested - candidate_identities
     if missing_pairs:
+        formatted_missing = sorted(tuple(sorted(pair)) for pair in missing_pairs)
         raise ValueError(
             "Requested disulfide bonds were not detected as close CYS SG pairs "
-            f"within {cutoff_angstrom:.1f} A in {pdb_path}: {missing_pairs}"
+            f"within {cutoff_angstrom:.1f} A in {pdb_path}: {formatted_missing}"
         )
 
-    answers = ["y" if pair in requested else "n" for pair in candidate_pairs]
-    logger.info(f"pdb2gmx disulfide candidates: {candidate_pairs}; requested: {sorted(requested)}")
+    answers = ["y" if frozenset(pair) in requested else "n" for pair in candidate_pairs]
+    formatted_requested = sorted(tuple(sorted(pair)) for pair in requested)
+    logger.info(
+        f"pdb2gmx disulfide candidates: {candidate_pairs}; requested: {formatted_requested}"
+    )
     return "\n".join(answers) + "\n"
+
+
+def _read_pdb_residues(pdb_path: Path) -> dict[_ResidueKey, str]:
+    """Read physical PDB residues keyed by chain, residue id, and insertion code."""
+    residues: dict[_ResidueKey, str] = {}
+    with open(pdb_path) as f:
+        for line in f:
+            if not line.startswith(("ATOM", "HETATM")) or len(line) < 27:
+                continue
+            try:
+                resid = int(line[22:26].strip())
+            except ValueError:
+                continue
+            key = (line[21].strip(), resid, line[26].strip())
+            resname = line[17:20].strip()
+            previous = residues.setdefault(key, resname)
+            if previous != resname:
+                raise ValueError(
+                    f"Residue identifier '{_format_residue_key(key, resname)}' has "
+                    f"inconsistent residue names '{previous}' and '{resname}' in {pdb_path}."
+                )
+    return residues
+
+
+def _resolve_protonation_reference(
+    reference: str, residues: dict[_ResidueKey, str], pdb_path: Path
+) -> tuple[_ResidueKey, str]:
+    """Resolve a protonation reference to one physical PDB residue."""
+    chain, resname_prefix, resid, insertion_code = _parse_residue_reference(reference)
+    candidates = [
+        (key, current_resname)
+        for key, current_resname in residues.items()
+        if key[1] == resid
+        and (chain is None or key[0] == chain)
+        and key[2] == insertion_code
+        and _override_matches_residue(resname_prefix, current_resname)
+    ]
+    if not candidates:
+        raise ValueError(
+            f"Protonation state override '{reference}' matched no residue in {pdb_path}. "
+            "Check the residue number, insertion code, chain, and name against the input PDB."
+        )
+    if len(candidates) > 1:
+        choices = sorted(
+            _format_residue_key(key, current_resname) for key, current_resname in candidates
+        )
+        raise ValueError(
+            f"Protonation state override '{reference}' is ambiguous across chains or "
+            f"insertion codes. Use one of these fully qualified references: {choices}."
+        )
+    return candidates[0]
 
 
 def _apply_protonation_states(
@@ -205,9 +305,11 @@ def _apply_protonation_states(
     pdb_path : Path
         Input PDB file (absolute path).
     protonation_states : dict[str, str]
-        Mapping of "RESNAME<resid>" to target residue name, e.g.
-        {"HIS15": "HIE"}. For CHARMM only 3-character states are expressible
-        (histidine tautomers, neutral lysine).
+        Mapping of "RESNAME<resid>" (or chain-qualified "CHAIN:RESNAME<resid>")
+        to target residue name, e.g. {"HIS15": "HIE"} or {"A:HIS15": "HIE"}. An
+        unqualified key that matches the residue in more than one chain is
+        rejected as ambiguous. For CHARMM only 3-character states are
+        expressible (histidine tautomers, neutral lysine).
     output_dir : Path
         Directory for the modified PDB.
     forcefield : str | None
@@ -221,58 +323,38 @@ def _apply_protonation_states(
     """
     output_pdb = output_dir / "protonation_adjusted.pdb"
 
-    # Parse overrides: "HIS15" -> (key, resname_prefix="HIS", resid=15, new_name="HSE")
-    overrides = []
-    for key, new_name in protonation_states.items():
-        match = re.fullmatch(r"([A-Za-z]+)(\d+)", key)
-        if not match:
+    residues = _read_pdb_residues(pdb_path)
+    resolved_overrides: dict[_ResidueKey, tuple[str, str]] = {}
+    for reference, new_name in protonation_states.items():
+        residue_key, _ = _resolve_protonation_reference(reference, residues, pdb_path)
+        target_name = _resolve_protonation_residue_name(new_name, forcefield)
+        if residue_key in resolved_overrides:
+            previous_reference = resolved_overrides[residue_key][0]
             raise ValueError(
-                f"Invalid protonation state key '{key}'. "
-                "Expected format: RESNAME<resid>, e.g. 'HIS15'."
+                f"Protonation state overrides '{previous_reference}' and '{reference}' "
+                "resolve to the same residue. Specify it only once."
             )
-        resname_prefix = match.group(1).upper()
-        resid = int(match.group(2))
-        overrides.append(
-            (key, resname_prefix, resid, _resolve_protonation_residue_name(new_name, forcefield))
-        )
-
-    matched_keys: set[str] = set()
-    resids_present: set[int] = set()
+        resolved_overrides[residue_key] = (reference, target_name)
 
     with open(pdb_path) as f_in, open(output_pdb, "w") as f_out:
         for line in f_in:
             output_line = line
-            if output_line.startswith(("ATOM", "HETATM")) and len(output_line) >= 26:
-                current_resname = output_line[17:20].strip()
+            if output_line.startswith(("ATOM", "HETATM")) and len(output_line) >= 27:
                 try:
                     current_resid = int(output_line[22:26].strip())
                 except ValueError:
                     f_out.write(output_line)
                     continue
-
-                resids_present.add(current_resid)
-                for key, prefix, target_resid, new_name in overrides:
-                    if current_resid == target_resid and _override_matches_residue(
-                        prefix, current_resname
-                    ):
-                        padded = f"{new_name:<3s}"
-                        output_line = output_line[:17] + padded + output_line[20:]
-                        matched_keys.add(key)
-                        break
+                residue_key = (
+                    output_line[21].strip(),
+                    current_resid,
+                    output_line[26].strip(),
+                )
+                override = resolved_overrides.get(residue_key)
+                if override is not None:
+                    new_name = override[1]
+                    output_line = output_line[:17] + f"{new_name:<3s}" + output_line[20:]
             f_out.write(output_line)
-
-    unmatched = [(key, resid) for key, _, resid, _ in overrides if key not in matched_keys]
-    if unmatched:
-        details = ", ".join(
-            f"'{key}' (resid {resid} "
-            + ("present but not a matching residue" if resid in resids_present else "not found")
-            + ")"
-            for key, resid in unmatched
-        )
-        raise ValueError(
-            f"Protonation state override(s) matched no residue: {details}. "
-            "Check the residue numbers and names against the input PDB."
-        )
 
     logger.info(f"Protonation states applied: {protonation_states}")
     return output_pdb
@@ -351,8 +433,21 @@ def download_forcefield(name: str) -> Path:
 
     logger.info(f"Downloading force field '{name}' from {entry['url']}...")
     response = urlopen(entry["url"], timeout=120)  # noqa: S310
-    data = io.BytesIO(response.read())
+    payload = response.read()
 
+    expected_sha256 = entry.get("sha256")
+    if expected_sha256:
+        actual_sha256 = hashlib.sha256(payload).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                f"Force field '{name}' download failed integrity check.\n"
+                f"Expected SHA-256: {expected_sha256}\n"
+                f"Actual SHA-256:   {actual_sha256}\n"
+                "The download may be corrupted or tampered with. If the upstream file was "
+                "legitimately updated, update the pinned 'sha256' in FORCEFIELD_REGISTRY."
+            )
+
+    data = io.BytesIO(payload)
     with tarfile.open(fileobj=data, mode="r:gz") as tar:
         tar.extractall(path=ff_dir, filter="data")
 
@@ -484,8 +579,11 @@ def clean_pdb(pdb_path: Path, output_path: Path) -> Path:
 
     from openmm.app import PDBFile  # noqa: PLC0415
 
+    # keepIds=True preserves the input chain IDs and residue numbers so that
+    # user-supplied chain, disulfide, and protonation references (which name
+    # residues by their original numbering) still resolve after cleaning.
     with open(output_path, "w") as f:
-        PDBFile.writeFile(fixer.topology, fixer.positions, f)
+        PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
 
     logger.info(f"PDB cleaned: {pdb_path} -> {output_path}")
     return output_path
@@ -789,14 +887,16 @@ def update_topology_molecules(
 
 
 def bundle_forcefield_into_topology(top_path: Path) -> str | None:
-    """Copy the force field referenced by absolute #includes next to the topology.
+    """Copy the force field referenced by #include lines next to the topology.
 
-    pdb2gmx writes force-field ``#include`` lines pointing at the absolute location
-    where it found the force field (its GMXLIB entry). Copy that ``.ff`` directory
-    next to the topology and rewrite those includes to reference the bundled copy,
-    so the topology resolves them from its own directory without GMXLIB and the
-    build directory stays portable. Mirrors the CGenFF strategy in
-    ``generate_gromacs_topology``.
+    pdb2gmx writes force-field ``#include`` lines that point either at the absolute
+    location where it found the force field (its GMXLIB entry) or, for built-in
+    GROMACS force fields, at a relative path such as ``charmm27.ff/forcefield.itp``.
+    Copy that ``.ff`` directory next to the topology so the includes resolve from
+    the topology's own directory without GMXLIB and the build directory stays
+    portable. Absolute includes are also rewritten to the bundled relative form;
+    relative includes already resolve once the directory sits alongside them and
+    are left untouched. Mirrors the CGenFF strategy in ``generate_gromacs_topology``.
 
     Parameters
     ----------
@@ -807,38 +907,68 @@ def bundle_forcefield_into_topology(top_path: Path) -> str | None:
     -------
     str or None
         Name of the bundled force-field directory (e.g. "charmm36-....ff"), or
-        None if the topology has no absolute force-field includes.
+        None if the topology has no force-field includes.
+
+    Raises
+    ------
+    RuntimeError
+        If a relative ``.ff`` include cannot be resolved against any GROMACS
+        search path, so it cannot be bundled for a portable topology.
 
     """
     lines = top_path.read_text().splitlines(keepends=True)
     ff_dir_name: str | None = None
     copied_sources: set[Path] = set()
-    changed = False
+    search_paths: list[Path] | None = None
+    rewrote_line = False
 
     for i, line in enumerate(lines):
         stripped = line.strip()
         if not stripped.startswith("#include") or '"' not in stripped:
             continue
         include_path = stripped.split('"')[1]
-        if ".ff/" not in include_path or not Path(include_path).is_absolute():
+        if ".ff/" not in include_path:
             continue
 
         parts = Path(include_path).parts
         ff_index = next(idx for idx, part in enumerate(parts) if part.endswith(".ff"))
-        ff_source = Path(*parts[: ff_index + 1])
         ff_dir_name = parts[ff_index]
         remainder = "/".join(parts[ff_index + 1 :])
+        is_absolute = Path(include_path).is_absolute()
+
+        if is_absolute:
+            ff_source = Path(*parts[: ff_index + 1])
+        else:
+            # Built-in force fields emit relative includes; resolve the .ff directory
+            # against the GROMACS search paths so it can be bundled.
+            if search_paths is None:
+                search_paths = _get_gmx_search_paths()
+            ff_source = next(
+                (sp / ff_dir_name for sp in search_paths if (sp / ff_dir_name).is_dir()),
+                None,
+            )
+            if ff_source is None:
+                raise RuntimeError(
+                    f"Force-field directory '{ff_dir_name}' referenced by {top_path} was "
+                    f"not found in any GROMACS search path: {[str(p) for p in search_paths]}. "
+                    "Cannot bundle it for a portable topology."
+                )
 
         # A topology has several includes into the same .ff directory
         # (forcefield.itp, water, ions); copy the directory only once.
         if ff_source not in copied_sources:
             shutil.copytree(ff_source, top_path.parent / ff_dir_name, dirs_exist_ok=True)
             copied_sources.add(ff_source)
-        lines[i] = line.replace(include_path, f"{ff_dir_name}/{remainder}")
-        changed = True
 
-    if changed:
+        # Relative includes already resolve from the topology's directory; only
+        # absolute includes need rewriting to the bundled relative form.
+        if is_absolute:
+            lines[i] = line.replace(include_path, f"{ff_dir_name}/{remainder}")
+            rewrote_line = True
+
+    if rewrote_line:
         top_path.write_text("".join(lines))
+    if ff_dir_name is not None:
         logger.info(f"Bundled force field '{ff_dir_name}' into {top_path.parent}")
 
     return ff_dir_name

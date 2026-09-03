@@ -199,3 +199,6 @@ charmm36.ff/
 !mdfactory/tests/fixtures/**
 
 .pixi/
+
+# local proteinbox end-to-end build outputs for inspection (not for commit)
+proteinbox_e2e_outputs/

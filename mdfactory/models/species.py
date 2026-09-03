@@ -81,7 +81,7 @@ class SingleMoleculeSpecies(Species):
                 f"Attempted to build lipid, but it didn't work: {e}. Continuing with normal code..."
             )
         if head_index is not None and len(tail_indices):
-            from ..utils.setup_utilities import generate_lipid_structure
+            from ..utils.setup_utilities import generate_lipid_structure  # noqa: PLC0415
 
             try:
                 mol = generate_lipid_structure(
@@ -120,7 +120,7 @@ class SingleMoleculeSpecies(Species):
     @property
     def openff_molecule(self):
         """Return an OpenFF Molecule with residue name set."""
-        from openff.toolkit.topology import Molecule
+        from openff.toolkit.topology import Molecule  # noqa: PLC0415
 
         ret = Molecule.from_rdkit(
             self.rdkit_molecule,
@@ -133,7 +133,7 @@ class SingleMoleculeSpecies(Species):
     @property
     def universe(self):
         """Return an MDAnalysis Universe built from the molecule's PDB representation."""
-        import MDAnalysis as mda
+        import MDAnalysis as mda  # noqa: PLC0415
 
         pdb = Chem.MolToPDBBlock(self.rdkit_molecule)
         u = mda.Universe(io.StringIO(pdb), format="pdb")
@@ -180,7 +180,7 @@ class LipidSpecies(SingleMoleculeSpecies):
     @cached_property
     def rdkit_molecule(self) -> "Chem.rdchem.Mol":
         """Return an RDKit molecule with lipid-specific 3D coordinate generation."""
-        from ..utils.setup_utilities import generate_lipid_structure
+        from ..utils.setup_utilities import generate_lipid_structure  # noqa: PLC0415
 
         mol = generate_lipid_structure(
             self.smiles, head_indices=self.head_atoms, tail_indices=self.tail_atoms
@@ -217,16 +217,40 @@ class ProteinSpecies(Species):
         default_factory=list,
         description=(
             "Pairs of cysteine residues forming disulfide bonds, "
-            "e.g. [('CYS6', 'CYS127'), ('CYS30', 'CYS115')]."
+            "e.g. [('CYS6', 'CYS127'), ('CYS30', 'CYS115')]. Each residue may be "
+            "chain-qualified and may include a PDB insertion code (e.g. 'A:CYS6' or "
+            "'H:CYS100A'); a partially qualified reference matching multiple residues is "
+            "rejected as ambiguous."
         ),
     )
     protonation_states: dict[str, str] = Field(
         default_factory=dict,
         description=(
-            "Residue-specific protonation states, e.g. {'HIS15': 'HIE'}. For CHARMM "
-            "only 3-character states are expressible (histidine tautomers, neutral lysine)."
+            "Residue-specific protonation states, e.g. {'HIS15': 'HIE'}. Keys may be "
+            "chain-qualified and may include a PDB insertion code (e.g. "
+            "{'A:HIS15': 'HIE'} or {'H:HIS100A': 'HIE'}); a partially qualified key "
+            "matching multiple residues is rejected as ambiguous. For CHARMM only "
+            "3-character states are expressible (histidine tautomers, neutral lysine)."
         ),
     )
+
+    @model_validator(mode="after")
+    def check_single_copy(self) -> "ProteinSpecies":
+        """Enforce that a protein species describes exactly one copy.
+
+        The builder produces a single protein structure and metadata reports a
+        total count of 1, so a count or fraction other than one would silently
+        contradict what is built.
+        """
+        if self.count != 1:
+            raise ValueError(
+                f"ProteinSpecies represents one protein; count must be 1, got {self.count}."
+            )
+        if self.fraction != 1.0:
+            raise ValueError(
+                f"ProteinSpecies represents one protein; fraction must be 1.0, got {self.fraction}."
+            )
+        return self
 
     @property
     def charge(self) -> int | None:

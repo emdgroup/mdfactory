@@ -2,6 +2,9 @@
 # ABOUTME: Covers ProteinSpecies, ProteinBoxComposition, Pdb2gmxConfig, and BuildInput
 """Tests for proteinbox models, topology parsing, and YAML validation."""
 
+import hashlib
+import io
+import tarfile
 import textwrap
 from pathlib import Path
 
@@ -16,21 +19,25 @@ from mdfactory.models.composition import ProteinBoxComposition
 from mdfactory.models.input import BuildInput
 from mdfactory.models.parametrization import Pdb2gmxConfig
 from mdfactory.models.species import ProteinSpecies
+from mdfactory.setup import protein
 from mdfactory.setup.protein import (
     _apply_protonation_states,
     _build_disulfide_prompt_input,
     _sum_charges_from_itp,
     bundle_forcefield_into_topology,
     check_forcefield_available,
+    clean_pdb,
+    download_forcefield,
     run_pdb2gmx,
     update_topology_molecules,
 )
 from mdfactory.workflows import _resolve_proteinbox_pdb_path
 
 
-def _pdb_atom(serial, atom_name, resname, resid, x, y, z):
+def _pdb_atom(serial, atom_name, resname, resid, x, y, z, chain="A", insertion_code=""):
     return (
-        f"ATOM  {serial:5d} {atom_name:<4s} {resname:>3s} A{resid:4d}    "
+        f"ATOM  {serial:5d} {atom_name:<4s} {resname:>3s} "
+        f"{chain:1s}{resid:4d}{insertion_code:1s}   "
         f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00\n"
     )
 
@@ -63,6 +70,25 @@ def _make_pdb2gmx_run(molecule_names, extra_files=()):
         return Result()
 
     return fake_run
+
+
+def _make_ff_tarball(dirname):
+    """Build an in-memory gzip tarball containing a minimal .ff directory."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        content = b"; forcefield\n"
+        info = tarfile.TarInfo(name=f"{dirname}/forcefield.itp")
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def read(self):
+        return self._payload
 
 
 class TestProteinSpecies:
@@ -105,6 +131,22 @@ class TestProteinSpecies:
         pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
         with pytest.raises(ValueError, match="Residue name must be less"):
             ProteinSpecies(resname="TOOLONG", pdb_path=pdb)
+
+    def test_rejects_multiple_copies(self, tmp_path):
+        pdb = tmp_path / "test.pdb"
+        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+        with pytest.raises(ValueError, match="count must be 1"):
+            ProteinSpecies(resname="LYZ", pdb_path=pdb, count=7)
+        with pytest.raises(ValueError, match="fraction must be 1.0"):
+            ProteinSpecies(resname="LYZ", pdb_path=pdb, fraction=0.25)
+
+    def test_rejects_null_count_or_fraction(self, tmp_path):
+        pdb = tmp_path / "test.pdb"
+        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+        with pytest.raises(ValueError, match="count must be 1"):
+            ProteinSpecies(resname="LYZ", pdb_path=pdb, count=None)
+        with pytest.raises(ValueError, match="fraction must be 1.0"):
+            ProteinSpecies(resname="LYZ", pdb_path=pdb, fraction=None)
 
 
 class TestProteinBoxComposition:
@@ -198,6 +240,40 @@ class TestForceFieldCheck:
         )
         with pytest.raises(ValueError, match="Downloadable"):
             check_forcefield_available("charmm36m")
+
+
+class TestForceFieldDownload:
+    def _install(self, monkeypatch, tmp_path, payload, sha256):
+        """Register a stub force field served from an in-memory tarball."""
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.urlopen",
+            lambda url, timeout=0: _FakeResponse(payload),
+        )
+        monkeypatch.setattr("mdfactory.setup.protein.get_forcefield_dir", lambda: tmp_path)
+        monkeypatch.setitem(
+            protein.FORCEFIELD_REGISTRY,
+            "test-ff",
+            {
+                "url": "https://example.invalid/test.ff.tgz",
+                "dirname": "test.ff",
+                "sha256": sha256,
+                "description": "stub force field",
+            },
+        )
+
+    def test_verifies_matching_sha256_and_extracts(self, tmp_path, monkeypatch):
+        payload = _make_ff_tarball("test.ff")
+        self._install(monkeypatch, tmp_path, payload, hashlib.sha256(payload).hexdigest())
+        result = download_forcefield("test-ff")
+        assert result == tmp_path / "test.ff"
+        assert (result / "forcefield.itp").is_file()
+
+    def test_rejects_mismatched_sha256(self, tmp_path, monkeypatch):
+        payload = _make_ff_tarball("test.ff")
+        self._install(monkeypatch, tmp_path, payload, "0" * 64)
+        with pytest.raises(RuntimeError, match="failed integrity check"):
+            download_forcefield("test-ff")
+        assert not (tmp_path / "test.ff").exists()
 
 
 class TestBuildInputProteinbox:
@@ -401,6 +477,69 @@ class TestTopologyParsing:
         with pytest.raises(ValueError, match="matched no residue"):
             _apply_protonation_states(pdb, {"HIS99": "HIE"}, tmp_path)
 
+    def test_apply_protonation_states_rejects_ambiguous_unqualified_key(self, tmp_path):
+        # HIS15 exists in both chain A and chain B; an unqualified key cannot say which.
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(
+            "".join(
+                [
+                    _pdb_atom(1, "N", "HIS", 15, 1.0, 2.0, 3.0, chain="A"),
+                    _pdb_atom(2, "N", "HIS", 15, 4.0, 5.0, 6.0, chain="B"),
+                ]
+            )
+        )
+        with pytest.raises(ValueError, match="ambiguous across chains"):
+            _apply_protonation_states(pdb, {"HIS15": "HIE"}, tmp_path)
+
+    def test_apply_protonation_states_chain_qualified_key_targets_one_chain(self, tmp_path):
+        # A chain-qualified key renames only the residue in that chain.
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(
+            "".join(
+                [
+                    _pdb_atom(1, "N", "HIS", 15, 1.0, 2.0, 3.0, chain="A"),
+                    _pdb_atom(2, "N", "HIS", 15, 4.0, 5.0, 6.0, chain="B"),
+                ]
+            )
+        )
+        result = _apply_protonation_states(pdb, {"A:HIS15": "HIE"}, tmp_path)
+        lines = [ln for ln in result.read_text().splitlines() if ln.startswith("ATOM")]
+        by_chain = {ln[21]: ln[17:20].strip() for ln in lines}
+        assert by_chain["A"] == "HIE"
+        assert by_chain["B"] == "HIS"
+
+    def test_apply_protonation_states_resolves_insertion_code(self, tmp_path):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(
+            "".join(
+                [
+                    _pdb_atom(1, "N", "HIS", 100, 1.0, 2.0, 3.0, chain="H"),
+                    _pdb_atom(
+                        2,
+                        "N",
+                        "HIS",
+                        100,
+                        4.0,
+                        5.0,
+                        6.0,
+                        chain="H",
+                        insertion_code="A",
+                    ),
+                ]
+            )
+        )
+        result = _apply_protonation_states(pdb, {"H:HIS100A": "HIE"}, tmp_path)
+        lines = [ln for ln in result.read_text().splitlines() if ln.startswith("ATOM")]
+        by_insertion_code = {ln[26]: ln[17:20].strip() for ln in lines}
+        assert by_insertion_code[" "] == "HIS"
+        assert by_insertion_code["A"] == "HIE"
+
+        result = _apply_protonation_states(pdb, {"H:HIS100": "HID"}, tmp_path)
+        lines = [ln for ln in result.read_text().splitlines() if ln.startswith("ATOM")]
+        by_insertion_code = {ln[26]: ln[17:20].strip() for ln in lines}
+        assert by_insertion_code[" "] == "HID"
+        assert by_insertion_code["A"] == "HIS"
+
     def test_build_disulfide_prompt_input_answers_exact_requested_pairs(self, tmp_path):
         pdb = tmp_path / "input.pdb"
         pdb.write_text(
@@ -427,6 +566,71 @@ class TestTopologyParsing:
         )
         with pytest.raises(ValueError, match="not detected as close CYS SG pairs"):
             _build_disulfide_prompt_input(pdb, [("CYS6", "CYS127")])
+
+    def test_build_disulfide_prompt_input_rejects_ambiguous_reference(self, tmp_path):
+        # CYS7 exists in both chains; an unqualified reference is ambiguous.
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(
+            "".join(
+                [
+                    _pdb_atom(1, "SG", "CYS", 7, 0.0, 0.0, 0.0, chain="A"),
+                    _pdb_atom(2, "SG", "CYS", 7, 2.0, 0.0, 0.0, chain="B"),
+                ]
+            )
+        )
+        with pytest.raises(ValueError, match="ambiguous across chains"):
+            _build_disulfide_prompt_input(pdb, [("CYS7", "CYS7")])
+
+    def test_build_disulfide_prompt_input_chain_qualified_inter_chain_bond(self, tmp_path):
+        # An inter-chain disulfide (e.g. insulin A7-B7) is expressed with chain-qualified
+        # references and matched as a close SG pair across chains.
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(
+            "".join(
+                [
+                    _pdb_atom(1, "SG", "CYS", 7, 0.0, 0.0, 0.0, chain="A"),
+                    _pdb_atom(2, "SG", "CYS", 7, 2.0, 0.0, 0.0, chain="B"),
+                    _pdb_atom(3, "SG", "CYS", 20, 20.0, 0.0, 0.0, chain="A"),
+                ]
+            )
+        )
+        assert _build_disulfide_prompt_input(pdb, [("A:CYS7", "B:CYS7")]) == "y\n"
+
+    def test_build_disulfide_prompt_input_preserves_pdb_chain_order(self, tmp_path):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(
+            "".join(
+                [
+                    _pdb_atom(1, "SG", "CYS", 6, 0.0, 0.0, 0.0, chain="B"),
+                    _pdb_atom(2, "SG", "CYS", 127, 2.0, 0.0, 0.0, chain="B"),
+                    _pdb_atom(3, "SG", "CYS", 6, 10.0, 0.0, 0.0, chain="A"),
+                    _pdb_atom(4, "SG", "CYS", 127, 12.0, 0.0, 0.0, chain="A"),
+                ]
+            )
+        )
+        assert _build_disulfide_prompt_input(pdb, [("B:CYS6", "B:CYS127")]) == "y\nn\n"
+
+    def test_build_disulfide_prompt_input_resolves_insertion_code(self, tmp_path):
+        pdb = tmp_path / "input.pdb"
+        pdb.write_text(
+            "".join(
+                [
+                    _pdb_atom(1, "SG", "CYS", 100, 0.0, 0.0, 0.0, chain="H"),
+                    _pdb_atom(
+                        2,
+                        "SG",
+                        "CYS",
+                        100,
+                        2.0,
+                        0.0,
+                        0.0,
+                        chain="H",
+                        insertion_code="A",
+                    ),
+                ]
+            )
+        )
+        assert _build_disulfide_prompt_input(pdb, [("H:CYS100A", "H:CYS100")]) == "y\n"
 
     def test_run_pdb2gmx_passes_disulfide_answers_to_subprocess(self, tmp_path, monkeypatch):
         pdb = tmp_path / "input.pdb"
@@ -594,16 +798,14 @@ class TestBundleForcefield:
             """)
         )
 
-        import mdfactory.setup.protein as protein_module
-
         calls = []
-        real_copytree = protein_module.shutil.copytree
+        real_copytree = protein.shutil.copytree
 
         def counting_copytree(src, dst, *args, **kwargs):
             calls.append((src, dst))
             return real_copytree(src, dst, *args, **kwargs)
 
-        monkeypatch.setattr(protein_module.shutil, "copytree", counting_copytree)
+        monkeypatch.setattr(protein.shutil, "copytree", counting_copytree)
 
         bundle_forcefield_into_topology(top)
 
@@ -619,6 +821,62 @@ class TestBundleForcefield:
 
         assert bundle_forcefield_into_topology(top) is None
         assert top.read_text() == original
+
+    def test_bundles_relative_ff_include(self, tmp_path, monkeypatch):
+        # Built-in force fields emit relative includes like charmm27.ff/forcefield.itp;
+        # the directory must be resolved from a search path and copied next to the topology.
+        ff_source = tmp_path / "gmxtop" / "charmm27.ff"
+        ff_source.mkdir(parents=True)
+        (ff_source / "forcefield.itp").write_text("; forcefield\n")
+        monkeypatch.setattr(
+            "mdfactory.setup.protein._get_gmx_search_paths",
+            lambda: [tmp_path / "gmxtop"],
+        )
+
+        build_dir = tmp_path / "build"
+        build_dir.mkdir()
+        top = build_dir / "topology.top"
+        top.write_text('#include "charmm27.ff/forcefield.itp"\n#include "posre.itp"\n')
+
+        ff_name = bundle_forcefield_into_topology(top)
+
+        assert ff_name == "charmm27.ff"
+        assert (build_dir / "charmm27.ff" / "forcefield.itp").is_file()
+        # A relative include already resolves from the topology directory once the
+        # force field sits alongside it, so the line is left untouched.
+        assert '#include "charmm27.ff/forcefield.itp"' in top.read_text()
+
+    def test_relative_ff_include_not_found_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "mdfactory.setup.protein._get_gmx_search_paths",
+            lambda: [tmp_path / "empty"],
+        )
+        top = tmp_path / "topology.top"
+        top.write_text('#include "charmm27.ff/forcefield.itp"\n')
+        with pytest.raises(RuntimeError, match="not found in any GROMACS search path"):
+            bundle_forcefield_into_topology(top)
+
+
+class TestCleanPdb:
+    def test_preserves_chain_and_residue_numbers(self, tmp_path):
+        # A residue in chain H numbered 15: cleaning must not renumber it to A/1,
+        # or later chain/disulfide/protonation references stop resolving.
+        pdb = tmp_path / "in.pdb"
+        pdb.write_text(
+            "ATOM      1  N   ALA H  15A      0.000   0.000   0.000  1.00  0.00           N\n"
+            "ATOM      2  CA  ALA H  15A      1.458   0.000   0.000  1.00  0.00           C\n"
+            "ATOM      3  C   ALA H  15A      2.009   1.420   0.000  1.00  0.00           C\n"
+            "ATOM      4  O   ALA H  15A      1.251   2.390   0.000  1.00  0.00           O\n"
+            "ATOM      5  CB  ALA H  15A      1.988  -0.773   1.199  1.00  0.00           C\n"
+            "TER\n"
+            "END\n"
+        )
+        out = clean_pdb(pdb, tmp_path / "clean.pdb")
+        atom_lines = [ln for ln in out.read_text().splitlines() if ln.startswith("ATOM")]
+        assert atom_lines
+        assert all(ln[21] == "H" for ln in atom_lines)
+        assert all(ln[22:26].strip() == "15" for ln in atom_lines)
+        assert all(ln[26] == "A" for ln in atom_lines)
 
 
 class TestMetadata:
