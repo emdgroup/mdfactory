@@ -1,0 +1,1010 @@
+# ABOUTME: Interactive SLURM configuration wizard using questionary.
+# ABOUTME: Leverages cluster autodiscovery to guide users through executor setup.
+"""Interactive SLURM configuration wizard.
+
+Provides a terminal-based wizard that queries the local SLURM cluster
+(via :func:`~mdfactory.performance.cluster.discover_cluster`) and guides
+the user through selecting accounts, partitions, and resource limits.
+The result is a :class:`~mdfactory.orchestration.config.SlurmExecutorConfig`
+that can be saved as YAML and used with Parsl-based workflows.
+
+The wizard is structured into three distinct sections:
+
+1. **SLURM Allocation** — cluster infrastructure (account, partition, resources)
+2. **Execution Environment** — project/tool setup (modules, pixi, extra init)
+3. **Per-Stage Tuning** — simulation-specific overrides (cpus, gres, gmx_binary)
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+from rich.console import Console
+from rich.panel import Panel
+from rich.rule import Rule
+
+from mdfactory.orchestration.config import SlurmExecutorConfig
+from mdfactory.orchestration.environment import EnvironmentConfig
+from mdfactory.performance.cluster import ClusterInfo, Partition, discover_cluster
+
+console = Console()
+
+
+def _import_questionary():
+    """Import questionary with a clear error message if not installed.
+
+    ``questionary`` ships in the ``[parsl]`` optional extra. Importing it
+    lazily (rather than at module level) means ``import mdfactory.orchestration``
+    succeeds for users who never touch the TUI, matching the lazy-import
+    pattern used for ``parsl`` and ``rich``.
+
+    Returns
+    -------
+    module
+        The questionary module.
+
+    Raises
+    ------
+    ImportError
+        If questionary is not installed.
+
+    """
+    try:
+        import questionary
+    except ImportError as exc:
+        raise ImportError(
+            "questionary is required for the SLURM TUI. "
+            "Install with: pip install 'mdfactory[parsl]'"
+        ) from exc
+    return questionary
+
+
+def _detect_gromacs_modules() -> list[str]:
+    """Discover available GROMACS modules via ``module avail``.
+
+    Returns
+    -------
+    list[str]
+        Module names (e.g. ``["gromacs/2024.4", "gromacs/2023.5"]``),
+        or an empty list if ``module`` is not available or no GROMACS
+        modules are found.
+    """
+    import subprocess
+
+    try:
+        # 'module avail' writes to stderr (by design)
+        result = subprocess.run(
+            ["bash", "-lc", "module avail gromacs 2>&1"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        output = result.stdout + result.stderr
+        # Parse module names — typical format: "gromacs/2024.4"
+        modules = []
+        for token in output.split():
+            # Strip trailing markers like "(default)", "(D)", or "*"
+            clean = token.strip().rstrip("*")
+            if "(" in clean:
+                clean = clean[: clean.index("(")]
+            # Match patterns like "gromacs/2024" or "gromacs/2024.4-gpu"
+            if clean.lower().startswith("gromacs/") and "/" in clean:
+                if clean not in modules:
+                    modules.append(clean)
+        return modules
+    except Exception:
+        return []
+
+
+def _prompt_gromacs_modules() -> list[str]:
+    """Prompt the user to select GROMACS modules for compute workers.
+
+    Only prompts if ``gmx``/``gmx_mpi`` is not on the current PATH.
+    If GROMACS is already available, returns an empty list.
+
+    Returns
+    -------
+    list[str]
+        Module names to load (e.g. ``["gromacs/2024.4"]``), or ``[]``.
+    """
+    import shutil
+
+    # If gmx is already on PATH, no action needed
+    if shutil.which("gmx") or shutil.which("gmx_mpi"):
+        return []
+
+    questionary = _import_questionary()
+
+    # Try to discover modules
+    modules = _detect_gromacs_modules()
+
+    console.print("\n  [yellow]⚠ GROMACS (gmx/gmx_mpi) not found in current PATH.[/yellow]")
+    console.print("  Compute workers need GROMACS to run simulations.\n")
+
+    _CUSTOM = "Custom module name…"
+    _SKIP = "Skip (I'll handle it in extra_init or PATH)"
+
+    if modules:
+        choices = [*modules, _CUSTOM, _SKIP]
+        selected = _require(
+            questionary.select(
+                "GROMACS module to load on workers:",
+                choices=choices,
+                default=modules[0],
+            ).ask(),
+            "gromacs module",
+        )
+    else:
+        # No modules found — offer manual entry or skip
+        selected = _require(
+            questionary.select(
+                "GROMACS module to load on workers:",
+                choices=[_CUSTOM, _SKIP],
+            ).ask(),
+            "gromacs module",
+        )
+
+    if selected == _SKIP:
+        return []
+    elif selected == _CUSTOM:
+        mod_name = _require(
+            questionary.text(
+                "Module name (e.g. 'gromacs/2024.4-gpu'):",
+            ).ask(),
+            "gromacs module name",
+        )
+        return [mod_name.strip()] if mod_name.strip() else []
+    else:
+        # User selected a discovered module
+        return [selected]
+
+
+class UserCancelledError(Exception):
+    """Raised when the user cancels an interactive prompt."""
+
+
+def _require(value: str | None, label: str) -> str:
+    """Return *value* or raise if the user cancelled the prompt.
+
+    Parameters
+    ----------
+    value : str or None
+        Return value from a ``questionary`` ``.ask()`` call.
+    label : str
+        Human-readable label used in the error message.
+
+    Returns
+    -------
+    str
+        The validated, non-None value.
+
+    Raises
+    ------
+    UserCancelledError
+        If *value* is None (user pressed Ctrl-C / Ctrl-D).
+    """
+    if value is None:
+        raise UserCancelledError(f"Prompt cancelled at: {label}")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Partition / node helpers
+# ---------------------------------------------------------------------------
+
+
+def _format_node_type_summary(partition: Partition) -> str:
+    """Build a one-line summary of node hardware for a partition label.
+
+    Parameters
+    ----------
+    partition : Partition
+        Partition whose node types to summarise.
+
+    Returns
+    -------
+    str
+        Human-readable summary, e.g. ``"96 cpu, 512 GB, 4×a100"``
+    """
+    parts: list[str] = []
+    for nt in partition.node_types:
+        items = [f"{nt.cpus} cpu", f"{nt.memory_mb // 1024} GB"]
+        for count, gpu_type in nt.gpu_specs:
+            gpu_label = f"{count}×{gpu_type}" if gpu_type else f"{count}×gpu"
+            items.append(gpu_label)
+        parts.append(", ".join(items))
+    return " | ".join(parts)
+
+
+def _partition_has_gpus(partition: Partition) -> bool:
+    """Check whether any node type in *partition* has GPUs."""
+    return any(len(nt.gpu_specs) > 0 for nt in partition.node_types)
+
+
+def _suggest_gres(partition: Partition) -> str:
+    """Suggest a ``--gres`` string from the first GPU-equipped node type.
+
+    Parameters
+    ----------
+    partition : Partition
+        Selected partition.
+
+    Returns
+    -------
+    str
+        Suggested GRES string, e.g. ``"gpu:a100:1"``, or empty string.
+    """
+    for nt in partition.node_types:
+        for count, gpu_type in nt.gpu_specs:
+            if gpu_type:
+                return f"gpu:{gpu_type}:1"
+            return "gpu:1"
+    return ""
+
+
+def _suggest_mem(partition: Partition) -> str:
+    """Suggest a ``--mem`` value from the first node type.
+
+    Parameters
+    ----------
+    partition : Partition
+        Selected partition.
+
+    Returns
+    -------
+    str
+        Suggested memory string in GB, e.g. ``"64G"``.
+    """
+    if partition.node_types:
+        mem_gb = partition.node_types[0].memory_mb // 1024
+        return f"{mem_gb}G"
+    return "16G"
+
+
+# ---------------------------------------------------------------------------
+# Selection helpers
+# ---------------------------------------------------------------------------
+
+
+def _select_with_custom(
+    message: str,
+    choices: list[str],
+    default: str = "",
+) -> str:
+    """Present a selection list with a "Custom…" escape hatch.
+
+    Parameters
+    ----------
+    message : str
+        Prompt message shown to the user.
+    choices : list[str]
+        Pre-defined choices (e.g. ``["1h", "2h", "4h"]``).
+    default : str
+        Pre-selected value in the list.
+
+    Returns
+    -------
+    str
+        The selected or custom-entered value.
+
+    Raises
+    ------
+    UserCancelledError
+        If the user cancels.
+    """
+    questionary = _import_questionary()
+    _CUSTOM = "Custom…"
+    all_choices = [*choices, _CUSTOM]
+    selected = _require(
+        questionary.select(message, choices=all_choices, default=default).ask(),
+        message,
+    )
+    if selected == _CUSTOM:
+        return _require(
+            questionary.text(f"{message} (enter value):").ask(),
+            message,
+        )
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Stage override prompts
+# ---------------------------------------------------------------------------
+
+
+def _resolve_stages(stages: tuple[str, ...] | None) -> tuple[str, ...]:
+    """Resolve *stages* to a concrete tuple of stage names.
+
+    Parameters
+    ----------
+    stages : tuple[str, ...] or None
+        Explicit stage names, or ``None`` to use the full pipeline from
+        :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY`.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Concrete stage names.
+    """
+    if stages is not None:
+        return stages
+    from mdfactory.orchestration.stages import STAGE_REGISTRY
+
+    return tuple(s.name for s in STAGE_REGISTRY)
+
+
+def _prompt_stage_overrides(
+    common_cpus: int,
+    common_gres: str | None,
+    common_gmx: str,
+    stages: tuple[str, ...],
+) -> dict[str, dict]:
+    """Prompt the user for per-stage resource overrides.
+
+    Only prompts when there are multiple stages *and* per-stage
+    differentiation is meaningful (e.g. GPU selected but EM cannot use
+    it). Skipped entirely when fewer than 2 stages are configured.
+
+    Parameters
+    ----------
+    common_cpus : int
+        The ``cpus_per_node`` value from the common configuration.
+    common_gres : str or None
+        The ``gres`` value from the common configuration.
+    common_gmx : str
+        The ``gmx_binary`` value from the common configuration.
+    stages : tuple[str, ...]
+        The stages that will actually run. Empty or single-element
+        tuples cause an early return (no overrides needed).
+
+    Returns
+    -------
+    dict[str, dict]
+        Stage overrides dict ready for ``SlurmExecutorConfig``.
+        Empty dict if the user declines, no deviations are entered,
+        or overrides are not applicable.
+
+    Raises
+    ------
+    UserCancelledError
+        If the user cancels any prompt.
+    """
+    # No point configuring per-stage overrides for a single-stage workflow
+    if len(stages) < 2:
+        return {}
+
+    questionary = _import_questionary()
+    has_gpu = common_gres is not None
+    has_em = "EM" in stages
+
+    # --- EM/GPU information panel ---
+    if has_gpu and has_em:
+        console.print(
+            Panel(
+                "[bold]GROMACS energy minimisation (EM) does not support GPU acceleration.[/bold]\n"
+                "EM uses steepest-descent/conjugate-gradient integrators which have no GPU\n"
+                "code path. Consider configuring a CPU-only override for the EM stage with\n"
+                "more CPU cores to compensate.",
+                title="ℹ  Stage hint",
+                border_style="blue",
+            )
+        )
+
+    # Only proactively suggest overrides when there's a reason (GPU + EM mismatch)
+    default_configure = has_gpu and has_em
+    configure = questionary.confirm(
+        "Configure per-stage resource overrides?",
+        default=default_configure,
+    ).ask()
+    if configure is None:
+        raise UserCancelledError("Prompt cancelled at: stage overrides confirm")
+    if not configure:
+        return {}
+
+    # --- Select stages to override ---
+    stage_choices = [
+        questionary.Choice(title=stage, value=stage, checked=(stage == "EM" and has_gpu))
+        for stage in stages
+    ]
+    selected_stages = questionary.checkbox(
+        "Select stages to customise:",
+        choices=stage_choices,
+    ).ask()
+    if selected_stages is None:
+        raise UserCancelledError("Prompt cancelled at: stage selection")
+    if not selected_stages:
+        return {}
+
+    # --- Prompt for each selected stage ---
+    stage_overrides: dict[str, dict] = {}
+    for stage in selected_stages:
+        console.print(f"\n  [bold]Configure {stage} stage:[/bold]")
+
+        # Suggest higher CPU count for EM when GPU is the common config
+        em_cpu_default = str(common_cpus * 2) if (stage == "EM" and has_gpu) else str(common_cpus)
+        # Suggest empty gres for EM when GPU is common
+        em_gres_default = "" if (stage == "EM" and has_gpu) else (common_gres or "")
+
+        cpus_input = _require(
+            questionary.text(
+                f"  {stage} — CPUs per node:",
+                default=em_cpu_default,
+            ).ask(),
+            f"{stage} cpus_per_node",
+        )
+        cpus_val = int(cpus_input)
+
+        gres_input = _require(
+            questionary.text(
+                f"  {stage} — GRES (leave empty for CPU-only):",
+                default=em_gres_default,
+            ).ask(),
+            f"{stage} gres",
+        )
+        gres_val: str | None = gres_input.strip() or None
+
+        gmx_input = _require(
+            questionary.text(
+                f"  {stage} — gmx_binary:",
+                default=common_gmx,
+            ).ask(),
+            f"{stage} gmx_binary",
+        )
+        gmx_val = gmx_input.strip()
+
+        # Only store fields that differ from common values
+        overrides: dict = {}
+        if cpus_val != common_cpus:
+            overrides["cpus_per_node"] = cpus_val
+        if gres_val != common_gres:
+            overrides["gres"] = gres_val
+        if gmx_val != common_gmx:
+            overrides["gmx_binary"] = gmx_val
+
+        if overrides:
+            stage_overrides[stage] = overrides
+
+    return stage_overrides
+
+
+# ---------------------------------------------------------------------------
+# Environment section prompts
+# ---------------------------------------------------------------------------
+
+
+def _prompt_environment(
+    *, stages: tuple[str, ...] | None = None, ignore_global: bool = False
+) -> EnvironmentConfig:
+    """Prompt the user for execution-environment configuration.
+
+    If a global environment config exists (written by
+    ``mdfactory config environment``), it is used directly without
+    prompting.  Otherwise, auto-detects pixi/conda/venv, prompts for
+    GROMACS modules (if needed for simulate workflows), and offers an
+    extra_init escape hatch.
+
+    Parameters
+    ----------
+    stages : tuple[str, ...] or None, optional
+        The simulation stages. Pass ``()`` to skip GROMACS prompts
+        (e.g. for ``build``). ``None`` uses the full pipeline.
+    ignore_global : bool, optional
+        If True, skip loading the global config and always run the
+        interactive wizard. Used by ``configure_and_save_environment``
+        so users can update an existing global config.
+
+    Returns
+    -------
+    EnvironmentConfig
+        Structured environment configuration.
+    """
+    from mdfactory.orchestration.environment import get_global_environment_path
+
+    if not ignore_global:
+        global_env = EnvironmentConfig.load_global()
+    else:
+        global_env = None
+    if global_env is not None:
+        path = get_global_environment_path()
+        console.print(f"  ✓ Using saved environment config from {path}")
+        if global_env.modules:
+            console.print(f"    modules: {', '.join(global_env.modules)}")
+        if global_env.pixi_manifest:
+            console.print(f"    pixi: {global_env.pixi_manifest}")
+        elif global_env.conda_env:
+            console.print(f"    conda: {global_env.conda_env}")
+        return global_env
+
+    questionary = _import_questionary()
+
+    # Start with auto-detection
+    env = EnvironmentConfig.detect()
+
+    # Show what was detected
+    if env.pixi_manifest:
+        console.print(f"  ✓ Detected pixi environment at {env.pixi_manifest}")
+    elif env.conda_env:
+        console.print(f"  ✓ Detected conda environment: {env.conda_env}")
+    elif env.venv_path:
+        console.print(f"  ✓ Detected virtualenv at {env.venv_path}")
+    else:
+        console.print("  ℹ No Python environment auto-detected.")
+
+    # GROMACS module prompts (skip for build workflows)
+    modules: list[str] = []
+    if stages != ():
+        modules = _prompt_gromacs_modules()
+
+    # Extra init commands
+    extra_init = _require(
+        questionary.text(
+            "Additional init commands (leave empty to skip):",
+            default="",
+        ).ask(),
+        "extra_init",
+    )
+
+    # Build the final config, merging auto-detected + user input
+    return EnvironmentConfig(
+        modules=modules,
+        pixi_manifest=env.pixi_manifest,
+        conda_env=env.conda_env if not env.pixi_manifest else None,
+        venv_path=env.venv_path if not env.pixi_manifest and not env.conda_env else None,
+        extra_init=extra_init.strip(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Interactive prompts — cluster-assisted
+# ---------------------------------------------------------------------------
+
+
+def _configure_with_cluster(
+    cluster: ClusterInfo,
+    *,
+    stages: tuple[str, ...] | None = None,
+) -> SlurmExecutorConfig:
+    """Run the interactive wizard using autodiscovered cluster info.
+
+    Parameters
+    ----------
+    cluster : ClusterInfo
+        Cluster information from ``discover_cluster()``.
+    stages : tuple[str, ...] or None, optional
+        The simulation stages that will run. Determines whether per-stage
+        override prompts are shown and which stages are offered. Pass an
+        empty tuple to skip stage-override prompts entirely (e.g. for
+        ``build``). ``None`` (default) uses the full simulation pipeline
+        from :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY`.
+
+    Returns
+    -------
+    SlurmExecutorConfig
+        Fully populated SLURM executor config.
+
+    Raises
+    ------
+    UserCancelledError
+        If the user cancels any prompt.
+    """
+    questionary = _import_questionary()
+
+    # ━━━ Section 1: SLURM Allocation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("SLURM Allocation", style="bold cyan"))
+
+    # --- Account ---
+    if cluster.accounts:
+        account = _require(
+            questionary.select(
+                "SLURM account:",
+                choices=cluster.accounts,
+                default=cluster.default_account or cluster.accounts[0],
+            ).ask(),
+            "account",
+        )
+    else:
+        account = _require(
+            questionary.text("SLURM account (no accounts discovered):").ask(),
+            "account",
+        )
+
+    # --- Partition ---
+    up_partitions = [p for p in cluster.partitions if p.state == "up"]
+    if not up_partitions:
+        console.print("⚠ No partitions in 'up' state — showing all partitions.")
+        up_partitions = list(cluster.partitions)
+
+    if not up_partitions:
+        raise UserCancelledError("No partitions available on the cluster.")
+
+    partition_choices = [
+        questionary.Choice(
+            title=f"{p.name}  ({p.total_nodes} nodes — {_format_node_type_summary(p)})",
+            value=p.name,
+        )
+        for p in up_partitions
+    ]
+    default_partition = next((p.name for p in up_partitions if p.is_default), up_partitions[0].name)
+
+    partition_name = _require(
+        questionary.select(
+            "SLURM partition:",
+            choices=partition_choices,
+            default=default_partition,
+        ).ask(),
+        "partition",
+    )
+
+    partition = next(p for p in up_partitions if p.name == partition_name)
+
+    # --- Display node types ---
+    console.print(f"\n  Partition '{partition_name}' node types:")
+    for nt in partition.node_types:
+        gpu_info = ""
+        if nt.gpu_specs:
+            gpu_parts = [f"{c}×{t}" if t else f"{c}×gpu" for c, t in nt.gpu_specs]
+            gpu_info = f", GPUs: {', '.join(gpu_parts)}"
+        console.print(
+            f"    {nt.count} nodes — {nt.cpus} CPUs, {nt.memory_mb // 1024} GB RAM{gpu_info}"
+        )
+    console.print()
+
+    # --- Walltime ---
+    walltime = _select_with_custom(
+        "Walltime (--time):",
+        choices=["30m", "1h", "2h", "4h", "8h", "12h", "1d"],
+        default="2h",
+    )
+
+    # --- CPUs per node ---
+    max_cpus = partition.node_types[0].cpus if partition.node_types else 128
+    cpu_choices = [str(c) for c in [1, 2, 4, 8, 16, 32, 64, max_cpus] if c <= max_cpus]
+    # Deduplicate (max_cpus might equal one of the fixed values)
+    cpu_choices = list(dict.fromkeys(cpu_choices))
+    cpus_per_node = int(
+        _select_with_custom(
+            "CPUs per node (--cpus-per-task):",
+            choices=cpu_choices,
+            default="4" if "4" in cpu_choices else cpu_choices[0],
+        )
+    )
+
+    # --- GPU ---
+    gres: str | None = None
+    if _partition_has_gpus(partition):
+        gres_default = _suggest_gres(partition)
+        gres_input = _require(
+            questionary.text(
+                "GRES (--gres), leave empty to skip:",
+                default=gres_default,
+            ).ask(),
+            "gres",
+        )
+        gres = gres_input.strip() or None
+
+    # --- Memory ---
+    mem_gb = partition.node_types[0].memory_mb // 1024 if partition.node_types else 128
+    mem_choices = [f"{m}G" for m in [10, 20, 50, 100, 200, 500, mem_gb] if m <= mem_gb]
+    mem_choices = list(dict.fromkeys(mem_choices))
+    mem_selected = _select_with_custom(
+        "Memory per node (--mem):",
+        choices=mem_choices,
+        default="20G" if "20G" in mem_choices else mem_choices[0],
+    )
+    mem: str | None = mem_selected.strip() or None
+
+    # --- Max blocks ---
+    max_blocks = int(
+        _select_with_custom(
+            "Max simultaneous SLURM jobs (max_blocks):",
+            choices=["1", "2", "4", "8", "16", "32"],
+            default="4",
+        )
+    )
+
+    # --- QOS ---
+    qos: str | None = None
+    if cluster.qos_policies:
+        use_qos = questionary.confirm("Configure QOS?", default=False).ask()
+        if use_qos is None:
+            raise UserCancelledError("Prompt cancelled at: qos confirm")
+        if use_qos:
+            qos = _require(
+                questionary.select("QOS policy:", choices=cluster.qos_policies).ask(),
+                "qos",
+            )
+
+    # --- Constraint ---
+    constraint_input = _require(
+        questionary.text(
+            "Node feature constraint (--constraint), leave empty to skip:",
+            default="",
+        ).ask(),
+        "constraint",
+    )
+    constraint: str | None = constraint_input.strip() or None
+
+    # ━━━ Section 2: Execution Environment ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("Execution Environment", style="bold green"))
+
+    environment = _prompt_environment(stages=stages)
+
+    # ━━━ Section 3: Per-Stage Tuning ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("Per-Stage Tuning", style="bold yellow"))
+
+    resolved_stages = _resolve_stages(stages)
+    stage_overrides = _prompt_stage_overrides(
+        common_cpus=cpus_per_node,
+        common_gres=gres,
+        common_gmx="auto",
+        stages=resolved_stages,
+    )
+
+    return SlurmExecutorConfig(
+        account=account,
+        partition=partition_name,
+        walltime=walltime,
+        cpus_per_node=cpus_per_node,
+        gres=gres,
+        mem=mem,
+        qos=qos,
+        constraint=constraint,
+        max_blocks=max_blocks,
+        environment=environment,
+        stage_overrides=stage_overrides,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Interactive prompts — manual fallback
+# ---------------------------------------------------------------------------
+
+
+def _configure_manual(*, stages: tuple[str, ...] | None = None) -> SlurmExecutorConfig:
+    """Run the interactive wizard with manual text entry (no cluster info).
+
+    Parameters
+    ----------
+    stages : tuple[str, ...] or None, optional
+        The simulation stages that will run. Pass an empty tuple to skip
+        stage-override prompts entirely. ``None`` (default) uses the full
+        simulation pipeline.
+
+    Returns
+    -------
+    SlurmExecutorConfig
+        Fully populated SLURM executor config.
+
+    Raises
+    ------
+    UserCancelledError
+        If the user cancels any prompt.
+    """
+    questionary = _import_questionary()
+
+    # ━━━ Section 1: SLURM Allocation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("SLURM Allocation", style="bold cyan"))
+
+    account = _require(questionary.text("SLURM account:").ask(), "account")
+    partition = _require(questionary.text("SLURM partition:", default="gpu").ask(), "partition")
+    walltime = _require(questionary.text("Walltime (--time):", default="2:00:00").ask(), "walltime")
+    cpus_per_node = int(
+        _require(questionary.text("CPUs per node:", default="12").ask(), "cpus_per_node")
+    )
+
+    gres_input = _require(
+        questionary.text("GRES (--gres), leave empty to skip:", default="").ask(),
+        "gres",
+    )
+    gres: str | None = gres_input.strip() or None
+
+    mem_input = _require(
+        questionary.text("Memory per node (--mem), leave empty to skip:", default="").ask(),
+        "mem",
+    )
+    mem: str | None = mem_input.strip() or None
+
+    qos_input = _require(
+        questionary.text("QOS (--qos), leave empty to skip:", default="").ask(),
+        "qos",
+    )
+    qos: str | None = qos_input.strip() or None
+
+    max_blocks = int(
+        _require(
+            questionary.text("Max simultaneous SLURM jobs (max_blocks):", default="4").ask(),
+            "max_blocks",
+        )
+    )
+
+    # ━━━ Section 2: Execution Environment ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("Execution Environment", style="bold green"))
+
+    environment = _prompt_environment(stages=stages)
+
+    # ━━━ Section 3: Per-Stage Tuning ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    console.print(Rule("Per-Stage Tuning", style="bold yellow"))
+
+    resolved_stages = _resolve_stages(stages)
+    stage_overrides = _prompt_stage_overrides(
+        common_cpus=cpus_per_node,
+        common_gres=gres,
+        common_gmx="auto",
+        stages=resolved_stages,
+    )
+
+    return SlurmExecutorConfig(
+        account=account,
+        partition=partition,
+        walltime=walltime,
+        cpus_per_node=cpus_per_node,
+        gres=gres,
+        mem=mem,
+        qos=qos,
+        max_blocks=max_blocks,
+        environment=environment,
+        stage_overrides=stage_overrides,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def configure_slurm_interactive(
+    *,
+    stages: tuple[str, ...] | None = None,
+) -> SlurmExecutorConfig:
+    """Interactive SLURM configuration wizard.
+
+    Attempts to autodiscover the SLURM cluster. If discovery succeeds,
+    the wizard presents select menus populated with real partitions,
+    accounts, and hardware specs. Otherwise it falls back to free-text
+    prompts.
+
+    Parameters
+    ----------
+    stages : tuple[str, ...] or None, optional
+        The simulation stages that will run. Controls whether per-stage
+        resource override prompts are shown and which stages are offered.
+        Pass an empty tuple to skip stage-override prompts entirely
+        (e.g. for ``build``). ``None`` (default) uses the full
+        simulation pipeline from
+        :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY`.
+
+    Returns
+    -------
+    SlurmExecutorConfig
+        A validated SLURM executor config ready for use with Parsl.
+
+    Raises
+    ------
+    UserCancelledError
+        If the user cancels any prompt (Ctrl-C / Ctrl-D).
+    """
+    questionary = _import_questionary()
+    console.print("Querying SLURM cluster...")
+    cluster = discover_cluster()
+
+    if cluster is not None:
+        console.print(
+            f"✓ Cluster discovered: {len(cluster.partitions)} partitions, "
+            f"{len(cluster.accounts)} accounts\n"
+        )
+        return _configure_with_cluster(cluster, stages=stages)
+
+    console.print("⚠ SLURM not detected (sinfo unavailable). Falling back to manual entry.\n")
+    proceed = questionary.confirm("Enter SLURM configuration manually?", default=True).ask()
+    if not proceed:
+        raise UserCancelledError("User declined manual SLURM configuration.")
+    return _configure_manual(stages=stages)
+
+
+def save_slurm_config_yaml(config: SlurmExecutorConfig, path: Path) -> None:
+    """Write a SLURM executor config to a YAML file.
+
+    Parameters
+    ----------
+    config : SlurmExecutorConfig
+        The config to serialise.
+    path : Path
+        Destination file path. Parent directories are created if needed.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    data = config.model_dump(exclude_none=True)
+
+    # Clean up empty fields in environment section
+    if "environment" in data:
+        env_data = data["environment"]
+        if not env_data.get("modules"):
+            env_data.pop("modules", None)
+        if not env_data.get("extra_init"):
+            env_data.pop("extra_init", None)
+        # Remove environment section entirely if empty after cleanup
+        if not env_data:
+            data.pop("environment")
+
+    # Omit empty stage_overrides for cleaner YAML output
+    if not data.get("stage_overrides"):
+        data.pop("stage_overrides", None)
+
+    with open(path, "w") as fh:
+        yaml.dump(data, fh, default_flow_style=False, sort_keys=False)
+
+    console.print(f"✓ SLURM config written to {path}")
+
+
+def configure_and_save_slurm() -> SlurmExecutorConfig:
+    """Run the interactive wizard and save the result to YAML.
+
+    Combines :func:`configure_slurm_interactive` with a file-save prompt.
+
+    Returns
+    -------
+    SlurmExecutorConfig
+        The config that was saved.
+
+    Raises
+    ------
+    UserCancelledError
+        If the user cancels any prompt.
+    """
+    questionary = _import_questionary()
+    try:
+        config = configure_slurm_interactive()
+    except UserCancelledError:
+        console.print("Configuration cancelled.")
+        raise
+
+    save_path = _require(
+        questionary.text("Save config to:", default="slurm_executor.yaml").ask(),
+        "save path",
+    )
+
+    save_slurm_config_yaml(config, Path(save_path))
+    return config
+
+
+def configure_and_save_environment() -> EnvironmentConfig:
+    """Run the environment wizard and save to the global config location.
+
+    Prompts for execution environment (modules, pixi/conda/venv, extra init)
+    and saves the result to ``~/.config/mdfactory/environment.yaml`` (or the
+    platform-appropriate config directory).
+
+    This global environment config is automatically loaded by
+    :meth:`~mdfactory.orchestration.config.ExecutorConfig.from_yaml` when a
+    SLURM executor YAML does not contain an ``environment:`` section.
+
+    Returns
+    -------
+    EnvironmentConfig
+        The environment config that was saved.
+
+    Raises
+    ------
+    UserCancelledError
+        If the user cancels any prompt.
+    """
+    from mdfactory.orchestration.environment import get_global_environment_path
+
+    console.print(Rule("Execution Environment", style="bold green"))
+
+    try:
+        env = _prompt_environment(stages=None, ignore_global=True)
+    except UserCancelledError:
+        console.print("Configuration cancelled.")
+        raise
+
+    save_path = get_global_environment_path()
+    env.save_yaml(save_path)
+    console.print(f"✓ Environment config written to {save_path}")
+    console.print(
+        "  This will be used automatically when SLURM configs don't include an environment section."
+    )
+    return env

@@ -17,7 +17,7 @@ For each alcohol, the tutorial uses four solvent fractions. That gives a total o
 
 1. prepare 20 systems from one CSV
 2. build all simulation directories
-3. optionally run the checked-in GROMACS Nextflow workflow
+3. optionally run the GROMACS simulation chain
 4. run the current mixed-box analysis
 5. push systems and analysis results into SQLite
 6. pull the data back out
@@ -135,24 +135,30 @@ After this step, each hash directory should contain the standard build outputs s
 - `npt.mdp`
 - `md.mdp`
 
-## 4. Optional: run the checked-in GROMACS workflow
+## 4. Optional: run the GROMACS simulation chain
 
-If you want to continue through a full simulation campaign, use the stage-2 Nextflow workflow:
+If you want to continue through a full simulation campaign, run the simulation pipeline:
 
 ```bash
-nextflow run workflows/simulate.nf \
-  -c workflows/simulate.config \
-  --base_dir tutorial_campaign \
-  --config_yaml tutorial_campaign/mixedbox_chain_length_series_20.yaml
+mdfactory simulate tutorial_campaign/mixedbox_chain_length_series_20.yaml
 ```
 
-<Callout type="warn" title="Cluster-specific configuration">
-The shipped `simulate.config` contains SLURM settings tuned for a specific cluster. Edit this file to match your HPC environment before running. See [Running on HPC Clusters](/docs/user-guide/running-on-hpc) for details.
+For SLURM clusters, generate a config and pass it:
+
+```bash
+mdfactory config slurm
+mdfactory simulate \
+  tutorial_campaign/mixedbox_chain_length_series_20.yaml \
+  --slurm slurm_executor.yaml
+```
+
+<Callout type="info" title="SLURM configuration">
+The `mdfactory config slurm` wizard auto-discovers your cluster's partitions, accounts, and hardware. See [Running on HPC Clusters](/docs/user-guide/running-on-hpc) for details.
 </Callout>
 
-This executes the fixed sequence implemented in `workflows/simulate.nf`:
+This executes the fixed simulation sequence:
 
-1. minimization
+1. minimization (EM)
 2. NVT equilibration
 3. NPT equilibration
 4. production

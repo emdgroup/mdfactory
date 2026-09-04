@@ -1,0 +1,5 @@
+; Minimal SPC water topology for rescue integration test.
+; Force field includes are replaced at test time by the fixture
+; to match whatever is available in the local GROMACS installation.
+;
+; Placeholder — overwritten by test fixture.

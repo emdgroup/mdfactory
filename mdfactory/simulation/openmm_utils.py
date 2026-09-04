@@ -1,5 +1,5 @@
-# ABOUTME: OpenMM simulation utilities for box compression and equilibration
-# ABOUTME: Provides volume convergence monitoring and density-targeted compression
+# ABOUTME: OpenMM simulation utilities for box compression, equilibration, and relaxation
+# ABOUTME: Provides convergence checks, density-targeted compression, and protein restraints
 """OpenMM simulation utilities for box compression and equilibration."""
 
 import sys
@@ -634,4 +634,122 @@ def compress_equilibrate_bilayer(
     plt.tight_layout()
     plt.savefig("equilibration_analysis.png", dpi=300, bbox_inches="tight")
 
+    return ret
+
+
+def relax_with_protein_restraints(
+    u,
+    pdb,
+    top,
+    protein_indices,
+    restraint_k=1000.0,
+    steps=10000,
+):
+    """Minimize and briefly equilibrate with protein atoms position-restrained.
+
+    Runs a short NPT simulation at 1 bar with harmonic restraints on
+    the specified protein atom indices, allowing water and ions to relax
+    around the fixed protein structure.
+
+    Parameters
+    ----------
+    u : mda.Universe
+        Reference MDAnalysis Universe whose topology is preserved.
+    pdb : str or Path
+        Path to the input PDB file for OpenMM.
+    top : str or Path
+        Path to the GROMACS topology file.
+    protein_indices : list of int
+        0-based atom indices to restrain (typically protein heavy atoms).
+    restraint_k : float, optional
+        Restraint force constant in kJ/mol/nm^2. Default is 1000.0.
+    steps : int, optional
+        Number of MD steps after minimization. Default is 10000.
+
+    Returns
+    -------
+    mda.Universe
+        Universe with relaxed solvent positions. Protein positions
+        remain at their restrained coordinates.
+
+    """
+    print("Loading GROMACS files for protein relaxation...")
+    gro = app.PDBFile(str(pdb))
+    top_file = app.GromacsTopFile(str(top), periodicBoxVectors=gro.topology.getPeriodicBoxVectors())
+
+    print("Creating OpenMM system...")
+    system = top_file.createSystem(
+        nonbondedMethod=app.PME,
+        nonbondedCutoff=1.0 * unit.nanometer,
+        constraints=app.HBonds,
+    )
+
+    # Position restraints on protein atoms
+    restraint_force = mm.CustomExternalForce("k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
+    restraint_force.addGlobalParameter(
+        "k", restraint_k * unit.kilojoules_per_mole / unit.nanometer**2
+    )
+    restraint_force.addPerParticleParameter("x0")
+    restraint_force.addPerParticleParameter("y0")
+    restraint_force.addPerParticleParameter("z0")
+
+    for idx in protein_indices:
+        pos = gro.positions[idx]
+        restraint_force.addParticle(
+            idx,
+            [
+                pos[0].value_in_unit(unit.nanometer),
+                pos[1].value_in_unit(unit.nanometer),
+                pos[2].value_in_unit(unit.nanometer),
+            ],
+        )
+
+    system.addForce(restraint_force)
+
+    # Isotropic barostat at 1 bar
+    barostat = mm.MonteCarloBarostat(1.0 * unit.bar, 300 * unit.kelvin)
+    system.addForce(barostat)
+
+    integrator = mm.LangevinMiddleIntegrator(
+        300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picoseconds
+    )
+
+    simulation = app.Simulation(top_file.topology, system, integrator)
+    simulation.context.setPositions(gro.positions)
+
+    simulation.reporters.append(
+        app.StateDataReporter(
+            sys.stdout,
+            1000,
+            step=True,
+            potentialEnergy=True,
+            temperature=True,
+            density=True,
+            volume=True,
+        )
+    )
+
+    print("Minimizing energy (protein restrained)...")
+    simulation.minimizeEnergy()
+
+    print(f"Running {steps} steps of NPT relaxation (protein restrained)...")
+    simulation.step(steps)
+
+    positions = simulation.context.getState(getPositions=True).getPositions()
+    state = simulation.context.getState()
+    box_vectors = state.getPeriodicBoxVectors()
+    simulation.topology.setPeriodicBoxVectors(box_vectors)
+
+    with open("relaxed_system.pdb", "w") as f:
+        app.PDBFile.writeFile(simulation.topology, positions, f, keepIds=True)
+    with open("relaxed_system.mmcif", "w") as f:
+        app.PDBxFile.writeFile(simulation.topology, positions, f, keepIds=True)
+
+    u_tmp = mda.Universe(app.PDBxFile("relaxed_system.mmcif"))
+    ret = mda.Merge(u.atoms)
+    ret.atoms.positions = u_tmp.atoms.positions
+    ret.dimensions = u_tmp.dimensions
+    ret.atoms.positions = ret.atoms.wrap(compound="residues")
+
+    print("Protein relaxation complete.")
     return ret

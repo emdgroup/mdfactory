@@ -1,86 +1,167 @@
 ---
 title: Workflows
-description: Nextflow scripts that are currently checked into the repository
+description: Build and simulate systems at scale with the mdfactory CLI
 ---
 
-The repository contains Nextflow scripts under `workflows/`. The two-stage flow is built around:
+MDFactory provides a two-command workflow for running simulation campaigns, from building systems to executing multi-stage GROMACS simulations. The orchestration layer uses [Parsl](https://parsl-project.org/) to parallelize work across local CPUs or SLURM cluster nodes.
 
-- `workflows/build.nf` — generate system folders and build files from CSV
-- `workflows/simulate.nf` — run the GROMACS simulation chain
+## Overview
 
-Those scripts match the current `mdfactory prepare-build` and `mdfactory build` commands plus the GROMACS file layout produced by the builders.
+The workflow has two stages:
 
-## Full pipeline
+1. **Build** — generate simulation-ready directories from YAML or CSV input
+2. **Simulate** — run the GROMACS pipeline (EM → NVT → NPT → Production) for each built system
 
-The easiest way to run both stages is the provided shell script:
+Each stage can run locally or on a SLURM cluster. With `--slurm`, Parsl submits many systems concurrently — multiple builds run in parallel, and multiple GROMACS simulations execute simultaneously across cluster nodes.
+
+## Prerequisites
 
 ```bash
-cd workflows/
-bash run_full_pipeline.sh
+pip install "mdfactory[parsl]"   # SLURM orchestration requires the parsl extra
 ```
 
-Edit the variables at the top of `run_full_pipeline.sh` to set your CSV input and output directory. The script runs the build stage followed by the simulation stage.
+## Stage 1: build systems
 
-## Stage 1: generate build folders
-
-`build.nf` expects a CSV input file and an output directory:
+Build from CSV (batch) or summary YAML:
 
 ```bash
-nextflow run workflows/build.nf \
-  --csv_file systems.csv \
-  --output_dir results
+# Sequential (local, no Parsl)
+mdfactory build systems.csv --output results
+
+# Parallel on SLURM
+mdfactory build systems.csv --output results --slurm slurm_executor.yaml
 ```
 
 What it does:
 
-1. Runs `mdfactory prepare-build`.
-2. Reads the summary YAML written into the output directory.
-3. Builds each generated hash directory with `mdfactory build`.
+1. Runs `mdfactory prepare-build` internally (CSV → per-hash YAML + summary YAML).
+2. Builds each hash directory using the appropriate builder (mixedbox, bilayer, LNP).
+3. With `--slurm`, builds run as parallel Parsl `python_app` tasks on allocated nodes.
 
 The summary YAML filename is derived from the CSV stem. For example, `systems.csv` produces `results/systems.yaml`.
 
 ## Stage 2: run the GROMACS chain
 
-`simulate.nf` consumes the stage-1 output directory plus the summary YAML:
-
 ```bash
-nextflow run workflows/simulate.nf \
-  -c workflows/simulate.config \
-  --base_dir results \
-  --config_yaml results/systems.yaml
+# Local execution (all stages, all systems)
+mdfactory simulate results/
+
+# SLURM execution with config file
+mdfactory simulate results/ --slurm slurm_executor.yaml
+
+# Interactive SLURM setup
+mdfactory simulate results/ --slurm tui
 ```
 
-<Callout type="warn" title="Cluster-specific configuration">
-The shipped `simulate.config` contains SLURM settings (queue name, module loads, GPU/CPU/memory requests) tuned for a specific cluster. Edit this file to match your HPC environment before running. See [Running on HPC Clusters](/docs/user-guide/running-on-hpc) for guidance.
-</Callout>
+`simulate` executes this sequence for each simulation directory:
 
-`simulate.nf` executes this fixed sequence for each hash listed in the summary YAML:
+1. **EM** — energy minimization using `em.mdp`
+2. **NVT** — NVT equilibration using `nvt.mdp`
+3. **NPT** — NPT equilibration using `npt.mdp`
+4. **Production** — production run using `md.mdp`
 
-1. Minimization using `em.mdp`
-2. NVT equilibration using `nvt.mdp`
-3. NPT equilibration using `npt.mdp`
-4. Production using `md.mdp`
+### Stage selection
 
-Outputs are published back into each simulation directory under `--base_dir`.
+Run only a subset of stages:
+
+```bash
+mdfactory simulate results/ --stages EM NVT NPT    # skip production
+mdfactory simulate results/ --stages Production     # production only (requires prior stages)
+```
+
+### Checkpoint and restart
+
+The `--checkpoint` flag controls how existing progress is handled:
+
+| Mode | Behavior |
+|------|----------|
+| `auto` (default) | Validates output files and trajectory frame counts. Resumes from the last valid checkpoint. |
+| `skip` | Skips stages where the output file exists (no validation). |
+| `force` | Re-runs all stages from scratch, ignoring existing outputs. |
+
+```bash
+mdfactory simulate results/ --slurm gpu.yaml --checkpoint auto
+```
+
+### Hash filtering
+
+Run only specific simulations by hash prefix:
+
+```bash
+mdfactory simulate results/ --hash abc123 def456
+```
+
+### Dry-run
+
+Preview the execution plan without submitting anything:
+
+```bash
+mdfactory simulate results/ --slurm gpu.yaml --dry-run
+```
+
+## SLURM executor configuration
+
+Generate a config interactively (auto-discovers cluster resources):
+
+```bash
+mdfactory config slurm
+```
+
+Or write a YAML file manually. See [`examples/slurm_executor.yaml`](https://github.com/emdgroup/mdfactory/blob/main/examples/slurm_executor.yaml) for an annotated reference.
+
+Key fields:
+
+```yaml
+provider: slurm
+account: my-account
+partition: gpu
+walltime: "8h"
+nodes: 1
+cpus_per_node: 16
+gres: "gpu:1"
+max_workers_per_node: 1
+max_blocks: 4
+gmx_binary: auto
+environment:
+  modules:
+    - gromacs/2024
+```
+
+### Per-stage resource overrides
+
+Override `cpus_per_node`, `gres`, or `gmx_binary` for individual stages:
+
+```yaml
+stage_overrides:
+  EM:
+    gres: null           # CPU-only minimization
+    cpus_per_node: 4
+  Production:
+    gres: "gpu:2"
+    cpus_per_node: 32
+```
 
 ## Expected directory shape
 
 <Files>
-  <Folder name="<hash> (after build.nf)" defaultOpen>
-    <File name="system.pdb" />
-    <File name="topology.top" />
-    <File name="em.mdp" />
-    <File name="nvt.mdp" />
-    <File name="npt.mdp" />
-    <File name="md.mdp" />
-  </Folder>
-  <Folder name="<hash> (after simulate.nf)" defaultOpen>
-    <File name="min.gro" />
-    <File name="nvt.gro" />
-    <File name="npt.gro" />
-    <File name="prod.gro" />
-    <File name="prod.xtc" />
-    <File name="prod.edr" />
+  <Folder name="results/" defaultOpen>
+    <File name="systems.yaml" />
+    <Folder name="&lt;hash&gt; (after build)" defaultOpen>
+      <File name="system.pdb" />
+      <File name="topology.top" />
+      <File name="em.mdp" />
+      <File name="nvt.mdp" />
+      <File name="npt.mdp" />
+      <File name="md.mdp" />
+    </Folder>
+    <Folder name="&lt;hash&gt; (after simulate)" defaultOpen>
+      <File name="min.gro" />
+      <File name="nvt.gro" />
+      <File name="npt.gro" />
+      <File name="prod.gro" />
+      <File name="prod.xtc" />
+      <File name="prod.edr" />
+    </Folder>
   </Folder>
 </Files>
 

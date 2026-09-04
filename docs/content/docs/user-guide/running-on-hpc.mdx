@@ -3,13 +3,14 @@ title: Running on HPC Clusters
 description: Deploy MDFactory workflows on SLURM-based HPC clusters
 ---
 
-MDFactory works well on SLURM-based HPC clusters for large-scale simulation campaigns.
+MDFactory works well on SLURM-based HPC clusters for large-scale simulation campaigns. The orchestration layer uses [Parsl](https://parsl-project.org/) to submit and manage GROMACS jobs through SLURM.
 
 ## Prerequisites
 
 - SSH access to your HPC cluster
 - SLURM workload manager
-- Python 3.11+, Nextflow, and Apptainer/Singularity available (via modules or otherwise)
+- Python 3.11+
+- GROMACS available (via modules or otherwise)
 
 ## Installation on HPC
 
@@ -28,19 +29,19 @@ ssh your-cluster.example.com
 Load required modules (names may vary by site):
 
 ```bash
-module load nextflow apptainer python/3.11
+module load python/3.11 gromacs
 ```
 
 </Step>
 <Step>
 
-Install MDFactory in your project directory:
+Install MDFactory with the Parsl extra:
 
 ```bash
 cd /path/to/your/project
 git clone https://github.com/emdgroup/mdfactory.git
 cd mdfactory
-pip install -e .
+pip install -e ".[parsl]"
 ```
 
 </Step>
@@ -51,157 +52,178 @@ pip install -e .
 Most SLURM clusters offer several partitions. Choose based on your workload:
 
 - **CPU partition**: CPU-only MD engines, preprocessing, analysis
-- **GPU partition**: GPU-accelerated GROMACS/LAMMPS runs
+- **GPU partition**: GPU-accelerated GROMACS runs
 - **Large-memory partition**: Very large systems or multi-GPU runs
 - **Interactive partition**: Testing, visualization, debugging
 
-Consult your cluster's documentation for available partitions, GPU types, and resource limits.
+Use `mdfactory config cluster` to discover available partitions, accounts, and QOS policies on your cluster:
 
-## Nextflow configuration
-
-Create `nextflow.config` in your pipeline directory. Adjust partition names, GPU types, and resource limits to match your cluster:
-
-```groovy
-process {
-  executor = 'slurm'
-  queue = 'gpu'
-
-  withName: 'minimization' {
-    cpus = 8
-    memory = '16 GB'
-    time = '2h'
-    clusterOptions = '--gres=gpu:1'
-  }
-
-  withName: 'equilibration' {
-    cpus = 16
-    memory = '32 GB'
-    time = '8h'
-    clusterOptions = '--gres=gpu:2'
-  }
-
-  withName: 'production' {
-    cpus = 32
-    memory = '64 GB'
-    time = '24h'
-    clusterOptions = '--gres=gpu:4'
-  }
-}
-
-executor {
-  $slurm {
-    queueSize = 50
-    submitRateLimit = '10 sec'
-  }
-}
-
-singularity {
-  enabled = true
-  autoMounts = true
-}
+```bash
+mdfactory config cluster
+mdfactory config cluster --json   # machine-readable output
 ```
 
-## SLURM job template
+## SLURM executor configuration
 
-Create a wrapper script `run_mdfactory.sh`. Adjust paths and module names for your site:
+MDFactory uses a YAML file to configure SLURM resources. Generate one interactively:
+
+```bash
+mdfactory config slurm
+```
+
+The wizard auto-discovers your cluster's partitions, accounts, and hardware (GPU types, memory, CPU counts) and walks through resource selection. The result is saved to a YAML file (default: `slurm_executor.yaml`).
+
+<Callout type="info" title="Three-section wizard">
+The wizard is organized into three distinct sections:
+
+1. **SLURM Allocation** — account, partition, walltime, CPUs, GPUs, memory
+2. **Execution Environment** — auto-detected pixi/conda activation, GROMACS modules
+3. **Per-Stage Tuning** — resource overrides for individual simulation stages (EM, NVT, etc.)
+
+GROMACS modules are discovered via `module avail` on the login node and offered as a selection. The pixi/conda environment is auto-detected from the filesystem.
+</Callout>
+
+### Manual configuration
+
+You can also write the YAML file directly. See [`examples/slurm_executor.yaml`](https://github.com/emdgroup/mdfactory/blob/main/examples/slurm_executor.yaml) for an annotated reference with all available fields.
+
+A minimal GPU configuration with the structured `environment` section:
+
+```yaml
+provider: slurm
+account: my-account
+partition: gpu
+walltime: "8h"
+cpus_per_node: 16
+gres: "gpu:1"
+max_workers_per_node: 1
+max_blocks: 4
+environment:
+  modules:
+    - gromacs/2024
+  pixi_manifest: /path/to/project
+```
+
+
+
+### Per-stage resource overrides
+
+Override `cpus_per_node`, `gres`, or `gmx_binary` for individual simulation stages:
+
+```yaml
+stage_overrides:
+  EM:
+    gres: null           # CPU-only minimization
+    cpus_per_node: 4
+  Production:
+    gres: "gpu:2"        # more GPUs for production
+    cpus_per_node: 32
+```
+
+### Key configuration fields
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `provider` | `"local"` or `"slurm"` | `"local"` |
+| `account` | SLURM account (`--account`) | — |
+| `partition` | SLURM partition (`--partition`) | — |
+| `walltime` | Wall-clock time (`--time`) | `"2h"` |
+| `nodes` | Nodes per job (`--nodes`) | `1` |
+| `cpus_per_node` | CPUs per node | `12` |
+| `gres` | GPU resources (`--gres`) | — |
+| `mem` | Memory per node (`--mem`) | — |
+| `max_workers_per_node` | Parallel tasks per node | `1` |
+| `max_blocks` | Max concurrent SLURM allocations | `1` |
+| `available_accelerators` | GPU count or device IDs for `CUDA_VISIBLE_DEVICES` | `0` |
+| `retries` | Infrastructure retry count (OOM, timeout, preemption) | `3` |
+| `gmx_binary` | `"auto"`, `"gmx"`, or `"gmx_mpi"` | `"auto"` |
+| `environment.modules` | Module loads for workers (e.g. `["gromacs/2024"]`) | `[]` |
+| `environment.pixi_manifest` | Path to pixi project root | auto-detected |
+| `environment.conda_env` | Conda env name to activate | — |
+| `environment.extra_init` | Custom shell commands | `""` |
+
+## Running simulations on SLURM
+
+Once your config is ready, build and simulate with:
+
+```bash
+# Build systems (parallel on SLURM)
+mdfactory build systems.csv --output results --slurm slurm_executor.yaml
+
+# Run the GROMACS chain (parallel on SLURM)
+mdfactory simulate results/ --slurm slurm_executor.yaml
+```
+
+<Callout type="info" title="Two layers of retry">
+MDFactory has two independent retry mechanisms on SLURM:
+
+- **`retries`** (executor config) — Parsl re-submits the same SLURM job on infrastructure failures (OOM, timeout, node preemption). The command is unchanged.
+- **`--max-rescue`** (CLI flag, default 3) — Automatically halves the step size and doubles `nsteps` for physics failures (LINCS errors, exploding box) in EM/NVT/NPT stages. Use `--max-rescue 0` to disable.
+
+When sizing walltime, account for potential rescue tiers — each tier roughly doubles the wall-clock cost of a rescue-eligible stage.
+</Callout>
+
+### SLURM job wrapper
+
+For batch scheduling, wrap the commands in a lightweight SLURM script. The controller job only needs a CPU allocation — Parsl submits the compute-heavy GROMACS work as separate SLURM jobs:
 
 ```bash
 #!/usr/bin/env bash
 #SBATCH --job-name=mdfactory
 #SBATCH -A <your-account>
 #SBATCH --partition=cpu
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=4G
 #SBATCH --time=24:00:00
 #SBATCH --output=mdfactory_%j.out
 #SBATCH --error=mdfactory_%j.err
-#SBATCH --export=ALL
 
 set -euo pipefail
 
-module load nextflow apptainer python/3.11
-
-SHARED_SCRATCH="${SCRATCH}"
-SRC_DIR="$(realpath "${SRC_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}")"
-JOB_TAG="${SLURM_JOB_NAME}_jobid_${SLURM_JOB_ID}"
-JOB_DIR="$SHARED_SCRATCH/$JOB_TAG"
-
-APPT_CACHE="$JOB_DIR/nf_apptainer_cache"
-APPT_TMP="${TMPDIR:-/tmp}/${USER}/appt_tmp"
-
-mkdir -p "$APPT_CACHE" "$APPT_TMP"
-
-export APPTAINER_TMPDIR="$APPT_TMP"
-export APPTAINER_CACHEDIR="$APPT_CACHE"
-export NXF_SINGULARITY_CACHEDIR="$APPT_CACHE"
-export NXF_HOME="$JOB_DIR/.nextflow"
-export NXF_OPTS=${NXF_OPTS:-'-Xms1g -Xmx8g'}
-
-echo "[INFO] Job directory: $JOB_DIR"
-echo "[INFO] Source directory: $SRC_DIR"
-echo "[INFO] Controller node: $(hostname)"
-
-mkdir -p "$JOB_DIR"/{work,results}
-rsync -a --delete \
-  --exclude '.git' \
-  --exclude 'work' \
-  --exclude 'results' \
-  --exclude '.nextflow*' \
-  "$SRC_DIR/" "$JOB_DIR/"
-
-rsync -a "$HOME/nf_apptainer_cache/" "$APPT_CACHE/" 2>/dev/null || true
-
-DEST_DIR="${DEST_DIR:-$HOME/mdfactory_results/$JOB_TAG}"
-mkdir -p "$DEST_DIR"
+module load python/3.11
 
 CSV_FILE="${CSV_FILE:-systems.csv}"
-CSV_BASENAME="$(basename "$CSV_FILE")"
-SUMMARY_YAML="${CSV_BASENAME%.csv}.yaml"
+OUTPUT_DIR="${OUTPUT_DIR:-results}"
+SLURM_CONFIG="${SLURM_CONFIG:-slurm_executor.yaml}"
 
-finish() {
-  set +e
-  echo "[INFO] Copying results to $DEST_DIR"
+# Stage 1: build
+mdfactory build "$CSV_FILE" --output "$OUTPUT_DIR" --slurm "$SLURM_CONFIG"
 
-  rsync -a "$JOB_DIR/results/" "$DEST_DIR/results/"
-  rsync -a "$JOB_DIR"/.nextflow* "$DEST_DIR/" 2>/dev/null || true
-  rsync -a "$JOB_DIR"/mdfactory_*.out "$DEST_DIR/" 2>/dev/null || true
-  rsync -a "$APPT_CACHE/" "$HOME/nf_apptainer_cache/"
-
-  if [[ "${CLEANUP:-true}" == "true" ]]; then
-    rm -rf "$JOB_DIR"
-  fi
-}
-trap finish EXIT
-
-cd "$JOB_DIR"
-
-nextflow run workflows/build.nf \
-  --csv_file "$CSV_FILE" \
-  --output_dir "$JOB_DIR/results" \
-  -work-dir "$JOB_DIR/work/build" \
-  "$@"
-
-nextflow run workflows/simulate.nf \
-  -c workflows/simulate.config \
-  --base_dir "$JOB_DIR/results" \
-  --config_yaml "$JOB_DIR/results/$SUMMARY_YAML" \
-  -work-dir "$JOB_DIR/work/simulate" \
-  "$@"
+# Stage 2: simulate
+mdfactory simulate "$OUTPUT_DIR" --slurm "$SLURM_CONFIG"
 
 echo "[INFO] Pipeline completed"
 ```
 
-## Submit the job
+Submit with:
 
 ```bash
 sbatch run_mdfactory.sh
 ```
 
-Check status:
+### Preview before submitting
+
+Use `--dry-run` to verify the execution plan without launching any jobs:
 
 ```bash
-squeue -u $USER
+mdfactory simulate results/ --slurm slurm_executor.yaml --dry-run
 ```
+
+### Checkpoint and restart
+
+Simulations automatically resume from checkpoints. If a job is interrupted, re-run the same command — completed stages are skipped:
+
+```bash
+mdfactory simulate results/ --slurm slurm_executor.yaml --checkpoint auto
+```
+
+If a job was killed mid-flight and left stale checkpoints (e.g. `.cpt` files without matching trajectory files), use `--clean` to reset before re-running:
+
+```bash
+mdfactory simulate results/ --clean --slurm slurm_executor.yaml
+```
+
+This removes simulation outputs while preserving build inputs. Use `--clean --dry-run` to preview what would be deleted. The `--stages` filter is respected — `--clean --stages Production` only cleans Production files.
 
 ## Submit analyses with submitit
 
@@ -327,40 +349,36 @@ tail -f mdfactory_<jobid>.out
 Use your cluster's storage tiers appropriately:
 
 - **Project/home storage**: Input files, final results, code
-- **Scratch storage** (`$SCRATCH`): Temporary files, work directories (typically auto-cleaned)
+- **Scratch storage** (`$SCRATCH`): Temporary files, Parsl run directories (typically auto-cleaned)
 - **Local node storage** (`$TMPDIR` or similar): Fast node-local disk for I/O intensive tasks
+
+Configure the Parsl run directory to use scratch:
+
+```yaml
+run_dir: /scratch/$USER/parsl/mdfactory
+```
 
 ## Workflow diagram
 
 ```mermaid
 graph LR
     A[Submit Job] --> B[Controller]
-    B --> C[Spawn Tasks]
-    C --> D[GPU Queue]
+    B --> C[Parsl submits tasks]
+    C --> D[GPU/CPU Queues]
     D --> E[Results]
     E --> F[Copy to Project]
 ```
 
 ## Best practices
 
-**Use scratch for work directories**
-
-Temporary Nextflow work files should go to scratch:
-
-```groovy
-workDir = "${System.getenv('SCRATCH')}/work"
-```
-
 **Request appropriate resources**
 
 Match resource requests to actual needs:
 
-```groovy
-process {
-  // Don't over-request
-  cpus = 8      // not 256
-  memory = '16 GB'  // not 1 TB
-}
+```yaml
+# Don't over-request
+cpus_per_node: 8       # not 256
+mem: "16G"             # not 1TB
 ```
 
 **Monitor job efficiency**
@@ -397,10 +415,10 @@ Common reasons:
 
 **Out of scratch space**
 
-Clean old work directories:
+Clean old Parsl run directories:
 
 ```bash
-rm -rf $SCRATCH/work/
+rm -rf /scratch/$USER/parsl/mdfactory/
 ```
 
 **Permission errors**

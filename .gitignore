@@ -44,6 +44,7 @@ htmlcov/
 .cache
 nosetests.xml
 coverage.xml
+cov.xml
 *.cover
 *.py,cover
 .hypothesis/
@@ -194,4 +195,10 @@ charmm36.ff/
 !docs/public/diagrams/**/*.png
 !docs/public/mdfactory-logo-v1.0.png
 
+# Allow GROMACS test fixtures
+!mdfactory/tests/fixtures/**
+
 .pixi/
+
+# local proteinbox end-to-end build outputs for inspection (not for commit)
+proteinbox_e2e_outputs/

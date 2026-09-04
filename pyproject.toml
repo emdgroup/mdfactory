@@ -43,6 +43,9 @@ foundry = [
 submitit = [
     "submitit>=1.5.1",
 ]
+parsl = [
+    "parsl>=2024.1.1",
+]
 dev = [
     "bump-my-version",
     "hatch",
@@ -94,18 +97,32 @@ openff-interchange = ">=0.3"
 openff-units = "*"
 openff-nagl = "*"
 openmm = "*"
+pdbfixer = "*"
 
 [tool.pixi.pypi-dependencies]
 mdfactory = { path = ".", editable = true }
+parsl = ">=2024.1.1"
 
 [tool.pixi.tasks]
 test = "pytest -k 'not build' mdfactory"
 # lint = "ruff check ."
 # format-check = "ruff format --check ."
 
+[tool.pixi.feature.docs.dependencies]
+bun = ">=1.3"
+pip = "*"
+
+[tool.pixi.feature.docs.tasks]
+docs-install = { cmd = "bun install", cwd = "docs" }
+docs-fumapy = { cmd = "python -m pip install ./docs/node_modules/fumadocs-python", depends-on = ["docs-install"] }
+docs-dev = { cmd = "bun run dev", cwd = "docs", depends-on = ["docs-fumapy"] }
+docs-build = { cmd = "bun run build", cwd = "docs", depends-on = ["docs-fumapy"] }
+docs-generate = { cmd = "bun run docs:generate", cwd = "docs", depends-on = ["docs-fumapy"] }
+
 [tool.pixi.environments]
 default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
+docs = { features = ["docs"], solve-group = "default" }
 
 # --- Ruff linter/formatter ---------------------------------------------------
 
@@ -164,6 +181,7 @@ select = [
 ignore = [
     "D105", # Missing docstring in magic functions
     "D107", # Missing docstring in __init__
+    "PLC0415", # Import not at top of file (lazy imports for optional deps)
     "PLR0912", # Too many branches
     "PLR0913", # Too many arguments in function definition
     "PLR0915", # Too many statements
@@ -209,3 +227,4 @@ addopts = "-m 'not foundry_live and not slow' -v --cov mdfactory --cov-report xm
 
 [tool.coverage.run]
 omit = ["mdfactory/tests/*"]
+

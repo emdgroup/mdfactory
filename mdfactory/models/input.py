@@ -8,8 +8,18 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from .composition import BilayerComposition, LNPComposition, MixedBoxComposition
-from .parametrization import CgenffConfig, ParametrizationConfig, SmirnoffConfig
+from .composition import (
+    BilayerComposition,
+    LNPComposition,
+    MixedBoxComposition,
+    ProteinBoxComposition,
+)
+from .parametrization import (
+    CgenffConfig,
+    ParametrizationConfig,
+    Pdb2gmxConfig,
+    SmirnoffConfig,
+)
 
 # Map system_type to the corresponding model class
 # TODO: StrEnum?
@@ -17,15 +27,25 @@ type_mapping = {
     "mixedbox": MixedBoxComposition,
     "bilayer": BilayerComposition,
     "lnp": LNPComposition,
+    "proteinbox": ProteinBoxComposition,
+}
+
+# Parametrizations each simulation type accepts. Proteins are parametrized with
+# gmx pdb2gmx; small-molecule systems use CGenFF or SMIRNOFF.
+allowed_parametrizations = {
+    "mixedbox": {"cgenff", "smirnoff"},
+    "bilayer": {"cgenff", "smirnoff"},
+    "lnp": {"cgenff", "smirnoff"},
+    "proteinbox": {"pdb2gmx"},
 }
 
 
 class BuildInput(BaseModel):
     """Represent a complete simulation build specification with composition and parametrization."""
 
-    simulation_type: Literal["mixedbox", "bilayer", "lnp"]
-    system: MixedBoxComposition | BilayerComposition | LNPComposition
-    parametrization: Literal["cgenff", "smirnoff"] = Field(
+    simulation_type: Literal["mixedbox", "bilayer", "lnp", "proteinbox"]
+    system: MixedBoxComposition | BilayerComposition | LNPComposition | ProteinBoxComposition
+    parametrization: Literal["cgenff", "smirnoff", "pdb2gmx"] = Field(
         "cgenff", description="Parametrization to use."
     )
     parametrization_config: ParametrizationConfig | None = Field(
@@ -74,6 +94,10 @@ class BuildInput(BaseModel):
         elif self.simulation_type == "mixedbox":
             system_specific["target_density"] = self.system.target_density
             system_specific["ionization"] = self.system.ionization.model_dump()
+        elif self.simulation_type == "proteinbox":
+            system_specific["padding"] = self.system.padding
+            system_specific["ionization"] = self.system.ionization.model_dump()
+            system_specific["pdb_path"] = str(self.system.protein.pdb_path)
 
         return {
             "hash": self.hash,
@@ -162,4 +186,41 @@ class BuildInput(BaseModel):
                 object.__setattr__(self, "parametrization_config", SmirnoffConfig())
             elif self.parametrization == "cgenff":
                 object.__setattr__(self, "parametrization_config", CgenffConfig())
+            elif self.parametrization == "pdb2gmx":
+                object.__setattr__(self, "parametrization_config", Pdb2gmxConfig())
+        return self
+
+    @model_validator(mode="after")
+    def validate_parametrization_consistency(self) -> "BuildInput":
+        """Ensure simulation type, parametrization, and config discriminator agree."""
+        allowed = allowed_parametrizations[self.simulation_type]
+        if self.parametrization not in allowed:
+            raise ValueError(
+                f"Parametrization '{self.parametrization}' is not valid for "
+                f"simulation type '{self.simulation_type}'. Allowed: {sorted(allowed)}."
+            )
+        config_type = self.parametrization_config.type
+        if config_type != self.parametrization:
+            raise ValueError(
+                f"Parametrization config type '{config_type}' does not match "
+                f"parametrization '{self.parametrization}'."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_proteinbox_chain_config(self) -> "BuildInput":
+        """Reject declaring chains while also merging them into one moleculetype.
+
+        merge_all fuses every chain into a single ``Protein`` moleculetype, which
+        contradicts protein.chains declaring subunits to build separately. Catching
+        this here avoids a confusing chain-mismatch failure deep inside pdb2gmx.
+        """
+        if self.simulation_type != "proteinbox":
+            return self
+        if getattr(self.parametrization_config, "merge_all", False) and self.system.protein.chains:
+            raise ValueError(
+                "protein.chains declares subunits to build as separate moleculetypes, but "
+                "parametrization_config.merge_all merges all chains into one. Set "
+                "merge_all=false to keep per-chain subunits, or drop protein.chains to merge."
+            )
         return self

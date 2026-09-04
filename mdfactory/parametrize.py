@@ -269,6 +269,11 @@ def parametrize_smirnoff_gromacs(
         if not itp_path.is_file():
             workdir.mkdir(parents=True, exist_ok=True)
             molecule = species.openff_molecule
+            # Force molecule name to "SOL" for consistent Interchange output,
+            # regardless of the user-provided resname (e.g. "WAT").
+            # This ensures atom types are always SOL_0, SOL_1, ... and the
+            # generated ITP is always SOL_SOL.itp.
+            molecule.name = "SOL"
             topology = Topology.from_molecules([molecule])
             forcefield = ForceField(water_model)
             interchange = Interchange.from_smirnoff(force_field=forcefield, topology=topology)
@@ -280,6 +285,9 @@ def parametrize_smirnoff_gromacs(
                 generated_itp = workdir / "SOL_SOL.itp"
                 if generated_itp.is_file():
                     generated_itp.rename(itp_path)
+            # Remove stale params if atomtypes were regenerated
+            if params_itp_path.is_file():
+                params_itp_path.unlink()
         if top_path.is_file() and atomtypes_path.is_file() and not params_itp_path.is_file():
             _build_smirnoff_parameter_itp(top_path, atomtypes_path, params_itp_path)
 

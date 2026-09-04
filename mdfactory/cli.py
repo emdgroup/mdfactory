@@ -8,7 +8,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import pandas as pd
 import questionary
@@ -33,7 +33,10 @@ from .prepare import df_to_build_input_models
 from .utils.data_manager import check_run_exists
 from .utils.push import push_systems
 from .utils.utilities import working_directory
-from .workflows import run_build_from_file
+from .workflows import run_build_from_dict, run_build_from_file
+
+if TYPE_CHECKING:
+    from .orchestration import ExecutorConfig
 
 app = App(name="MDFactory", version=__version__)
 
@@ -82,52 +85,612 @@ def prepare_build(input: Path, output: Path = Path(".")):
 
     logger.info("Created DataFrame for systems:\n{}", df)
 
-    dirs = []
-    for _, row in df.iterrows():
-        out = output / Path(row.hash)
-        out.mkdir(parents=True, exist_ok=False)
-        yml_path = out / f"{row.hash}.yaml"
-        dirs.append(str(out.resolve()))
-        with open(yml_path, "w") as fb:
-            yaml.safe_dump(row.model.model_dump(), fb)
-
-    summary = {
-        "n_systems": df.shape[0],
-        "input": str(input),
-        "output": str(output),
-        "hash": df.hash.values.tolist(),
-        "simulation_type": [x.simulation_type for x in df.model.values],
-        "system_directory": dirs,
-        "date": datetime.now(),
-    }
-    with open(yml_build_path, "w") as fb:
-        yaml.safe_dump(summary, fb)
+    _prepare_system_directories(models, input, output, exist_ok=False)
 
 
 def df_models_from_input_csv(input):
     df = pd.read_csv(input)
     # remove 'unnamed' CSV columns
     df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
+    # Resolve relative protein PDB paths against the CSV's own directory so the
+    # emitted per-system YAMLs carry absolute paths regardless of where the build
+    # later runs.
+    pdb_col = "system.protein.pdb_path"
+    if pdb_col in df.columns:
+        df[pdb_col] = df[pdb_col].apply(
+            lambda p: p
+            if pd.isna(p) or Path(p).is_absolute()
+            else str((input.parent / p).resolve())
+        )
     models, errors = df_to_build_input_models(df)
     return df, models, errors
 
 
+def _prepare_system_directories(
+    models: list,
+    input_path: Path,
+    output: Path,
+    *,
+    exist_ok: bool = True,
+) -> tuple[list[str], Path]:
+    """Create per-hash build directories, write system YAMLs, and generate summary.
+
+    Parameters
+    ----------
+    models : list
+        List of BuildInput models.
+    input_path : Path
+        Original input file path (used for summary YAML naming).
+    output : Path
+        Base output directory.
+    exist_ok : bool
+        Whether to allow existing directories.
+
+    Returns
+    -------
+    tuple[list[str], Path]
+        List of system directory paths, and path to the summary YAML.
+
+    """
+    dirs = []
+    for model in models:
+        build_dir = output / model.hash
+        build_dir.mkdir(parents=True, exist_ok=exist_ok)
+        yml_path = build_dir / f"{model.hash}.yaml"
+        if not yml_path.exists():
+            with open(yml_path, "w") as f:
+                # mode="json" so Path and tuple fields (e.g. proteinbox pdb_path and
+                # disulfide_bonds) serialize to plain str/list that yaml.safe_dump can write.
+                yaml.safe_dump(model.model_dump(mode="json"), f)
+        dirs.append(str(build_dir.resolve()))
+
+    summary_path = output / f"{input_path.stem}.yaml"
+    summary = {
+        "n_systems": len(models),
+        "input": str(input_path),
+        "output": str(output),
+        "hash": [m.hash for m in models],
+        "simulation_type": [m.simulation_type for m in models],
+        "system_directory": dirs,
+        "date": datetime.now(),
+    }
+    with open(summary_path, "w") as f:
+        yaml.safe_dump(summary, f)
+    return dirs, summary_path
+
+
+def _resolve_slurm_flag(
+    slurm: str | None,
+    *,
+    stages: tuple[str, ...] | None = None,
+) -> "ExecutorConfig | Path | None":
+    """Resolve the ``--slurm`` CLI flag to an executor config or YAML path.
+
+    Parameters
+    ----------
+    slurm : str or None
+        Raw value from the ``--slurm`` flag.  ``"tui"`` launches the
+        interactive wizard (which returns a config object directly).
+        Any other non-None value is treated as a file path.
+    stages : tuple[str, ...] or None, optional
+        Simulation stages to configure overrides for. Passed through to
+        the TUI wizard. Use an empty tuple for workflows without
+        simulation stages (e.g. ``build``). ``None`` (default) uses the
+        full simulation pipeline.
+
+    Returns
+    -------
+    ExecutorConfig, Path, or None
+        An ExecutorConfig when using TUI mode, a Path to executor config
+        YAML, or None if no SLURM config requested.
+
+    """
+    if slurm is None:
+        return None
+
+    if slurm.strip().lower() == "tui":
+        from mdfactory.orchestration.tui import UserCancelledError, configure_slurm_interactive
+
+        try:
+            return configure_slurm_interactive(stages=stages)
+        except UserCancelledError:
+            logger.info("SLURM configuration cancelled.")
+            sys.exit(0)
+
+    path = Path(slurm)
+    if not path.exists():
+        logger.error(f"SLURM config file not found: {path}")
+        sys.exit(1)
+    return path
+
+
+def _load_executor_config(config: "ExecutorConfig | Path | None") -> "ExecutorConfig":
+    """Load executor config from path or return directly if already loaded.
+
+    Parameters
+    ----------
+    config : ExecutorConfig, Path, or None
+        An already-loaded config object, a path to a YAML file, or None
+        for default local execution.
+
+    Returns
+    -------
+    ExecutorConfig
+        The resolved executor configuration.
+
+    """
+    if config is None:
+        from mdfactory.orchestration import EnvironmentConfig, ExecutorConfig
+
+        global_env = EnvironmentConfig.load_global()
+        if global_env is not None:
+            return ExecutorConfig(environment=global_env)
+        return ExecutorConfig()
+    if isinstance(config, Path):
+        from mdfactory.orchestration import ExecutorConfig
+
+        return ExecutorConfig.from_yaml(config)
+    return config  # already an ExecutorConfig instance
+
+
 @app.command(name="build", group="Build")
-def build_system(input: Path, output: Path = Path(".")):
-    """Build MD system from YAML input file.
+def build_system(
+    input: Path,
+    output: Path = Path("."),
+    slurm: Annotated[
+        str | None,
+        Parameter(
+            help=("SLURM executor config: path to YAML file, or 'tui' for interactive setup.")
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool, Parameter(help="Print what would be built without executing.")
+    ] = False,
+):
+    """Build MD system(s) from YAML, CSV, or summary input.
+
+    Supports three input modes:
+
+    - Single YAML: builds one system locally (original behavior)
+    - CSV file: builds systems from each row (parallel with --slurm, sequential without)
+    - Summary YAML: dispatches builds for previously prepared systems
 
     Parameters
     ----------
     input : Path
-        Path to the YAML file specifying the `BuildInput`
+        Path to input file (YAML for single build, CSV for batch, summary YAML for prepared).
     output : Path, optional
-        Output directory, by default Path(".")
+        Output directory, by default Path(".").
+    slurm : str, optional
+        Path to SLURM executor config YAML, or ``"tui"`` to launch the
+        interactive configuration wizard.
+    dry_run : bool, optional
+        Print what would be built without executing.
 
     """
     input = input.resolve()
-    logger.info(f"Building system from YAML file {input} and output directory: {output}.")
-    with working_directory(output, create=True):
-        run_build_from_file(input)
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+
+    # Resolve --slurm flag: "tui" launches the interactive wizard,
+    # anything else is treated as a path to a YAML config file.
+    # Build has no simulation stages, so skip the stage-override prompts.
+    config: "ExecutorConfig | Path | None" = _resolve_slurm_flag(slurm, stages=())
+
+    suffix = input.suffix.lower()
+
+    if suffix == ".csv":
+        _build_from_csv(input, output, config=config, dry_run=dry_run)
+    elif suffix in (".yaml", ".yml"):
+        _build_from_yaml(input, output, config=config, dry_run=dry_run)
+    else:
+        logger.error(f"Unsupported input file format: {suffix}. Use .csv, .yaml, or .yml.")
+        sys.exit(1)
+
+
+def _build_from_csv(
+    input: Path,
+    output: Path,
+    *,
+    config: "ExecutorConfig | Path | None" = None,
+    dry_run: bool = False,
+):
+    """Handle CSV input for the build command."""
+    df, models, errors = df_models_from_input_csv(input)
+    if errors:
+        logger.error("Errors building models from CSV:")
+        for k, v in errors.items():
+            logger.error(f"  Row {k}: {v}")
+        sys.exit(1)
+
+    if dry_run:
+        from mdfactory.orchestration import build_systems
+
+        executor_config = _load_executor_config(config)
+        build_systems(models, executor_config, output_dir=output, dry_run=True)
+        return
+
+    # Create per-hash directories, write per-system YAMLs, and generate summary
+    dirs, summary_path = _prepare_system_directories(models, input, output, exist_ok=True)
+    logger.info(f"Summary YAML written to {summary_path}")
+
+    if config is not None:
+        # Parallel builds via Parsl
+        from mdfactory.orchestration import build_systems
+
+        executor_config = _load_executor_config(config)
+        results = build_systems(models, executor_config, output_dir=output)
+        _report_build_results(results, output_dir=output)
+    else:
+        # Sequential local builds
+        logger.info(f"Building {len(models)} system(s) sequentially.")
+        for model in models:
+            build_dir = output / model.hash
+            logger.info(f"Building {model.hash} ({model.simulation_type})...")
+            with working_directory(build_dir, create=True):
+                run_build_from_dict(model)
+
+
+def _build_from_yaml(
+    input: Path,
+    output: Path,
+    *,
+    config: "ExecutorConfig | Path | None" = None,
+    dry_run: bool = False,
+):
+    """Handle YAML input for the build command."""
+    with open(input) as f:
+        data = yaml.safe_load(f)
+
+    if not isinstance(data, dict):
+        logger.error(f"Invalid YAML input file (empty or not a mapping): {input}")
+        sys.exit(1)
+
+    if "system_directory" in data:
+        # Summary YAML -- dispatch builds for prepared systems
+        _build_from_summary_yaml(data, output, config=config, dry_run=dry_run)
+    else:
+        # Single build YAML
+        from mdfactory.models.input import BuildInput
+
+        model = BuildInput(**data)
+
+        if config is not None or dry_run:
+            from mdfactory.orchestration import build_systems
+
+            executor_config = _load_executor_config(config)
+            results = build_systems([model], executor_config, output_dir=output, dry_run=dry_run)
+            if not dry_run:
+                _report_build_results(results, output_dir=output)
+        else:
+            build_dir = output / model.hash
+            logger.info(f"Building {model.hash} ({model.simulation_type}) -> {build_dir}")
+            with working_directory(build_dir, create=True):
+                run_build_from_file(input)
+            logger.info(f"Output: {output}")
+            logger.info("Next step — run simulations:")
+            logger.info(f"  mdfactory simulate {output}")
+            logger.info(
+                f"  # with SLURM: mdfactory simulate {output} --slurm <executor-config.yaml>"
+            )
+
+
+def _build_from_summary_yaml(
+    data: dict,
+    output: Path,
+    *,
+    config: "ExecutorConfig | Path | None" = None,
+    dry_run: bool = False,
+):
+    """Handle summary YAML (from prepare-build) for the build command."""
+    dirs = data.get("system_directory", [])
+    hashes = data.get("hash", [])
+
+    if not dirs:
+        logger.error("Summary YAML contains no system_directory entries.")
+        sys.exit(1)
+
+    if len(dirs) != len(hashes):
+        logger.error(
+            f"Summary YAML is malformed: system_directory has {len(dirs)} entries "
+            f"but hash has {len(hashes)}."
+        )
+        sys.exit(1)
+
+    from mdfactory.models.input import BuildInput
+
+    models = []
+    for sim_dir, sim_hash in zip(dirs, hashes):
+        yml_path = Path(sim_dir) / f"{sim_hash}.yaml"
+        if not yml_path.exists():
+            logger.error(f"Build YAML not found: {yml_path}")
+            sys.exit(1)
+        with open(yml_path) as f:
+            model_data = yaml.safe_load(f)
+        models.append(BuildInput(**model_data))
+
+    if config is not None or dry_run:
+        from mdfactory.orchestration import build_systems
+
+        executor_config = _load_executor_config(config)
+        results = build_systems(models, executor_config, output_dir=output, dry_run=dry_run)
+        if not dry_run:
+            _report_build_results(results, output_dir=output)
+    else:
+        # Sequential local builds
+        logger.info(f"Building {len(models)} prepared system(s) sequentially.")
+        for model, sim_dir in zip(models, dirs):
+            logger.info(f"Building {model.hash} ({model.simulation_type})...")
+            with working_directory(Path(sim_dir), create=True):
+                run_build_from_dict(model)
+        logger.info(f"Output: {output}")
+        logger.info("Next step — run simulations:")
+        logger.info(f"  mdfactory simulate {output}")
+        logger.info(f"  # with SLURM: mdfactory simulate {output} --slurm <executor-config.yaml>")
+
+
+def _report_build_results(results: list[dict], output_dir: Path | None = None):
+    """Report build results to the user.
+
+    Parameters
+    ----------
+    results : list[dict]
+        Build result dicts from build_systems().
+    output_dir : Path, optional
+        Output directory used for the build.  When provided, a "next steps"
+        hint pointing to ``mdfactory simulate`` is printed so users know
+        exactly what to run next.
+
+    """
+    succeeded = sum(1 for r in results if r.get("status") == "success")
+    failed = sum(1 for r in results if r.get("status") == "failed")
+    logger.info(f"Build complete: {succeeded} succeeded, {failed} failed.")
+    for r in results:
+        if r.get("status") == "failed":
+            logger.error(f"  {r.get('hash', 'unknown')}: {r.get('error', 'unknown error')}")
+    if succeeded and output_dir is not None:
+        logger.info(f"Output: {output_dir}")
+        logger.info("Next step — run simulations:")
+        logger.info(f"  mdfactory simulate {output_dir}")
+        logger.info(
+            f"  # with SLURM: mdfactory simulate {output_dir} --slurm <executor-config.yaml>"
+        )
+
+
+def _filter_sim_paths_by_hash_prefix(sim_paths: list[Path], prefixes: list[str]) -> list[Path]:
+    """Filter simulation paths by hash prefix without requiring completed trajectories.
+
+    Unlike :func:`~mdfactory.analysis.submit.filter_paths_by_hash`, this
+    helper works purely on directory names and therefore works on freshly
+    built directories that have not yet been simulated.
+
+    Hash matching is case-insensitive so short prefixes typed in lower-case
+    still resolve correctly.
+
+    Parameters
+    ----------
+    sim_paths : list[Path]
+        Candidate simulation directories (already validated by
+        :func:`_discover_sim_dirs`).
+    prefixes : list[str]
+        Hash strings or prefix fragments to match against directory names.
+
+    Returns
+    -------
+    list[Path]
+        Subset of *sim_paths* whose directory names start with at least one
+        requested prefix.
+
+    Raises
+    ------
+    ValueError
+        If none of the requested prefixes match any discovered directory.
+
+    """
+    upper_prefixes = [p.upper() for p in prefixes]
+    matched = [
+        p for p in sim_paths if any(p.name.upper().startswith(pref) for pref in upper_prefixes)
+    ]
+    if not matched:
+        available = sorted(p.name for p in sim_paths)
+        raise ValueError(f"No simulation directories match {prefixes}.\nAvailable: {available}")
+    return sorted(matched)
+
+
+def _discover_sim_dirs(root: Path) -> list[Path]:
+    """Find simulation-ready directories under *root*.
+
+    A directory is considered simulation-ready when it contains ``system.pdb``.
+    Unlike :func:`~mdfactory.analysis.utils.discover_simulations` (which is
+    designed for post-run analysis), this helper does **not** require a
+    ``BuildInput`` YAML or a completed trajectory — it works on freshly
+    prepared directories.
+
+    Rules
+    -----
+    - If *root* itself contains ``system.pdb`` it is returned as a single-item
+      list (direct simulation directory).
+    - Otherwise the immediate children of *root* that contain ``system.pdb``
+      are returned (build-output layout where each hash subdirectory is one
+      simulation).
+
+    Raises
+    ------
+    ValueError
+        If no simulation-ready directories are found under *root*.
+
+    """
+    if (root / "system.pdb").exists():
+        return [root]
+
+    sims = sorted(d for d in root.iterdir() if d.is_dir() and (d / "system.pdb").exists())
+    if not sims:
+        raise ValueError(
+            f"No simulation directories found under {root}.\n"
+            "Each simulation directory must contain system.pdb.  "
+            "Run 'mdfactory build' first, or point directly to a prepared "
+            "simulation directory."
+        )
+    return sims
+
+
+def _resolve_sim_paths_for_simulate(source: Path) -> list[Path]:
+    """Resolve *source* to a list of simulation-ready directories.
+
+    Handles both directory trees (delegating to :func:`_discover_sim_dirs`)
+    and YAML summary files.
+
+    Parameters
+    ----------
+    source : Path
+        Resolved absolute path to a build output directory or summary YAML.
+
+    Returns
+    -------
+    list[Path]
+        Simulation directories ready for submission.
+
+    Raises
+    ------
+    ValueError
+        If *source* is neither a directory nor a recognised YAML file, or if
+        no simulation directories are found.
+
+    """
+    if source.is_dir():
+        return _discover_sim_dirs(source)
+    if source.suffix in (".yaml", ".yml"):
+        with open(source) as f:
+            summary = yaml.safe_load(f)
+        return [Path(p) for p in summary.get("system_directory", [])]
+    raise ValueError(f"Invalid source: {source}. Provide a directory or YAML.")
+
+
+@app.command(name="simulate", group="Simulation")
+def simulate_systems(
+    source: Annotated[Path, Parameter(help="Simulation directory or summary YAML")],
+    slurm: Annotated[
+        str | None,
+        Parameter(help="SLURM config YAML or 'tui' for interactive setup"),
+    ] = None,
+    stages: Annotated[
+        list[str] | None,
+        Parameter(help="Stages to run (EM, NVT, NPT, Production)", consume_multiple=True),
+    ] = None,
+    checkpoint: Annotated[
+        str,
+        Parameter(help="Checkpoint mode: auto (default), skip, force"),
+    ] = "auto",
+    hash: Annotated[
+        list[str] | None,
+        Parameter(help="Filter by hash prefix", consume_multiple=True),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        Parameter(help="Preview plan without executing"),
+    ] = False,
+    clean: Annotated[
+        bool,
+        Parameter(help="Remove simulation outputs before running"),
+    ] = False,
+    max_rescue: Annotated[
+        int,
+        Parameter(
+            help="Max rescue tiers for physics failures (0 to disable)",
+        ),
+    ] = 3,
+):
+    """Run GROMACS MD simulations via Parsl.
+
+    Examples
+    --------
+    Local execution (all stages)::
+
+        mdfactory simulate output_dir/
+
+    SLURM with interactive config::
+
+        mdfactory simulate output_dir/ --slurm tui
+
+    Resume from checkpoint::
+
+        mdfactory simulate output_dir/ --slurm gpu.yaml --checkpoint auto
+
+    Equilibration only::
+
+        mdfactory simulate output_dir/ --stages EM NVT NPT
+
+    Filter specific simulations::
+
+        mdfactory simulate output_dir/ --hash abc123 def456
+
+    Dry-run preview::
+
+        mdfactory simulate output_dir/ --slurm gpu.yaml --dry-run
+
+    Clean before running::
+
+        mdfactory simulate output_dir/ --clean --stages Production
+
+    """
+    source = source.resolve()
+
+    try:
+        sim_paths = _resolve_sim_paths_for_simulate(source)
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
+    if hash:
+        try:
+            sim_paths = _filter_sim_paths_by_hash_prefix(sim_paths, list(hash))
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(1)
+
+    if not sim_paths:
+        logger.error("No simulations found.")
+        sys.exit(1)
+
+    logger.info(f"Found {len(sim_paths)} simulation(s)")
+
+    # Pass the user's --stages selection to the TUI so it only shows
+    # relevant stage-override prompts. None = full pipeline.
+    tui_stages = tuple(stages) if stages else None
+    config = _resolve_slurm_flag(slurm, stages=tui_stages)
+    executor_config = _load_executor_config(config)
+
+    from mdfactory.orchestration import run_simulations
+
+    try:
+        results = run_simulations(
+            sim_paths,
+            executor_config,
+            stages=stages,
+            checkpoint_mode=checkpoint,
+            dry_run=dry_run,
+            clean=clean,
+            max_rescue=max_rescue,
+        )
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
+    if not dry_run:
+        _report_simulation_results(results)
+
+
+def _report_simulation_results(results: list[dict]):
+    """Report simulation results to user."""
+    succeeded = sum(1 for r in results if r.get("status") == "success")
+    failed = sum(1 for r in results if r.get("status") == "failed")
+    skipped = sum(1 for r in results if r.get("status") == "skipped")
+
+    logger.info(f"Simulation complete: {succeeded} succeeded, {failed} failed, {skipped} skipped")
+
+    for r in results:
+        if r.get("status") == "failed":
+            logger.error(f"  {r.get('hash', 'unknown')}: {r.get('error', 'unknown error')}")
 
 
 @app.command(name="clean")
@@ -1142,6 +1705,89 @@ def _resolve_sim_paths(
     return sim_paths
 
 
+def _resolve_analysis_slurm_config(
+    account: "str | None",
+    partition: "str | None",
+    time: str,
+    cpus: int,
+    mem_gb: int,
+    qos: "str | None",
+    constraint: "str | None",
+    job_name_prefix: str,
+) -> "SlurmConfig":
+    """Resolve a :class:`~mdfactory.analysis.submit.SlurmConfig` for analysis/artifact jobs.
+
+    Tries autodiscovery when *account* is ``None``; falls back to an explicit
+    config when *account* is given.  Used by :func:`analysis_run` and
+    :func:`analysis_artifacts_run` to avoid repeating the autodiscovery block.
+
+    Parameters
+    ----------
+    account : str or None
+        SLURM account name.  ``None`` triggers ``SlurmConfig.from_cluster()``.
+    partition : str or None
+        SLURM partition.  ``None`` lets ``from_cluster`` choose; ``"cpu"``
+        is used as the fallback when *account* is explicit.
+    time : str
+        Wall-time limit (e.g. ``"2h"``).
+    cpus : int
+        CPUs per task.
+    mem_gb : int
+        Memory per node in GiB.
+    qos : str or None
+        SLURM QOS string.
+    constraint : str or None
+        SLURM constraint string.
+    job_name_prefix : str
+        Prefix for the SLURM job name.
+
+    Returns
+    -------
+    SlurmConfig
+        Resolved SLURM configuration.
+
+    Raises
+    ------
+    ValueError
+        If autodiscovery fails and *account* was not provided.
+
+    """
+    if account is None:
+        try:
+            slurm_cfg = SlurmConfig.from_cluster(
+                needs_gpu=False,
+                min_cpus=cpus,
+                min_mem_gb=mem_gb,
+                time=time,
+                cpus_per_task=cpus,
+                mem_gb=mem_gb,
+                qos=qos,
+                constraint=constraint,
+                job_name_prefix=job_name_prefix,
+                **({"partition": partition} if partition is not None else {}),
+            )
+            logger.info(
+                f"Using autodiscovered SLURM config: account={slurm_cfg.account}, "
+                f"partition={slurm_cfg.partition}"
+            )
+        except RuntimeError as e:
+            raise ValueError(
+                f"SLURM autodiscovery failed: {e}\nPlease specify --account explicitly."
+            ) from e
+    else:
+        slurm_cfg = SlurmConfig(
+            account=account,
+            partition=partition or "cpu",
+            time=time,
+            cpus_per_task=cpus,
+            mem_gb=mem_gb,
+            qos=qos,
+            constraint=constraint,
+            job_name_prefix=job_name_prefix,
+        )
+    return slurm_cfg
+
+
 @analysis_app.command(name="run")
 def analysis_run(
     source: Path | None = None,
@@ -1153,7 +1799,7 @@ def analysis_run(
     skip_existing: bool = True,
     slurm: bool = False,
     account: str | None = None,
-    partition: str = "cpu",
+    partition: str | None = None,
     time: str = "2h",
     cpus: int = 4,
     mem_gb: int = 8,
@@ -1187,8 +1833,6 @@ def analysis_run(
     if source is None:
         raise ValueError("Provide SOURCE as a simulation directory or build summary YAML.")
 
-    if slurm and account is None:
-        raise ValueError("--account is required when using --slurm.")
     if analysis_workers is not None and analysis_workers < 1:
         raise ValueError("--analysis-workers must be >= 1.")
 
@@ -1233,15 +1877,8 @@ def analysis_run(
         print(result_df)
         return
 
-    slurm_cfg = SlurmConfig(
-        account=account or "",
-        partition=partition,
-        time=time,
-        cpus_per_task=cpus,
-        mem_gb=mem_gb,
-        qos=qos,
-        constraint=constraint,
-        job_name_prefix=job_name_prefix,
+    slurm_cfg = _resolve_analysis_slurm_config(
+        account, partition, time, cpus, mem_gb, qos, constraint, job_name_prefix
     )
     if log_dir is None:
         log_dir = determine_log_dir(sim_paths)
@@ -1473,7 +2110,7 @@ def analysis_artifacts_run(
     skip_existing: bool = True,
     slurm: bool = False,
     account: str | None = None,
-    partition: str = "cpu",
+    partition: str | None = None,
     time: str = "2h",
     cpus: int = 4,
     mem_gb: int = 8,
@@ -1520,18 +2157,8 @@ def analysis_artifacts_run(
         print(summary)
         return
 
-    if account is None:
-        raise ValueError("--account is required when using --slurm.")
-
-    slurm_cfg = SlurmConfig(
-        account=account,
-        partition=partition,
-        time=time,
-        cpus_per_task=cpus,
-        mem_gb=mem_gb,
-        qos=qos,
-        constraint=constraint,
-        job_name_prefix=job_name_prefix,
+    slurm_cfg = _resolve_analysis_slurm_config(
+        account, partition, time, cpus, mem_gb, qos, constraint, job_name_prefix
     )
     if log_dir is None:
         log_dir = determine_log_dir(sim_paths)
@@ -1748,6 +2375,151 @@ def config_edit():
 
     editor = os.environ.get("EDITOR", "vi")
     subprocess.run([editor, str(config_path)], check=False)
+
+
+@config_app.command(name="slurm")
+def config_slurm():
+    """Interactive wizard to configure a SLURM executor and save to YAML.
+
+    Queries the local SLURM scheduler for available accounts, partitions,
+    and hardware, then walks through resource selection interactively.
+    The result is saved to a YAML file that can be reused with
+    ``mdfactory build --slurm <file>``.
+
+    On non-SLURM machines, falls back to manual text entry.
+    """
+    from mdfactory.orchestration.tui import UserCancelledError, configure_and_save_slurm
+
+    try:
+        configure_and_save_slurm()
+    except UserCancelledError:
+        logger.info("SLURM configuration cancelled.")
+
+
+@config_app.command(name="environment")
+def config_environment():
+    """Interactive wizard to configure the execution environment.
+
+    Detects the current Python environment (pixi, conda, or virtualenv),
+    prompts for GROMACS modules and additional init commands, then saves
+    the result to the global config directory.
+
+    The saved environment config is automatically used by SLURM executor
+    YAMLs that don't include an ``environment:`` section, so you only
+    need to configure this once per machine.
+    """
+    from mdfactory.orchestration.tui import UserCancelledError, configure_and_save_environment
+
+    try:
+        configure_and_save_environment()
+    except UserCancelledError:
+        logger.info("Environment configuration cancelled.")
+
+
+@config_app.command(name="cluster")
+def config_cluster(
+    json_output: Annotated[bool, Parameter("--json", help="Output in JSON format.")] = False,
+):
+    """Show discovered SLURM cluster information.
+
+    Queries the local SLURM scheduler and displays available partitions,
+    accounts, and QOS policies. Useful for verifying autodiscovery works
+    and understanding cluster resources before submitting jobs.
+
+    On non-SLURM machines, prints a helpful message instead of failing.
+    """
+    import json as json_module
+
+    from mdfactory.performance.cluster import discover_cluster
+
+    cluster = discover_cluster()
+
+    if cluster is None:
+        if json_output:
+            print(json_module.dumps({"error": "SLURM not available", "cluster": None}))
+        else:
+            print("SLURM cluster not detected.")
+            print()
+            print("This machine does not appear to be a SLURM cluster node,")
+            print("or SLURM commands (sinfo, sacctmgr) are not in PATH.")
+            print()
+            print("To use SLURM submission, run this command on a cluster login node.")
+        return
+
+    if json_output:
+        # Build JSON-serializable structure
+        data = {
+            "default_account": cluster.default_account,
+            "accounts": cluster.accounts,
+            "qos_policies": cluster.qos_policies,
+            "partitions": [
+                {
+                    "name": p.name,
+                    "state": p.state,
+                    "is_default": p.is_default,
+                    "max_time": p.max_time,
+                    "default_time": p.default_time,
+                    "total_nodes": p.total_nodes,
+                    "node_types": [
+                        {
+                            "cpus": nt.cpus,
+                            "memory_mb": nt.memory_mb,
+                            "gpu_specs": [
+                                {"count": count, "type": gtype} for count, gtype in nt.gpu_specs
+                            ],
+                            "features": list(nt.features),
+                            "count": nt.count,
+                        }
+                        for nt in p.node_types
+                    ],
+                }
+                for p in cluster.partitions
+            ],
+        }
+        print(json_module.dumps(data, indent=2))
+        return
+
+    # Human-readable output
+    print("SLURM Cluster Information")
+    print("=" * 50)
+    print()
+
+    # Account info
+    print(f"Default Account: {cluster.default_account or '(none)'}")
+    if cluster.accounts:
+        print(f"Available Accounts: {', '.join(cluster.accounts)}")
+    print()
+
+    # QOS info
+    if cluster.qos_policies:
+        print(f"QOS Policies: {', '.join(cluster.qos_policies)}")
+        print()
+
+    # Partition info
+    print("Partitions:")
+    print("-" * 50)
+    for partition in cluster.partitions:
+        default_marker = " (default)" if partition.is_default else ""
+        state_marker = f" [{partition.state}]" if partition.state != "up" else ""
+        print(f"\n  {partition.name}{default_marker}{state_marker}")
+        print(f"    Nodes: {partition.total_nodes}")
+        print(f"    Max Time: {partition.max_time}")
+        if partition.default_time != partition.max_time:
+            print(f"    Default Time: {partition.default_time}")
+
+        # Summarize node types
+        for nt in partition.node_types:
+            gpu_info = ""
+            if nt.gpu_specs:
+                # Format multiple GPU types like "7x b200, 7x 1g.23gb"
+                gpu_parts = [f"{count}x {gtype or 'unknown'}" for count, gtype in nt.gpu_specs]
+                gpu_info = f", {', '.join(gpu_parts)}"
+            mem_gb = nt.memory_mb // 1024
+            features_str = ""
+            if nt.features:
+                features_str = f" [{', '.join(nt.features)}]"
+            count_str = f" ({nt.count} node{'s' if nt.count != 1 else ''})"
+            print(f"      - {nt.cpus} CPUs, {mem_gb} GB{gpu_info}{features_str}{count_str}")
 
 
 def main():
