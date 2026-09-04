@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 from MDAnalysis.analysis import distances
 
+from mdfactory.build import ionize_solvated_system
+from mdfactory.models.composition import IonizationConfig
 from mdfactory.models.species import SingleMoleculeSpecies
 from mdfactory.setup import solvation
 
@@ -136,3 +138,17 @@ def test_remove_clashes():
             )
             clashes_no_pbc.add(tuple(sorted(um.atoms.residues.resids)))
     assert len(clashes_no_pbc) == 0
+
+
+def test_ionize_solvated_system_skips_when_no_ions():
+    """Skip ionization when no ions should be added."""
+    u = mda.Universe(Path(solvation.__file__).parent / "data" / "spc216.gro")
+    n_atoms_before = len(u.atoms)
+
+    ion_config = IonizationConfig(concentration=0.0, neutralize=False)
+    u_out, additional_species = ionize_solvated_system(ion_config, u, total_charge=0)
+
+    assert additional_species == []
+    assert len(u_out.atoms) == n_atoms_before
+    assert len(u_out.select_atoms("resname NA")) == 0
+    assert len(u_out.select_atoms("resname CL")) == 0
