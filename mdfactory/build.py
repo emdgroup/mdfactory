@@ -669,6 +669,10 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge):
         f"Adding {num_na} Na+ and {num_cl} Cl- ions to the system for neutralization "
         f"and {c_ions} M salt concentration."
     )
+    if num_na == 0 and num_cl == 0:
+        logger.info("No ions to add; skipping ionization.")
+        return u_solvated, []
+
     u_ionized = ionize(
         u_solvated,
         num_na=num_na,

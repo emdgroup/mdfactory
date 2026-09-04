@@ -70,10 +70,14 @@ class BuildInput(BaseModel):
         if self.simulation_type == "bilayer":
             system_specific["z_padding"] = self.system.z_padding
             system_specific["monolayer"] = self.system.monolayer
-            system_specific["ionization"] = self.system.ionization.model_dump()
+            system_specific["ionization"] = (
+                self.system.ionization.model_dump() if self.system.ionization is not None else None
+            )
         elif self.simulation_type == "mixedbox":
             system_specific["target_density"] = self.system.target_density
-            system_specific["ionization"] = self.system.ionization.model_dump()
+            system_specific["ionization"] = (
+                self.system.ionization.model_dump() if self.system.ionization is not None else None
+            )
 
         return {
             "hash": self.hash,
