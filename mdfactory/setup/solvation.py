@@ -289,11 +289,16 @@ def ionize(u: mda.Universe, num_na: int, num_cl: int, seed: int = None, min_dist
         allatomindices - set(all_atoms_to_remove) - set(anion_indices) - set(cation_indices)
     )
     atomstokeep = u.atoms[atomstokeepindices]
-    anions = u.atoms[sorted(anion_indices)]
-    anions.residues.resids = np.arange(1, anions.n_atoms + 1)
-    cations = u.atoms[sorted(cation_indices)]
-    cations.residues.resids = np.arange(1, cations.n_atoms + 1)
-    newuniverse = mda.Merge(atomstokeep, cations, anions)
+    ion_groups = []
+    if cation_indices:
+        cations = u.atoms[sorted(cation_indices)]
+        cations.residues.resids = np.arange(1, cations.n_atoms + 1)
+        ion_groups.append(cations)
+    if anion_indices:
+        anions = u.atoms[sorted(anion_indices)]
+        anions.residues.resids = np.arange(1, anions.n_atoms + 1)
+        ion_groups.append(anions)
+    newuniverse = mda.Merge(atomstokeep, *ion_groups)
 
     n_atoms = len(newuniverse.atoms)
     n_atoms_orig = len(u.atoms)

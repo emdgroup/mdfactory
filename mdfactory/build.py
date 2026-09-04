@@ -656,10 +656,14 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge):
             f"{add_cl} Cl- ions for neutralization."
         )
 
+    c_ions = ion_config.concentration  # mol/l
+    if c_ions == 0 and add_na == 0 and add_cl == 0:
+        logger.info("No ions to add; skipping ionization.")
+        return u_solvated, []
+
     n_water = len(u_solvated.select_atoms("water").residues)
     if n_water == 0:
         raise ValueError("Cannot ionize system without water.")
-    c_ions = ion_config.concentration  # mol/l
     M_water = 55.55  # mol/l
     n_ions = np.ceil(c_ions * n_water / M_water).astype(int)
 
@@ -683,6 +687,9 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge):
     u_ionized.dimensions = u_solvated.dimensions
     logger.info(f"Added {n_ions} Na+/Cl- ions.")
 
-    na_spec = SingleMoleculeSpecies(count=num_na, smiles="[Na+]", resname="NA")
-    cl_spec = SingleMoleculeSpecies(count=num_cl, smiles="[Cl-]", resname="CL")
-    return u_ionized, [na_spec, cl_spec]
+    additional_species = []
+    if num_na > 0:
+        additional_species.append(SingleMoleculeSpecies(count=num_na, smiles="[Na+]", resname="NA"))
+    if num_cl > 0:
+        additional_species.append(SingleMoleculeSpecies(count=num_cl, smiles="[Cl-]", resname="CL"))
+    return u_ionized, additional_species
