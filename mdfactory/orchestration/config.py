@@ -243,6 +243,12 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
         Generic resource specification (``--gres``), e.g. ``"gpu:l40s:1"``.
     mem : str or None
         Memory per node (``--mem``), e.g. ``"32G"``.
+    exclusive : bool
+        Request an exclusive (whole-node) allocation. Parsl wires this to
+        ``SlurmProvider(exclusive=...)``, which adds ``#SBATCH --exclusive`` to
+        the job script when ``True``. Defaults to ``False`` so partial-node
+        requests (e.g. a few CPUs and one GPU) allocate and are billed only for
+        what was requested. Set to ``True`` to reserve the entire node.
     qos : str or None
         Quality of service (``--qos``).
     constraint : str or None
@@ -291,6 +297,7 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
     cpus_per_node: int = 12
     gres: str | None = None
     mem: str | None = None
+    exclusive: bool = False
     scheduler_options: str = ""
     launch_options: str = ""
     stage_overrides: dict[str, dict] = Field(
@@ -417,6 +424,7 @@ class SlurmExecutorConfig(ExecutorConfig, BaseSlurmConfig):
             cores_per_node=self.cpus_per_node,
             worker_init=self.environment.compose_worker_init(),
             scheduler_options=scheduler_options,
+            exclusive=self.exclusive,
             min_blocks=0,
             init_blocks=1,
             max_blocks=self.max_blocks,

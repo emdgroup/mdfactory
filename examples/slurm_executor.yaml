@@ -83,6 +83,11 @@ gmx_binary: auto
 # Directory where Parsl writes runinfo logs and monitoring DB.
 # run_dir: ~/.parsl/mdfactory
 
+# Reserve a whole node per allocation (adds #SBATCH --exclusive).
+# Default false: only the requested CPUs/GPUs are allocated (shared-node
+# scheduling). Set true to use a whole node.
+# exclusive: true
+
 # Extra raw #SBATCH lines appended to the job script.
 # scheduler_options: "#SBATCH --exclusive"
 

@@ -132,6 +132,7 @@ stage_overrides:
 | `cpus_per_node` | CPUs per node | `12` |
 | `gres` | GPU resources (`--gres`) | — |
 | `mem` | Memory per node (`--mem`) | — |
+| `exclusive` | Whole-node allocation (`--exclusive`); `false` allocates only requested resources | `false` |
 | `max_workers_per_node` | Parallel tasks per node | `1` |
 | `max_blocks` | Max concurrent SLURM allocations | `1` |
 | `available_accelerators` | GPU count or device IDs for `CUDA_VISIBLE_DEVICES` | `0` |
