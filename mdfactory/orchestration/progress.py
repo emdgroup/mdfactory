@@ -1,13 +1,6 @@
 # ABOUTME: Thread-safe progress tracking and shared Rich progress display loop
 # ABOUTME: Provides StageProgressTracker, run_progress_loop, and display_stage_progress
-"""Progress tracking and display for orchestration workflows.
-
-Provides :class:`StageProgressTracker`, a thread-safe tracker that worker
-threads report into, :func:`run_progress_loop`, a shared Rich-based
-Live/poll/render loop used by both build and simulate workflows, and
-:func:`display_stage_progress`, a convenience wrapper for simulation
-stage progress.
-"""
+"""Progress tracking and display for orchestration workflows."""
 
 from __future__ import annotations
 
@@ -16,10 +9,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from rich.progress import Progress
 
 
 class SimState(Enum):
@@ -152,43 +141,12 @@ def _get_block_status() -> str:
         return ""
 
 
-def run_progress_loop(
-    *,
-    setup: Callable[[Progress], None],
-    update: Callable[[Progress], bool],
-    render_extras: Callable[[], list] = lambda: [],
-    poll_interval: float = 2.0,
-) -> None:
-    """Run a Rich Live progress display with a poll loop.
-
-    Owns the shared column layout, ``Live``/``Group`` context, SLURM block
-    status rendering, and ``KeyboardInterrupt`` handling.  Callers provide
-    callbacks to set up progress bars, update state each tick, and
-    optionally render extra lines (e.g. an activity log).
-
-    Parameters
-    ----------
-    setup : callable
-        ``(progress: Progress) -> None``.  Called once to create progress
-        bar task(s) via ``progress.add_task(...)``.
-    update : callable
-        ``(progress: Progress) -> bool``.  Called each tick to refresh bar
-        state.  Must return ``True`` when the loop should exit.
-    render_extras : callable
-        ``() -> list``.  Returns additional Rich renderables (e.g.
-        ``Text`` lines) appended below the progress bars.
-    poll_interval : float
-        Seconds between ticks.
-
-    """
-    from rich.console import Console, Group
-    from rich.live import Live
+def _make_progress():
+    """Create a Rich Progress bar with the standard orchestration column layout."""
+    from rich.console import Console
     from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
-    from rich.text import Text
 
-    console = Console()
-
-    progress = Progress(
+    return Progress(
         TextColumn("{task.description}"),
         BarColumn(bar_width=40),
         MofNCompleteColumn(),
@@ -196,11 +154,27 @@ def run_progress_loop(
         TextColumn("[green]{task.fields[succeeded]} ✓[/]"),
         TextColumn("[red]{task.fields[failed]} ✗[/]"),
         TextColumn("[yellow]{task.fields[running]} ●[/]"),
-        console=console,
+        console=Console(),
         transient=False,
     )
 
-    setup(progress)
+
+def run_progress_loop(
+    progress,
+    *,
+    update: Callable[[], bool],
+    render_extras: Callable[[], list] = lambda: [],
+    poll_interval: float = 2.0,
+) -> None:
+    """Run a Live poll loop around a Progress bar until *update* returns ``True``.
+
+    Handles the SLURM block-status line and ``KeyboardInterrupt`` uniformly.
+    """
+    from rich.console import Group
+    from rich.live import Live
+    from rich.text import Text
+
+    console = progress.console
 
     def _render():
         parts: list = [progress]
@@ -213,7 +187,7 @@ def run_progress_loop(
     try:
         with Live(_render(), console=console, refresh_per_second=2) as live:
             while True:
-                done = update(progress)
+                done = update()
                 live.update(_render())
                 if done:
                     break
@@ -228,50 +202,32 @@ def display_stage_progress(
     *,
     poll_interval: float = 2.0,
 ) -> None:
-    """Poll the tracker and render Rich progress bars until all simulations finish.
-
-    Runs on the main thread.  Blocks until :meth:`StageProgressTracker.all_done`
-    returns ``True``.
-
-    Parameters
-    ----------
-    tracker : StageProgressTracker
-        Shared tracker updated by worker threads.
-    poll_interval : float
-        Seconds between display refreshes.
-
-    """
+    """Poll *tracker* and render Rich progress bars until all simulations finish."""
     total = len(tracker.sim_hashes)
-    task_ids: dict[str, object] = {}
+    progress = _make_progress()
 
-    def _setup(progress):
-        max_len = max(len(s) for s in tracker.stages)
-        for stage in tracker.stages:
-            tid = progress.add_task(
-                f"⚒ {stage:<{max_len}}",
-                total=total,
-                succeeded=0,
-                failed=0,
-                running=0,
-            )
-            task_ids[stage] = tid
+    task_ids = {}
+    max_len = max(len(s) for s in tracker.stages)
+    for stage in tracker.stages:
+        task_ids[stage] = progress.add_task(
+            f"⚒ {stage:<{max_len}}",
+            total=total,
+            succeeded=0,
+            failed=0,
+            running=0,
+        )
 
-    def _update(progress):
+    def _update():
         snap = tracker.snapshot()
         for stage in tracker.stages:
-            counts = snap[stage]
-            done = counts["succeeded"] + counts["failed"] + counts["skipped"]
+            c = snap[stage]
             progress.update(
                 task_ids[stage],
-                completed=done,
-                succeeded=counts["succeeded"],
-                failed=counts["failed"],
-                running=counts["running"],
+                completed=c["succeeded"] + c["failed"] + c["skipped"],
+                succeeded=c["succeeded"],
+                failed=c["failed"],
+                running=c["running"],
             )
         return tracker.all_done()
 
-    run_progress_loop(
-        setup=_setup,
-        update=_update,
-        poll_interval=poll_interval,
-    )
+    run_progress_loop(progress, update=_update, poll_interval=poll_interval)

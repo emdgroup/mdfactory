@@ -164,7 +164,7 @@ def _collect_results(results: list, hashes: list[str]) -> list[dict]:
     return list(results)
 
 
-from .progress import run_progress_loop  # noqa: E402
+from .progress import _make_progress, run_progress_loop  # noqa: E402
 
 
 def _is_running(future) -> bool:
@@ -243,58 +243,30 @@ def _wait_with_progress(
     result_transform=None,
     poll_interval: float = 2.0,
 ) -> list[dict]:
-    """Wait for futures with a live terminal progress display.
+    """Wait for futures with a live progress display and scrolling activity log.
 
-    Shows a progress bar with summary counts and a scrolling activity log
-    of recent completions/failures. Scales to any number of builds.
-
-    Per-future result handling is delegated to :func:`_poll_future`; SLURM
-    block status querying to :func:`_get_block_status`.  The shared
-    Live/poll/render loop is provided by :func:`run_progress_loop`.
-
-    Parameters
-    ----------
-    futures : list
-        List of Parsl AppFutures.
-    hashes : list[str], optional
-        Known hashes for each build (displayed in activity log).
-    label : str
-        Heading shown next to the progress bar.
-    result_transform : callable or None, optional
-        ``(raw_result, display_hash) -> dict`` applied to each successful
-        future's return value before it is stored.
-    poll_interval : float
-        Seconds between status polls.
-
-    Returns
-    -------
-    list[dict]
-        Result dicts for each future.
-
+    The shared Live/poll/render loop is provided by :func:`run_progress_loop`.
     """
     from rich.text import Text
 
     total = len(futures)
     results: list[dict | None] = [None] * total
     display_hashes = hashes or [f"build-{i}" for i in range(total)]
-
     succeeded = 0
     failed = 0
     max_activity = 12
     activity: list[Text] = []
-    task_id_holder: list = []
 
-    def _setup(progress):
-        tid = progress.add_task(
-            f"⚒ [bold]{label}[/]",
-            total=total,
-            succeeded=0,
-            failed=0,
-            running=0,
-        )
-        task_id_holder.append(tid)
+    progress = _make_progress()
+    task_id = progress.add_task(
+        f"⚒ [bold]{label}[/]",
+        total=total,
+        succeeded=0,
+        failed=0,
+        running=0,
+    )
 
-    def _update(progress):
+    def _update():
         nonlocal succeeded, failed
         done_count = 0
         for i, future in enumerate(futures):
@@ -310,10 +282,9 @@ def _wait_with_progress(
                 else:
                     succeeded += 1
                 done_count += 1
-
         running = sum(1 for i, f in enumerate(futures) if results[i] is None and _is_running(f))
         progress.update(
-            task_id_holder[0],
+            task_id,
             completed=succeeded + failed,
             succeeded=succeeded,
             failed=failed,
@@ -322,17 +293,14 @@ def _wait_with_progress(
         return done_count == total
 
     def _render_extras():
-        extras: list = []
-        if activity:
-            extras.append(Text(""))
-            extras.extend(activity[-max_activity:])
-        return extras
+        if not activity:
+            return []
+        return [Text(""), *activity[-max_activity:]]
 
     run_progress_loop(
-        setup=_setup,
+        progress,
         update=_update,
         render_extras=_render_extras,
         poll_interval=poll_interval,
     )
-
     return _collect_results(results, display_hashes)
