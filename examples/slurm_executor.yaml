@@ -89,7 +89,7 @@ gmx_binary: auto
 # exclusive: true
 
 # Extra raw #SBATCH lines appended to the job script.
-# scheduler_options: "#SBATCH --exclusive"
+# scheduler_options: "e.g. #SBATCH --distribution=block:cyclic"
 
 # Extra flags passed to srun when launching workers.
 # launch_options: "--mpi=pmix"
