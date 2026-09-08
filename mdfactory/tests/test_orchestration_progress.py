@@ -1,10 +1,11 @@
-# ABOUTME: Tests for per-stage simulation progress tracking
-# ABOUTME: Covers StageProgressTracker state transitions, thread safety, and result collection
-"""Tests for the per-stage progress tracker."""
+# ABOUTME: Tests for per-stage simulation progress tracking and shared progress loop
+# ABOUTME: Covers StageProgressTracker state transitions, thread safety, and run_progress_loop
+"""Tests for the progress tracker and shared progress loop."""
 
 import threading
+from unittest.mock import MagicMock, patch
 
-from mdfactory.orchestration.progress import StageProgressTracker
+from mdfactory.orchestration.progress import StageProgressTracker, run_progress_loop
 
 
 class TestStageProgressTracker:
@@ -138,3 +139,73 @@ class TestStageProgressTracker:
         assert snap["NVT"]["failed"] == 1
         assert snap["NPT"]["skipped"] == 1
         assert snap["Production"]["skipped"] == 1
+
+
+class TestRunProgressLoop:
+    """Unit tests for the shared run_progress_loop driver."""
+
+    @patch("mdfactory.orchestration.progress._get_block_status", return_value="")
+    @patch("rich.live.Live")
+    def test_setup_called_once(self, _mock_live, _mock_block):
+        """setup callback is invoked exactly once."""
+        setup = MagicMock()
+        update = MagicMock(return_value=True)
+
+        run_progress_loop(setup=setup, update=update)
+
+        setup.assert_called_once()
+
+    @patch("mdfactory.orchestration.progress._get_block_status", return_value="")
+    @patch("rich.live.Live")
+    def test_update_polled_until_done(self, _mock_live, _mock_block):
+        """update is called repeatedly until it returns True."""
+        setup = MagicMock()
+        # Return False twice, then True on third call.
+        update = MagicMock(side_effect=[False, False, True])
+
+        run_progress_loop(setup=setup, update=update, poll_interval=0.0)
+
+        assert update.call_count == 3
+
+    @patch("mdfactory.orchestration.progress._get_block_status", return_value="")
+    @patch("rich.live.Live")
+    def test_render_extras_called_each_tick(self, _mock_live, _mock_block):
+        """render_extras is called on every render (setup + each update)."""
+        setup = MagicMock()
+        update = MagicMock(side_effect=[False, True])
+        render_extras = MagicMock(return_value=[])
+
+        run_progress_loop(
+            setup=setup, update=update, render_extras=render_extras, poll_interval=0.0
+        )
+
+        # Called during initial render + once per update tick (2 ticks)
+        assert render_extras.call_count >= 2
+
+    @patch("mdfactory.orchestration.progress._get_block_status", return_value="")
+    @patch("rich.live.Live")
+    def test_keyboard_interrupt_reraised(self, mock_live_cls, _mock_block):
+        """KeyboardInterrupt during the loop is caught, printed, and re-raised."""
+        setup = MagicMock()
+        update = MagicMock(side_effect=KeyboardInterrupt)
+
+        import pytest
+
+        with pytest.raises(KeyboardInterrupt):
+            run_progress_loop(setup=setup, update=update)
+
+    @patch("mdfactory.orchestration.progress._get_block_status", return_value="")
+    @patch("rich.live.Live")
+    def test_setup_receives_progress_object(self, _mock_live, _mock_block):
+        """setup callback receives a Progress instance with the standard columns."""
+        from rich.progress import Progress
+
+        captured = {}
+
+        def _setup(progress):
+            captured["progress"] = progress
+
+        update = MagicMock(return_value=True)
+        run_progress_loop(setup=_setup, update=update)
+
+        assert isinstance(captured["progress"], Progress)

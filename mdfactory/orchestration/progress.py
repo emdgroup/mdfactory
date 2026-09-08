@@ -1,19 +1,25 @@
-# ABOUTME: Thread-safe progress tracking for per-stage simulation monitoring
-# ABOUTME: Provides StageProgressTracker and Rich progress display for EM/NVT/NPT/Production stages
-"""Per-stage progress tracking for simulation orchestration.
+# ABOUTME: Thread-safe progress tracking and shared Rich progress display loop
+# ABOUTME: Provides StageProgressTracker, run_progress_loop, and display_stage_progress
+"""Progress tracking and display for orchestration workflows.
 
 Provides :class:`StageProgressTracker`, a thread-safe tracker that worker
-threads report into, and :func:`display_stage_progress`, a Rich-based
-display that polls the tracker and renders one progress bar per simulation
-stage (EM, NVT, NPT, Production).
+threads report into, :func:`run_progress_loop`, a shared Rich-based
+Live/poll/render loop used by both build and simulate workflows, and
+:func:`display_stage_progress`, a convenience wrapper for simulation
+stage progress.
 """
 
 from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from rich.progress import Progress
 
 
 class SimState(Enum):
@@ -146,6 +152,77 @@ def _get_block_status() -> str:
         return ""
 
 
+def run_progress_loop(
+    *,
+    setup: Callable[[Progress], None],
+    update: Callable[[Progress], bool],
+    render_extras: Callable[[], list] = lambda: [],
+    poll_interval: float = 2.0,
+) -> None:
+    """Run a Rich Live progress display with a poll loop.
+
+    Owns the shared column layout, ``Live``/``Group`` context, SLURM block
+    status rendering, and ``KeyboardInterrupt`` handling.  Callers provide
+    callbacks to set up progress bars, update state each tick, and
+    optionally render extra lines (e.g. an activity log).
+
+    Parameters
+    ----------
+    setup : callable
+        ``(progress: Progress) -> None``.  Called once to create progress
+        bar task(s) via ``progress.add_task(...)``.
+    update : callable
+        ``(progress: Progress) -> bool``.  Called each tick to refresh bar
+        state.  Must return ``True`` when the loop should exit.
+    render_extras : callable
+        ``() -> list``.  Returns additional Rich renderables (e.g.
+        ``Text`` lines) appended below the progress bars.
+    poll_interval : float
+        Seconds between ticks.
+
+    """
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
+    from rich.text import Text
+
+    console = Console()
+
+    progress = Progress(
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TextColumn("·"),
+        TextColumn("[green]{task.fields[succeeded]} ✓[/]"),
+        TextColumn("[red]{task.fields[failed]} ✗[/]"),
+        TextColumn("[yellow]{task.fields[running]} ●[/]"),
+        console=console,
+        transient=False,
+    )
+
+    setup(progress)
+
+    def _render():
+        parts: list = [progress]
+        block_info = _get_block_status()
+        if block_info:
+            parts.append(Text.from_markup(f"  ▸ SLURM: {block_info}"))
+        parts.extend(render_extras())
+        return Group(*parts)
+
+    try:
+        with Live(_render(), console=console, refresh_per_second=2) as live:
+            while True:
+                done = update(progress)
+                live.update(_render())
+                if done:
+                    break
+                time.sleep(poll_interval)
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]Interrupted[/]")
+        raise
+
+
 def display_stage_progress(
     tracker: StageProgressTracker,
     *,
@@ -164,39 +241,22 @@ def display_stage_progress(
         Seconds between display refreshes.
 
     """
-    from rich.console import Console, Group
-    from rich.live import Live
-    from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
-    from rich.text import Text
-
-    console = Console()
     total = len(tracker.sim_hashes)
+    task_ids: dict[str, object] = {}
 
-    progress = Progress(
-        TextColumn("{task.description}"),
-        BarColumn(bar_width=40),
-        MofNCompleteColumn(),
-        TextColumn("·"),
-        TextColumn("[green]{task.fields[succeeded]} ✓[/]"),
-        TextColumn("[red]{task.fields[failed]} ✗[/]"),
-        TextColumn("[yellow]{task.fields[running]} ●[/]"),
-        console=console,
-        transient=False,
-    )
+    def _setup(progress):
+        max_len = max(len(s) for s in tracker.stages)
+        for stage in tracker.stages:
+            tid = progress.add_task(
+                f"⚒ {stage:<{max_len}}",
+                total=total,
+                succeeded=0,
+                failed=0,
+                running=0,
+            )
+            task_ids[stage] = tid
 
-    task_ids = {}
-    max_len = max(len(s) for s in tracker.stages)
-    for stage in tracker.stages:
-        tid = progress.add_task(
-            f"⚒ {stage:<{max_len}}",
-            total=total,
-            succeeded=0,
-            failed=0,
-            running=0,
-        )
-        task_ids[stage] = tid
-
-    def _render():
+    def _update(progress):
         snap = tracker.snapshot()
         for stage in tracker.stages:
             counts = snap[stage]
@@ -208,18 +268,10 @@ def display_stage_progress(
                 failed=counts["failed"],
                 running=counts["running"],
             )
-        parts: list = [progress]
-        block_info = _get_block_status()
-        if block_info:
-            parts.append(Text.from_markup(f"  ▸ SLURM: {block_info}"))
-        return Group(*parts)
+        return tracker.all_done()
 
-    try:
-        with Live(_render(), console=console, refresh_per_second=2) as live:
-            while not tracker.all_done():
-                time.sleep(poll_interval)
-                live.update(_render())
-            live.update(_render())
-    except KeyboardInterrupt:
-        console.print("\n[bold yellow]Interrupted[/]")
-        raise
+    run_progress_loop(
+        setup=_setup,
+        update=_update,
+        poll_interval=poll_interval,
+    )

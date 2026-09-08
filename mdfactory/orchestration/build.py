@@ -164,7 +164,7 @@ def _collect_results(results: list, hashes: list[str]) -> list[dict]:
     return list(results)
 
 
-from .progress import _get_block_status  # noqa: E402
+from .progress import run_progress_loop  # noqa: E402
 
 
 def _is_running(future) -> bool:
@@ -249,7 +249,8 @@ def _wait_with_progress(
     of recent completions/failures. Scales to any number of builds.
 
     Per-future result handling is delegated to :func:`_poll_future`; SLURM
-    block status querying to :func:`_get_block_status`.
+    block status querying to :func:`_get_block_status`.  The shared
+    Live/poll/render loop is provided by :func:`run_progress_loop`.
 
     Parameters
     ----------
@@ -271,83 +272,67 @@ def _wait_with_progress(
         Result dicts for each future.
 
     """
-    import time
-
-    from rich.console import Console, Group
-    from rich.live import Live
-    from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
     from rich.text import Text
 
     total = len(futures)
     results: list[dict | None] = [None] * total
     display_hashes = hashes or [f"build-{i}" for i in range(total)]
-    console = Console()
 
     succeeded = 0
     failed = 0
     max_activity = 12
     activity: list[Text] = []
+    task_id_holder: list = []
 
-    progress = Progress(
-        TextColumn(f"⚒ [bold]{label}[/]"),
-        BarColumn(bar_width=40),
-        MofNCompleteColumn(),
-        TextColumn("·"),
-        TextColumn("[green]{task.fields[succeeded]} ✓[/]"),
-        TextColumn("[red]{task.fields[failed]} ✗[/]"),
-        TextColumn("[yellow]{task.fields[running]} ●[/]"),
-        console=console,
-        transient=False,
-    )
-    task_id = progress.add_task("builds", total=total, succeeded=0, failed=0, running=0)
+    def _setup(progress):
+        tid = progress.add_task(
+            f"⚒ [bold]{label}[/]",
+            total=total,
+            succeeded=0,
+            failed=0,
+            running=0,
+        )
+        task_id_holder.append(tid)
 
-    def _render():
-        done_count = succeeded + failed
+    def _update(progress):
+        nonlocal succeeded, failed
+        done_count = 0
+        for i, future in enumerate(futures):
+            if results[i] is not None:
+                done_count += 1
+                continue
+            if future.done():
+                result, line = _poll_future(future, display_hashes[i], result_transform)
+                results[i] = result
+                activity.append(line)
+                if result.get("status") == "failed":
+                    failed += 1
+                else:
+                    succeeded += 1
+                done_count += 1
+
         running = sum(1 for i, f in enumerate(futures) if results[i] is None and _is_running(f))
         progress.update(
-            task_id,
-            completed=done_count,
+            task_id_holder[0],
+            completed=succeeded + failed,
             succeeded=succeeded,
             failed=failed,
             running=running,
         )
-        parts = [progress]
-        block_info = _get_block_status()
-        if block_info:
-            parts.append(Text.from_markup(f"  ▸ SLURM: {block_info}"))
+        return done_count == total
+
+    def _render_extras():
+        extras: list = []
         if activity:
-            parts.append(Text(""))
-            for line in activity[-max_activity:]:
-                parts.append(line)
-        return Group(*parts)
+            extras.append(Text(""))
+            extras.extend(activity[-max_activity:])
+        return extras
 
-    try:
-        with Live(_render(), console=console, refresh_per_second=2) as live:
-            while True:
-                done_count = 0
-                for i, future in enumerate(futures):
-                    if results[i] is not None:
-                        done_count += 1
-                        continue
-                    if future.done():
-                        result, line = _poll_future(future, display_hashes[i], result_transform)
-                        results[i] = result
-                        activity.append(line)
-                        if result.get("status") == "failed":
-                            failed += 1
-                        else:
-                            succeeded += 1
-                        done_count += 1
-
-                live.update(_render())
-
-                if done_count == total:
-                    break
-
-                time.sleep(poll_interval)
-
-    except KeyboardInterrupt:
-        console.print("\n[bold yellow]Interrupted[/]")
-        raise
+    run_progress_loop(
+        setup=_setup,
+        update=_update,
+        render_extras=_render_extras,
+        poll_interval=poll_interval,
+    )
 
     return _collect_results(results, display_hashes)
