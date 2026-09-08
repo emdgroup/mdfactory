@@ -203,26 +203,25 @@ def display_stage_progress(
     poll_interval: float = 2.0,
 ) -> None:
     """Poll *tracker* and render Rich progress bars until all simulations finish."""
-    total = len(tracker.sim_hashes)
-    progress = _make_progress()
-
-    task_ids = {}
+    total, progress = len(tracker.sim_hashes), _make_progress()
     max_len = max(len(s) for s in tracker.stages)
-    for stage in tracker.stages:
-        task_ids[stage] = progress.add_task(
+    task_ids = {
+        stage: progress.add_task(
             f"⚒ {stage:<{max_len}}",
             total=total,
             succeeded=0,
             failed=0,
             running=0,
         )
+        for stage in tracker.stages
+    }
 
     def _update():
         snap = tracker.snapshot()
-        for stage in tracker.stages:
+        for stage, tid in task_ids.items():
             c = snap[stage]
             progress.update(
-                task_ids[stage],
+                tid,
                 completed=c["succeeded"] + c["failed"] + c["skipped"],
                 succeeded=c["succeeded"],
                 failed=c["failed"],

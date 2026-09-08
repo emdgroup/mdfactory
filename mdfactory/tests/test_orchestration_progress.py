@@ -5,6 +5,8 @@
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from mdfactory.orchestration.progress import StageProgressTracker, run_progress_loop
 
 
@@ -141,42 +143,30 @@ class TestStageProgressTracker:
         assert snap["Production"]["skipped"] == 1
 
 
-class TestRunProgressLoop:
-    """Unit tests for the shared run_progress_loop driver."""
+_no_block = patch("mdfactory.orchestration.progress._get_block_status", return_value="")
+_no_live = patch("rich.live.Live")
 
-    def _progress(self):
-        from mdfactory.orchestration.progress import _make_progress
 
-        return _make_progress()
+def _progress():
+    from mdfactory.orchestration.progress import _make_progress
 
-    @patch("mdfactory.orchestration.progress._get_block_status", return_value="")
-    @patch("rich.live.Live")
-    def test_update_polled_until_done(self, _mock_live, _mock_block):
-        """update is called repeatedly until it returns True."""
-        update = MagicMock(side_effect=[False, False, True])
+    return _make_progress()
 
-        run_progress_loop(self._progress(), update=update, poll_interval=0.0)
 
-        assert update.call_count == 3
+@_no_block
+@_no_live
+def test_run_progress_loop_polls_until_done(_live, _block):
+    """update is called repeatedly until it returns True; render_extras each tick."""
+    update = MagicMock(side_effect=[False, False, True])
+    extras = MagicMock(return_value=[])
+    run_progress_loop(_progress(), update=update, render_extras=extras, poll_interval=0.0)
+    assert update.call_count == 3
+    assert extras.call_count >= 2
 
-    @patch("mdfactory.orchestration.progress._get_block_status", return_value="")
-    @patch("rich.live.Live")
-    def test_render_extras_called_each_tick(self, _mock_live, _mock_block):
-        """render_extras is called on every render."""
-        update = MagicMock(side_effect=[False, True])
-        render_extras = MagicMock(return_value=[])
 
-        run_progress_loop(
-            self._progress(), update=update, render_extras=render_extras, poll_interval=0.0
-        )
-
-        assert render_extras.call_count >= 2
-
-    @patch("mdfactory.orchestration.progress._get_block_status", return_value="")
-    @patch("rich.live.Live")
-    def test_keyboard_interrupt_reraised(self, _mock_live, _mock_block):
-        """KeyboardInterrupt during the loop is caught, printed, and re-raised."""
-        import pytest
-
-        with pytest.raises(KeyboardInterrupt):
-            run_progress_loop(self._progress(), update=MagicMock(side_effect=KeyboardInterrupt))
+@_no_block
+@_no_live
+def test_run_progress_loop_keyboard_interrupt(_live, _block):
+    """KeyboardInterrupt is caught, printed, and re-raised."""
+    with pytest.raises(KeyboardInterrupt):
+        run_progress_loop(_progress(), update=MagicMock(side_effect=KeyboardInterrupt))
