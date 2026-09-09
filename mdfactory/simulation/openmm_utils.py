@@ -393,7 +393,8 @@ def compress_box(
     -------
     mda.Universe
         Universe with compressed positions and updated box dimensions.
-        Positions are wrapped by residue.
+        Positions are wrapped by residue unless *protein_indices* is given, in
+        which case the caller is responsible for re-imaging the protein.
 
     """
     # TODO: use proper logging
@@ -499,7 +500,11 @@ def compress_box(
     ret = mda.Merge(u.atoms)
     ret.atoms.positions = u_tmp.atoms.positions
     ret.dimensions = u_tmp.dimensions
-    ret.atoms.positions = ret.atoms.wrap(compound="residues")
+    # A restrained protein ends up torn across the PBC boundary; wrapping by
+    # residue here would scatter its residues. The caller makes the protein
+    # whole and re-centers instead, so only wrap when there is no protein.
+    if protein_indices is None:
+        ret.atoms.positions = ret.atoms.wrap(compound="residues")
     return ret
 
 
