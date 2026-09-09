@@ -319,41 +319,6 @@ def test_stage_order_preservation(mock_sim_dir):
     assert needed == ["Production", "NPT", "EM", "NVT"]
 
 
-@patch("mdfactory.orchestration.simulate.parsl_session")
-@patch("mdfactory.orchestration.simulate._execute_stage_list")
-def test_wait_false_returns_futures(mock_execute, mock_session, mock_sim_dir):
-    """When wait=False, returns raw futures."""
-    mock_future = MagicMock()
-    mock_execute.return_value = mock_future
-
-    mock_session_obj = MagicMock()
-    mock_session.return_value.__enter__.return_value = mock_session_obj
-
-    results = run_simulations([mock_sim_dir], ExecutorConfig(), wait=False)
-
-    # Should return futures, not results
-    assert results == [mock_future]
-    # Session should be detached
-    mock_session_obj.detach.assert_called_once()
-
-
-@patch("mdfactory.orchestration.simulate.parsl_session")
-@patch("mdfactory.orchestration.simulate._execute_stage_list")
-def test_wait_false_emits_warning(mock_execute, mock_session, mock_sim_dir):
-    """wait=False logs a warning that raw futures resolve to None, not dicts."""
-    mock_execute.return_value = MagicMock()
-    mock_session.return_value.__enter__.return_value = MagicMock()
-
-    with patch("mdfactory.orchestration.simulate.logger") as mock_logger:
-        run_simulations([mock_sim_dir], ExecutorConfig(), wait=False)
-
-    # Warning must be emitted and mention the None / parsl.clear() contract
-    mock_logger.warning.assert_called()
-    warning_text = " ".join(str(a) for call in mock_logger.warning.call_args_list for a in call[0])
-    assert "None" in warning_text or "raw" in warning_text
-    assert "parsl.clear()" in warning_text
-
-
 def test_empty_sim_list():
     """Handle empty simulation list gracefully."""
     results = run_simulations([], ExecutorConfig(), dry_run=True)
@@ -1564,9 +1529,12 @@ def test_detect_needed_stages_with_restart_info_partial(tmp_path):
     assert items[0]["cpt_file"] == sim_dir / "nvt.cpt"
 
 
+@patch("mdfactory.orchestration.progress.display_stage_progress")
 @patch("mdfactory.orchestration.simulate.parsl_session")
 @patch("mdfactory.orchestration.simulate._execute_stage_list")
-def test_run_simulations_propagates_stage_restarts(mock_execute, mock_session, tmp_path):
+def test_run_simulations_propagates_stage_restarts(
+    mock_execute, mock_session, mock_display, tmp_path
+):
     """stage_restarts dict assembled from checkpoint detection is passed to _execute_stage_list."""
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()
@@ -1584,7 +1552,7 @@ def test_run_simulations_propagates_stage_restarts(mock_execute, mock_session, t
 
     from mdfactory.orchestration.config import ExecutorConfig
 
-    run_simulations([sim_dir], ExecutorConfig(), wait=False)
+    run_simulations([sim_dir], ExecutorConfig())
 
     # _execute_stage_list must be called; assert stage_restarts contains NVT entry
     assert mock_execute.called

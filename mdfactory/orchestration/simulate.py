@@ -38,7 +38,6 @@ def run_simulations(
     config: "ExecutorConfig",
     *,
     stages: list[str] | None = None,
-    wait: bool = True,
     dry_run: bool = False,
     clean: bool = False,
     checkpoint_mode: str = "auto",
@@ -54,8 +53,6 @@ def run_simulations(
         Parsl executor configuration (local or SLURM).
     stages : list[str], optional
         Stages to run. Default: ["EM", "NVT", "NPT", "Production"].
-    wait : bool
-        Wait for completion (default: True).
     dry_run : bool
         Preview plan without executing (default: False).
     clean : bool
@@ -75,7 +72,7 @@ def run_simulations(
     Returns
     -------
     list[dict]
-        Results with status, errors, timing (or futures if wait=False).
+        Results with status, errors, and timing per simulation.
 
     """
     valid_stages = [s.name for s in STAGE_REGISTRY]
@@ -181,55 +178,15 @@ def run_simulations(
         logger.info("All simulations already complete.")
         return skipped_results
 
-    # 6. Parsl session
-    with parsl_session(config) as session:
+    # 6. Parsl session: tracked execution with per-stage progress display
+    import threading
+
+    from .errors import _describe_failure
+    from .progress import StageProgressTracker, display_stage_progress
+
+    with parsl_session(config):
         grompp_app = get_grompp_app()
         mdrun_app = get_mdrun_app()
-
-        # wait=False: legacy path returning raw futures (no progress display)
-        if not wait:
-            from concurrent.futures import Future as StdFuture
-            from concurrent.futures import ThreadPoolExecutor
-
-            futures: list[tuple[str, object]] = []
-
-            def _run_pipeline_nowait(item):
-                return _execute_stage_list(
-                    item["sim_dir"],
-                    item["stages"],
-                    grompp_app,
-                    mdrun_app,
-                    stage_restarts=item.get("stage_restarts"),
-                    config=config,
-                    max_rescue=max_rescue,
-                )
-
-            with ThreadPoolExecutor() as pool:
-                thread_futs = [
-                    (item["hash"], pool.submit(_run_pipeline_nowait, item)) for item in active_items
-                ]
-                for h, tf in thread_futs:
-                    try:
-                        futures.append((h, tf.result()))
-                    except Exception as exc:
-                        logger.error(f"Pipeline failed for {h}: {exc}")
-                        failed_fut = StdFuture()
-                        failed_fut.set_exception(exc)
-                        futures.append((h, failed_fut))
-
-            logger.info(f"Submitted {len(futures)} simulation(s)")
-            logger.warning(
-                "Returning raw AppFuture objects — futures resolve to None (bash_app exit), "
-                "not status dicts.  Caller must call parsl.clear() when done."
-            )
-            session.detach()
-            return [fut for _, fut in futures]
-
-        # 7. wait=True: tracked execution with per-stage progress display
-        import threading
-
-        from .errors import _describe_failure
-        from .progress import StageProgressTracker, display_stage_progress
 
         all_hashes = [item["hash"] for item in active_items]
         tracker = StageProgressTracker(stages=stages, sim_hashes=all_hashes)
