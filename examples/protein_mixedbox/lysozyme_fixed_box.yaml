@@ -1,0 +1,39 @@
+simulation_type: protein_mixedbox
+engine: gromacs
+parametrization: charmm
+parametrization_config:
+  type: charmm
+  forcefield: charmm36m
+  water_model: tip3p
+  ignore_hydrogens: true
+
+system:
+  protein:
+    resname: LYZ
+    count: 1
+    pdb_path: ../proteinbox/1aki.pdb
+    chains: [A]
+    disulfide_bonds:
+      - [CYS6, CYS127]
+      - [CYS30, CYS115]
+      - [CYS64, CYS80]
+      - [CYS76, CYS94]
+    protonation_states:
+      HIS15: HIE
+  species:
+    - smiles: O
+      resname: SOL
+      concentration: 55.0
+    - smiles: CCO
+      resname: ETH
+      concentration: 1.0
+  sizing:
+    type: fixed_box
+    box_size: 72.0
+  padding: 12.0
+  concentration_volume_basis: protein_excluded
+  partial_specific_volume: 0.73
+  relax_steps: 10000
+  ionization:
+    neutralize: true
+    concentration: 0.15
