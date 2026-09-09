@@ -48,6 +48,7 @@ ANALYSIS_REGISTRY: dict[str, dict[str, Callable]] = {
         "lipid_rg": lipid_rg,
     },
     "mixedbox": {},
+    "protein_mixedbox": {},
 }
 
 # Register system_chemistry for all simulation types
