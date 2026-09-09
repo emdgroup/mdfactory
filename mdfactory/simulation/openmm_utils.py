@@ -187,6 +187,61 @@ def simulate_compression_until_density_reached(
     return densities, step, converged
 
 
+def simulate_compression_until_volume_reached(
+    simulation: app.Simulation, target_volume_nm3: float, steps: int = 100000
+) -> tuple[list[float], int, bool]:
+    """Run an NPT simulation until the box volume shrinks to a target value.
+
+    Step the simulation in 1000-step increments and stop early once the box
+    volume falls to or below *target_volume_nm3*. Used for the ``fixed_box``
+    protein_mixedbox sizing mode, where the requested box edge is authoritative
+    and the final density is emergent.
+
+    Parameters
+    ----------
+    simulation : openmm.app.Simulation
+        An initialized OpenMM simulation with a barostat.
+    target_volume_nm3 : float
+        Target box volume in nm^3.
+    steps : int, optional
+        Maximum number of MD steps. Default is 100000.
+
+    Returns
+    -------
+    volumes : list of float
+        Recorded box volumes in nm^3 at each reporting interval.
+    step : int
+        Total number of steps executed.
+    converged : bool
+        Whether the target volume was reached before *steps* was exhausted.
+
+    """
+    volumes = []
+    report_interval = 1000
+
+    converged = False
+    step = 0
+
+    for _ in range(1, steps // report_interval + 1):
+        simulation.step(report_interval)
+        step += report_interval
+
+        state = simulation.context.getState()
+        box_vectors = state.getPeriodicBoxVectors()
+
+        volume = (box_vectors[0][0] * box_vectors[1][1] * box_vectors[2][2]).value_in_unit(
+            unit.nanometer**3
+        )
+        volumes.append(volume)
+
+        print(f"Step {step:6d}: Volume = {volume:.2f} nm³ (target {target_volume_nm3:.2f} nm³)")
+        if volume <= target_volume_nm3:
+            converged = True
+            print(f"Volume reached target: {volume:.2f} nm³")
+            break
+    return volumes, step, converged
+
+
 def create_sphere(u, pdb, top, radius, steps: int = 100_000):
     """Compress a system into a sphere using a harmonic radial restraint.
 
@@ -287,11 +342,26 @@ def create_sphere(u, pdb, top, radius, steps: int = 100_000):
     return ret
 
 
-def compress_box(u, pdb, top, target_density=1.0, pressure=1000.0, steps_compression=200_000):
+def compress_box(
+    u,
+    pdb,
+    top,
+    target_density=1.0,
+    pressure=1000.0,
+    steps_compression=200_000,
+    target_volume=None,
+    protein_indices=None,
+    restraint_k=1000.0,
+):
     """Compress a periodic box to a target density using high-pressure NPT.
 
     Apply a Monte Carlo barostat at elevated pressure, minimize, and run
-    dynamics until the system density reaches *target_density*.
+    dynamics until the system density reaches *target_density* (or, when
+    *target_volume* is given, until the box shrinks to that volume). When
+    *protein_indices* is given, every listed atom is held with a harmonic
+    position restraint through both minimization and compression, so a
+    pdb2gmx-prepared protein stays fixed while solvent and solutes pack around
+    it.
 
     Parameters
     ----------
@@ -303,11 +373,21 @@ def compress_box(u, pdb, top, target_density=1.0, pressure=1000.0, steps_compres
     top : str or Path
         Path to the GROMACS topology file.
     target_density : float, optional
-        Target density in g/mL. Default is 1.0.
+        Target density in g/mL. Default is 1.0. Ignored when *target_volume*
+        is given.
     pressure : float, optional
         Barostat pressure in bar. Default is 1000.0.
     steps_compression : int, optional
         Maximum number of compression MD steps. Default is 200000.
+    target_volume : float or None, optional
+        Target box volume in Å^3. When given, compression stops once the box
+        reaches this volume instead of a target density (the ``fixed_box``
+        sizing mode). Default is None.
+    protein_indices : list of int or None, optional
+        0-based atom indices to hold with harmonic position restraints. Default
+        is None (no restraints).
+    restraint_k : float, optional
+        Restraint force constant in kJ/mol/nm^2. Default is 1000.0.
 
     Returns
     -------
@@ -326,6 +406,27 @@ def compress_box(u, pdb, top, target_density=1.0, pressure=1000.0, steps_compres
     system = top.createSystem(
         nonbondedMethod=app.PME, nonbondedCutoff=1.0 * unit.nanometer, constraints=app.HBonds
     )
+
+    # Hold the protein fixed so solvent and solutes compress around it.
+    if protein_indices is not None:
+        restraint_force = mm.CustomExternalForce("k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
+        restraint_force.addGlobalParameter(
+            "k", restraint_k * unit.kilojoules_per_mole / unit.nanometer**2
+        )
+        restraint_force.addPerParticleParameter("x0")
+        restraint_force.addPerParticleParameter("y0")
+        restraint_force.addPerParticleParameter("z0")
+        for idx in protein_indices:
+            pos = gro.positions[idx]
+            restraint_force.addParticle(
+                idx,
+                [
+                    pos[0].value_in_unit(unit.nanometer),
+                    pos[1].value_in_unit(unit.nanometer),
+                    pos[2].value_in_unit(unit.nanometer),
+                ],
+            )
+        system.addForce(restraint_force)
 
     barostat = mm.MonteCarloBarostat(
         pressure * unit.bar,
@@ -373,9 +474,15 @@ def compress_box(u, pdb, top, target_density=1.0, pressure=1000.0, steps_compres
     minimized_positions = simulation.context.getState(getPositions=True).getPositions()
     app.PDBFile.writeFile(simulation.topology, minimized_positions, open("min.pdb", "w"))
 
-    simulate_compression_until_density_reached(
-        simulation, mass=totalMass, steps=steps_compression, target_density=target_density
-    )
+    if target_volume is not None:
+        # target_volume is in Å^3; OpenMM box volumes are in nm^3 (1 nm^3 = 1000 Å^3).
+        simulate_compression_until_volume_reached(
+            simulation, target_volume_nm3=target_volume / 1000.0, steps=steps_compression
+        )
+    else:
+        simulate_compression_until_density_reached(
+            simulation, mass=totalMass, steps=steps_compression, target_density=target_density
+        )
 
     state = simulation.context.getState()
     positions = simulation.context.getState(getPositions=True).getPositions()
