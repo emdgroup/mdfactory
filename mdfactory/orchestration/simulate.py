@@ -1,53 +1,35 @@
 # ABOUTME: Main dispatcher for Parsl-based GROMACS simulation orchestration
-# ABOUTME: Handles checkpoint detection, dry-run, and progress monitoring
+# ABOUTME: Handles dry-run logging, stage execution, and progress monitoring
 """GROMACS simulation orchestration via Parsl.
 
 Provides :func:`run_simulations`, the main entry point for orchestrating
-GROMACS MD simulations via Parsl. Handles checkpoint detection, dry-run mode,
-and progress monitoring.
+GROMACS MD simulations via Parsl. Handles stage execution, dry-run mode,
+and progress monitoring.  Checkpoint detection lives in
+:mod:`.checkpoint`; trajectory validation in :mod:`.trajectory`.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
 from .apps import get_grompp_app, get_mdrun_app
+from .checkpoint import _detect_needed_stages_with_restart_info
 from .config import get_stage_config_or_none
 from .session import parsl_session
 from .stages import (
     STAGE_BY_NAME,
     STAGE_REGISTRY,
-    StageSpec,
     run_stage,
 )
-
-# Import MDAnalysis at module level for testability
-try:
-    import MDAnalysis as mda
-except ImportError:
-    mda = None
 
 if TYPE_CHECKING:
     from parsl import AppFuture
 
     from .config import ExecutorConfig
     from .progress import StageProgressTracker
-
-
-class _StageState(TypedDict):
-    """Checkpoint detection result for a single stage."""
-
-    status: str  # "complete" | "partial" | "not_started"
-    cpt_file: "Path | None"
-    restart: bool
-
-
-def _has_restart_pair(cpt_file: Path, tpr_file: Path) -> bool:
-    """Return True if both checkpoint and TPR files exist (restartable state)."""
-    return cpt_file.exists() and tpr_file.exists()
 
 
 def _bash_result_to_dict(raw: object, sim_hash: str) -> dict:
@@ -409,146 +391,6 @@ def clean_simulation_outputs(
     return existing
 
 
-def _detect_skip_mode_state(output_file: Path, cpt_file: Path, tpr_file: Path) -> _StageState:
-    """Return stage state for 'skip' mode: complete if output exists, partial if cpt+tpr exist."""
-    if output_file.exists():
-        return {"status": "complete", "cpt_file": None, "restart": False}
-    if _has_restart_pair(cpt_file, tpr_file):
-        return {"status": "partial", "cpt_file": cpt_file, "restart": True}
-    return {"status": "not_started", "cpt_file": None, "restart": False}
-
-
-def _detect_production_output_state(
-    sim_dir: Path,
-    cpt_file: Path,
-    tpr_file: Path,
-    traj_files: "tuple[str, ...]",
-) -> _StageState:
-    """Check Production trajectory completeness; restart from cpt if incomplete."""
-    expected_frames = _extract_expected_frames_from_mdp(sim_dir, "Production")
-    for traj_file in traj_files:
-        if _validate_trajectory_complete(sim_dir, traj_file, expected_frames):
-            return {"status": "complete", "cpt_file": None, "restart": False}
-    if _has_restart_pair(cpt_file, tpr_file):
-        return {"status": "partial", "cpt_file": cpt_file, "restart": True}
-    # All trajectory files incomplete and no checkpoint to restart from
-    return {"status": "partial", "cpt_file": None, "restart": False}
-
-
-def _detect_skip_stage_state(
-    sim_dir: Path,
-    spec: "StageSpec",
-    cpt_file: Path,
-    tpr_file: Path,
-) -> _StageState:
-    """Return stage state for 'skip' mode: file-existence only, no integrity checks."""
-    if spec.traj_files:
-        # Mirror auto mode: complete if ANY trajectory file exists (XTC or TRR).
-        if any((sim_dir / tf).exists() for tf in spec.traj_files):
-            return {"status": "complete", "cpt_file": None, "restart": False}
-        if _has_restart_pair(cpt_file, tpr_file):
-            return {"status": "partial", "cpt_file": cpt_file, "restart": True}
-        return {"status": "not_started", "cpt_file": None, "restart": False}
-    return _detect_skip_mode_state(sim_dir / spec.gro_out, cpt_file, tpr_file)
-
-
-def _detect_auto_output_state(
-    sim_dir: Path,
-    stage: str,
-    spec: "StageSpec",
-    cpt_file: Path,
-    tpr_file: Path,
-    prereq_cpt: "Path | None",
-) -> _StageState:
-    """Return stage state for 'auto' mode; validates prerequisite integrity before accepting."""
-    # Workflow integrity: prerequisite checkpoint must exist for the output to
-    # be trustworthy (e.g. npt.gro is only valid if nvt.cpt is present).
-    if prereq_cpt and not prereq_cpt.exists():
-        return {"status": "not_started", "cpt_file": None, "restart": False}
-    if stage == "Production":
-        return _detect_production_output_state(sim_dir, cpt_file, tpr_file, spec.traj_files)
-    return {"status": "complete", "cpt_file": None, "restart": False}
-
-
-def _detect_stage_state(sim_dir: Path, stage: str, mode: str = "auto") -> _StageState:
-    """Detect completion or partial progress of a stage given checkpoint *mode*."""
-    spec = STAGE_BY_NAME[stage]
-    cpt_file = sim_dir / spec.cpt_file
-    tpr_file = sim_dir / spec.tpr_file
-
-    if mode == "skip":
-        return _detect_skip_stage_state(sim_dir, spec, cpt_file, tpr_file)
-
-    # For trajectory stages (Production) any accepted file counts as output.
-    # For structure stages (EM/NVT/NPT) the single gro_out is the output.
-    if spec.traj_files:
-        output_exists = any(
-            (sim_dir / tf).exists() and (sim_dir / tf).stat().st_size > 0 for tf in spec.traj_files
-        )
-    else:
-        gro_out_file = sim_dir / spec.gro_out
-        output_exists = gro_out_file.exists() and gro_out_file.stat().st_size > 0
-
-    # Prerequisite checkpoint (for validating workflow integrity in auto mode)
-    prereq_cpt = sim_dir / spec.prereq_cpt if spec.prereq_cpt else None
-
-    if output_exists:
-        return _detect_auto_output_state(sim_dir, stage, spec, cpt_file, tpr_file, prereq_cpt)
-
-    # Check partial progress (checkpoint exists, output doesn't).
-    if _has_restart_pair(cpt_file, tpr_file):
-        if spec.traj_files:
-            # Trajectory stage (Production): stale checkpoint without a
-            # trajectory file cannot use -append — GROMACS would crash.
-            # Treat as not_started so grompp+mdrun run from scratch.
-            return {"status": "not_started", "cpt_file": None, "restart": False}
-        return {"status": "partial", "cpt_file": cpt_file, "restart": True}
-
-    return {"status": "not_started", "cpt_file": None, "restart": False}
-
-
-def _detect_needed_stages(sim_dir: Path, stages: list[str], mode: str) -> list[str]:
-    """Return stage names that still need to run (discards restart metadata)."""
-    return [
-        item["stage"] for item in _detect_needed_stages_with_restart_info(sim_dir, stages, mode)
-    ]
-
-
-def _detect_needed_stages_with_restart_info(
-    sim_dir: Path, stages: list[str], mode: str
-) -> list[dict]:
-    """Return stage work items ``[{"stage", "restart", "cpt_file"}, ...]`` for incomplete stages."""
-    if mode == "force":
-        return [{"stage": s, "restart": False, "cpt_file": None} for s in stages]
-
-    needed = []
-    for stage in stages:
-        state = _detect_stage_state(sim_dir, stage, mode)
-
-        if state["status"] == "complete":
-            continue  # Skip completed stages
-        elif state["status"] == "partial" and state["restart"]:
-            # Can resume from checkpoint
-            needed.append(
-                {
-                    "stage": stage,
-                    "restart": True,
-                    "cpt_file": state["cpt_file"],
-                }
-            )
-        else:
-            # Not started or can't restart - run from beginning
-            needed.append(
-                {
-                    "stage": stage,
-                    "restart": False,
-                    "cpt_file": None,
-                }
-            )
-
-    return needed
-
-
 def _execute_stage_list(
     sim_dir: Path,
     stages: list[str],
@@ -661,127 +503,6 @@ def _validate_stage_prerequisites(sim_dir: Path, first_stage: str) -> None:
             f"  2. Or force overwrite all:\n"
             f"     mdfactory simulate {sim_dir} --checkpoint force"
         )
-
-
-def _validate_trajectory_complete(
-    sim_dir: Path, traj_file: str, expected_frames: int | None = None
-) -> bool:
-    """Return True if *traj_file* exists, is readable via MDAnalysis, and has enough frames."""
-    traj_path = sim_dir / traj_file
-
-    if not traj_path.exists():
-        return False
-
-    # Quick check: empty file
-    if traj_path.stat().st_size == 0:
-        return False
-
-    # Try to read with MDAnalysis
-    try:
-        if mda is None:
-            raise ImportError("MDAnalysis not available")
-
-        # Find structure file for topology
-        structure_file = find_structure_file(sim_dir)
-        if not structure_file:
-            logger.warning(f"No structure file found in {sim_dir}, skipping frame check")
-            # Cannot validate frames without a topology — treat as incomplete so
-            # the caller can decide (partial restart will regenerate if needed).
-            return False
-
-        # Load trajectory and count frames
-        u = mda.Universe(str(structure_file), str(traj_path))
-        num_frames = len(u.trajectory)
-
-        logger.debug(f"{traj_file}: {num_frames} frames")
-
-        if expected_frames is not None:
-            return num_frames >= expected_frames
-        else:
-            # If no expectation, just check it's readable and non-trivial
-            return num_frames > 0
-
-    except Exception as e:
-        logger.warning(f"Trajectory validation failed for {traj_file}: {e}")
-        # A parse failure means the file is corrupt or truncated — not complete.
-        # Return False so the caller triggers a partial restart rather than
-        # silently skipping the stage on a bad trajectory.
-        return False
-
-
-#: Candidate structure files checked by :func:`find_structure_file` in
-#: priority order (most-equilibrated first), followed by the raw input.
-#: Derived from :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY` at
-#: import time — add a new stage to the registry and this list stays in sync
-#: automatically without any further edits to this module.
-_STRUCTURE_CANDIDATES: list[str] = [
-    spec.gro_out for spec in reversed(STAGE_REGISTRY) if spec.gro_out
-] + ["system.pdb"]
-
-
-def find_structure_file(sim_dir: Path) -> Path | None:
-    """Find the best available structure file in a simulation directory.
-
-    Checks candidates in GROMACS output priority order so that the most
-    equilibrated coordinates are used when available.  This is the canonical
-    priority list shared by trajectory validation (this module) and benchmark
-    pre-processing (:mod:`mdfactory.performance.benchmark`).
-
-    The candidate list is derived from
-    :data:`~mdfactory.orchestration.stages.STAGE_REGISTRY` at import time
-    (see :data:`_STRUCTURE_CANDIDATES`), so adding a new stage with a
-    ``gro_out`` field automatically extends the search without modifying this
-    function.
-
-    Parameters
-    ----------
-    sim_dir : Path
-        Simulation directory.
-
-    Returns
-    -------
-    Path or None
-        Path to the first existing structure file, or ``None`` if none of the
-        candidates are found.
-
-    Notes
-    -----
-    Priority order (highest to lowest):
-
-    1. Most-recently-added stage's ``.gro`` (most equilibrated)
-    2. …earlier stages in reverse registry order…
-    3. ``system.pdb`` — raw starting structure
-
-    """
-    for candidate in _STRUCTURE_CANDIDATES:
-        path = sim_dir / candidate
-        if path.exists():
-            return path
-    return None
-
-
-def _extract_expected_frames_from_mdp(sim_dir: Path, stage: str) -> int | None:
-    """Extract expected frame count from MDP file (nsteps / output_frequency)."""
-    from .mdp import get_mdp_value, parse_mdp
-
-    mdp_path = sim_dir / STAGE_BY_NAME.get(stage, STAGE_BY_NAME["Production"]).mdp_file
-    if not mdp_path.exists():
-        return None
-    try:
-        parsed = parse_mdp(mdp_path)
-        nsteps_val = get_mdp_value(parsed, "nsteps")
-        # XTC frequency preferred; fall back to TRR
-        nstxout_val = get_mdp_value(parsed, "nstxout_compressed") or get_mdp_value(
-            parsed, "nstxout"
-        )
-        if nsteps_val and nstxout_val:
-            nsteps = int(nsteps_val)
-            nstxout = int(nstxout_val)
-            if nstxout > 0:
-                return nsteps // nstxout
-    except Exception as e:
-        logger.debug(f"Could not parse MDP file: {e}")
-    return None
 
 
 def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[dict]:
