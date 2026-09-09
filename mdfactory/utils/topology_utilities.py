@@ -473,7 +473,47 @@ def extract_reusable_parts_from_cgenff_gmx_top(
     return "".join(lines[start:stop]), parameter_str, sections
 
 
-def merge_extra_parameter_itps(prm_files: list[str | Path]):
+def collect_forcefield_atomtypes(ff_dir: str | Path) -> set[str]:
+    """Return the atom type names defined by a bundled GROMACS force-field directory.
+
+    Scans every ``.itp`` file in ``ff_dir`` for ``[ atomtypes ]`` sections and
+    collects the first column (the type name) of each data line. Used to
+    deduplicate CGenFF small-molecule parameters against a CHARMM force field
+    that already bundles CGenFF, so a redefined atom type does not fail
+    ``grompp -maxwarn 0``.
+
+    Parameters
+    ----------
+    ff_dir : str or Path
+        Path to a bundled GROMACS ``.ff`` directory.
+
+    Returns
+    -------
+    set[str]
+        Atom type names defined anywhere in the force field.
+
+    """
+    atomtypes: set[str] = set()
+    for itp in sorted(Path(ff_dir).glob("*.itp")):
+        in_atomtypes = False
+        with open(itp) as fb:
+            for line in fb:
+                stripped = line.strip()
+                if not stripped or stripped.startswith((";", "#")):
+                    continue
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    in_atomtypes = stripped[1:-1].strip() == "atomtypes"
+                    continue
+                if in_atomtypes:
+                    atomtypes.add(stripped.split()[0])
+    return atomtypes
+
+
+def merge_extra_parameter_itps(
+    prm_files: list[str | Path],
+    exclude_atomtypes: set[str] | None = None,
+    drop_defaults: bool = False,
+):
     """Merge parameter sections from multiple CGenFF topology files.
 
     Extract parameter sections (atomtypes, bondtypes, etc.) from each file,
@@ -483,6 +523,13 @@ def merge_extra_parameter_itps(prm_files: list[str | Path]):
     ----------
     prm_files : list of str or Path
         Paths to GROMACS topology files containing parameter sections.
+    exclude_atomtypes : set[str] or None, optional
+        Atom type names to drop from the merged ``[ atomtypes ]`` section
+        because a bundled force field already defines them. The section header
+        is kept. Default is None (keep all atom types).
+    drop_defaults : bool, optional
+        If True, drop the ``[ defaults ]`` section entirely, because a bundled
+        force field already provides it. Default is False.
 
     Returns
     -------
@@ -494,10 +541,19 @@ def merge_extra_parameter_itps(prm_files: list[str | Path]):
     for prm in prm_files:
         *_, sections = extract_reusable_parts_from_cgenff_gmx_top(prm, must_have_moleculetype=False)
         for sn, sv in sections:
+            if drop_defaults and sn == "defaults":
+                continue
             sv_lines = [
                 line for line in sv.split("\n") if len(line) > 0 and not line.startswith(";")
             ]
             for svl in sv_lines:
+                if (
+                    exclude_atomtypes
+                    and sn == "atomtypes"
+                    and not svl.startswith("[")
+                    and svl.split()[0] in exclude_atomtypes
+                ):
+                    continue
                 if svl not in section_dict[sn]:
                     section_dict[sn].append(svl)
     params_clean = ""
