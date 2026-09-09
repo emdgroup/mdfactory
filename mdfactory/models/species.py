@@ -152,6 +152,38 @@ class SingleMoleculeSpecies(Species):
         return Descriptors.MolWt(ml)
 
 
+class SolutionSpecies(SingleMoleculeSpecies):
+    """Represent a solution molecule specified by an exact count or a molar concentration.
+
+    Used for the molecules packed around a protein in a protein_mixedbox: water
+    (expressed as ``smiles: O``), ions, and arbitrary SMILES solutes. Exactly one
+    of ``count`` or ``concentration`` must be given; fractions are not supported,
+    because the box packs an explicit number of each molecule or resolves a molar
+    concentration to a count against a chosen volume basis.
+    """
+
+    concentration: Optional[float] = Field(
+        None, description="Target molar concentration in mol/L (M).", ge=0.0
+    )
+
+    @model_validator(mode="after")
+    def check_fraction_or_count(self) -> "SolutionSpecies":
+        """Require exactly one of count or concentration and reject fractions.
+
+        Shadows the base ``Species`` validator (same method name) so a species
+        carrying only a concentration is not rejected for lacking a count.
+        """
+        if self.fraction is not None:
+            raise ValueError(
+                "SolutionSpecies does not support 'fraction'; provide 'count' or 'concentration'."
+            )
+        if (self.count is None) == (self.concentration is None):
+            raise ValueError(
+                "SolutionSpecies requires exactly one of 'count' or 'concentration'."
+            )
+        return self
+
+
 class LipidSpecies(SingleMoleculeSpecies):
     """Represent a lipid species with head, tail, and branch atom annotations."""
 

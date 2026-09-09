@@ -2,12 +2,18 @@
 # ABOUTME: Defines species counts, ionization, and composition validation
 """Pydantic models for system composition (mixedbox, bilayer, LNP, proteinbox)."""
 
-from typing import Optional
+from typing import Annotated, Literal, Optional
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
 
-from .species import LipidSpecies, ProteinSpecies, SingleMoleculeSpecies, Species
+from .species import (
+    LipidSpecies,
+    ProteinSpecies,
+    SingleMoleculeSpecies,
+    SolutionSpecies,
+    Species,
+)
 
 
 def distribute_counts(fractions: list[float], total: int) -> list[int]:
@@ -409,3 +415,117 @@ class ProteinBoxComposition(BaseModel):
     def charge(self) -> int:
         """Protein charge is not pre-computable; return 0 as placeholder."""
         return 0
+
+
+class FixedBoxSizing(BaseModel):
+    """Size the box to an explicit cubic edge; the final density is emergent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["fixed_box"] = Field("fixed_box", description="Sizing mode discriminator.")
+    box_size: float = Field(..., description="Cubic box edge length in Angstroms.", gt=0.0)
+
+
+class CountDensitySizing(BaseModel):
+    """Size the cubic box from the total protein + species mass and a target density."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["count_density"] = Field(
+        "count_density", description="Sizing mode discriminator."
+    )
+    target_density: float = Field(1.0, description="Target packing density in g/cm^3.", gt=0.0)
+
+
+SizingConfig = Annotated[
+    Annotated[FixedBoxSizing, Tag("fixed_box")]
+    | Annotated[CountDensitySizing, Tag("count_density")],
+    Discriminator("type"),
+]
+
+
+class ProteinMixedBoxComposition(BaseModel):
+    """Pack water, ions, and SMILES small molecules around one fixed protein.
+
+    The protein is prepared with pdb2gmx and held completely fixed while the
+    solution molecules are packed around it and compressed. Concentrations are
+    resolved to counts against the chosen volume basis at build time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    protein: ProteinSpecies
+    species: list[SolutionSpecies] = Field(
+        ...,
+        description="Solution molecules to pack, including water as an explicit 'smiles: O' species.",
+    )
+    sizing: SizingConfig = Field(..., description="How the final cubic box is sized.")
+    padding: float = Field(
+        10.0, description="Minimum distance from protein to box edge in Angstroms.", ge=0.0
+    )
+    concentration_volume_basis: Literal["protein_excluded", "box"] = Field(
+        "protein_excluded",
+        description=(
+            "Volume that molar concentrations are resolved against: the full box, or "
+            "the box minus the protein's displaced volume."
+        ),
+    )
+    partial_specific_volume: float = Field(
+        0.73,
+        description="Protein partial specific volume in mL/g, for displaced-volume estimation.",
+        gt=0.0,
+    )
+    relax_steps: int = Field(
+        10000,
+        description="OpenMM steps for the position-restrained relaxation of the packed system.",
+        ge=0,
+    )
+    ionization: IonizationConfig = Field(
+        default_factory=IonizationConfig, description="Configuration for ionization."
+    )
+
+    @model_validator(mode="after")
+    def check_fixed_box_fits_padding(self) -> "ProteinMixedBoxComposition":
+        """A fixed box must be wider than twice the padding to leave room for the protein.
+
+        The full protein-fits-with-padding check needs the protein extent from the
+        PDB and runs at build time; this catches the obviously-too-small case early.
+        """
+        if isinstance(self.sizing, FixedBoxSizing) and self.sizing.box_size <= 2 * self.padding:
+            raise ValueError(
+                f"box_size ({self.sizing.box_size} Å) must exceed 2 × padding "
+                f"({2 * self.padding} Å) to leave room for the protein."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_count_density_uses_counts(self) -> "ProteinMixedBoxComposition":
+        """count_density derives the box from total mass, so every species needs a count."""
+        if isinstance(self.sizing, CountDensitySizing):
+            by_concentration = [s.resname for s in self.species if s.count is None]
+            if by_concentration:
+                raise ValueError(
+                    "count_density sizing derives the box from total mass, so every "
+                    f"species must specify a 'count'; these use concentration: {by_concentration}."
+                )
+        return self
+
+    @property
+    def total_count(self) -> Optional[int]:
+        """Total resolved count (protein + counted species), or None if any is concentration-based."""
+        if any(s.count is None for s in self.species):
+            return None
+        return 1 + sum(s.count for s in self.species)
+
+    @property
+    def charge(self) -> int:
+        """Charge from solution species with resolved counts (ions).
+
+        The protein charge (unknown until pdb2gmx) and concentration-derived counts
+        are excluded; this mirrors ProteinBoxComposition's placeholder charge.
+        """
+        return sum(
+            s.count * s.charge
+            for s in self.species
+            if s.count is not None and s.charge is not None
+        )

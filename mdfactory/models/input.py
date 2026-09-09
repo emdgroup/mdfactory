@@ -13,9 +13,11 @@ from .composition import (
     LNPComposition,
     MixedBoxComposition,
     ProteinBoxComposition,
+    ProteinMixedBoxComposition,
 )
 from .parametrization import (
     CgenffConfig,
+    CharmmConfig,
     ParametrizationConfig,
     Pdb2gmxConfig,
     SmirnoffConfig,
@@ -28,24 +30,33 @@ type_mapping = {
     "bilayer": BilayerComposition,
     "lnp": LNPComposition,
     "proteinbox": ProteinBoxComposition,
+    "protein_mixedbox": ProteinMixedBoxComposition,
 }
 
 # Parametrizations each simulation type accepts. Proteins are parametrized with
-# gmx pdb2gmx; small-molecule systems use CGenFF or SMIRNOFF.
+# gmx pdb2gmx; small-molecule systems use CGenFF or SMIRNOFF. A protein packed
+# with small molecules uses the combined CHARMM/CGenFF parametrization.
 allowed_parametrizations = {
     "mixedbox": {"cgenff", "smirnoff"},
     "bilayer": {"cgenff", "smirnoff"},
     "lnp": {"cgenff", "smirnoff"},
     "proteinbox": {"pdb2gmx"},
+    "protein_mixedbox": {"charmm"},
 }
 
 
 class BuildInput(BaseModel):
     """Represent a complete simulation build specification with composition and parametrization."""
 
-    simulation_type: Literal["mixedbox", "bilayer", "lnp", "proteinbox"]
-    system: MixedBoxComposition | BilayerComposition | LNPComposition | ProteinBoxComposition
-    parametrization: Literal["cgenff", "smirnoff", "pdb2gmx"] = Field(
+    simulation_type: Literal["mixedbox", "bilayer", "lnp", "proteinbox", "protein_mixedbox"]
+    system: (
+        MixedBoxComposition
+        | BilayerComposition
+        | LNPComposition
+        | ProteinBoxComposition
+        | ProteinMixedBoxComposition
+    )
+    parametrization: Literal["cgenff", "smirnoff", "pdb2gmx", "charmm"] = Field(
         "cgenff", description="Parametrization to use."
     )
     parametrization_config: ParametrizationConfig | None = Field(
@@ -96,6 +107,15 @@ class BuildInput(BaseModel):
             system_specific["ionization"] = self.system.ionization.model_dump()
         elif self.simulation_type == "proteinbox":
             system_specific["padding"] = self.system.padding
+            system_specific["ionization"] = self.system.ionization.model_dump()
+            system_specific["pdb_path"] = str(self.system.protein.pdb_path)
+        elif self.simulation_type == "protein_mixedbox":
+            system_specific["padding"] = self.system.padding
+            system_specific["sizing"] = self.system.sizing.model_dump()
+            system_specific["concentration_volume_basis"] = (
+                self.system.concentration_volume_basis
+            )
+            system_specific["partial_specific_volume"] = self.system.partial_specific_volume
             system_specific["ionization"] = self.system.ionization.model_dump()
             system_specific["pdb_path"] = str(self.system.protein.pdb_path)
 
@@ -188,6 +208,8 @@ class BuildInput(BaseModel):
                 object.__setattr__(self, "parametrization_config", CgenffConfig())
             elif self.parametrization == "pdb2gmx":
                 object.__setattr__(self, "parametrization_config", Pdb2gmxConfig())
+            elif self.parametrization == "charmm":
+                object.__setattr__(self, "parametrization_config", CharmmConfig())
         return self
 
     @model_validator(mode="after")
@@ -208,14 +230,14 @@ class BuildInput(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def validate_proteinbox_chain_config(self) -> "BuildInput":
+    def validate_protein_chain_config(self) -> "BuildInput":
         """Reject declaring chains while also merging them into one moleculetype.
 
         merge_all fuses every chain into a single ``Protein`` moleculetype, which
         contradicts protein.chains declaring subunits to build separately. Catching
         this here avoids a confusing chain-mismatch failure deep inside pdb2gmx.
         """
-        if self.simulation_type != "proteinbox":
+        if self.simulation_type not in ("proteinbox", "protein_mixedbox"):
             return self
         if getattr(self.parametrization_config, "merge_all", False) and self.system.protein.chains:
             raise ValueError(

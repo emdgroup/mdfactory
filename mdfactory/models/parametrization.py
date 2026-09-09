@@ -31,6 +31,33 @@ def validate_absolute_path(path: Path):
 AbsoluteFilePath = Annotated[FilePath, AfterValidator(validate_absolute_path)]
 
 
+def _validate_charmm_forcefield_and_water(forcefield: str, water_model: str) -> None:
+    """Reject force fields and water models the CHARMM run schedules cannot honor.
+
+    The run schedules use CHARMM Force-switch LJ (cutoff, not LJ-PME) and solvate
+    with 3-site spc216 coordinates, so a non-CHARMM force field, an LJ-PME variant,
+    or a non-3-site water model would silently mismatch the mdp settings.
+    """
+    if not forcefield.lower().startswith("charmm"):
+        raise ValueError(
+            f"Force field '{forcefield}' is not supported. The run schedule uses "
+            "CHARMM Force-switch LJ settings, so only CHARMM force fields (e.g. "
+            "charmm36m, charmm36, charmm27) are supported."
+        )
+    if "ljpme" in forcefield.lower():
+        raise ValueError(
+            f"Force field '{forcefield}' is not supported. The run schedule uses "
+            "cutoff/Force-switch LJ, which is incompatible with an LJ-PME force "
+            "field. Use the standard CHARMM variant (e.g. charmm36m)."
+        )
+    if water_model.lower() not in SUPPORTED_WATER_MODELS:
+        raise ValueError(
+            f"Water model '{water_model}' is not supported. Solvation uses 3-site "
+            "spc216 coordinates, so only 3-site water models are supported: "
+            f"{sorted(SUPPORTED_WATER_MODELS)}."
+        )
+
+
 class SmirnoffConfig(BaseModel):
     """Configuration for SMIRNOFF parametrization."""
 
@@ -81,31 +108,42 @@ class Pdb2gmxConfig(BaseModel):
     @model_validator(mode="after")
     def check_supported_forcefield_and_water(self) -> "Pdb2gmxConfig":
         """Reject force fields and water models the proteinbox pipeline cannot honor."""
-        if not self.forcefield.lower().startswith("charmm"):
-            raise ValueError(
-                f"Force field '{self.forcefield}' is not supported. The proteinbox "
-                "pipeline uses CHARMM Force-switch LJ settings, so only CHARMM force "
-                "fields (e.g. charmm36m, charmm36, charmm27) are supported."
-            )
-        if "ljpme" in self.forcefield.lower():
-            raise ValueError(
-                f"Force field '{self.forcefield}' is not supported. The proteinbox "
-                "run schedule uses cutoff/Force-switch LJ, which is incompatible with "
-                "an LJ-PME force field. Use the standard CHARMM variant (e.g. charmm36m)."
-            )
-        if self.water_model.lower() not in SUPPORTED_WATER_MODELS:
-            raise ValueError(
-                f"Water model '{self.water_model}' is not supported. Solvation uses "
-                "3-site spc216 coordinates, so only 3-site water models are supported: "
-                f"{sorted(SUPPORTED_WATER_MODELS)}."
-            )
+        _validate_charmm_forcefield_and_water(self.forcefield, self.water_model)
+        return self
+
+
+class CharmmConfig(BaseModel):
+    """Configuration for CHARMM parametrization of a protein packed with small molecules.
+
+    Protein atoms are built with gmx pdb2gmx and ordinary SMILES solutes with
+    CGenFF under one compatible CHARMM/CGenFF force-field family; native water and
+    supported CHARMM ions skip CGenFF.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: Literal["charmm"] = Field("charmm", description="Config type discriminator.")
+    forcefield: str = Field(
+        "charmm36m", description="Force field name as recognized by gmx pdb2gmx."
+    )
+    water_model: str = Field("tip3p", description="Water model name as recognized by gmx pdb2gmx.")
+    ignore_hydrogens: bool = Field(
+        True, description="Ignore hydrogens in input PDB (regenerate with pdb2gmx)."
+    )
+    merge_all: bool = Field(False, description="Merge all chains into a single moleculetype.")
+
+    @model_validator(mode="after")
+    def check_supported_forcefield_and_water(self) -> "CharmmConfig":
+        """Reject force fields and water models the protein_mixedbox pipeline cannot honor."""
+        _validate_charmm_forcefield_and_water(self.forcefield, self.water_model)
         return self
 
 
 ParametrizationConfig = Annotated[
     Annotated[SmirnoffConfig, Tag("smirnoff")]
     | Annotated[CgenffConfig, Tag("cgenff")]
-    | Annotated[Pdb2gmxConfig, Tag("pdb2gmx")],
+    | Annotated[Pdb2gmxConfig, Tag("pdb2gmx")]
+    | Annotated[CharmmConfig, Tag("charmm")],
     Discriminator("type"),
 ]
 
