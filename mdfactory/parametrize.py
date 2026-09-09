@@ -11,6 +11,7 @@ from .models.parametrization import CgenffConfig, GromacsSingleMoleculeParameter
 from .models.species import SingleMoleculeSpecies
 from .settings import settings
 from .utils.topology_utilities import (
+    collect_forcefield_atomtypes,
     count_contiguous_strings,
     extract_reusable_parts_from_cgenff_gmx_top,
     merge_extra_parameter_itps,
@@ -494,6 +495,188 @@ def generate_gromacs_topology(u, species, parameters, system_name) -> str:
 
     with open("topology.top", "w") as fb:
         fb.write(top_str)
+
+
+def _read_include_layout(
+    lines: list[str],
+) -> tuple[int | None, int | None, int | None, int | None]:
+    """Locate the force-field, water, system, and [ molecules ] anchors in a pdb2gmx topology.
+
+    A pdb2gmx topology includes ``forcefield.itp`` first, then (after the protein
+    moleculetypes) the water and ion topologies, then ``[ system ]``, and ends
+    with ``[ molecules ]``. Returns the line indices of the ``forcefield.itp``
+    include, the first non-forcefield force-field include (the water topology),
+    the ``[ system ]`` header, and the ``[ molecules ]`` header, any of which may
+    be None if absent.
+    """
+    ff_include_idx = None
+    water_include_idx = None
+    system_idx = None
+    molecules_idx = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#include") and '"' in stripped:
+            include_path = stripped.split('"')[1]
+            if ".ff/" not in include_path:
+                continue
+            if "forcefield.itp" in include_path:
+                if ff_include_idx is None:
+                    ff_include_idx = i
+            elif ff_include_idx is not None and water_include_idx is None:
+                water_include_idx = i
+        elif stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip().lower()
+            if section == "system" and system_idx is None:
+                system_idx = i
+            elif section == "molecules" and molecules_idx is None:
+                molecules_idx = i
+    return ff_include_idx, water_include_idx, system_idx, molecules_idx
+
+
+def generate_gromacs_topology_with_protein(
+    protein_top_path: Path,
+    ff_dir: Path,
+    species: list,
+    parameters: list[GromacsSingleMoleculeParameterSet],
+    counts: list[int],
+    system_name: str,
+    out_path: Path = Path("topology.top"),
+) -> None:
+    """Write one GROMACS topology for a pdb2gmx protein packed with solution molecules.
+
+    Builds a single composite topology in strict include order: the bundled
+    CHARMM force field, the merged CGenFF small-molecule parameters (with
+    ``[ atomtypes ]`` de-duplicated against the force field and ``[ defaults ]``
+    dropped, because the force field already bundles CGenFF), the protein
+    moleculetypes and position restraints from pdb2gmx, the CGenFF
+    small-molecule moleculetypes, and finally the water and ion topologies the
+    pdb2gmx topology already includes. The ``[ molecules ]`` section keeps the
+    protein chain entries and appends the solution molecules in the order given,
+    so it matches a coordinate file ordered protein → small molecules → water →
+    ions.
+
+    Native species (water and supported ions) carry no ``parameter_itp`` and use
+    the moleculetypes the pdb2gmx force-field includes already provide; only
+    CGenFF small molecules contribute an ``.itp`` include and merged parameters.
+
+    Parameters
+    ----------
+    protein_top_path : Path
+        Local pdb2gmx topology whose force-field ``#include`` lines resolve from
+        its own directory (force field already bundled alongside it).
+    ff_dir : Path
+        The bundled force-field directory, scanned for atom types to de-duplicate.
+    species : list
+        Non-protein solution species, in the coordinate/packing order.
+    parameters : list[GromacsSingleMoleculeParameterSet]
+        Parameter sets aligned with ``species``.
+    counts : list[int]
+        Actual molecule count for each species, aligned with ``species``.
+    system_name : str
+        Name written into the ``[ system ]`` section (inherited from pdb2gmx).
+    out_path : Path, optional
+        Destination topology path. Its parent receives the merged parameter file
+        and copied small-molecule ITPs. Default ``topology.top`` in the cwd.
+
+    """
+    if not (len(species) == len(parameters) == len(counts)):
+        raise ValueError("species, parameters, and counts must have equal length.")
+
+    out_path = Path(out_path)
+    out_dir = out_path.parent
+
+    lines = protein_top_path.read_text().splitlines(keepends=True)
+    ff_include_idx, water_include_idx, system_idx, molecules_idx = _read_include_layout(lines)
+    if ff_include_idx is None:
+        raise RuntimeError(
+            f"No force-field include found in {protein_top_path}; cannot build composite topology."
+        )
+    if molecules_idx is None:
+        raise RuntimeError(
+            f"No [ molecules ] section found in {protein_top_path}; cannot build composite topology."
+        )
+
+    # CGenFF small molecules carry a parameter_itp; native water/ions do not and
+    # reuse the moleculetypes the pdb2gmx force-field includes already provide.
+    cgenff_parameters = [par for par in parameters if par.parameter_itp is not None]
+
+    extra_params_include = ""
+    if cgenff_parameters:
+        exclude_atomtypes = collect_forcefield_atomtypes(ff_dir)
+        prm_files = sorted({str(par.parameter_itp) for par in cgenff_parameters})
+        merged = merge_extra_parameter_itps(
+            prm_files, exclude_atomtypes=exclude_atomtypes, drop_defaults=True
+        )
+        params_path = out_dir / "extra_params.itp"
+        with open(params_path, "w") as fb:
+            fb.write(f"; merged from {prm_files}\n")
+            fb.write(merged)
+        extra_params_include = '#include "extra_params.itp"\n'
+
+    # Copy each unique small-molecule ITP next to the topology and include it once.
+    smallmol_include_block = ""
+    copied_itps: set[str] = set()
+    for par in cgenff_parameters:
+        itp_name = par.itp.name
+        if itp_name in copied_itps:
+            continue
+        shutil.copy(par.itp, out_dir / itp_name)
+        copied_itps.add(itp_name)
+        smallmol_include_block += f'#include "{itp_name}"\n'
+
+    # Copy everything up to [ molecules ], inserting the merged parameters right
+    # after the force field and the small-molecule moleculetypes before water,
+    # and replacing the [ system ] title with system_name.
+    new_lines: list[str] = []
+    system_title_written = False
+    for i in range(molecules_idx):
+        line = lines[i]
+        if i == water_include_idx and smallmol_include_block:
+            new_lines.append("; Include CGenFF small-molecule topologies\n")
+            new_lines.append(smallmol_include_block)
+        stripped = line.strip()
+        if (
+            system_idx is not None
+            and i > system_idx
+            and not system_title_written
+            and stripped
+            and not stripped.startswith(";")
+        ):
+            new_lines.append(f"{system_name}\n")
+            system_title_written = True
+            continue
+        new_lines.append(line)
+        if i == ff_include_idx and extra_params_include:
+            new_lines.append("; Include merged CGenFF parameters\n")
+            new_lines.append(extra_params_include)
+
+    # A single-chain protein has no water include; append the small-molecule
+    # moleculetypes after the protein block when they were not inserted above.
+    if smallmol_include_block and water_include_idx is None:
+        new_lines.append("; Include CGenFF small-molecule topologies\n")
+        new_lines.append(smallmol_include_block)
+
+    # Keep the protein chain entries pdb2gmx wrote, then append the solution
+    # molecules in coordinate order.
+    protein_mol_lines = []
+    for i in range(molecules_idx + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith(";"):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            break
+        protein_mol_lines.append(stripped)
+
+    new_lines.append("[ molecules ]\n")
+    new_lines.append("; Compound        #mols\n")
+    for mol_line in protein_mol_lines:
+        new_lines.append(mol_line + "\n")
+    for spec, par, count in zip(species, parameters, counts):
+        if count <= 0:
+            continue
+        new_lines.append(f"{par.moleculetype:<20s} {count}  ; {spec.resname}, {spec.smiles}\n")
+
+    out_path.write_text("".join(new_lines))
 
 
 DISPATCH_ENGINE_PARAMETRIZE = {
