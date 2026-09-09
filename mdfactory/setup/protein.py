@@ -854,6 +854,77 @@ def _sum_charges_from_itp(itp_path: Path) -> float:
     return total
 
 
+def extract_mass_from_topology(top_path: Path) -> float:
+    """Parse the topology file to determine the total protein mass in Daltons.
+
+    Reads the [ atoms ] section(s) and sums the mass column (the eighth field),
+    following local ``#include`` files (protein chains) but not force-field
+    library files.
+
+    Parameters
+    ----------
+    top_path : Path
+        Path to the GROMACS .top file.
+
+    Returns
+    -------
+    float
+        Total mass in Daltons.
+
+    """
+    total_mass = 0.0
+    in_atoms = False
+
+    with open(top_path) as f:
+        for line in f:
+            stripped = line.strip()
+
+            if stripped.startswith("#include"):
+                include_path = stripped.split('"')[1] if '"' in stripped else None
+                if include_path and ".ff/" not in include_path:
+                    itp_path = top_path.parent / include_path
+                    if itp_path.is_file():
+                        total_mass += _sum_masses_from_itp(itp_path)
+                continue
+
+            if stripped.startswith("["):
+                section = stripped.strip("[] ").lower()
+                in_atoms = section == "atoms"
+                continue
+
+            if in_atoms and stripped and not stripped.startswith(";"):
+                parts = stripped.split()
+                if len(parts) >= 8:
+                    try:
+                        total_mass += float(parts[7])
+                    except (ValueError, IndexError):
+                        pass
+
+    return total_mass
+
+
+def _sum_masses_from_itp(itp_path: Path) -> float:
+    """Sum masses from the [ atoms ] section of an .itp file."""
+    total = 0.0
+    in_atoms = False
+
+    with open(itp_path) as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("["):
+                section = stripped.strip("[] ").lower()
+                in_atoms = section == "atoms"
+                continue
+            if in_atoms and stripped and not stripped.startswith(";"):
+                parts = stripped.split()
+                if len(parts) >= 8:
+                    try:
+                        total += float(parts[7])
+                    except (ValueError, IndexError):
+                        pass
+    return total
+
+
 def update_topology_molecules(
     top_path: Path, n_water: int, num_na: int, num_cl: int, water_name: str = "SOL"
 ) -> None:

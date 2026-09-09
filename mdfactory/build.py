@@ -23,7 +23,11 @@ from .models.parametrization import SmirnoffConfig
 from .models.species import SingleMoleculeSpecies
 from .run_schedules import RunScheduleManager
 from .setup.solvation import ionize, solvate
-from .utils.setup_utilities import create_bilayer_from_model, create_mixed_box_universe
+from .utils.setup_utilities import (
+    N_AVOGADRO,
+    create_bilayer_from_model,
+    create_mixed_box_universe,
+)
 from .utils.utilities import working_directory
 
 
@@ -621,7 +625,7 @@ def merge_lnp_components(
     return u_equil
 
 
-def ionize_solvated_system(ion_config, u_solvated, total_charge):
+def ionize_solvated_system(ion_config, u_solvated, total_charge, solvent_volume_a3=None):
     """Add ions for neutralization and salt concentration.
 
     Parameters
@@ -632,6 +636,11 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge):
         Solvated system universe
     total_charge : int
         Total charge of the system before ionization
+    solvent_volume_a3 : float or None, optional
+        Volume in Å³ to resolve the salt concentration against. When given, the
+        salt pair count is ``round(concentration · volume · N_A)`` on that volume
+        (the protein_mixedbox concentration-volume basis). When None, the count
+        is estimated from the water-molecule count as ``ceil(c · n_water / 55.55)``.
 
     Returns
     -------
@@ -661,8 +670,13 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge):
     if n_water == 0:
         raise ValueError("Cannot ionize system without water.")
     c_ions = ion_config.concentration  # mol/l
-    M_water = 55.55  # mol/l
-    n_ions = np.ceil(c_ions * n_water / M_water).astype(int)
+    if solvent_volume_a3 is not None:
+        # 1 Å³ = 1e-27 L, so n_salt = concentration[mol/L] * V[L] * N_A.
+        v_liters = solvent_volume_a3 * 1e-27
+        n_ions = int(round(c_ions * v_liters * N_AVOGADRO))
+    else:
+        M_water = 55.55  # mol/l
+        n_ions = np.ceil(c_ions * n_water / M_water).astype(int)
 
     num_na = n_ions + add_na
     num_cl = n_ions + add_cl
