@@ -12,8 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TypedDict
 
-from loguru import logger
-
 from .stages import STAGE_BY_NAME, StageSpec
 from .trajectory import _extract_expected_frames_from_mdp, _validate_trajectory_complete
 
@@ -146,26 +144,8 @@ def _detect_needed_stages_with_restart_info(
     needed = []
     for stage in stages:
         state = _detect_stage_state(sim_dir, stage, mode)
-
         if state["status"] == "complete":
-            continue  # Skip completed stages
-        elif state["status"] == "partial" and state["restart"]:
-            # Can resume from checkpoint
-            needed.append(
-                {
-                    "stage": stage,
-                    "restart": True,
-                    "cpt_file": state["cpt_file"],
-                }
-            )
-        else:
-            # Not started or can't restart - run from beginning
-            needed.append(
-                {
-                    "stage": stage,
-                    "restart": False,
-                    "cpt_file": None,
-                }
-            )
+            continue
+        needed.append({"stage": stage, "restart": state["restart"], "cpt_file": state["cpt_file"]})
 
     return needed

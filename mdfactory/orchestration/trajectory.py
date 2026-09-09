@@ -82,41 +82,34 @@ def _validate_trajectory_complete(
     if not traj_path.exists():
         return False
 
-    # Quick check: empty file
     if traj_path.stat().st_size == 0:
         return False
 
-    # Try to read with MDAnalysis
+    if mda is None:
+        logger.warning(f"Trajectory validation skipped for {traj_file}: MDAnalysis not available")
+        return False
+
+    structure_file = find_structure_file(sim_dir)
+    if not structure_file:
+        # Cannot validate frames without a topology — treat as incomplete so
+        # the caller can decide (partial restart will regenerate if needed).
+        logger.warning(f"No structure file found in {sim_dir}, skipping frame check")
+        return False
+
     try:
-        if mda is None:
-            raise ImportError("MDAnalysis not available")
-
-        # Find structure file for topology
-        structure_file = find_structure_file(sim_dir)
-        if not structure_file:
-            logger.warning(f"No structure file found in {sim_dir}, skipping frame check")
-            # Cannot validate frames without a topology — treat as incomplete so
-            # the caller can decide (partial restart will regenerate if needed).
-            return False
-
-        # Load trajectory and count frames
         u = mda.Universe(str(structure_file), str(traj_path))
         num_frames = len(u.trajectory)
-
-        logger.debug(f"{traj_file}: {num_frames} frames")
-
-        if expected_frames is not None:
-            return num_frames >= expected_frames
-        else:
-            # If no expectation, just check it's readable and non-trivial
-            return num_frames > 0
-
     except Exception as e:
+        # Corrupt or truncated trajectory — trigger partial restart rather than
+        # silently skipping the stage.
         logger.warning(f"Trajectory validation failed for {traj_file}: {e}")
-        # A parse failure means the file is corrupt or truncated — not complete.
-        # Return False so the caller triggers a partial restart rather than
-        # silently skipping the stage on a bad trajectory.
         return False
+
+    logger.debug(f"{traj_file}: {num_frames} frames")
+
+    if expected_frames is not None:
+        return num_frames >= expected_frames
+    return num_frames > 0
 
 
 def _extract_expected_frames_from_mdp(sim_dir: Path, stage: str) -> int | None:
