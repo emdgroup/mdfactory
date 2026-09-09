@@ -19,11 +19,10 @@ from mdfactory.orchestration.apps import (
 )
 from mdfactory.orchestration.config import ExecutorConfig
 from mdfactory.orchestration.checkpoint import _detect_needed_stages
+from mdfactory.orchestration.execution import _execute_stage_list, _validate_stage_prerequisites
 from mdfactory.orchestration.simulate import (
-    _execute_stage_list,
     _log_dry_run_plan,
     _missing_build_files,
-    _validate_stage_prerequisites,
     run_simulations,
 )
 from mdfactory.orchestration.trajectory import _validate_trajectory_complete
@@ -681,7 +680,7 @@ def test_execute_stage_list_validates_unknown_stage():
         _execute_stage_list(Path("/tmp/test"), ["Equilibration"], None, None, max_rescue=0)
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_em_only(mock_run_stage):
     """Execute stage list dispatches EM via run_stage with correct spec and no prev_future."""
     mock_future = MagicMock()
@@ -696,7 +695,7 @@ def test_execute_stage_list_em_only(mock_run_stage):
     assert result == mock_future
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_em_nvt_chain(mock_run_stage):
     """Execute stage list chains EM → NVT: NVT receives EM's future as prev_future."""
     em_future = MagicMock()
@@ -720,7 +719,7 @@ def test_execute_stage_list_em_nvt_chain(mock_run_stage):
     assert result == nvt_future
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_full_pipeline(mock_run_stage):
     """Execute stage list chains all 4 stages via run_stage with correct futures."""
     stage_futures = [MagicMock() for _ in range(4)]
@@ -748,7 +747,7 @@ def test_execute_stage_list_full_pipeline(mock_run_stage):
     assert result is stage_futures[3]
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_partial_pipeline_from_checkpoint(mock_run_stage):
     """Checkpoint resume: first stage is not EM; prev_future starts as None."""
     nvt_fut = MagicMock()
@@ -770,7 +769,7 @@ def test_execute_stage_list_partial_pipeline_from_checkpoint(mock_run_stage):
 
 
 @patch("mdfactory.orchestration.rescue.execute_stage_with_rescue")
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_routes_to_rescue_when_enabled(mock_run_stage, mock_rescue):
     """Rescue-eligible stages dispatch to execute_stage_with_rescue when max_rescue > 0."""
     rescue_future = MagicMock()
@@ -785,7 +784,7 @@ def test_execute_stage_list_routes_to_rescue_when_enabled(mock_run_stage, mock_r
 
 
 @patch("mdfactory.orchestration.rescue.execute_stage_with_rescue")
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_production_bypasses_rescue(mock_run_stage, mock_rescue):
     """Production stage uses run_stage even when max_rescue > 0."""
     prod_future = MagicMock()
@@ -1241,7 +1240,7 @@ def test_get_gromacs_detect_script_prefers_gmx_over_gmx_mpi():
 # === Decision 7: Restart wiring through stage functions and execute_stage_list ===
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_passes_restart_to_stage_fn(mock_run_stage):
     """_execute_stage_list forwards stage_restarts to run_stage as restart_from_cpt."""
     mock_run_stage.return_value = MagicMock()
@@ -1260,7 +1259,7 @@ def test_execute_stage_list_passes_restart_to_stage_fn(mock_run_stage):
     assert call_kwargs.get("restart_from_cpt") == "/sim/nvt.cpt"
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_restart_only_for_matching_stage(mock_run_stage):
     """Only the stage with a cpt entry gets a non-empty restart_from_cpt."""
     nvt_fut = MagicMock()
@@ -1355,7 +1354,7 @@ def test_production_stage_skips_grompp_on_restart():
 # === Decision 6: Per-stage resource config wiring tests ===
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_passes_stage_config_when_slurm(mock_run_stage):
     """_execute_stage_list resolves per-stage config and forwards as stage_config to run_stage."""
     from mdfactory.orchestration.config import SlurmExecutorConfig
@@ -1378,7 +1377,7 @@ def test_execute_stage_list_passes_stage_config_when_slurm(mock_run_stage):
     assert em_cfg.cpus_per_node == 4
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_no_stage_config_for_local(mock_run_stage):
     """_execute_stage_list does not inject stage_config for LocalProvider (no overrides)."""
     from mdfactory.orchestration.config import ExecutorConfig
