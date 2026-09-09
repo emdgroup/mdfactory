@@ -1,10 +1,13 @@
-# ABOUTME: Tests for per-stage simulation progress tracking
-# ABOUTME: Covers StageProgressTracker state transitions, thread safety, and result collection
-"""Tests for the per-stage progress tracker."""
+# ABOUTME: Tests for per-stage simulation progress tracking and shared progress loop
+# ABOUTME: Covers StageProgressTracker state transitions, thread safety, and run_progress_loop
+"""Tests for the progress tracker and shared progress loop."""
 
 import threading
+from unittest.mock import MagicMock, patch
 
-from mdfactory.orchestration.progress import StageProgressTracker
+import pytest
+
+from mdfactory.orchestration.progress import StageProgressTracker, run_progress_loop
 
 
 class TestStageProgressTracker:
@@ -138,3 +141,32 @@ class TestStageProgressTracker:
         assert snap["NVT"]["failed"] == 1
         assert snap["NPT"]["skipped"] == 1
         assert snap["Production"]["skipped"] == 1
+
+
+_no_block = patch("mdfactory.orchestration.progress._get_block_status", return_value="")
+_no_live = patch("rich.live.Live")
+
+
+def _progress():
+    from mdfactory.orchestration.progress import _make_progress
+
+    return _make_progress()
+
+
+@_no_block
+@_no_live
+def test_run_progress_loop_polls_until_done(_live, _block):
+    """update is called repeatedly until it returns True; render_extras each tick."""
+    update = MagicMock(side_effect=[False, False, True])
+    extras = MagicMock(return_value=[])
+    run_progress_loop(_progress(), update=update, render_extras=extras, poll_interval=0.0)
+    assert update.call_count == 3
+    assert extras.call_count >= 2
+
+
+@_no_block
+@_no_live
+def test_run_progress_loop_keyboard_interrupt(_live, _block):
+    """KeyboardInterrupt is caught, printed, and re-raised."""
+    with pytest.raises(KeyboardInterrupt):
+        run_progress_loop(_progress(), update=MagicMock(side_effect=KeyboardInterrupt))
