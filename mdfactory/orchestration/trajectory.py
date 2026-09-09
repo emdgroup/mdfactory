@@ -79,10 +79,7 @@ def _validate_trajectory_complete(
     """Return True if *traj_file* exists, is readable via MDAnalysis, and has enough frames."""
     traj_path = sim_dir / traj_file
 
-    if not traj_path.exists():
-        return False
-
-    if traj_path.stat().st_size == 0:
+    if not traj_path.exists() or traj_path.stat().st_size == 0:
         return False
 
     if mda is None:

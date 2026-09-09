@@ -17,8 +17,8 @@ from mdfactory.orchestration.apps import (
     _resolve_thread_count_expr,
     _resolve_thread_flags,
 )
-from mdfactory.orchestration.config import ExecutorConfig
 from mdfactory.orchestration.checkpoint import _detect_needed_stages
+from mdfactory.orchestration.config import ExecutorConfig
 from mdfactory.orchestration.execution import _execute_stage_list, _validate_stage_prerequisites
 from mdfactory.orchestration.simulate import (
     _log_dry_run_plan,
@@ -291,7 +291,9 @@ def test_multiple_simulations_mixed_states(tmp_path):
     (sim3 / "prod.xtc").write_text("FAKE")  # Trajectory present
 
     # Mock trajectory validation so fake XTC counts as complete
-    with patch("mdfactory.orchestration.checkpoint._validate_trajectory_complete", return_value=True):
+    with patch(
+        "mdfactory.orchestration.checkpoint._validate_trajectory_complete", return_value=True
+    ):
         results = run_simulations([sim1, sim2, sim3], ExecutorConfig(), dry_run=True)
 
     assert len(results) == 3
@@ -1041,8 +1043,8 @@ def test_find_structure_file_returns_none_if_missing(tmp_path):
 
 def test_find_structure_file_candidates_derived_from_registry():
     """_STRUCTURE_CANDIDATES matches the current STAGE_REGISTRY gro_out fields."""
-    from mdfactory.orchestration.trajectory import _STRUCTURE_CANDIDATES
     from mdfactory.orchestration.stages import STAGE_REGISTRY
+    from mdfactory.orchestration.trajectory import _STRUCTURE_CANDIDATES
 
     expected = [spec.gro_out for spec in reversed(STAGE_REGISTRY) if spec.gro_out] + ["system.pdb"]
     assert _STRUCTURE_CANDIDATES == expected
