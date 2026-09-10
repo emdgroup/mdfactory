@@ -85,7 +85,7 @@ class TrialResult(BaseModel, frozen=True):
 
     @property
     def efficiency(self) -> float | None:
-        """Throughput per core-hour (ns/day per core)."""
+        """Throughput per core (ns/day / cpu_count)."""
         if self.ns_per_day is None or self.cpu_count == 0:
             return None
         return self.ns_per_day / self.cpu_count
@@ -123,7 +123,7 @@ class BenchmarkConfig(BaseModel, frozen=True):
         Benchmark trial duration in picoseconds.
     selection : str
         Optimum selection: ``"ns_per_day"`` for raw throughput or
-        ``"efficiency"`` for throughput per core-hour.
+        ``"efficiency"`` for throughput per core.
     mdp_overrides : dict[str, str]
         Additional MDP parameter overrides applied to the benchmark MDP
         (e.g. ``{"nstxout-compressed": "0"}`` to disable trajectory output).
@@ -199,11 +199,12 @@ def _generate_benchmark_mdp(
     nsteps = int(duration_ps / dt)
     parsed = modify_mdp_value(parsed, "nsteps", str(nsteps))
 
-    # Reduce output frequency to minimize I/O overhead during benchmark
-    # Use large intervals — we only care about performance, not trajectory
+    # Reduce output frequency to minimize I/O overhead during benchmark.
+    # Skip keys already set to "0" (intentionally disabled outputs).
     io_interval = str(max(nsteps, 1000))
     for key in ("nstxout", "nstvout", "nstfout", "nstxout_compressed", "nstenergy", "nstlog"):
-        if get_mdp_value(parsed, key) is not None:
+        current = get_mdp_value(parsed, key)
+        if current is not None and current != "0":
             parsed = modify_mdp_value(parsed, key, io_interval)
 
     # Apply any user-specified overrides
@@ -370,7 +371,7 @@ def run_benchmark_sweep(
 
     from mdfactory.orchestration.apps import get_grompp_app, get_mdrun_app
     from mdfactory.orchestration.session import parsl_session
-    from mdfactory.orchestration.stages import _extract_resource_hints
+    from mdfactory.orchestration.stages import extract_resource_hints
     from mdfactory.orchestration.trajectory import find_structure_file
 
     structure = find_structure_file(system_path)
@@ -389,28 +390,32 @@ def run_benchmark_sweep(
 
         logger.info(f"Trial: cpus={cpu_count}, gpu_replicas={gpu_reps}")
 
-        trial_dir = system_path / f".benchmark/cpus{cpu_count}_gpu{gpu_reps}"
-        trial_dir.mkdir(parents=True, exist_ok=True)
-
-        # Symlink inputs into trial directory
-        for src_file in [bench_mdp, structure, system_path / "topology.top"]:
-            dst = trial_dir / src_file.name
-            if not dst.exists():
-                dst.symlink_to(src_file.resolve())
-
-        # Rename benchmark.mdp symlink to md.mdp for the Production stage
-        bench_link = trial_dir / "benchmark.mdp"
-        md_link = trial_dir / prod_spec.mdp_file
-        if bench_link.exists() and not md_link.exists():
-            bench_link.rename(md_link)
-
         deffnm = "bench"
+        trial_dir = system_path / f".benchmark/cpus{cpu_count}_gpu{gpu_reps}"
         log_file = trial_dir / f"{deffnm}.log"
 
         start_time = time.monotonic()
 
         try:
-            hints = _extract_resource_hints(trial_config)
+            trial_dir.mkdir(parents=True, exist_ok=True)
+
+            # Symlink inputs into trial directory (remove stale symlinks first)
+            for src_file in [bench_mdp, structure, system_path / "topology.top"]:
+                dst = trial_dir / src_file.name
+                if dst.is_symlink():
+                    dst.unlink()
+                if not dst.exists():
+                    dst.symlink_to(src_file.resolve())
+
+            # Rename benchmark.mdp symlink to md.mdp for the Production stage
+            bench_link = trial_dir / "benchmark.mdp"
+            md_link = trial_dir / prod_spec.mdp_file
+            if bench_link.exists() or bench_link.is_symlink():
+                if md_link.is_symlink():
+                    md_link.unlink()
+                if not md_link.exists():
+                    bench_link.rename(md_link)
+            hints = extract_resource_hints(trial_config)
 
             with parsl_session(trial_config):
                 grompp_app = get_grompp_app()
@@ -420,9 +425,9 @@ def run_benchmark_sweep(
                 grompp_future = grompp_app(
                     work_dir=str(trial_dir),
                     mdp_file=prod_spec.mdp_file,
-                    structure_file=structure.name,
-                    topology_file="topology.top",
-                    tpr_output=f"{deffnm}.tpr",
+                    gro_file=structure.name,
+                    top_file="topology.top",
+                    tpr_file=f"{deffnm}.tpr",
                     maxwarn=prod_spec.maxwarn,
                 )
                 grompp_future.result()

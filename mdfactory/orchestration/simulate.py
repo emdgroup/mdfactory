@@ -345,7 +345,7 @@ def clean_simulation_outputs(
 def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[dict]:
     """Log the dry-run work plan with resolved gmx commands per stage."""
     from .apps import _build_grompp_script, _build_mdrun_script
-    from .stages import _extract_resource_hints
+    from .stages import extract_resource_hints
 
     logger.info("=" * 60)
     logger.info("DRY RUN - No jobs will be submitted")
@@ -365,7 +365,7 @@ def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[d
             # Resolve and display actual commands per stage
             work_dir = str(Path(item["sim_dir"]).resolve())
             stage_config = get_stage_config_or_none(config, item["stages"][0])
-            hints = _extract_resource_hints(stage_config)
+            hints = extract_resource_hints(stage_config)
 
             for stage_name in item["stages"]:
                 spec = STAGE_BY_NAME[stage_name]

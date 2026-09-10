@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -170,6 +170,11 @@ class TestTrialResult:
         t = TrialResult(cpu_count=8, gpu_replicas=0, ns_per_day=None, wall_seconds=None)
         assert t.efficiency is None
 
+    def test_efficiency_none_when_zero_cpus(self):
+        """Efficiency is None when cpu_count is 0 (guard against division by zero)."""
+        t = TrialResult(cpu_count=0, gpu_replicas=0, ns_per_day=5.0, wall_seconds=10.0)
+        assert t.efficiency is None
+
     def test_select_optimum_ns_per_day(self):
         """Select by ns_per_day picks highest throughput."""
         trials = [
@@ -235,11 +240,25 @@ class TestGenerateBenchmarkMdp:
         src.write_text(SAMPLE_MDP)
         out = tmp_path / "benchmark.mdp"
         _generate_benchmark_mdp(
-            src, out, duration_ps=100.0, extra_overrides={"nstxout_compressed": "0"}
+            src, out, duration_ps=100.0, extra_overrides={"nstxout_compressed": "99999"}
         )
         content = out.read_text()
-        # nstxout-compressed should be overridden to 0
-        assert "0" in content
+        assert "99999" in content
+
+    def test_disabled_outputs_preserved(self, tmp_path):
+        """Outputs set to 0 (disabled) are not overridden."""
+        src = tmp_path / "md.mdp"
+        src.write_text(SAMPLE_MDP)
+        out = tmp_path / "benchmark.mdp"
+        _generate_benchmark_mdp(src, out, duration_ps=100.0)
+
+        from mdfactory.orchestration.mdp import get_mdp_value, parse_mdp
+
+        parsed = parse_mdp(out)
+        # nstfout was 0 in SAMPLE_MDP — should remain 0
+        assert get_mdp_value(parsed, "nstfout") == "0"
+        # nstxout was 5000 — should be overridden to nsteps (50000)
+        assert get_mdp_value(parsed, "nstxout") == "50000"
 
     def test_explicit_dt_override(self, tmp_path):
         """Explicit dt parameter overrides the source MDP value."""
@@ -368,3 +387,149 @@ class TestBenchmarkResultPersistence:
         assert "trials" in data
         assert "optimum" in data
         assert "selection_criterion" in data
+
+
+# ---------------------------------------------------------------------------
+# T8: Mocked execution path (dry_run=False)
+# ---------------------------------------------------------------------------
+
+
+def _setup_sim_dir(tmp_path):
+    """Create a minimal simulation directory for benchmark tests."""
+    sim_dir = tmp_path / "sim"
+    sim_dir.mkdir()
+    (sim_dir / "system.pdb").write_text("FAKE")
+    (sim_dir / "topology.top").write_text("FAKE")
+    # Production MDP
+    (sim_dir / "md.mdp").write_text(SAMPLE_MDP)
+    return sim_dir
+
+
+class TestRunBenchmarkSweepExecution:
+    """Tests for the live execution path (dry_run=False)."""
+
+    @patch("mdfactory.orchestration.trajectory.find_structure_file")
+    @patch("mdfactory.orchestration.session.parsl_session")
+    @patch("mdfactory.orchestration.apps.get_grompp_app")
+    @patch("mdfactory.orchestration.apps.get_mdrun_app")
+    @patch("mdfactory.performance.benchmark.parse_mdlog_performance")
+    def test_mocked_sweep_runs_all_points(
+        self, mock_parse, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+    ):
+        """Mocked sweep runs one Parsl session per sweep point."""
+        from mdfactory.orchestration.config import ExecutorConfig
+
+        sim_dir = _setup_sim_dir(tmp_path)
+        mock_find.return_value = sim_dir / "system.pdb"
+        mock_session.return_value.__enter__ = MagicMock()
+        mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_grompp = MagicMock()
+        mock_grompp.return_value.result.return_value = "ok"
+        mock_grompp_app.return_value = mock_grompp
+
+        mock_mdrun = MagicMock()
+        mock_mdrun.return_value.result.return_value = "ok"
+        mock_mdrun_app.return_value = mock_mdrun
+
+        mock_parse.return_value = 5.234
+
+        cfg = ExecutorConfig()
+        bench_cfg = BenchmarkConfig(cpu_counts=[2, 4])
+
+        result = run_benchmark_sweep(sim_dir, cfg, bench_cfg)
+
+        # Two sweep points → two Parsl sessions
+        assert mock_session.call_count == 2
+        assert mock_grompp.call_count == 2
+        assert mock_mdrun.call_count == 2
+        assert len(result.trials) == 2
+        assert all(t.ns_per_day == pytest.approx(5.234) for t in result.trials)
+        assert result.optimum is not None
+        # Result saved as JSON sidecar
+        assert (sim_dir / "benchmark_result.json").exists()
+
+    @patch("mdfactory.orchestration.trajectory.find_structure_file")
+    @patch("mdfactory.orchestration.session.parsl_session")
+    @patch("mdfactory.orchestration.apps.get_grompp_app")
+    @patch("mdfactory.orchestration.apps.get_mdrun_app")
+    @patch("mdfactory.performance.benchmark.parse_mdlog_performance")
+    def test_failed_trial_continues_sweep(
+        self, mock_parse, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+    ):
+        """A failed trial records the error and continues to the next point."""
+        from mdfactory.orchestration.config import ExecutorConfig
+
+        sim_dir = _setup_sim_dir(tmp_path)
+        mock_find.return_value = sim_dir / "system.pdb"
+        mock_session.return_value.__enter__ = MagicMock()
+        mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+        # First trial fails, second succeeds
+        mock_grompp = MagicMock()
+        mock_grompp_app.return_value = mock_grompp
+
+        call_count = {"n": 0}
+
+        def grompp_side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            future = MagicMock()
+            if call_count["n"] == 1:
+                future.result.side_effect = RuntimeError("GROMACS grompp failed")
+            else:
+                future.result.return_value = "ok"
+            return future
+
+        mock_grompp.side_effect = grompp_side_effect
+
+        mock_mdrun = MagicMock()
+        mock_mdrun.return_value.result.return_value = "ok"
+        mock_mdrun_app.return_value = mock_mdrun
+        mock_parse.return_value = 8.0
+
+        cfg = ExecutorConfig()
+        bench_cfg = BenchmarkConfig(cpu_counts=[2, 4])
+
+        result = run_benchmark_sweep(sim_dir, cfg, bench_cfg)
+
+        assert len(result.trials) == 2
+        # First trial failed
+        assert result.trials[0].ns_per_day is None
+        assert result.trials[0].error is not None
+        assert "grompp failed" in result.trials[0].error
+        # Second trial succeeded
+        assert result.trials[1].ns_per_day == pytest.approx(8.0)
+        # Optimum selected from successful trials only
+        assert result.optimum is not None
+        assert result.optimum.cpu_count == 4
+
+
+# ---------------------------------------------------------------------------
+# T9: Error paths
+# ---------------------------------------------------------------------------
+
+
+class TestRunBenchmarkSweepErrors:
+    """Tests for error handling in run_benchmark_sweep."""
+
+    def test_missing_production_mdp(self, tmp_path):
+        """Missing production MDP raises FileNotFoundError."""
+        from mdfactory.orchestration.config import ExecutorConfig
+
+        sim_dir = tmp_path / "sim"
+        sim_dir.mkdir()
+        # No md.mdp file
+
+        with pytest.raises(FileNotFoundError, match="Production MDP not found"):
+            run_benchmark_sweep(sim_dir, ExecutorConfig())
+
+    @patch("mdfactory.orchestration.trajectory.find_structure_file")
+    def test_missing_structure_file(self, mock_find, tmp_path):
+        """Missing structure file raises FileNotFoundError."""
+        from mdfactory.orchestration.config import ExecutorConfig
+
+        sim_dir = _setup_sim_dir(tmp_path)
+        mock_find.return_value = None
+
+        with pytest.raises(FileNotFoundError, match="No structure file found"):
+            run_benchmark_sweep(sim_dir, ExecutorConfig())
