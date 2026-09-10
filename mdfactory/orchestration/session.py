@@ -34,23 +34,10 @@ class ParslSession:
     ----------
     parsl : module
         The imported ``parsl`` module, for submitting apps or inspecting the DFK.
-    detached : bool
-        When ``True``, the context manager will **not** shut down the DFK on
-        exit; the caller takes ownership of cleanup. Set via :meth:`detach`.
 
     """
 
     parsl: object
-    detached: bool = False
-
-    def detach(self) -> None:
-        """Transfer DFK ownership to the caller (skip shutdown on exit).
-
-        Used when returning raw futures (e.g. ``wait=False``): the caller is
-        then responsible for calling ``parsl.clear()`` once all futures
-        complete.
-        """
-        self.detached = True
 
 
 @contextmanager
@@ -58,8 +45,7 @@ def parsl_session(config: "ExecutorConfig") -> Iterator[ParslSession]:
     """Manage a Parsl ``DataFlowKernel`` lifecycle for an orchestration run.
 
     Guards against an already-active DFK, loads ``config``'s Parsl config,
-    yields a :class:`ParslSession`, and guarantees shutdown on exit unless the
-    session was detached via :meth:`ParslSession.detach`.
+    yields a :class:`ParslSession`, and guarantees shutdown on exit.
 
     Sessions must be **sequential, never nested**.  :func:`_guard_no_active_dfk`
     raises :class:`RuntimeError` if a DFK is already loaded when this context
@@ -81,8 +67,7 @@ def parsl_session(config: "ExecutorConfig") -> Iterator[ParslSession]:
     Yields
     ------
     ParslSession
-        Session handle exposing the ``parsl`` module and a ``detach()`` escape
-        hatch.
+        Session handle exposing the ``parsl`` module.
 
     Raises
     ------
@@ -103,8 +88,7 @@ def parsl_session(config: "ExecutorConfig") -> Iterator[ParslSession]:
     try:
         yield session
     finally:
-        if not session.detached:
-            _shutdown_parsl()
+        _shutdown_parsl()
 
 
 def _guard_no_active_dfk(parsl) -> None:

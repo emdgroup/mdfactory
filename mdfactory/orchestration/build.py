@@ -37,7 +37,6 @@ def build_systems(
     config: "ExecutorConfig",
     *,
     output_dir: Path | None = None,
-    wait: bool = True,
     dry_run: bool = False,
 ) -> list:
     """Submit parallel builds via Parsl (or preview with dry_run).
@@ -50,10 +49,6 @@ def build_systems(
         Executor configuration for Parsl.
     output_dir : Path, optional
         Base output directory for builds. Defaults to current directory.
-    wait : bool, optional
-        Whether to wait for all futures to complete. Default True.
-        If False, returns raw AppFutures and the caller is responsible
-        for calling ``parsl.clear()`` after all futures complete.
     dry_run : bool, optional
         If True, log what would be built and return descriptions without
         loading Parsl or submitting any work. Default False.
@@ -62,8 +57,7 @@ def build_systems(
     -------
     list
         If dry_run=True, list of description dicts.
-        If wait=True, list of result dicts.
-        If wait=False, list of AppFutures.
+        Otherwise, list of result dicts.
 
     """
     output_dir = Path(output_dir) if output_dir else Path.cwd()
@@ -104,7 +98,7 @@ def build_systems(
 
     # parsl_session owns the full DFK lifecycle: guard, load, and shutdown
     # (including scancel of lingering SLURM jobs) on exit.
-    with parsl_session(config) as session:
+    with parsl_session(config):
         build_app = get_build_app()
 
         # Submit all builds
@@ -115,11 +109,6 @@ def build_systems(
             futures.append(build_app(input_dict))
 
         logger.info(f"Submitted {len(futures)} build(s) to Parsl")
-
-        if not wait:
-            logger.warning("Returning raw futures — caller must call parsl.clear() when done.")
-            session.detach()
-            return futures
 
         # Poll futures with live status reporting
         return _wait_with_progress(futures, hashes=input_hashes, label="Parsl Builds")
