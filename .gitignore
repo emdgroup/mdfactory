@@ -182,6 +182,8 @@ charmm36.ff/
 *.itp
 *.pdb
 *.mdp
+# Package-owned GROMACS templates must remain available to wheel discovery.
+!mdfactory/run_schedules/gromacs/**/*.mdp
 *.edr
 *.gro
 *.top
