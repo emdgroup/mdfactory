@@ -445,12 +445,18 @@ def run_benchmark_sweep(
             wall_seconds = time.monotonic() - start_time
             ns_per_day = parse_mdlog_performance(log_file)
 
+            error = None
+            if ns_per_day is None:
+                error = f"no performance data in {log_file}"
+                logger.warning(f"  {error}")
+
             trials.append(
                 TrialResult(
                     cpu_count=cpu_count,
                     gpu_replicas=gpu_reps,
                     ns_per_day=ns_per_day,
                     wall_seconds=wall_seconds,
+                    error=error,
                 )
             )
             logger.info(f"  Result: {ns_per_day or 'N/A'} ns/day, {wall_seconds:.1f}s wall")
