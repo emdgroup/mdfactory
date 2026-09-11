@@ -54,5 +54,7 @@ jobs:
           environments: dev
       - name: Build sdist and wheel
         run: pixi run -e dev hatch build
+      - name: Verify wheel resource packaging
+        run: pixi run -e dev pytest mdfactory/tests/test_packaging.py -v --no-cov
       - name: Verify package version
         run: pixi run python -c "import mdfactory; print(mdfactory.__version__)"
