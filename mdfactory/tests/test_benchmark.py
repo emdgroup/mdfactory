@@ -445,9 +445,48 @@ class TestRunBenchmarkSweepExecution:
         assert mock_mdrun.call_count == 2
         assert len(result.trials) == 2
         assert all(t.ns_per_day == pytest.approx(5.234) for t in result.trials)
+        assert all(t.error is None for t in result.trials)
         assert result.optimum is not None
         # Result saved as JSON sidecar
         assert (sim_dir / "benchmark_result.json").exists()
+
+    @patch("mdfactory.orchestration.trajectory.find_structure_file")
+    @patch("mdfactory.orchestration.session.parsl_session")
+    @patch("mdfactory.orchestration.apps.get_grompp_app")
+    @patch("mdfactory.orchestration.apps.get_mdrun_app")
+    @patch("mdfactory.performance.benchmark.parse_mdlog_performance")
+    def test_missing_performance_data_sets_error(
+        self, mock_parse, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+    ):
+        """When mdrun succeeds but log has no performance data, error is set."""
+        from mdfactory.orchestration.config import ExecutorConfig
+
+        sim_dir = _setup_sim_dir(tmp_path)
+        mock_find.return_value = sim_dir / "system.pdb"
+        mock_session.return_value.__enter__ = MagicMock()
+        mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_grompp = MagicMock()
+        mock_grompp.return_value.result.return_value = "ok"
+        mock_grompp_app.return_value = mock_grompp
+
+        mock_mdrun = MagicMock()
+        mock_mdrun.return_value.result.return_value = "ok"
+        mock_mdrun_app.return_value = mock_mdrun
+
+        # Parser returns None — no performance block found
+        mock_parse.return_value = None
+
+        cfg = ExecutorConfig()
+        bench_cfg = BenchmarkConfig(cpu_counts=[4])
+
+        result = run_benchmark_sweep(sim_dir, cfg, bench_cfg)
+
+        assert len(result.trials) == 1
+        assert result.trials[0].ns_per_day is None
+        assert result.trials[0].error is not None
+        assert "no performance data" in result.trials[0].error
+        assert result.optimum is None
 
     @patch("mdfactory.orchestration.trajectory.find_structure_file")
     @patch("mdfactory.orchestration.session.parsl_session")
