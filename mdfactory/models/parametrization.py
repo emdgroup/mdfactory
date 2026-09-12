@@ -136,6 +136,16 @@ class CharmmConfig(BaseModel):
     def check_supported_forcefield_and_water(self) -> "CharmmConfig":
         """Reject force fields and water models the protein_mixedbox pipeline cannot honor."""
         _validate_charmm_forcefield_and_water(self.forcefield, self.water_model)
+        if self.forcefield != "charmm36m":
+            raise ValueError(
+                "protein_mixedbox currently supports only the registered 'charmm36m' "
+                "bundle, which pins a compatible CHARMM36m + CGenFF parameter family."
+            )
+        if self.water_model != "tip3p":
+            raise ValueError(
+                "protein_mixedbox currently supports only 'tip3p', whose native atom "
+                "and residue names are normalized during packing."
+            )
         return self
 
 

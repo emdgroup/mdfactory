@@ -35,5 +35,8 @@ system:
   partial_specific_volume: 0.73
   relax_steps: 10000
   ionization:
+    # Salt is added on top of neutralization (and any packed ion species),
+    # resolved against concentration_volume_basis. Set concentration: 0 to add
+    # no salt and set ionic strength via packed ion species instead.
     neutralize: true
     concentration: 0.15

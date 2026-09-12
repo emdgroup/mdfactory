@@ -16,6 +16,8 @@ from mdfactory import workflows
 from mdfactory.build import (
     PROTEIN_MIXEDBOX_RMSD_TOLERANCE_A,
     _check_no_protein_clashes,
+    _check_no_solution_clashes,
+    _protein_internal_rmsd,
     _reimage_protein_centered,
     ionize_solvated_system,
 )
@@ -28,11 +30,21 @@ from mdfactory.models.composition import (
 from mdfactory.models.input import BuildInput
 from mdfactory.models.parametrization import CharmmConfig
 from mdfactory.models.species import ProteinSpecies, SolutionSpecies
-from mdfactory.parametrize import generate_gromacs_topology_with_protein
+from mdfactory.parametrize import (
+    generate_gromacs_topology_with_protein,
+    parametrize_cgenff_gromacs,
+)
 from mdfactory.prepare import df_to_build_input_models
 from mdfactory.run_schedules import RunScheduleManager
+from mdfactory.settings import settings
+from mdfactory.simulation.openmm_utils import (
+    _add_protein_rmsd_restraint,
+    simulate_compression_until_volume_reached,
+)
 from mdfactory.utils.setup_utilities import (
     N_AVOGADRO,
+    charmm_native_atom_names,
+    create_protein_mixedbox_universe,
     cubic_box_edge_for_density,
     protein_displaced_volume_a3,
     resolve_solution_counts,
@@ -100,6 +112,18 @@ class TestSolutionSpecies:
         with pytest.raises(ValueError, match="does not support 'fraction'"):
             SolutionSpecies(smiles="O", resname="SOL", fraction=0.5)
 
+    def test_rejects_negative_count(self):
+        with pytest.raises(ValueError):
+            SolutionSpecies(smiles="CCO", resname="ETH", count=-1)
+
+    @pytest.mark.parametrize(
+        ("smiles", "wrong_resname"),
+        [("O", "WAT"), ("[Na+]", "SOD"), ("[Cl-]", "CLA")],
+    )
+    def test_native_species_require_charmm_resname(self, smiles, wrong_resname):
+        with pytest.raises(ValueError, match="Native CHARMM species"):
+            SolutionSpecies(smiles=smiles, resname=wrong_resname, count=1)
+
 
 class TestCharmmConfig:
     def test_defaults(self):
@@ -126,6 +150,14 @@ class TestCharmmConfig:
     def test_rejects_ljpme_forcefield(self):
         with pytest.raises(ValueError, match="LJ-PME"):
             CharmmConfig(forcefield="charmm36m-ljpme")
+
+    def test_rejects_unpinned_charmm_family(self):
+        with pytest.raises(ValueError, match="only the registered 'charmm36m'"):
+            CharmmConfig(forcefield="charmm27")
+
+    def test_rejects_non_tip3p_water(self):
+        with pytest.raises(ValueError, match="only 'tip3p'"):
+            CharmmConfig(water_model="spce")
 
 
 class TestSizingConfigs:
@@ -192,7 +224,9 @@ class TestProteinMixedBoxComposition:
             )
 
     def test_count_density_rejects_concentration_species(self, tmp_path):
-        with pytest.raises(ValueError, match="count_density sizing derives the box from total mass"):
+        with pytest.raises(
+            ValueError, match="count_density sizing derives the box from total mass"
+        ):
             ProteinMixedBoxComposition(
                 protein=self._protein(tmp_path),
                 species=[SolutionSpecies(smiles="O", resname="SOL", concentration=55.0)],
@@ -277,6 +311,28 @@ system:
         assert isinstance(inp.parametrization_config, CharmmConfig)
         assert inp.parametrization_config.forcefield == "charmm36m"
 
+    def test_metadata_includes_protein_and_requested_concentration(self, tmp_path):
+        pdb = tmp_path / "test.pdb"
+        _write_protein_pdb(pdb)
+        inp = BuildInput(
+            simulation_type="protein_mixedbox",
+            parametrization="charmm",
+            system={
+                "protein": {"resname": "LYZ", "count": 1, "pdb_path": str(pdb)},
+                "species": [{"smiles": "O", "resname": "SOL", "concentration": 55.0}],
+                "sizing": {"type": "fixed_box", "box_size": 72.0},
+                "padding": 12.0,
+            },
+        )
+        species_composition = inp.metadata["species_composition"]
+        # The protein leads the composition; the packed solution follows.
+        protein_entry = species_composition[0]
+        assert protein_entry["resname"] == "LYZ"
+        assert protein_entry["count"] == 1
+        assert protein_entry["concentration"] is None
+        assert species_composition[1]["resname"] == "SOL"
+        assert species_composition[1]["concentration"] == 55.0
+
     def test_rejects_cgenff_parametrization(self, tmp_path):
         pdb = tmp_path / "test.pdb"
         _write_protein_pdb(pdb)
@@ -327,6 +383,26 @@ system:
         with pytest.raises(ValueError, match="merge_all"):
             BuildInput(**data)
 
+    def test_rejects_unmerged_multichain_compression(self, tmp_path):
+        pdb = tmp_path / "test.pdb"
+        _write_protein_pdb(pdb)
+        data = {
+            "simulation_type": "protein_mixedbox",
+            "parametrization": "charmm",
+            "system": {
+                "protein": {
+                    "resname": "INS",
+                    "pdb_path": str(pdb),
+                    "chains": ["A", "B"],
+                },
+                "species": [{"smiles": "O", "resname": "SOL", "count": 10}],
+                "sizing": {"type": "fixed_box", "box_size": 72.0},
+                "padding": 12.0,
+            },
+        }
+        with pytest.raises(ValueError, match="multi-chain protein_mixedbox"):
+            BuildInput(**data)
+
 
 class TestExampleFiles:
     def test_fixed_box_yaml_loads(self):
@@ -371,8 +447,11 @@ class TestVolumeAndCountHelpers:
     def test_explicit_count_kept_regardless_of_basis(self):
         specs = [SolutionSpecies(smiles="CCO", resname="ETH", count=42)]
         counts = resolve_solution_counts(
-            specs, box_volume_a3=1e5, protein_mass_dalton=1e4,
-            partial_specific_volume=0.73, basis="protein_excluded"
+            specs,
+            box_volume_a3=1e5,
+            protein_mass_dalton=1e4,
+            partial_specific_volume=0.73,
+            basis="protein_excluded",
         )
         assert counts == [42]
 
@@ -380,8 +459,11 @@ class TestVolumeAndCountHelpers:
         specs = [SolutionSpecies(smiles="O", resname="SOL", concentration=1.0)]
         box_volume_a3 = 1e6
         counts = resolve_solution_counts(
-            specs, box_volume_a3=box_volume_a3, protein_mass_dalton=0.0,
-            partial_specific_volume=0.73, basis="box"
+            specs,
+            box_volume_a3=box_volume_a3,
+            protein_mass_dalton=0.0,
+            partial_specific_volume=0.73,
+            basis="box",
         )
         expected = int(round(1.0 * box_volume_a3 * 1e-27 * N_AVOGADRO))
         assert counts == [expected]
@@ -392,16 +474,22 @@ class TestVolumeAndCountHelpers:
         protein_mass = 1e5
         psv = 0.73
         counts = resolve_solution_counts(
-            specs, box_volume_a3=box_volume_a3, protein_mass_dalton=protein_mass,
-            partial_specific_volume=psv, basis="protein_excluded"
+            specs,
+            box_volume_a3=box_volume_a3,
+            protein_mass_dalton=protein_mass,
+            partial_specific_volume=psv,
+            basis="protein_excluded",
         )
         v_basis = box_volume_a3 - protein_displaced_volume_a3(protein_mass, psv)
         expected = int(round(1.0 * v_basis * 1e-27 * N_AVOGADRO))
         assert counts == [expected]
         # The excluded-volume count is strictly smaller than the whole-box count.
         box_counts = resolve_solution_counts(
-            specs, box_volume_a3=box_volume_a3, protein_mass_dalton=protein_mass,
-            partial_specific_volume=psv, basis="box"
+            specs,
+            box_volume_a3=box_volume_a3,
+            protein_mass_dalton=protein_mass,
+            partial_specific_volume=psv,
+            basis="box",
         )
         assert counts[0] < box_counts[0]
 
@@ -409,16 +497,22 @@ class TestVolumeAndCountHelpers:
         specs = [SolutionSpecies(smiles="O", resname="SOL", concentration=1e-9)]
         with pytest.raises(ValueError, match="resolves to zero"):
             resolve_solution_counts(
-                specs, box_volume_a3=1e3, protein_mass_dalton=0.0,
-                partial_specific_volume=0.73, basis="box"
+                specs,
+                box_volume_a3=1e3,
+                protein_mass_dalton=0.0,
+                partial_specific_volume=0.73,
+                basis="box",
             )
 
     def test_protein_larger_than_box_raises(self):
         specs = [SolutionSpecies(smiles="O", resname="SOL", concentration=1.0)]
         with pytest.raises(ValueError, match="non-positive"):
             resolve_solution_counts(
-                specs, box_volume_a3=1e3, protein_mass_dalton=1e9,
-                partial_specific_volume=0.73, basis="protein_excluded"
+                specs,
+                box_volume_a3=1e3,
+                protein_mass_dalton=1e9,
+                partial_specific_volume=0.73,
+                basis="protein_excluded",
             )
 
 
@@ -494,9 +588,7 @@ class TestReimageAndClash:
         n_protein = 5
         n_atoms = n_protein + 6
         atom_resindex = np.array([0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2])
-        u = mda.Universe.empty(
-            n_atoms, n_residues=3, atom_resindex=atom_resindex, trajectory=True
-        )
+        u = mda.Universe.empty(n_atoms, n_residues=3, atom_resindex=atom_resindex, trajectory=True)
         u.add_TopologyAttr("resnames", ["LYZ", "SOL", "SOL"])
         u.add_TopologyAttr("masses", [12.0] * n_protein + [16.0, 1.0, 1.0, 16.0, 1.0, 1.0])
         u.dimensions = [30.0, 30.0, 30.0, 90, 90, 90]
@@ -506,16 +598,27 @@ class TestReimageAndClash:
         u, n_protein = self._system()
         L = 30.0
         reference = np.array(
-            [[14.0, 15.0, 15.0], [16.0, 15.0, 15.0], [15.0, 16.0, 15.0],
-             [15.0, 15.0, 16.0], [15.0, 14.0, 15.0]]
+            [
+                [14.0, 15.0, 15.0],
+                [16.0, 15.0, 15.0],
+                [15.0, 16.0, 15.0],
+                [15.0, 15.0, 16.0],
+                [15.0, 14.0, 15.0],
+            ]
         )
         # A rigid translation pushes the protein across the +x boundary; wrapping
         # by box vector tears it apart, exactly as a barostat + restraint produces.
         placed = reference + np.array([13.0, 0.0, 0.0])
         torn = np.mod(placed, L)
         solution = np.array(
-            [[1.0, 1.0, 1.0], [1.5, 1.0, 1.0], [1.0, 1.5, 1.0],
-             [29.0, 29.0, 29.0], [28.5, 29.0, 29.0], [29.0, 28.5, 29.0]]
+            [
+                [1.0, 1.0, 1.0],
+                [1.5, 1.0, 1.0],
+                [1.0, 1.5, 1.0],
+                [29.0, 29.0, 29.0],
+                [28.5, 29.0, 29.0],
+                [29.0, 28.5, 29.0],
+            ]
         )
         u.atoms.positions = np.vstack([torn, solution])
 
@@ -531,12 +634,38 @@ class TestReimageAndClash:
         bbox_center = (protein_now.min(axis=0) + protein_now.max(axis=0)) / 2.0
         assert np.allclose(bbox_center, [L / 2, L / 2, L / 2], atol=1e-4)
 
+    def test_internal_rmsd_ignores_rigid_rotation_and_translation(self):
+        reference = np.array(
+            [
+                [1.0, 2.0, 3.0],
+                [4.0, 2.0, 3.0],
+                [1.0, 6.0, 3.0],
+                [1.0, 2.0, 8.0],
+            ]
+        )
+        angle = np.deg2rad(37.0)
+        rotation = np.array(
+            [
+                [np.cos(angle), -np.sin(angle), 0.0],
+                [np.sin(angle), np.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        transformed = reference @ rotation.T + np.array([12.0, -7.0, 4.0])
+
+        assert _protein_internal_rmsd(transformed, reference) == pytest.approx(0.0, abs=1e-6)
+
     def test_clash_check_raises_on_overlap(self):
         u, n_protein = self._system()
         pos = np.zeros((u.atoms.n_atoms, 3))
         pos[:n_protein] = np.array(
-            [[15.0, 15.0, 15.0], [16.0, 15.0, 15.0], [15.0, 16.0, 15.0],
-             [15.0, 15.0, 16.0], [15.0, 14.0, 15.0]]
+            [
+                [15.0, 15.0, 15.0],
+                [16.0, 15.0, 15.0],
+                [15.0, 16.0, 15.0],
+                [15.0, 15.0, 16.0],
+                [15.0, 14.0, 15.0],
+            ]
         )
         # First solution atom sits on top of a protein atom.
         pos[n_protein] = [15.0, 15.0, 15.1]
@@ -551,15 +680,247 @@ class TestReimageAndClash:
         u, n_protein = self._system()
         pos = np.zeros((u.atoms.n_atoms, 3))
         pos[:n_protein] = np.array(
-            [[15.0, 15.0, 15.0], [16.0, 15.0, 15.0], [15.0, 16.0, 15.0],
-             [15.0, 15.0, 16.0], [15.0, 14.0, 15.0]]
+            [
+                [15.0, 15.0, 15.0],
+                [16.0, 15.0, 15.0],
+                [15.0, 16.0, 15.0],
+                [15.0, 15.0, 16.0],
+                [15.0, 14.0, 15.0],
+            ]
         )
         pos[n_protein:] = np.array(
-            [[2.0, 2.0, 2.0], [2.5, 2.0, 2.0], [2.0, 2.5, 2.0],
-             [5.0, 5.0, 5.0], [5.5, 5.0, 5.0], [5.0, 5.5, 5.0]]
+            [
+                [2.0, 2.0, 2.0],
+                [2.5, 2.0, 2.0],
+                [2.0, 2.5, 2.0],
+                [5.0, 5.0, 5.0],
+                [5.5, 5.0, 5.0],
+                [5.0, 5.5, 5.0],
+            ]
         )
         u.atoms.positions = pos
         _check_no_protein_clashes(u, n_protein)  # must not raise
+
+    def test_solution_clash_check_raises_between_residues(self):
+        u, n_protein = self._system()
+        positions = u.atoms.positions.copy()
+        positions[:n_protein] = np.array(
+            [
+                [15.0, 15.0, 15.0],
+                [16.0, 15.0, 15.0],
+                [15.0, 16.0, 15.0],
+                [15.0, 15.0, 16.0],
+                [15.0, 14.0, 15.0],
+            ]
+        )
+        positions[n_protein:] = np.array(
+            [
+                [2.0, 2.0, 2.0],
+                [2.5, 2.0, 2.0],
+                [2.0, 2.5, 2.0],
+                [2.1, 2.0, 2.0],
+                [8.0, 8.0, 8.0],
+                [9.0, 9.0, 9.0],
+            ]
+        )
+        u.atoms.positions = positions
+        with pytest.raises(ValueError, match="solution-solution"):
+            _check_no_solution_clashes(u, n_protein)
+
+    def test_solution_clash_check_ignores_atoms_in_same_residue(self):
+        u, n_protein = self._system()
+        positions = u.atoms.positions.copy()
+        positions[n_protein:] = np.array(
+            [
+                [2.0, 2.0, 2.0],
+                [2.1, 2.0, 2.0],
+                [2.0, 2.1, 2.0],
+                [8.0, 8.0, 8.0],
+                [8.1, 8.0, 8.0],
+                [8.0, 8.1, 8.0],
+            ]
+        )
+        u.atoms.positions = positions
+        _check_no_solution_clashes(u, n_protein)
+
+
+class TestPackingAndRestraints:
+    def test_native_charmm_atom_names(self):
+        assert charmm_native_atom_names("O") == ["OW", "HW1", "HW2"]
+        assert charmm_native_atom_names("[Na+]") == ["NA"]
+        assert charmm_native_atom_names("[Cl-]") == ["CL"]
+        assert charmm_native_atom_names("CCO") is None
+
+    def test_native_parameters_come_from_selected_forcefield(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(settings, "parameter_store", tmp_path / "parameters")
+        ff_dir = tmp_path / "selected.ff"
+        ff_dir.mkdir()
+        for filename in ("forcefield.itp", "tip3p.itp", "ions.itp"):
+            (ff_dir / filename).touch()
+
+        water = parametrize_cgenff_gromacs(
+            SolutionSpecies(smiles="O", resname="SOL", count=1),
+            native_forcefield_dir=ff_dir,
+        )
+        sodium = parametrize_cgenff_gromacs(
+            SolutionSpecies(smiles="[Na+]", resname="NA", count=1),
+            native_forcefield_dir=ff_dir,
+        )
+        assert water.itp == ff_dir / "tip3p.itp"
+        assert sodium.itp == ff_dir / "ions.itp"
+        assert water.forcefield_itp == ff_dir / "forcefield.itp"
+
+    def test_packmol_reconstructs_native_residues_and_names(self, tmp_path):
+        from openff.interchange.components._packmol import _find_packmol
+
+        if _find_packmol() is None:
+            pytest.skip("Packmol is unavailable")
+
+        protein_pdb = tmp_path / "protein.pdb"
+        _write_protein_pdb(protein_pdb)
+        species = [
+            SolutionSpecies(smiles="O", resname="SOL", count=2),
+            SolutionSpecies(smiles="[Na+]", resname="NA", count=1),
+            SolutionSpecies(smiles="[Cl-]", resname="CL", count=1),
+        ]
+        universe = create_protein_mixedbox_universe(
+            mda.Universe(protein_pdb),
+            [spec.openff_molecule for spec in species],
+            [2, 1, 1],
+            [spec.resname for spec in species],
+            30.0,
+            tmp_path / "packmol",
+            native_atom_names=[charmm_native_atom_names(spec.smiles) for spec in species],
+        )
+        assert list(universe.residues.resnames[1:]) == ["SOL", "SOL", "NA", "CL"]
+        assert list(universe.residues[1].atoms.names) == ["OW", "HW1", "HW2"]
+        assert list(universe.residues[3].atoms.names) == ["NA"]
+        assert list(universe.residues[4].atoms.names) == ["CL"]
+
+        # Validate the packed native coordinates against the same registered
+        # CHARMM bundle used by protein_mixedbox. This catches atom/residue-name
+        # drift at the real GROMACS boundary.
+        import shutil
+        import subprocess
+
+        from mdfactory.setup.protein import get_forcefield_dir
+
+        gmx = shutil.which("gmx")
+        forcefields = sorted(get_forcefield_dir().glob("*cgenff-5.0.ff"))
+        if gmx is None or not forcefields:
+            pytest.skip("GROMACS or the registered CHARMM36m/CGenFF 5.0 bundle is unavailable")
+        (tmp_path / "charmm36m.ff").symlink_to(forcefields[-1], target_is_directory=True)
+        solution = mda.Merge(universe.atoms[1:])
+        solution.dimensions = universe.dimensions
+        solution.atoms.write(tmp_path / "solution.pdb")
+        (tmp_path / "topology.top").write_text(
+            textwrap.dedent("""\
+            #include "charmm36m.ff/forcefield.itp"
+            #include "charmm36m.ff/tip3p.itp"
+            #include "charmm36m.ff/ions.itp"
+
+            [ system ]
+            Native solution
+
+            [ molecules ]
+            SOL 2
+            NA  1
+            CL  1
+            """)
+        )
+        (tmp_path / "em.mdp").write_text(
+            textwrap.dedent("""\
+            integrator = steep
+            nsteps = 0
+            cutoff-scheme = Verlet
+            coulombtype = Cut-off
+            rlist = 1.0
+            rcoulomb = 1.0
+            rvdw = 1.0
+            constraints = none
+            """)
+        )
+        result = subprocess.run(
+            [
+                gmx,
+                "grompp",
+                "-f",
+                "em.mdp",
+                "-c",
+                "solution.pdb",
+                "-p",
+                "topology.top",
+                "-o",
+                "topol.tpr",
+                "-maxwarn",
+                "0",
+            ],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_rmsd_restraint_is_translation_invariant(self):
+        import openmm as mm
+        from openmm import unit
+
+        positions = [
+            mm.Vec3(0.0, 0.0, 0.0),
+            mm.Vec3(0.1, 0.0, 0.0),
+            mm.Vec3(0.0, 0.1, 0.0),
+        ] * unit.nanometer
+        system = mm.System()
+        for _ in positions:
+            system.addParticle(12.0)
+        _add_protein_rmsd_restraint(system, positions, [0, 1, 2], 1000.0)
+        integrator = mm.VerletIntegrator(0.001 * unit.picoseconds)
+        context = mm.Context(system, integrator)
+        context.setPositions(positions)
+        reference_energy = context.getState(getEnergy=True).getPotentialEnergy()
+        translated = [p + mm.Vec3(1.0, 1.0, 1.0) * unit.nanometer for p in positions]
+        context.setPositions(translated)
+        translated_energy = context.getState(getEnergy=True).getPotentialEnergy()
+        assert translated_energy.value_in_unit(unit.kilojoules_per_mole) == pytest.approx(
+            reference_energy.value_in_unit(unit.kilojoules_per_mole), abs=1e-8
+        )
+
+    @pytest.mark.parametrize(
+        ("volumes", "expected_converged", "expected_steps"),
+        [([12.0, 9.95, 9.5], True, 50), ([12.0, 11.0, 10.5], False, 75)],
+    )
+    def test_volume_compression_reports_convergence(
+        self, volumes, expected_converged, expected_steps
+    ):
+        import openmm as mm
+        from openmm import unit
+
+        class FakeSimulation:
+            def __init__(self, sampled_volumes):
+                self.context = self
+                self.sampled_volumes = iter(sampled_volumes)
+                self.edge = None
+
+            def step(self, _steps):
+                self.edge = next(self.sampled_volumes) ** (1.0 / 3.0)
+
+            def getState(self):
+                return self
+
+            def getPeriodicBoxVectors(self):
+                return (
+                    mm.Vec3(self.edge, 0, 0) * unit.nanometer,
+                    mm.Vec3(0, self.edge, 0) * unit.nanometer,
+                    mm.Vec3(0, 0, self.edge) * unit.nanometer,
+                )
+
+        sampled, completed_steps, converged = simulate_compression_until_volume_reached(
+            FakeSimulation(volumes), target_volume_nm3=10.0, steps=75
+        )
+        assert converged is expected_converged
+        assert completed_steps == expected_steps
+        assert sampled[-1] == pytest.approx(volumes[expected_steps // 25 - 1])
 
 
 class TestCompositeTopology:
@@ -583,8 +944,13 @@ class TestCompositeTopology:
         counts = [100, 5, 3, 6]
 
         generate_gromacs_topology_with_protein(
-            top, tmp_path / "nonexistent.ff", species, parameters, counts,
-            "protein_mixedbox", out_path=out
+            top,
+            tmp_path / "nonexistent.ff",
+            species,
+            parameters,
+            counts,
+            "protein_mixedbox",
+            out_path=out,
         )
         text = out.read_text()
 
@@ -596,7 +962,8 @@ class TestCompositeTopology:
 
         molecules = text.split("[ molecules ]", 1)[1]
         mol_lines = [
-            line.strip() for line in molecules.splitlines()
+            line.strip()
+            for line in molecules.splitlines()
             if line.strip() and not line.strip().startswith(";")
         ]
         assert mol_lines[0].split() == ["Protein_chain_A", "1"]
@@ -655,7 +1022,7 @@ class TestCompositeTopology:
         assert "CG331" not in merged
 
         # The small-molecule include precedes the water include.
-        assert text.index('#include "MOL0.itp"') < text.index('charmm36m.ff/tip3p.itp')
+        assert text.index('#include "MOL0.itp"') < text.index("charmm36m.ff/tip3p.itp")
 
     def test_zero_count_species_skipped(self, tmp_path):
         top = tmp_path / "topol_protein.top"
@@ -671,8 +1038,13 @@ class TestCompositeTopology:
             SimpleNamespace(moleculetype="ETH0", parameter_itp=None),
         ]
         generate_gromacs_topology_with_protein(
-            top, tmp_path / "nonexistent.ff", species, parameters, [100, 0],
-            "protein_mixedbox", out_path=out
+            top,
+            tmp_path / "nonexistent.ff",
+            species,
+            parameters,
+            [100, 0],
+            "protein_mixedbox",
+            out_path=out,
         )
         molecules = out.read_text().split("[ molecules ]", 1)[1]
         assert "ETH0" not in molecules

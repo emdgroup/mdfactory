@@ -1,11 +1,13 @@
 # ABOUTME: Tests for the system_chemistry analysis function.
 # ABOUTME: Verifies long-format species extraction and ANALYSIS_REGISTRY registration.
 
+import json
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
+from mdfactory.analysis.artifacts import ARTIFACT_REGISTRY
 from mdfactory.analysis.simulation import ANALYSIS_REGISTRY
 from mdfactory.analysis.utils import system_chemistry
 
@@ -118,8 +120,81 @@ def test_system_chemistry_registered_for_all_types():
         assert ANALYSIS_REGISTRY[sim_type]["system_chemistry"] is system_chemistry
 
 
+def test_proteinbox_registered_in_analysis_registry():
+    """proteinbox is a valid analysis target with system_chemistry."""
+    assert "proteinbox" in ANALYSIS_REGISTRY
+    assert ANALYSIS_REGISTRY["proteinbox"]["system_chemistry"] is system_chemistry
+
+
+def test_proteinbox_registered_in_artifact_registry():
+    """proteinbox can produce the last-frame PDB artifact."""
+    assert "proteinbox" in ARTIFACT_REGISTRY
+    assert "last_frame_pdb" in ARTIFACT_REGISTRY["proteinbox"]
+
+
 def test_system_chemistry_absorbs_kwargs(mock_simulation_bilayer):
     """Extra kwargs are absorbed without error (analysis dispatch may pass them)."""
     df = system_chemistry(mock_simulation_bilayer, backend="local", n_workers=4)
 
     assert len(df) == 3
+
+
+def _protein_mixedbox_simulation(tmp_path):
+    """Build a protein_mixedbox mock Simulation with one concentration-based species."""
+    species = [
+        SimpleNamespace(resname="SOL", smiles="O", count=None, fraction=None, concentration=55.0)
+    ]
+    protein = SimpleNamespace(resname="LYZ", count=1, fraction=1.0)
+    build_input = SimpleNamespace(
+        simulation_type="protein_mixedbox",
+        system=SimpleNamespace(species=species, protein=protein),
+    )
+    report = {
+        "species": [
+            {
+                "resname": "SOL",
+                "smiles": "O",
+                "resolved_count": 1000,
+                "final_count": 998,
+                "achieved_concentration_molar": 54.8,
+            }
+        ]
+    }
+    (tmp_path / "build_metadata.json").write_text(json.dumps(report))
+    return SimpleNamespace(build_input=build_input, path=tmp_path)
+
+
+def test_system_chemistry_reads_protein_mixedbox_build_metadata(tmp_path):
+    """Resolved counts and achieved concentrations come from the build report."""
+    simulation = _protein_mixedbox_simulation(tmp_path)
+
+    df = system_chemistry(simulation)
+    row = df[df["resname"] == "SOL"].iloc[0]
+    assert row["concentration"] == 55.0
+    assert row["resolved_count"] == 1000
+    assert row["final_count"] == 998
+    assert row["achieved_concentration"] == 54.8
+
+
+def test_system_chemistry_protein_mixedbox_includes_protein_row(tmp_path):
+    """The protein is listed as its own species row and consumes no achieved index."""
+    simulation = _protein_mixedbox_simulation(tmp_path)
+
+    df = system_chemistry(simulation)
+    assert list(df["resname"]) == ["LYZ", "SOL"]
+
+    protein_row = df.iloc[0]
+    assert protein_row["resname"] == "LYZ"
+    assert protein_row["count"] == 1
+    assert protein_row["fraction"] == 1.0
+    assert protein_row["smiles"] is None
+    # The protein has no build-resolved solution counts; pandas represents the
+    # missing numeric values as NaN once the column holds the solution row's floats.
+    assert pd.isna(protein_row["concentration"])
+    assert pd.isna(protein_row["resolved_count"])
+    assert pd.isna(protein_row["final_count"])
+    assert pd.isna(protein_row["achieved_concentration"])
+
+    # The solution row still reads its own build_metadata entry (alignment intact).
+    sol_row = df[df["resname"] == "SOL"].iloc[0]
+    assert sol_row["resolved_count"] == 1000

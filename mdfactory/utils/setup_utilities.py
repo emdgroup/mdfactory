@@ -735,7 +735,9 @@ def _pack_molecules_into_box(molecules, number_of_copies, working_dir, target_de
     )
 
 
-def protein_displaced_volume_a3(protein_mass_dalton: float, partial_specific_volume: float) -> float:
+def protein_displaced_volume_a3(
+    protein_mass_dalton: float, partial_specific_volume: float
+) -> float:
     """Return a protein's displaced volume in Å³ from its mass and partial specific volume.
 
     ``partial_specific_volume`` is in mL/g. The mass converts to grams via
@@ -748,7 +750,7 @@ def protein_displaced_volume_a3(protein_mass_dalton: float, partial_specific_vol
 
 
 def cubic_box_edge_for_density(total_mass_dalton: float, target_density: float) -> float:
-    """Return the cubic box edge (Å) that holds ``total_mass_dalton`` at ``target_density`` g/cm³."""
+    """Return box edge (Å) holding ``total_mass_dalton`` at the density."""
     mass_g = total_mass_dalton / N_AVOGADRO
     volume_cm3 = mass_g / target_density
     volume_a3 = volume_cm3 * 1e24
@@ -826,6 +828,7 @@ def create_protein_mixedbox_universe(
     box_edge: float,
     working_dir,
     tolerance_a: float = 2.0,
+    native_atom_names=None,
 ) -> mda.Universe:
     """Pack solution molecules around a fixed protein with packmol.
 
@@ -852,6 +855,10 @@ def create_protein_mixedbox_universe(
         Directory the packmol working files are written into.
     tolerance_a : float, optional
         Packmol non-overlap tolerance in Å. Default 2.0 (matches pack_box).
+    native_atom_names : list[list[str] | None] or None, optional
+        CHARMM atom names for each species, aligned with ``molecules``. Use
+        ``None`` for CGenFF species. These names replace the generic OpenFF PDB
+        names for native water and ions.
 
     Returns
     -------
@@ -867,7 +874,6 @@ def create_protein_mixedbox_universe(
         _build_input_file,
         _create_molecule_pdbs,
         _find_packmol,
-        _load_positions,
     )
     from openff.units import Quantity  # noqa: PLC0415
 
@@ -882,7 +888,6 @@ def create_protein_mixedbox_universe(
     box_center = np.array([box_edge, box_edge, box_edge]) / 2.0
     u_protein.atoms.translate(box_center - (bbox_min + bbox_max) / 2.0)
     n_protein_atoms = u_protein.atoms.n_atoms
-    n_protein_residues = u_protein.residues.n_residues
 
     with working_directory(working_dir, create=True) as wd:
         protein_pdb = wd / "protein_centered.pdb"
@@ -911,22 +916,69 @@ def create_protein_mixedbox_universe(
         # solution atoms from packmol's output.
         u_packed = mda.Universe(str(wd / output_file_path))
 
-    solution_resnames = []
-    for resname, count in zip(resnames, number_of_copies):
-        solution_resnames.extend([resname.upper()] * count)
+    if native_atom_names is None:
+        native_atom_names = [None] * len(molecules)
+    if not (len(molecules) == len(number_of_copies) == len(resnames) == len(native_atom_names)):
+        raise ValueError("molecules, number_of_copies, resnames, and native_atom_names must align.")
 
-    expected_residues = n_protein_residues + len(solution_resnames)
-    if u_packed.residues.n_residues != expected_residues:
+    solution_residue_data = []
+    for molecule, resname, count, atom_names in zip(
+        molecules, resnames, number_of_copies, native_atom_names
+    ):
+        solution_residue_data.extend([(resname.upper(), molecule.n_atoms, atom_names)] * count)
+
+    expected_atoms = n_protein_atoms + sum(n_atoms for _, n_atoms, _ in solution_residue_data)
+    if u_packed.atoms.n_atoms != expected_atoms:
         raise ValueError(
-            f"Packmol output has {u_packed.residues.n_residues} residues, expected "
-            f"{expected_residues} (protein {n_protein_residues} + packed "
-            f"{len(solution_resnames)}). Cannot map residue names."
+            f"Packmol output has {u_packed.atoms.n_atoms} atoms, expected "
+            f"{expected_atoms}. Cannot reconstruct packed molecules."
         )
 
-    solution_atoms = u_packed.atoms[n_protein_atoms:]
-    for residue, resname in zip(u_packed.residues[n_protein_residues:], solution_resnames):
-        residue.resname = resname
+    # Packmol preserves structure/copy order, but its repeated residue IDs and
+    # chain labels are not reliable molecule boundaries. Rebuild the solution in
+    # one allocation, assigning one residue per known molecule. Avoid a Merge per
+    # molecule here: realistic systems contain tens of thousands of waters.
+    atom_offset = n_protein_atoms
+    solution_names: list[str] = []
+    solution_resnames: list[str] = []
+    atom_resindex: list[int] = []
+    for residue_index, (resname, n_atoms, atom_names) in enumerate(solution_residue_data):
+        packed_names = list(u_packed.atoms.names[atom_offset : atom_offset + n_atoms])
+        if atom_names is not None:
+            if len(atom_names) != n_atoms:
+                raise ValueError(
+                    f"Native residue {resname} has {n_atoms} atoms, but "
+                    f"{len(atom_names)} CHARMM atom names were supplied."
+                )
+            packed_names = atom_names
+        solution_names.extend(packed_names)
+        solution_resnames.append(resname)
+        atom_resindex.extend([residue_index] * n_atoms)
+        atom_offset += n_atoms
 
-    merged = mda.Merge(u_protein.atoms, solution_atoms)
+    n_solution_atoms = expected_atoms - n_protein_atoms
+    solution = mda.Universe.empty(
+        n_solution_atoms,
+        n_residues=len(solution_residue_data),
+        atom_resindex=np.asarray(atom_resindex),
+        trajectory=True,
+    )
+    solution.add_TopologyAttr("names", solution_names)
+    solution.add_TopologyAttr("types", list(u_packed.atoms.types[n_protein_atoms:expected_atoms]))
+    solution.add_TopologyAttr("resnames", solution_resnames)
+    solution.add_TopologyAttr("resids", np.arange(1, len(solution_residue_data) + 1))
+    solution.add_TopologyAttr("chainIDs", ["S"] * n_solution_atoms)
+    solution.atoms.positions = u_packed.atoms.positions[n_protein_atoms:expected_atoms]
+
+    merged = mda.Merge(u_protein.atoms, solution.atoms)
     merged.dimensions = [box_edge, box_edge, box_edge, 90, 90, 90]
     return merged
+
+
+def charmm_native_atom_names(smiles: str) -> list[str] | None:
+    """Return canonical CHARMM36m atom names for supported native species."""
+    return {
+        "O": ["OW", "HW1", "HW2"],
+        "[Na+]": ["NA"],
+        "[Cl-]": ["CL"],
+    }.get(smiles)

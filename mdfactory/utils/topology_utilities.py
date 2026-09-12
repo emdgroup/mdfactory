@@ -473,6 +473,45 @@ def extract_reusable_parts_from_cgenff_gmx_top(
     return "".join(lines[start:stop]), parameter_str, sections
 
 
+def _atomtype_signature(line: str) -> tuple[str, ...]:
+    """Return the physical parameter columns from a GROMACS atom-type line."""
+    fields = line.split(";", 1)[0].split()
+    if len(fields) < 6:
+        raise ValueError(f"Malformed GROMACS atom-type definition: {line!r}")
+    signature = []
+    for value in fields[-5:]:
+        try:
+            signature.append(f"{float(value):.12g}")
+        except ValueError:
+            signature.append(value.lower())
+    return tuple(signature)
+
+
+def collect_forcefield_atomtype_definitions(
+    ff_dir: str | Path,
+) -> dict[str, tuple[str, ...]]:
+    """Return atom-type names and physical parameters from a force-field directory."""
+    definitions: dict[str, tuple[str, ...]] = {}
+    for itp in sorted(Path(ff_dir).glob("*.itp")):
+        in_atomtypes = False
+        with open(itp) as fb:
+            for line in fb:
+                stripped = line.strip()
+                if not stripped or stripped.startswith((";", "#")):
+                    continue
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    in_atomtypes = stripped[1:-1].strip() == "atomtypes"
+                    continue
+                if in_atomtypes:
+                    name = stripped.split()[0]
+                    signature = _atomtype_signature(stripped)
+                    previous = definitions.get(name)
+                    if previous is not None and previous != signature:
+                        raise ValueError(f"Force field defines atom type '{name}' inconsistently.")
+                    definitions[name] = signature
+    return definitions
+
+
 def collect_forcefield_atomtypes(ff_dir: str | Path) -> set[str]:
     """Return the atom type names defined by a bundled GROMACS force-field directory.
 
@@ -493,20 +532,32 @@ def collect_forcefield_atomtypes(ff_dir: str | Path) -> set[str]:
         Atom type names defined anywhere in the force field.
 
     """
-    atomtypes: set[str] = set()
-    for itp in sorted(Path(ff_dir).glob("*.itp")):
-        in_atomtypes = False
-        with open(itp) as fb:
-            for line in fb:
+    return set(collect_forcefield_atomtype_definitions(ff_dir))
+
+
+def validate_cgenff_atomtype_compatibility(prm_files: list[str | Path], ff_dir: str | Path) -> None:
+    """Reject CGenFF atom types that conflict with the selected CHARMM bundle."""
+    forcefield_types = collect_forcefield_atomtype_definitions(ff_dir)
+    for prm in prm_files:
+        *_, sections = extract_reusable_parts_from_cgenff_gmx_top(prm, must_have_moleculetype=False)
+        for section_name, section_text in sections:
+            if section_name != "atomtypes":
+                continue
+            for line in section_text.splitlines():
                 stripped = line.strip()
-                if not stripped or stripped.startswith((";", "#")):
+                if not stripped or stripped.startswith((";", "[")):
                     continue
-                if stripped.startswith("[") and stripped.endswith("]"):
-                    in_atomtypes = stripped[1:-1].strip() == "atomtypes"
+                name = stripped.split()[0]
+                existing = forcefield_types.get(name)
+                if existing is None:
                     continue
-                if in_atomtypes:
-                    atomtypes.add(stripped.split()[0])
-    return atomtypes
+                generated = _atomtype_signature(stripped)
+                if generated != existing:
+                    raise ValueError(
+                        f"CGenFF atom type '{name}' conflicts with the selected CHARMM "
+                        f"force-field bundle ({generated} != {existing}). Use a CGenFF "
+                        "installation matching the registered charmm36m bundle."
+                    )
 
 
 def merge_extra_parameter_itps(

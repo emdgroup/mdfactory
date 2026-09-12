@@ -11,9 +11,11 @@ import pytest
 from mdfactory.models.species import SingleMoleculeSpecies
 from mdfactory.settings import settings
 from mdfactory.utils.topology_utilities import (
+    _atomtype_signature,
     _get_sybyl_atom_type,
     extract_reusable_parts_from_cgenff_gmx_top,
     merge_extra_parameter_itps,
+    validate_cgenff_atomtype_compatibility,
     write_mol2_from_rdkit,
 )
 from mdfactory.utils.utilities import working_directory
@@ -22,6 +24,36 @@ cgenff_dir = settings.cgenff_dir
 cgenff_available = cgenff_dir.exists() and (cgenff_dir / "cgenff" / "cgenff_batch.sh").exists()
 
 MOL2_REFERENCES = Path(__file__).parent / "testfiles" / "mol2_references.json"
+
+
+def test_atomtype_signature_ignores_inline_comment():
+    """A trailing ';' comment does not change the physical-parameter signature."""
+    plain = "CG331 6 12.011 0.0 A 0.36 0.28"
+    commented = "CG331 6 12.011 0.0 A 0.36 0.28 ; sp3 carbon"
+    assert _atomtype_signature(commented) == _atomtype_signature(plain)
+
+
+def test_cgenff_atomtype_compatibility_ignores_inline_comment(tmp_path):
+    """Matching atom types with a trailing comment on one side are still compatible."""
+    ff_dir = tmp_path / "charmm36m.ff"
+    ff_dir.mkdir()
+    (ff_dir / "atomtypes.itp").write_text("[ atomtypes ]\nCG331 6 12.011 0.0 A 0.36 0.28\n")
+    generated = tmp_path / "generated.itp"
+    generated.write_text("[ atomtypes ]\nCG331 6 12.011 0.0 A 0.36 0.28 ; sp3 carbon\n")
+
+    # Identical physical parameters, only a comment differs -> no conflict raised.
+    validate_cgenff_atomtype_compatibility([generated], ff_dir)
+
+
+def test_cgenff_atomtype_compatibility_rejects_conflict(tmp_path):
+    ff_dir = tmp_path / "charmm36m.ff"
+    ff_dir.mkdir()
+    (ff_dir / "atomtypes.itp").write_text("[ atomtypes ]\nCG331 6 12.011 0.0 A 0.36 0.28\n")
+    generated = tmp_path / "generated.itp"
+    generated.write_text("[ atomtypes ]\nCG331 6 12.011 0.0 A 0.40 0.28\n")
+
+    with pytest.raises(ValueError, match="conflicts with the selected CHARMM"):
+        validate_cgenff_atomtype_compatibility([generated], ff_dir)
 
 
 def _load_mol2_references():

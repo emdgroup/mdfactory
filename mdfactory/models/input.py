@@ -94,6 +94,7 @@ class BuildInput(BaseModel):
                     "resname": species.resname,
                     "count": species.count,
                     "fraction": species.fraction,
+                    "concentration": getattr(species, "concentration", None),
                 }
             )
 
@@ -112,12 +113,23 @@ class BuildInput(BaseModel):
         elif self.simulation_type == "protein_mixedbox":
             system_specific["padding"] = self.system.padding
             system_specific["sizing"] = self.system.sizing.model_dump()
-            system_specific["concentration_volume_basis"] = (
-                self.system.concentration_volume_basis
-            )
+            system_specific["concentration_volume_basis"] = self.system.concentration_volume_basis
             system_specific["partial_specific_volume"] = self.system.partial_specific_volume
             system_specific["ionization"] = self.system.ionization.model_dump()
             system_specific["pdb_path"] = str(self.system.protein.pdb_path)
+            # The protein anchors the box but is not part of system.species
+            # (packing is solution-only); list it as a species so metadata
+            # matches proteinbox.
+            protein = self.system.protein
+            species_composition.insert(
+                0,
+                {
+                    "resname": protein.resname,
+                    "count": protein.count,
+                    "fraction": protein.fraction,
+                    "concentration": None,
+                },
+            )
 
         return {
             "hash": self.hash,
@@ -231,14 +243,26 @@ class BuildInput(BaseModel):
 
     @model_validator(mode="after")
     def validate_protein_chain_config(self) -> "BuildInput":
-        """Reject declaring chains while also merging them into one moleculetype.
+        """Validate protein chain grouping against pdb2gmx molecule handling.
 
         merge_all fuses every chain into a single ``Protein`` moleculetype, which
         contradicts protein.chains declaring subunits to build separately. Catching
         this here avoids a confusing chain-mismatch failure deep inside pdb2gmx.
+        Compression additionally requires a multi-chain complex to be merged so
+        the barostat cannot scale chain centers independently.
         """
         if self.simulation_type not in ("proteinbox", "protein_mixedbox"):
             return self
+        if (
+            self.simulation_type == "protein_mixedbox"
+            and len(self.system.protein.chains) > 1
+            and not getattr(self.parametrization_config, "merge_all", False)
+        ):
+            raise ValueError(
+                "A multi-chain protein_mixedbox must be one pdb2gmx moleculetype so "
+                "the barostat moves the complete protein as a rigid unit. Set "
+                "parametrization_config.merge_all=true and omit protein.chains."
+            )
         if getattr(self.parametrization_config, "merge_all", False) and self.system.protein.chains:
             raise ValueError(
                 "protein.chains declares subunits to build as separate moleculetypes, but "

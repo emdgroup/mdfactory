@@ -16,6 +16,7 @@ from .utils.topology_utilities import (
     extract_reusable_parts_from_cgenff_gmx_top,
     merge_extra_parameter_itps,
     run_cgenff_to_gmx,
+    validate_cgenff_atomtype_compatibility,
     write_mol2_from_rdkit,
 )
 from .utils.utilities import lock_local_folder, working_directory
@@ -111,13 +112,18 @@ def retrieve_or_deposit_parameters(engine, parametrization):
     return inner
 
 
-def parametrize_cgenff_gromacs(species: SingleMoleculeSpecies) -> GromacsSingleMoleculeParameterSet:
+def parametrize_cgenff_gromacs(
+    species: SingleMoleculeSpecies, native_forcefield_dir: Path | None = None
+) -> GromacsSingleMoleculeParameterSet:
     """Parametrize a species using CGenFF for GROMACS.
 
     Parameters
     ----------
     species : SingleMoleculeSpecies
         Molecule to parametrize
+    native_forcefield_dir : Path or None, optional
+        Selected bundled CHARMM directory providing native water/ion topology
+        files. The global CGenFF installation is used only when omitted.
 
     Returns
     -------
@@ -127,7 +133,11 @@ def parametrize_cgenff_gromacs(species: SingleMoleculeSpecies) -> GromacsSingleM
     """
     # local folder for parameter storage
     pardir = settings.parameter_store / "gromacs" / "cgenff"
-    charmm36_dir = settings.cgenff_dir / "data" / "gromacs" / "charmm36.ff"
+    charmm36_dir = (
+        Path(native_forcefield_dir)
+        if native_forcefield_dir is not None
+        else settings.cgenff_dir / "data" / "gromacs" / "charmm36.ff"
+    )
     forcefield_itp = charmm36_dir / "forcefield.itp"
     cgenff_config = CgenffConfig()
 
@@ -593,7 +603,8 @@ def generate_gromacs_topology_with_protein(
         )
     if molecules_idx is None:
         raise RuntimeError(
-            f"No [ molecules ] section found in {protein_top_path}; cannot build composite topology."
+            f"No [ molecules ] section found in {protein_top_path}; "
+            "cannot build composite topology."
         )
 
     # CGenFF small molecules carry a parameter_itp; native water/ions do not and
@@ -604,6 +615,7 @@ def generate_gromacs_topology_with_protein(
     if cgenff_parameters:
         exclude_atomtypes = collect_forcefield_atomtypes(ff_dir)
         prm_files = sorted({str(par.parameter_itp) for par in cgenff_parameters})
+        validate_cgenff_atomtype_compatibility(prm_files, ff_dir)
         merged = merge_extra_parameter_itps(
             prm_files, exclude_atomtypes=exclude_atomtypes, drop_defaults=True
         )

@@ -162,6 +162,7 @@ class SolutionSpecies(SingleMoleculeSpecies):
     concentration to a count against a chosen volume basis.
     """
 
+    count: Optional[int] = Field(None, description="Exact number of molecules to pack.", ge=0)
     concentration: Optional[float] = Field(
         None, description="Target molar concentration in mol/L (M).", ge=0.0
     )
@@ -178,8 +179,13 @@ class SolutionSpecies(SingleMoleculeSpecies):
                 "SolutionSpecies does not support 'fraction'; provide 'count' or 'concentration'."
             )
         if (self.count is None) == (self.concentration is None):
+            raise ValueError("SolutionSpecies requires exactly one of 'count' or 'concentration'.")
+        native_resnames = {"O": "SOL", "[Na+]": "NA", "[Cl-]": "CL"}
+        expected_resname = native_resnames.get(self.smiles)
+        if expected_resname is not None and self.resname.upper() != expected_resname:
             raise ValueError(
-                "SolutionSpecies requires exactly one of 'count' or 'concentration'."
+                f"Native CHARMM species {self.smiles!r} must use resname "
+                f"'{expected_resname}', not '{self.resname}'."
             )
         return self
 

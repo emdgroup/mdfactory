@@ -447,9 +447,10 @@ SizingConfig = Annotated[
 class ProteinMixedBoxComposition(BaseModel):
     """Pack water, ions, and SMILES small molecules around one fixed protein.
 
-    The protein is prepared with pdb2gmx and held completely fixed while the
-    solution molecules are packed around it and compressed. Concentrations are
-    resolved to counts against the chosen volume basis at build time.
+    The protein is prepared with pdb2gmx and its internal structure is restrained
+    while solution molecules are packed around it and compressed. Its rigid-body
+    position may follow periodic box scaling. Concentrations are resolved to
+    counts against the chosen volume basis at build time.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -457,7 +458,9 @@ class ProteinMixedBoxComposition(BaseModel):
     protein: ProteinSpecies
     species: list[SolutionSpecies] = Field(
         ...,
-        description="Solution molecules to pack, including water as an explicit 'smiles: O' species.",
+        description=(
+            "Solution molecules to pack, including water as an explicit 'smiles: O' species."
+        ),
     )
     sizing: SizingConfig = Field(..., description="How the final cubic box is sized.")
     padding: float = Field(
@@ -481,12 +484,19 @@ class ProteinMixedBoxComposition(BaseModel):
         ge=0,
     )
     ionization: IonizationConfig = Field(
-        default_factory=IonizationConfig, description="Configuration for ionization."
+        default_factory=IonizationConfig,
+        description=(
+            "Ionization settings. The salt is added on top of neutralization and any "
+            "ions already packed as explicit solution species -- it is not a target "
+            "total ionic strength. Salt count is resolved against "
+            "concentration_volume_basis. Set concentration: 0 to add no salt and "
+            "control ionic strength purely through packed ion species."
+        ),
     )
 
     @model_validator(mode="after")
     def check_fixed_box_fits_padding(self) -> "ProteinMixedBoxComposition":
-        """A fixed box must be wider than twice the padding to leave room for the protein.
+        """Require a fixed box wider than twice the requested protein padding.
 
         The full protein-fits-with-padding check needs the protein extent from the
         PDB and runs at build time; this catches the obviously-too-small case early.
@@ -512,7 +522,7 @@ class ProteinMixedBoxComposition(BaseModel):
 
     @property
     def total_count(self) -> Optional[int]:
-        """Total resolved count (protein + counted species), or None if any is concentration-based."""
+        """Return total count, or None when a species is concentration-based."""
         if any(s.count is None for s in self.species):
             return None
         return 1 + sum(s.count for s in self.species)
@@ -525,7 +535,5 @@ class ProteinMixedBoxComposition(BaseModel):
         are excluded; this mirrors ProteinBoxComposition's placeholder charge.
         """
         return sum(
-            s.count * s.charge
-            for s in self.species
-            if s.count is not None and s.charge is not None
+            s.count * s.charge for s in self.species if s.count is not None and s.charge is not None
         )

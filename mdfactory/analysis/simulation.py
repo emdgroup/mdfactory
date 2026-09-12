@@ -48,6 +48,7 @@ ANALYSIS_REGISTRY: dict[str, dict[str, Callable]] = {
         "lipid_rg": lipid_rg,
     },
     "mixedbox": {},
+    "proteinbox": {},
     "protein_mixedbox": {},
 }
 
@@ -229,7 +230,12 @@ class Simulation:
             Simulation metadata including species composition
 
         """
-        return self.build_input.metadata
+        metadata = self.build_input.metadata
+        build_metadata_path = self.path / "build_metadata.json"
+        if build_metadata_path.is_file():
+            with open(build_metadata_path) as file_handle:
+                metadata["build_metadata"] = json.load(file_handle)
+        return metadata
 
     @property
     def analysis_dir(self) -> Path:
