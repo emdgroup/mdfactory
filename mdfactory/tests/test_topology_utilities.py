@@ -13,6 +13,7 @@ from mdfactory.settings import settings
 from mdfactory.utils.topology_utilities import (
     _atomtype_signature,
     _get_sybyl_atom_type,
+    collect_forcefield_atomtype_definitions,
     extract_reusable_parts_from_cgenff_gmx_top,
     merge_extra_parameter_itps,
     validate_cgenff_atomtype_compatibility,
@@ -54,6 +55,39 @@ def test_cgenff_atomtype_compatibility_rejects_conflict(tmp_path):
 
     with pytest.raises(ValueError, match="conflicts with the selected CHARMM"):
         validate_cgenff_atomtype_compatibility([generated], ff_dir)
+
+
+def test_collect_atomtypes_honors_preprocessor_conditionals(tmp_path):
+    """#ifdef HEAVY_H alternatives for one atom type are not a redefinition conflict."""
+    ff_dir = tmp_path / "charmm36.ff"
+    ff_dir.mkdir()
+    (ff_dir / "ffnonbonded.itp").write_text(
+        "[ atomtypes ]\n"
+        "#ifdef HEAVY_H\n"
+        "HT 1 4.032 0.417 A 0.04000 0.19246\n"
+        "#else\n"
+        "HT 1 1.008 0.417 A 0.04000 0.19246\n"
+        "#endif\n"
+    )
+
+    definitions = collect_forcefield_atomtype_definitions(ff_dir)
+
+    # HEAVY_H is undefined for mdfactory builds, so the standard-mass branch wins.
+    assert definitions["HT"] == _atomtype_signature("HT 1 1.008 0.417 A 0.04000 0.19246")
+
+
+def test_collect_atomtypes_rejects_genuine_redefinition(tmp_path):
+    """Two unconditional definitions of one type with different params still raise."""
+    ff_dir = tmp_path / "charmm36.ff"
+    ff_dir.mkdir()
+    (ff_dir / "ffnonbonded.itp").write_text(
+        "[ atomtypes ]\n"
+        "HT 1 1.008 0.417 A 0.04000 0.19246\n"
+        "HT 1 4.032 0.417 A 0.04000 0.19246\n"
+    )
+
+    with pytest.raises(ValueError, match="inconsistently"):
+        collect_forcefield_atomtype_definitions(ff_dir)
 
 
 def _load_mol2_references():
