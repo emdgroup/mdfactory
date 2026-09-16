@@ -1735,61 +1735,61 @@ def test_build_mdrun_script_explicit_gmx_mpi():
 
 
 # ---------------------------------------------------------------------------
-# T7: _extract_resource_hints GPU / gmx_binary branches (Finding 18)
+# T7: extract_resource_hints GPU / gmx_binary branches (Finding 18)
 # ---------------------------------------------------------------------------
 
 
-def test_extract_resource_hints_gpu_gres_disables_disable_gpu():
+def testextract_resource_hints_gpu_gres_disables_disable_gpu():
     """GPU gres string → disable_gpu=False (GPU mode active)."""
-    from mdfactory.orchestration.stages import _extract_resource_hints
+    from mdfactory.orchestration.stages import extract_resource_hints
 
     cfg = MagicMock(
         cpus_per_node=12, gres="gpu:l40s:1", gmx_binary="gmx_mpi", max_workers_per_node=1
     )
-    hints = _extract_resource_hints(cfg)
+    hints = extract_resource_hints(cfg)
 
     assert hints.disable_gpu is False
     assert hints.gmx_binary == "gmx_mpi"
     assert hints.ntasks == 12
 
 
-def test_extract_resource_hints_non_gpu_gres_sets_disable_gpu():
+def testextract_resource_hints_non_gpu_gres_sets_disable_gpu():
     """Non-GPU gres string → disable_gpu=True (no GPU)."""
-    from mdfactory.orchestration.stages import _extract_resource_hints
+    from mdfactory.orchestration.stages import extract_resource_hints
 
     cfg = MagicMock(cpus_per_node=4, gres="ssd:1", gmx_binary="auto", max_workers_per_node=1)
-    hints = _extract_resource_hints(cfg)
+    hints = extract_resource_hints(cfg)
 
     assert hints.disable_gpu is True
 
 
-def test_extract_resource_hints_none_gres_sets_disable_gpu():
+def testextract_resource_hints_none_gres_sets_disable_gpu():
     """gres=None → disable_gpu=True (no GPU)."""
-    from mdfactory.orchestration.stages import _extract_resource_hints
+    from mdfactory.orchestration.stages import extract_resource_hints
 
     cfg = MagicMock(cpus_per_node=8, gres=None, gmx_binary="auto", max_workers_per_node=1)
-    hints = _extract_resource_hints(cfg)
+    hints = extract_resource_hints(cfg)
 
     assert hints.disable_gpu is True
 
 
-def test_extract_resource_hints_none_stage_config_is_cpu_safe():
+def testextract_resource_hints_none_stage_config_is_cpu_safe():
     """stage_config=None → disable_gpu=True (safe default for local runs)."""
-    from mdfactory.orchestration.stages import _extract_resource_hints
+    from mdfactory.orchestration.stages import extract_resource_hints
 
-    hints = _extract_resource_hints(None)
+    hints = extract_resource_hints(None)
 
     assert hints.disable_gpu is True
     assert hints.ntasks == 0
     assert hints.gmx_binary == "auto"
 
 
-def test_extract_resource_hints_divides_by_max_workers():
+def testextract_resource_hints_divides_by_max_workers():
     """ntasks is divided by max_workers_per_node when >1 to avoid oversubscription."""
-    from mdfactory.orchestration.stages import _extract_resource_hints
+    from mdfactory.orchestration.stages import extract_resource_hints
 
     cfg = MagicMock(cpus_per_node=12, gres=None, gmx_binary="auto", max_workers_per_node=2)
-    hints = _extract_resource_hints(cfg)
+    hints = extract_resource_hints(cfg)
 
     assert hints.ntasks == 6  # 12 // 2
 

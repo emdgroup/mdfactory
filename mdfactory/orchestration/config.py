@@ -197,7 +197,7 @@ class ExecutorConfig(BaseModel):
 
 #: Fields in :class:`SlurmExecutorConfig` that ``stage_overrides`` can
 #: legitimately change.  These are the mdrun-command-line knobs extracted by
-#: :func:`~mdfactory.orchestration.stages._extract_resource_hints`.  All other
+#: :func:`~mdfactory.orchestration.stages.extract_resource_hints`.  All other
 #: fields (``walltime``, ``mem``, ``nodes``, ``partition``, …) are baked into
 #: the Parsl allocation at session start and cannot vary per-stage without
 #: spawning separate executor instances.
