@@ -490,14 +490,36 @@ def _atomtype_signature(line: str) -> tuple[str, ...]:
 def collect_forcefield_atomtype_definitions(
     ff_dir: str | Path,
 ) -> dict[str, tuple[str, ...]]:
-    """Return atom-type names and physical parameters from a force-field directory."""
+    """Return atom-type names and physical parameters from a force-field directory.
+
+    Honors ``#ifdef``/``#ifndef``/``#else``/``#endif`` the way ``grompp`` does.
+    mdfactory builds without hydrogen-mass repartitioning, so no force-field
+    macros are defined and the ``#ifdef HEAVY_H`` water-hydrogen variants are
+    inactive. Without this, a type such as ``HT`` (defined once per branch with
+    a different mass) would read as an inconsistent redefinition.
+    """
+    defined_macros: set[str] = set()
     definitions: dict[str, tuple[str, ...]] = {}
     for itp in sorted(Path(ff_dir).glob("*.itp")):
         in_atomtypes = False
+        branch_active: list[bool] = []
         with open(itp) as fb:
             for line in fb:
                 stripped = line.strip()
-                if not stripped or stripped.startswith((";", "#")):
+                if not stripped or stripped.startswith(";"):
+                    continue
+                if stripped.startswith("#"):
+                    directive, _, rest = stripped.partition(" ")
+                    if directive == "#ifdef":
+                        branch_active.append(rest.strip() in defined_macros)
+                    elif directive == "#ifndef":
+                        branch_active.append(rest.strip() not in defined_macros)
+                    elif directive == "#else" and branch_active:
+                        branch_active[-1] = not branch_active[-1]
+                    elif directive == "#endif" and branch_active:
+                        branch_active.pop()
+                    continue
+                if not all(branch_active):
                     continue
                 if stripped.startswith("[") and stripped.endswith("]"):
                     in_atomtypes = stripped[1:-1].strip() == "atomtypes"
