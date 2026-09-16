@@ -1,5 +1,5 @@
 # ABOUTME: Tests for the reusable Parsl session context manager
-# ABOUTME: Validates DFK guard, load, shutdown, and detach semantics
+# ABOUTME: Validates DFK guard, load, and shutdown semantics
 """Tests for orchestration Parsl session management."""
 
 from unittest.mock import MagicMock
@@ -32,21 +32,9 @@ def test_parsl_session_loads_and_shuts_down(monkeypatch):
 
     with parsl_session(ExecutorConfig()) as session:
         assert isinstance(session, ParslSession)
-        assert session.detached is False
 
     parsl.load.assert_called_once()
     parsl.clear.assert_called_once()
-
-
-def test_parsl_session_detach_skips_shutdown(monkeypatch):
-    """A detached session does not shut down the DFK on exit."""
-    _patch_parsl(monkeypatch)
-
-    with parsl_session(ExecutorConfig()) as session:
-        session.detach()
-
-    parsl.load.assert_called_once()
-    parsl.clear.assert_not_called()
 
 
 def test_parsl_session_guards_active_dfk(monkeypatch):
