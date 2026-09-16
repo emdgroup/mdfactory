@@ -64,12 +64,10 @@ path = "mdfactory/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["mdfactory"]
 
-# These files are git-tracked (force-added) but match root .gitignore patterns,
-# so hatchling excludes them unless explicitly force-included.
+# These individual files match root .gitignore patterns and must be shipped.
 [tool.hatch.build.force-include]
 "mdfactory/setup/data/spc216.gro" = "mdfactory/setup/data/spc216.gro"
 "mdfactory/tests/testfiles/cgenff_output.itp" = "mdfactory/tests/testfiles/cgenff_output.itp"
-"mdfactory/run_schedules/gromacs" = "mdfactory/run_schedules/gromacs"
 
 [tool.bumpversion]
 current_version = "0.1.0"
