@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from mdfactory.orchestration.apps import MDRUN_PERF_MARKER
 from mdfactory.performance.benchmark import (
     BenchmarkConfig,
     BenchmarkResult,
@@ -15,7 +17,10 @@ from mdfactory.performance.benchmark import (
     _build_sweep_configs,
     _generate_benchmark_mdp,
     _select_optimum,
+    _sweep_lock,
     parse_mdlog_performance,
+    parse_performance_marker,
+    read_performance_file,
     run_benchmark_sweep,
 )
 
@@ -110,6 +115,71 @@ class TestParseMdlogPerformance:
         log = tmp_path / "empty.log"
         log.write_text("")
         assert parse_mdlog_performance(log) is None
+
+
+class TestParsePerformanceMarker:
+    """Tests for parse_performance_marker."""
+
+    def test_extracts_value(self):
+        """Marker line yields the ns/day value."""
+        stdout = f"some mdrun output\n{MDRUN_PERF_MARKER}5.234\n"
+        assert parse_performance_marker(stdout) == pytest.approx(5.234)
+
+    def test_uses_last_marker(self):
+        """When several markers are present, the last one wins."""
+        stdout = f"{MDRUN_PERF_MARKER}1.0\n{MDRUN_PERF_MARKER}9.75\n"
+        assert parse_performance_marker(stdout) == pytest.approx(9.75)
+
+    def test_missing_marker_returns_none(self):
+        """stdout without the marker returns None."""
+        assert parse_performance_marker("no marker here") is None
+
+    def test_empty_marker_returns_none(self):
+        """Marker with an empty value returns None (regex requires a digit)."""
+        assert parse_performance_marker(f"{MDRUN_PERF_MARKER}\n") is None
+
+    def test_none_stdout_returns_none(self):
+        """None or empty stdout returns None."""
+        assert parse_performance_marker(None) is None
+        assert parse_performance_marker("") is None
+
+
+class TestReadPerformanceFile:
+    """Tests for read_performance_file."""
+
+    def test_reads_marker_from_file(self, tmp_path):
+        """Sidecar with a marker line yields the value."""
+        perf = tmp_path / "bench.deadbeef.perf"
+        perf.write_text(f"{MDRUN_PERF_MARKER}5.234\n")
+        assert read_performance_file(perf) == pytest.approx(5.234)
+
+    def test_missing_file_returns_none(self, tmp_path):
+        """A sidecar that was never written returns None."""
+        assert read_performance_file(tmp_path / "nope.perf") is None
+
+    def test_empty_value_returns_none(self, tmp_path):
+        """A sidecar with an empty marker value returns None."""
+        perf = tmp_path / "bench.perf"
+        perf.write_text(f"{MDRUN_PERF_MARKER}\n")
+        assert read_performance_file(perf) is None
+
+
+class TestSweepLock:
+    """Tests for the concurrent-sweep guard."""
+
+    def test_second_sweep_rejected(self, tmp_path):
+        """A second concurrent sweep raises instead of sharing trial dirs."""
+        with _sweep_lock(tmp_path):
+            with pytest.raises(RuntimeError, match="already running"):
+                with _sweep_lock(tmp_path):
+                    pass
+
+    def test_lock_released_after_exit(self, tmp_path):
+        """The lock is released when the holding sweep exits."""
+        with _sweep_lock(tmp_path):
+            pass
+        with _sweep_lock(tmp_path):
+            pass  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +477,22 @@ def _setup_sim_dir(tmp_path):
     return sim_dir
 
 
+def _mdrun_writes_perf(perf_text: str):
+    """Build a mock mdrun side_effect that writes a performance sidecar.
+
+    The real mdrun script writes ns/day to ``performance_file`` inside
+    ``work_dir``; this mimics that so ``read_performance_file`` finds it.
+    """
+
+    def _fake(**kwargs):
+        Path(kwargs["work_dir"], kwargs["performance_file"]).write_text(perf_text)
+        fut = MagicMock()
+        fut.result.return_value = 0
+        return fut
+
+    return _fake
+
+
 class TestRunBenchmarkSweepExecution:
     """Tests for the live execution path (dry_run=False)."""
 
@@ -414,11 +500,10 @@ class TestRunBenchmarkSweepExecution:
     @patch("mdfactory.orchestration.session.parsl_session")
     @patch("mdfactory.orchestration.apps.get_grompp_app")
     @patch("mdfactory.orchestration.apps.get_mdrun_app")
-    @patch("mdfactory.performance.benchmark.parse_mdlog_performance")
     def test_mocked_sweep_runs_all_points(
-        self, mock_parse, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
-        """Mocked sweep runs one Parsl session per sweep point."""
+        """Mocked sweep runs every point inside a single allocation."""
         from mdfactory.orchestration.config import ExecutorConfig
 
         sim_dir = _setup_sim_dir(tmp_path)
@@ -431,18 +516,17 @@ class TestRunBenchmarkSweepExecution:
         mock_grompp_app.return_value = mock_grompp
 
         mock_mdrun = MagicMock()
-        mock_mdrun.return_value.result.return_value = "ok"
+        # mdrun writes ns/day to the (uniquely named) performance sidecar
+        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}5.234\n")
         mock_mdrun_app.return_value = mock_mdrun
-
-        mock_parse.return_value = 5.234
 
         cfg = ExecutorConfig()
         bench_cfg = BenchmarkConfig(cpu_counts=[2, 4])
 
         result = run_benchmark_sweep(sim_dir, cfg, bench_cfg)
 
-        # Two sweep points → two Parsl sessions
-        assert mock_session.call_count == 2
+        # One allocation for the whole sweep, two trials inside it
+        assert mock_session.call_count == 1
         assert mock_grompp.call_count == 2
         assert mock_mdrun.call_count == 2
         assert len(result.trials) == 2
@@ -451,6 +535,18 @@ class TestRunBenchmarkSweepExecution:
         assert result.optimum is not None
         # Result saved as JSON sidecar
         assert (sim_dir / "benchmark_result.json").exists()
+
+        # The allocation is sized to the largest requested CPU count...
+        allocation_config = mock_session.call_args.args[0]
+        assert allocation_config.cpus_per_node == 4
+        # ...while mdrun thread counts follow the individual sweep points.
+        assert [call.kwargs["ntasks"] for call in mock_mdrun.call_args_list] == [2, 4]
+
+        # Regression: ns/day must be extracted on the worker into a uniquely
+        # named sidecar, not by reading the log from the driver.
+        perf_names = [call.kwargs["performance_file"] for call in mock_mdrun.call_args_list]
+        assert all(name for name in perf_names)
+        assert len(set(perf_names)) == len(perf_names)  # unique per trial
 
         # Regression: apps must receive an explicit input dependency list.
         # Omitting it forwards ``inputs=None``, which Parsl cannot iterate.
@@ -466,11 +562,10 @@ class TestRunBenchmarkSweepExecution:
     @patch("mdfactory.orchestration.session.parsl_session")
     @patch("mdfactory.orchestration.apps.get_grompp_app")
     @patch("mdfactory.orchestration.apps.get_mdrun_app")
-    @patch("mdfactory.performance.benchmark.parse_mdlog_performance")
     def test_missing_performance_data_sets_error(
-        self, mock_parse, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
-        """When mdrun succeeds but log has no performance data, error is set."""
+        """When mdrun succeeds but emits no marker, error is set."""
         from mdfactory.orchestration.config import ExecutorConfig
 
         sim_dir = _setup_sim_dir(tmp_path)
@@ -483,11 +578,9 @@ class TestRunBenchmarkSweepExecution:
         mock_grompp_app.return_value = mock_grompp
 
         mock_mdrun = MagicMock()
-        mock_mdrun.return_value.result.return_value = "ok"
+        # No performance sidecar is written -> no performance data
+        mock_mdrun.return_value.result.return_value = 0
         mock_mdrun_app.return_value = mock_mdrun
-
-        # Parser returns None — no performance block found
-        mock_parse.return_value = None
 
         cfg = ExecutorConfig()
         bench_cfg = BenchmarkConfig(cpu_counts=[4])
@@ -504,9 +597,8 @@ class TestRunBenchmarkSweepExecution:
     @patch("mdfactory.orchestration.session.parsl_session")
     @patch("mdfactory.orchestration.apps.get_grompp_app")
     @patch("mdfactory.orchestration.apps.get_mdrun_app")
-    @patch("mdfactory.performance.benchmark.parse_mdlog_performance")
     def test_failed_trial_continues_sweep(
-        self, mock_parse, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
         """A failed trial records the error and continues to the next point."""
         from mdfactory.orchestration.config import ExecutorConfig
@@ -534,9 +626,8 @@ class TestRunBenchmarkSweepExecution:
         mock_grompp.side_effect = grompp_side_effect
 
         mock_mdrun = MagicMock()
-        mock_mdrun.return_value.result.return_value = "ok"
+        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}8.0\n")
         mock_mdrun_app.return_value = mock_mdrun
-        mock_parse.return_value = 8.0
 
         cfg = ExecutorConfig()
         bench_cfg = BenchmarkConfig(cpu_counts=[2, 4])
@@ -584,3 +675,11 @@ class TestRunBenchmarkSweepErrors:
 
         with pytest.raises(FileNotFoundError, match="No structure file found"):
             run_benchmark_sweep(sim_dir, ExecutorConfig())
+
+    def test_multi_node_allocation_rejected(self, tmp_path):
+        """A multi-node allocation is rejected because trials are single-rank."""
+        from mdfactory.orchestration.config import SlurmExecutorConfig
+
+        cfg = SlurmExecutorConfig(account="acct", partition="cpu", nodes=2)
+        with pytest.raises(ValueError, match="single-node"):
+            run_benchmark_sweep(tmp_path, cfg, BenchmarkConfig(cpu_counts=[2]))

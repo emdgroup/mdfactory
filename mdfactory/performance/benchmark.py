@@ -11,12 +11,19 @@ resulting GROMACS log for throughput (ns/day).
 
 from __future__ import annotations
 
+import fcntl
+import os
 import re
+import socket
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from loguru import logger
 from pydantic import BaseModel, field_validator
+
+from mdfactory.orchestration.apps import MDRUN_PERF_MARKER
 
 if TYPE_CHECKING:
     from mdfactory.orchestration.config import ExecutorConfig
@@ -67,6 +74,67 @@ def parse_mdlog_performance(log_path: Path) -> float | None:
     # Last match wins (restart with -append produces multiple blocks)
     ns_per_day = float(matches[-1].group(1))
     return ns_per_day
+
+
+#: Regex for the marker ``MDFACTORY_NS_PER_DAY=<value>`` echoed by mdrun.
+_PERF_MARKER_RE = re.compile(re.escape(MDRUN_PERF_MARKER) + r"([\d.]+)")
+
+
+def parse_performance_marker(stdout: str) -> float | None:
+    """Extract ns/day from the mdrun app's stdout marker.
+
+    The mdrun bash script greps the performance value out of its own log and
+    echoes ``MDFACTORY_NS_PER_DAY=<value>`` on stdout.  Because that script
+    runs on the node that wrote the log, this avoids the driver-side shared
+    filesystem staleness that can otherwise return a *previous* run's value
+    (GROMACS renames old outputs to ``#<name>.<n>#``, but a stale filesystem
+    view can still resolve ``bench.log`` to the pre-rename inode).
+
+    Parameters
+    ----------
+    stdout : str
+        Standard output returned by the mdrun Parsl app.
+
+    Returns
+    -------
+    float or None
+        Throughput in ns/day, or ``None`` when the marker is absent or its
+        value is empty.
+
+    """
+    if not stdout:
+        return None
+    matches = list(_PERF_MARKER_RE.finditer(stdout))
+    if not matches:
+        return None
+    return float(matches[-1].group(1))
+
+
+def read_performance_file(perf_path: Path) -> float | None:
+    """Read ns/day from the mdrun performance sidecar file.
+
+    The mdrun bash script writes the performance marker to a caller-named
+    file (see ``performance_file``).  Reading that file here is safe as long
+    as the name is unique per trial: a path the driver has never opened cannot
+    be served from a stale filesystem cache entry.
+
+    Parameters
+    ----------
+    perf_path : Path
+        Sidecar file written by the mdrun script.
+
+    Returns
+    -------
+    float or None
+        Throughput in ns/day, or ``None`` when the file is missing or holds
+        no marker value.
+
+    """
+    try:
+        text = perf_path.read_text()
+    except FileNotFoundError:
+        return None
+    return parse_performance_marker(text)
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +349,52 @@ def _build_sweep_configs(
     return points
 
 
+@contextmanager
+def _sweep_lock(system_path: Path):
+    """Serialize benchmark sweeps for one system via an exclusive file lock.
+
+    Two concurrent sweeps would share the same ``.benchmark/cpus*`` trial
+    directories and race on ``bench.log``/``bench.tpr``, yielding meaningless
+    results.  An ``flock`` on ``.benchmark/.lock`` makes a second sweep fail
+    fast, and the lock is released automatically if the holder dies.
+
+    Parameters
+    ----------
+    system_path : Path
+        Prepared simulation directory.
+
+    Yields
+    ------
+    None
+        While the lock is held.
+
+    Raises
+    ------
+    RuntimeError
+        If another sweep currently holds the lock.
+
+    """
+    lock_dir = system_path / ".benchmark"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / ".lock"
+    handle = open(lock_path, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise RuntimeError(
+            f"Another benchmark sweep is already running for {system_path} "
+            f"(lock held on {lock_path}). Wait for it to finish."
+        ) from exc
+    try:
+        handle.write(f"pid={os.getpid()} host={socket.gethostname()}\n")
+        handle.flush()
+        yield
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
 def run_benchmark_sweep(
     system_path: Path,
     base_config: "ExecutorConfig",
@@ -290,9 +404,11 @@ def run_benchmark_sweep(
 ) -> BenchmarkResult:
     """Run a scalability benchmark sweep for a simulation system.
 
-    Generates one executor config variant per sweep point, runs a short
-    mdrun trial for each, parses the GROMACS log for ns/day, and selects
-    the optimum configuration.
+    Opens **one** executor allocation sized to the largest requested CPU
+    count, then runs a short mdrun trial for every sweep point inside it,
+    varying only the mdrun thread count.  Keeping the whole study on a single
+    allocation/node removes job-placement and queueing variance from the
+    scaling curve.  Parses the GROMACS log for ns/day and selects the optimum.
 
     Parameters
     ----------
@@ -300,8 +416,9 @@ def run_benchmark_sweep(
         Path to a prepared simulation directory (must contain topology,
         structure, and MDP files).
     base_config : ExecutorConfig
-        Base executor configuration.  Sweep points are derived by
-        overriding ``cpus_per_node`` and ``max_workers_per_node``.
+        Base executor configuration.  The allocation is derived from it by
+        overriding ``cpus_per_node`` with the maximum sweep value and
+        ``max_workers_per_node`` with the maximum GPU replica count.
     benchmark_config : BenchmarkConfig, optional
         Sweep parameters.  Defaults to ``BenchmarkConfig()`` with
         CPU counts ``[1, 2, 4, 8]``.
@@ -312,6 +429,11 @@ def run_benchmark_sweep(
     -------
     BenchmarkResult
         All trial results with the selected optimum.
+
+    Raises
+    ------
+    ValueError
+        If the executor targets more than one node (trials are single-rank).
 
     """
     if benchmark_config is None:
@@ -347,6 +469,25 @@ def run_benchmark_sweep(
             selection_criterion=benchmark_config.selection,
         )
 
+    # The whole study runs inside ONE allocation sized to the largest requested
+    # point, so trial results differ only by mdrun thread count — not by job
+    # placement or queueing.  Validate it before doing any work.
+    max_cpus = max(point["cpu_count"] for point in sweep_points)
+    max_replicas = max((point["gpu_replicas"] for point in sweep_points), default=0)
+    allocation_config = base_config.model_copy(
+        update={"cpus_per_node": max_cpus, "max_workers_per_node": max(1, max_replicas)}
+    )
+    if getattr(allocation_config, "nodes", 1) > 1:
+        raise ValueError(
+            "Benchmark trials run as a single MPI rank; use a single-node "
+            f"allocation (got nodes={allocation_config.nodes})."
+        )
+
+    logger.info(
+        f"Single allocation: cpus={max_cpus}, "
+        f"max_workers_per_node={allocation_config.max_workers_per_node}"
+    )
+
     # Prepare benchmark MDP from the production MDP
     from mdfactory.orchestration.stages import STAGE_BY_NAME
 
@@ -366,7 +507,7 @@ def run_benchmark_sweep(
         extra_overrides=benchmark_config.mdp_overrides,
     )
 
-    # Run each sweep point as a sequential Parsl session
+    # Run every sweep point inside the single allocation computed above.
     import time
 
     from mdfactory.orchestration.apps import get_grompp_app, get_mdrun_app
@@ -380,52 +521,55 @@ def run_benchmark_sweep(
 
     trials: list[TrialResult] = []
 
-    for point in sweep_points:
-        cpu_count = point["cpu_count"]
-        gpu_reps = point["gpu_replicas"]
-        overrides = point["config_overrides"]
+    with _sweep_lock(system_path), parsl_session(allocation_config):
+        grompp_app = get_grompp_app()
+        mdrun_app = get_mdrun_app()
 
-        # Create a config variant for this sweep point
-        trial_config = base_config.model_copy(update=overrides)
+        for point in sweep_points:
+            cpu_count = point["cpu_count"]
+            gpu_reps = point["gpu_replicas"]
 
-        logger.info(f"Trial: cpus={cpu_count}, gpu_replicas={gpu_reps}")
-
-        deffnm = "bench"
-        trial_dir = system_path / f".benchmark/cpus{cpu_count}_gpu{gpu_reps}"
-        log_file = trial_dir / f"{deffnm}.log"
-
-        start_time = time.monotonic()
-
-        try:
-            trial_dir.mkdir(parents=True, exist_ok=True)
-
-            # Symlink all top-level inputs into the trial directory (replacing
-            # stale symlinks).  GROMACS resolves ``#include`` paths relative to
-            # the topology file, so every companion ``.itp`` file and
-            # force-field directory must be reachable from the trial dir too —
-            # not just ``topology.top`` itself.
-            for src_file in system_path.iterdir():
-                if src_file.name == ".benchmark":
-                    continue
-                dst = trial_dir / src_file.name
-                if dst.is_symlink():
-                    dst.unlink()
-                if not dst.exists():
-                    dst.symlink_to(src_file.resolve(), target_is_directory=src_file.is_dir())
-
-            # Point the Production stage's expected MDP name at the benchmark MDP
-            bench_link = trial_dir / "benchmark.mdp"
-            md_link = trial_dir / prod_spec.mdp_file
-            if bench_link.exists() or bench_link.is_symlink():
-                if md_link.is_symlink():
-                    md_link.unlink()
-                if not md_link.exists():
-                    bench_link.rename(md_link)
+            # Derive mdrun thread hints from the per-point overrides; the
+            # allocation itself stays at the maximum requested size.
+            trial_config = base_config.model_copy(update=point["config_overrides"])
             hints = extract_resource_hints(trial_config)
 
-            with parsl_session(trial_config):
-                grompp_app = get_grompp_app()
-                mdrun_app = get_mdrun_app()
+            logger.info(f"Trial: cpus={cpu_count}, gpu_replicas={gpu_reps}")
+
+            deffnm = "bench"
+            trial_dir = system_path / f".benchmark/cpus{cpu_count}_gpu{gpu_reps}"
+            # Unique sidecar name: a path the driver has never opened cannot be
+            # served from a stale filesystem cache entry.
+            perf_name = f"{deffnm}.{uuid.uuid4().hex}.perf"
+            perf_path = trial_dir / perf_name
+
+            start_time = time.monotonic()
+
+            try:
+                trial_dir.mkdir(parents=True, exist_ok=True)
+
+                # Symlink all top-level inputs into the trial directory
+                # (replacing stale symlinks).  GROMACS resolves ``#include``
+                # paths relative to the topology file, so every companion
+                # ``.itp`` file and force-field directory must be reachable
+                # from the trial dir too — not just ``topology.top`` itself.
+                for src_file in system_path.iterdir():
+                    if src_file.name == ".benchmark":
+                        continue
+                    dst = trial_dir / src_file.name
+                    if dst.is_symlink():
+                        dst.unlink()
+                    if not dst.exists():
+                        dst.symlink_to(src_file.resolve(), target_is_directory=src_file.is_dir())
+
+                # Point the Production stage's expected MDP name at the benchmark MDP
+                bench_link = trial_dir / "benchmark.mdp"
+                md_link = trial_dir / prod_spec.mdp_file
+                if bench_link.exists() or bench_link.is_symlink():
+                    if md_link.is_symlink():
+                        md_link.unlink()
+                    if not md_link.exists():
+                        bench_link.rename(md_link)
 
                 # grompp
                 grompp_future = grompp_app(
@@ -446,41 +590,47 @@ def run_benchmark_sweep(
                     ntasks=hints.ntasks,
                     disable_gpu=hints.disable_gpu,
                     gmx_binary=hints.gmx_binary,
+                    performance_file=perf_name,
                     inputs=[grompp_future],
                 )
+                # The mdrun script extracts ns/day on the node that wrote the
+                # log and writes it to perf_path.  Parsing the log from the
+                # driver is unsafe: the shared filesystem can serve a stale
+                # pre-backup inode, which previously reported a previous
+                # trial's throughput.  A uniquely named sidecar avoids that.
                 mdrun_future.result()
 
-            wall_seconds = time.monotonic() - start_time
-            ns_per_day = parse_mdlog_performance(log_file)
+                wall_seconds = time.monotonic() - start_time
+                ns_per_day = read_performance_file(perf_path)
 
-            error = None
-            if ns_per_day is None:
-                error = f"no performance data in {log_file}"
-                logger.warning(f"  {error}")
+                error = None
+                if ns_per_day is None:
+                    error = f"no performance data in {perf_path}"
+                    logger.warning(f"  {error}")
 
-            trials.append(
-                TrialResult(
-                    cpu_count=cpu_count,
-                    gpu_replicas=gpu_reps,
-                    ns_per_day=ns_per_day,
-                    wall_seconds=wall_seconds,
-                    error=error,
+                trials.append(
+                    TrialResult(
+                        cpu_count=cpu_count,
+                        gpu_replicas=gpu_reps,
+                        ns_per_day=ns_per_day,
+                        wall_seconds=wall_seconds,
+                        error=error,
+                    )
                 )
-            )
-            logger.info(f"  Result: {ns_per_day or 'N/A'} ns/day, {wall_seconds:.1f}s wall")
+                logger.info(f"  Result: {ns_per_day or 'N/A'} ns/day, {wall_seconds:.1f}s wall")
 
-        except Exception as exc:
-            wall_seconds = time.monotonic() - start_time
-            logger.opt(exception=True).warning(f"  Trial failed: {exc}")
-            trials.append(
-                TrialResult(
-                    cpu_count=cpu_count,
-                    gpu_replicas=gpu_reps,
-                    ns_per_day=None,
-                    wall_seconds=wall_seconds,
-                    error=str(exc),
+            except Exception as exc:
+                wall_seconds = time.monotonic() - start_time
+                logger.opt(exception=True).warning(f"  Trial failed: {exc}")
+                trials.append(
+                    TrialResult(
+                        cpu_count=cpu_count,
+                        gpu_replicas=gpu_reps,
+                        ns_per_day=None,
+                        wall_seconds=wall_seconds,
+                        error=str(exc),
+                    )
                 )
-            )
 
     optimum = _select_optimum(trials, benchmark_config.selection)
     result = BenchmarkResult(

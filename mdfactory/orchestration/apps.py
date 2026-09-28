@@ -4,6 +4,14 @@
 
 from __future__ import annotations
 
+#: Marker the mdrun script echoes so a caller can read ns/day from the app's
+#: stdout instead of re-reading the log from a (possibly stale) shared
+#: filesystem view.
+MDRUN_PERF_MARKER = "MDFACTORY_NS_PER_DAY="
+
+#: ``sed`` program that extracts the GROMACS ``Performance:`` value from a log.
+_PERF_EXTRACT = r"sed -n 's/^ *Performance: *\([0-9.]*\).*/\1/p'"
+
 # ---------------------------------------------------------------------------
 # Layer 1: Single-responsibility decision resolvers
 # ---------------------------------------------------------------------------
@@ -76,15 +84,17 @@ def _resolve_thread_flags(is_mpi: "bool | None", has_gpu: bool) -> str:
     -------
     str
         Thread flag string to embed literally in the mdrun command line.
+        CPU paths append ``-pin on`` so GROMACS pins threads instead of
+        disabling its own affinity when Slurm confines the job to a cpuset.
 
     """
     if is_mpi is None:
         return "$MDRUN_THREAD_FLAGS"
     if is_mpi:
-        return "-ntomp $NTHR"
+        return "-ntomp $NTHR -pin on"
     if has_gpu:
         return "-ntmpi 1 -ntomp $NTHR"
-    return "-nt $NTHR"
+    return "-nt $NTHR -pin on"
 
 
 def _resolve_gpu_flags(has_gpu: bool, pme_gpu: bool) -> str:
@@ -319,10 +329,11 @@ def _build_binary_detection_preamble(has_gpu: bool) -> str:
     Delegates to :func:`_build_gmx_detect_block` for the shared skeleton.
 
     """
-    tmpi_flags = '"-ntmpi 1 -ntomp $NTHR"' if has_gpu else '"-nt $NTHR"'
+    tmpi_flags = '"-ntmpi 1 -ntomp $NTHR"' if has_gpu else '"-nt $NTHR -pin on"'
+    mpi_flags = '"-ntomp $NTHR"' if has_gpu else '"-ntomp $NTHR -pin on"'
     return _build_gmx_detect_block(
         gmx_extra=f"MDRUN_THREAD_FLAGS={tmpi_flags}",
-        gmx_mpi_extra='MDRUN_THREAD_FLAGS="-ntomp $NTHR"',
+        gmx_mpi_extra=f"MDRUN_THREAD_FLAGS={mpi_flags}",
     )
 
 
@@ -561,6 +572,7 @@ def _build_mdrun_script(
     gro_out: str = "",
     traj_files: "tuple[str, ...]" = (),
     gmx_binary: str = "auto",
+    performance_file: str = "",
 ) -> str:
     """Build the bash script for ``gmx mdrun``.
 
@@ -604,6 +616,11 @@ def _build_mdrun_script(
         GROMACS binary selection: ``"gmx"`` (thread-MPI build),
         ``"gmx_mpi"`` (pure MPI build), or ``"auto"`` (detect at runtime).
         Defaults to ``"auto"`` for backward compatibility.
+    performance_file : str, optional
+        When non-empty, write the GROMACS performance value (prefixed with
+        :data:`MDRUN_PERF_MARKER`) to this file, relative to ``work_dir``.
+        Lets a caller read ns/day from a freshly written file instead of
+        re-reading the (potentially stale) log.
 
     Returns
     -------
@@ -635,6 +652,13 @@ def _build_mdrun_script(
     output_check = _build_output_check(gro_out, traj_files)
     if output_check:
         sections.append(output_check)
+    if performance_file:
+        # Extract ns/day on the node that wrote the log and drop it in a
+        # caller-named sidecar file.  A caller re-reading the log over a
+        # shared filesystem can otherwise get a stale, pre-backup inode from
+        # a previous run; a uniquely named sidecar cannot have one.
+        extract = f'echo "{MDRUN_PERF_MARKER}$({_PERF_EXTRACT} {deffnm}.log | tail -1)"'
+        sections.append(f"{extract} > {performance_file}")
     sections.append(f'echo "GROMACS mdrun: SUCCESS - {deffnm} completed" >&2')
     return "\n".join(sections)
 
@@ -750,6 +774,7 @@ def get_mdrun_app():
         gro_out: str = "",
         traj_files: "tuple[str, ...]" = (),
         gmx_binary: str = "auto",
+        performance_file: str = "",
         stdout=None,
         stderr=None,
         inputs=None,
@@ -795,6 +820,9 @@ def get_mdrun_app():
             Trajectory output files to verify (at least one must exist).
         gmx_binary : str, optional
             GROMACS binary: ``"gmx"``, ``"gmx_mpi"``, or ``"auto"``.
+        performance_file : str, optional
+            When non-empty, write the GROMACS ns/day (prefixed with
+            :data:`MDRUN_PERF_MARKER`) to this file relative to ``work_dir``.
         stdout : str, optional
             File path for stdout.
         stderr : str, optional
@@ -818,6 +846,7 @@ def get_mdrun_app():
             gro_out,
             traj_files,
             gmx_binary,
+            performance_file=performance_file,
         )
 
     return run_mdrun
