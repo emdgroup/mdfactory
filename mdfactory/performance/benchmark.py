@@ -399,15 +399,21 @@ def run_benchmark_sweep(
         try:
             trial_dir.mkdir(parents=True, exist_ok=True)
 
-            # Symlink inputs into trial directory (remove stale symlinks first)
-            for src_file in [bench_mdp, structure, system_path / "topology.top"]:
+            # Symlink all top-level inputs into the trial directory (replacing
+            # stale symlinks).  GROMACS resolves ``#include`` paths relative to
+            # the topology file, so every companion ``.itp`` file and
+            # force-field directory must be reachable from the trial dir too —
+            # not just ``topology.top`` itself.
+            for src_file in system_path.iterdir():
+                if src_file.name == ".benchmark":
+                    continue
                 dst = trial_dir / src_file.name
                 if dst.is_symlink():
                     dst.unlink()
                 if not dst.exists():
-                    dst.symlink_to(src_file.resolve())
+                    dst.symlink_to(src_file.resolve(), target_is_directory=src_file.is_dir())
 
-            # Rename benchmark.mdp symlink to md.mdp for the Production stage
+            # Point the Production stage's expected MDP name at the benchmark MDP
             bench_link = trial_dir / "benchmark.mdp"
             md_link = trial_dir / prod_spec.mdp_file
             if bench_link.exists() or bench_link.is_symlink():
@@ -429,6 +435,7 @@ def run_benchmark_sweep(
                     top_file="topology.top",
                     tpr_file=f"{deffnm}.tpr",
                     maxwarn=prod_spec.maxwarn,
+                    inputs=[],
                 )
                 grompp_future.result()
 
@@ -439,6 +446,7 @@ def run_benchmark_sweep(
                     ntasks=hints.ntasks,
                     disable_gpu=hints.disable_gpu,
                     gmx_binary=hints.gmx_binary,
+                    inputs=[grompp_future],
                 )
                 mdrun_future.result()
 
@@ -463,7 +471,7 @@ def run_benchmark_sweep(
 
         except Exception as exc:
             wall_seconds = time.monotonic() - start_time
-            logger.warning(f"  Trial failed: {exc}")
+            logger.opt(exception=True).warning(f"  Trial failed: {exc}")
             trials.append(
                 TrialResult(
                     cpu_count=cpu_count,

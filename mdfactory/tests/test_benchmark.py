@@ -400,6 +400,8 @@ def _setup_sim_dir(tmp_path):
     sim_dir.mkdir()
     (sim_dir / "system.pdb").write_text("FAKE")
     (sim_dir / "topology.top").write_text("FAKE")
+    # Companion topology include — must be staged into each trial directory
+    (sim_dir / "extra_params.itp").write_text("FAKE")
     # Production MDP
     (sim_dir / "md.mdp").write_text(SAMPLE_MDP)
     return sim_dir
@@ -449,6 +451,16 @@ class TestRunBenchmarkSweepExecution:
         assert result.optimum is not None
         # Result saved as JSON sidecar
         assert (sim_dir / "benchmark_result.json").exists()
+
+        # Regression: apps must receive an explicit input dependency list.
+        # Omitting it forwards ``inputs=None``, which Parsl cannot iterate.
+        assert mock_grompp.call_args.kwargs["inputs"] == []
+        assert mock_mdrun.call_args.kwargs["inputs"] == [mock_grompp.return_value]
+
+        # Regression: topology include files must be staged into the trial dir
+        # (GROMACS resolves ``#include`` relative to the topology file).
+        trial_dir = sim_dir / ".benchmark" / "cpus2_gpu0"
+        assert (trial_dir / "extra_params.itp").is_symlink()
 
     @patch("mdfactory.orchestration.trajectory.find_structure_file")
     @patch("mdfactory.orchestration.session.parsl_session")
