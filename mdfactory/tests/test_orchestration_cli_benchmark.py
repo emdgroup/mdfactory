@@ -65,4 +65,25 @@ def test_benchmark_command_wires_arguments_into_sweep(tmp_path):
     assert benchmark_config.cpu_counts == [1, 2]
     assert benchmark_config.selection == "efficiency"
     assert benchmark_config.duration_ps == 5.0
+    # dry_run=False must be forwarded explicitly (finding 11): a dropped
+    # flag would make a preview run submit real work.
+    assert mock_sweep.call_args.kwargs["dry_run"] is False
     mock_report.assert_called_once()
+
+
+def test_benchmark_command_forwards_dry_run(tmp_path):
+    """--dry-run reaches run_benchmark_sweep so no work is submitted."""
+    (tmp_path / "system.pdb").touch()
+    config_path = tmp_path / "slurm.yaml"
+    config_path.write_text("provider: slurm\n")
+
+    with (
+        patch("mdfactory.cli._load_executor_config", return_value=MagicMock()),
+        patch("mdfactory.performance.benchmark.run_benchmark_sweep") as mock_sweep,
+        patch("mdfactory.cli._report_benchmark_result"),
+    ):
+        mock_sweep.return_value = MagicMock()
+        benchmark(source=tmp_path, slurm=str(config_path), dry_run=True)
+
+    assert mock_sweep.call_count == 1
+    assert mock_sweep.call_args.kwargs["dry_run"] is True

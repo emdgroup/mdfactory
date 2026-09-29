@@ -181,6 +181,20 @@ class TestSweepLock:
         with _sweep_lock(tmp_path):
             pass  # must not raise
 
+    def test_lock_held_before_mdp_generation(self, tmp_path):
+        """A concurrent sweep fails before touching the shared benchmark.mdp
+        (finding 2 regression: MDP generation used to run before the lock,
+        letting a losing sweep mutate a running sweep's trials)."""
+        from mdfactory.orchestration.config import ExecutorConfig
+
+        sim_dir = _setup_sim_dir(tmp_path)
+
+        with _sweep_lock(sim_dir):
+            with pytest.raises(RuntimeError, match="already running"):
+                run_benchmark_sweep(sim_dir, ExecutorConfig(), BenchmarkConfig(cpu_counts=[2]))
+            # The losing sweep must not have regenerated the shared MDP
+            assert not (sim_dir / "benchmark.mdp").exists()
+
 
 # ---------------------------------------------------------------------------
 # T2: BenchmarkConfig validation
@@ -357,6 +371,15 @@ class TestBuildSweepConfigs:
         assert len(points) == 3
         assert [p["cpu_count"] for p in points] == [2, 4, 8]
         assert all(p["gpu_replicas"] == 0 for p in points)
+
+    def test_cpu_only_points_normalize_max_workers(self):
+        """CPU-only points force max_workers_per_node=1 so ntasks equals the
+        labeled cpu_count regardless of the base config (finding 1)."""
+        base = MagicMock()
+        cfg = BenchmarkConfig(cpu_counts=[1, 2, 4, 8])
+        points = _build_sweep_configs(base, cfg)
+        assert all(p["config_overrides"]["max_workers_per_node"] == 1 for p in points)
+        assert [p["config_overrides"]["cpus_per_node"] for p in points] == [1, 2, 4, 8]
 
     def test_cpu_gpu_sweep(self):
         """CPU × GPU sweep generates the cross-product."""
@@ -539,6 +562,8 @@ class TestRunBenchmarkSweepExecution:
         # The allocation is sized to the largest requested CPU count...
         allocation_config = mock_session.call_args.args[0]
         assert allocation_config.cpus_per_node == 4
+        # ...with a single worker (CPU-only sweep runs one mdrun at a time).
+        assert allocation_config.max_workers_per_node == 1
         # ...while mdrun thread counts follow the individual sweep points.
         assert [call.kwargs["ntasks"] for call in mock_mdrun.call_args_list] == [2, 4]
 
@@ -557,6 +582,160 @@ class TestRunBenchmarkSweepExecution:
         # (GROMACS resolves ``#include`` relative to the topology file).
         trial_dir = sim_dir / ".benchmark" / "cpus2_gpu0"
         assert (trial_dir / "extra_params.itp").is_symlink()
+
+    @patch("mdfactory.orchestration.trajectory.find_structure_file")
+    @patch("mdfactory.orchestration.session.parsl_session")
+    @patch("mdfactory.orchestration.apps.get_grompp_app")
+    @patch("mdfactory.orchestration.apps.get_mdrun_app")
+    def test_cpu_threads_match_labels_with_base_max_workers(
+        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+    ):
+        """The labeled cpu_count equals the actual mdrun thread count even
+        when the base config declares max_workers_per_node > 1 (finding 1)."""
+        from mdfactory.orchestration.config import ExecutorConfig
+
+        sim_dir = _setup_sim_dir(tmp_path)
+        mock_find.return_value = sim_dir / "system.pdb"
+        mock_session.return_value.__enter__ = MagicMock()
+        mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_grompp = MagicMock()
+        mock_grompp.return_value.result.return_value = "ok"
+        mock_grompp_app.return_value = mock_grompp
+
+        mock_mdrun = MagicMock()
+        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}5.234\n")
+        mock_mdrun_app.return_value = mock_mdrun
+
+        # Base config claims 4 workers per node — previously this leaked into
+        # the per-point hints and produced ntasks 0, 0, 1, 2.
+        cfg = ExecutorConfig(max_workers_per_node=4)
+        bench_cfg = BenchmarkConfig(cpu_counts=[1, 2, 4, 8])
+
+        run_benchmark_sweep(sim_dir, cfg, bench_cfg)
+
+        assert [c.kwargs["ntasks"] for c in mock_mdrun.call_args_list] == [1, 2, 4, 8]
+        # The allocation itself stays single-worker; thread counts come from
+        # the per-point overrides.
+        assert mock_session.call_args.args[0].max_workers_per_node == 1
+
+    @patch("mdfactory.orchestration.trajectory.find_structure_file")
+    @patch("mdfactory.orchestration.session.parsl_session")
+    @patch("mdfactory.orchestration.apps.get_grompp_app")
+    @patch("mdfactory.orchestration.apps.get_mdrun_app")
+    def test_trial_md_mdp_resolves_to_benchmark_mdp(
+        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+    ):
+        """Each trial's md.mdp is the short benchmark MDP, not the production
+        MDP (finding 4 regression)."""
+        from mdfactory.orchestration.config import ExecutorConfig
+        from mdfactory.orchestration.mdp import get_mdp_value, parse_mdp
+
+        sim_dir = _setup_sim_dir(tmp_path)
+        mock_find.return_value = sim_dir / "system.pdb"
+        mock_session.return_value.__enter__ = MagicMock()
+        mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_grompp = MagicMock()
+        mock_grompp.return_value.result.return_value = "ok"
+        mock_grompp_app.return_value = mock_grompp
+
+        mock_mdrun = MagicMock()
+        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}5.234\n")
+        mock_mdrun_app.return_value = mock_mdrun
+
+        run_benchmark_sweep(sim_dir, ExecutorConfig(), BenchmarkConfig(cpu_counts=[2]))
+
+        trial_dir = sim_dir / ".benchmark" / "cpus2_gpu0"
+        md_mdp = trial_dir / "md.mdp"
+        # The trial's md.mdp must resolve to the shared benchmark MDP...
+        assert md_mdp.resolve() == (sim_dir / "benchmark.mdp").resolve()
+        # ...which is the short trial (100 ps / 0.002 ps = 50000 steps), not
+        # the production MDP (500000 steps).  A regression here would run the
+        # full-length production MDP for every trial.
+        assert get_mdp_value(parse_mdp(md_mdp), "nsteps") == "50000"
+        # grompp consumed the trial's md.mdp
+        assert mock_grompp.call_args.kwargs["mdp_file"] == "md.mdp"
+
+    @patch("mdfactory.orchestration.trajectory.find_structure_file")
+    @patch("mdfactory.orchestration.session.parsl_session")
+    @patch("mdfactory.orchestration.apps.get_grompp_app")
+    @patch("mdfactory.orchestration.apps.get_mdrun_app")
+    def test_gpu_replicas_run_concurrently_with_aggregate_throughput(
+        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+    ):
+        """A gpu_replicas=2 point launches two concurrent mdruns sharing the
+        GPU, each with half the threads, and records the aggregate ns/day
+        (findings 3 and 10)."""
+        from mdfactory.orchestration.config import SlurmExecutorConfig
+
+        sim_dir = _setup_sim_dir(tmp_path)
+        mock_find.return_value = sim_dir / "system.pdb"
+        mock_session.return_value.__enter__ = MagicMock()
+        mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_grompp = MagicMock()
+        mock_grompp.return_value.result.return_value = "ok"
+        mock_grompp_app.return_value = mock_grompp
+
+        events = []
+
+        def mdrun_side_effect(**kwargs):
+            events.append(f"submit:{kwargs['deffnm']}")
+            Path(kwargs["work_dir"], kwargs["performance_file"]).write_text(
+                f"{MDRUN_PERF_MARKER}5.234\n"
+            )
+            fut = MagicMock()
+
+            def _join(*args, **_kwargs):
+                events.append(f"join:{kwargs['deffnm']}")
+                return 0
+
+            fut.result.side_effect = _join
+            return fut
+
+        mock_app = MagicMock(side_effect=mdrun_side_effect)
+        mock_mdrun_app.return_value = mock_app
+
+        cfg = SlurmExecutorConfig(account="acct", partition="gpu", gres="gpu:l40s:1")
+        bench_cfg = BenchmarkConfig(cpu_counts=[4], gpu_replicas=[2])
+
+        result = run_benchmark_sweep(sim_dir, cfg, bench_cfg)
+
+        # One grompp (shared TPR), two concurrent mdruns
+        assert mock_grompp.call_count == 1
+        assert mock_app.call_count == 2
+        # Both replicas are submitted before either is joined => concurrent
+        assert events == ["submit:bench_r0", "submit:bench_r1", "join:bench_r0", "join:bench_r1"]
+
+        mdrun_calls = mock_app.call_args_list
+        # Distinct deffnms and unique perf sidecars per replica
+        assert [c.kwargs["deffnm"] for c in mdrun_calls] == ["bench_r0", "bench_r1"]
+        perf_names = [c.kwargs["performance_file"] for c in mdrun_calls]
+        assert len(set(perf_names)) == 2
+        # Thread division: 4 cpus across 2 replicas => 2 threads each
+        assert [c.kwargs["ntasks"] for c in mdrun_calls] == [2, 2]
+        # GPU stays enabled via the base config's gres
+        assert all(c.kwargs["disable_gpu"] is False for c in mdrun_calls)
+
+        # Allocation sized for the largest point with one worker per replica
+        allocation_config = mock_session.call_args.args[0]
+        assert allocation_config.cpus_per_node == 4
+        assert allocation_config.max_workers_per_node == 2
+
+        # Aggregate throughput across the two replicas (5.234 + 5.234)
+        assert len(result.trials) == 1
+        trial = result.trials[0]
+        assert trial.cpu_count == 4
+        assert trial.gpu_replicas == 2
+        assert trial.ns_per_day == pytest.approx(10.468)
+        assert trial.error is None
+
+        # Replicas share the single grompp TPR through per-replica symlinks
+        trial_dir = sim_dir / ".benchmark" / "cpus4_gpu2"
+        assert (trial_dir / "bench_r0.tpr").is_symlink()
+        assert (trial_dir / "bench_r1.tpr").is_symlink()
+        assert (trial_dir / "bench_r0.tpr").readlink() == Path("bench.tpr")
 
     @patch("mdfactory.orchestration.trajectory.find_structure_file")
     @patch("mdfactory.orchestration.session.parsl_session")
