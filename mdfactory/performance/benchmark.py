@@ -427,7 +427,9 @@ def run_benchmark_sweep(
     base_config : ExecutorConfig
         Base executor configuration.  The allocation is derived from it by
         overriding ``cpus_per_node`` with the maximum sweep value and
-        ``max_workers_per_node`` with the maximum GPU replica count.
+        ``max_workers_per_node`` with the maximum GPU replica count.  When the
+        config supports it (SLURM), the sweep allocation is marked
+        ``exclusive`` so neighbour jobs cannot skew the measurement.
     benchmark_config : BenchmarkConfig, optional
         Sweep parameters.  Defaults to ``BenchmarkConfig()`` with
         CPU counts ``[1, 2, 4, 8]``.
@@ -485,9 +487,18 @@ def run_benchmark_sweep(
     # placement or queueing.  Validate it before doing any work.
     max_cpus = max(point["cpu_count"] for point in sweep_points)
     max_replicas = max((point["gpu_replicas"] for point in sweep_points), default=0)
-    allocation_config = base_config.model_copy(
-        update={"cpus_per_node": max_cpus, "max_workers_per_node": max(1, max_replicas)}
-    )
+    allocation_update = {
+        "cpus_per_node": max_cpus,
+        "max_workers_per_node": max(1, max_replicas),
+    }
+    # A benchmark must measure the allocation, not our neighbours.  On a
+    # shared node other jobs steal cores, which swung the 8-core point ~37%
+    # between two runs of the same sweep.  Opt the *sweep* into an exclusive
+    # whole-node allocation (``#SBATCH --exclusive``); production runs keep
+    # the default shared behaviour.  Only SLURM configs carry the field.
+    if "exclusive" in type(base_config).model_fields:
+        allocation_update["exclusive"] = True
+    allocation_config = base_config.model_copy(update=allocation_update)
     if getattr(allocation_config, "nodes", 1) > 1:
         raise ValueError(
             "Benchmark trials run as a single MPI rank; use a single-node "
@@ -497,6 +508,11 @@ def run_benchmark_sweep(
     logger.info(
         f"Single allocation: cpus={max_cpus}, "
         f"max_workers_per_node={allocation_config.max_workers_per_node}"
+        + (
+            f", exclusive={allocation_config.exclusive}"
+            if hasattr(allocation_config, "exclusive")
+            else ""
+        )
     )
 
     # Run every sweep point inside the single allocation computed above.
@@ -661,9 +677,7 @@ def run_benchmark_sweep(
                             error=error,
                         )
                     )
-                    logger.info(
-                        f"  Result: {ns_per_day or 'N/A'} ns/day, {wall_seconds:.1f}s wall"
-                    )
+                    logger.info(f"  Result: {ns_per_day or 'N/A'} ns/day, {wall_seconds:.1f}s wall")
 
                 except Exception as exc:
                     wall_seconds = time.monotonic() - start_time

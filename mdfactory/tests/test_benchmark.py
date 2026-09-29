@@ -623,6 +623,41 @@ class TestRunBenchmarkSweepExecution:
     @patch("mdfactory.orchestration.session.parsl_session")
     @patch("mdfactory.orchestration.apps.get_grompp_app")
     @patch("mdfactory.orchestration.apps.get_mdrun_app")
+    def test_sweep_allocation_is_exclusive(
+        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+    ):
+        """The sweep allocation requests exclusive use of the node so neighbour
+        jobs cannot skew the measurement (a shared node swung the 8-core point
+        ~37% between identical runs)."""
+        from mdfactory.orchestration.config import SlurmExecutorConfig
+
+        sim_dir = _setup_sim_dir(tmp_path)
+        mock_find.return_value = sim_dir / "system.pdb"
+        mock_session.return_value.__enter__ = MagicMock()
+        mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_grompp = MagicMock()
+        mock_grompp.return_value.result.return_value = "ok"
+        mock_grompp_app.return_value = mock_grompp
+
+        mock_mdrun = MagicMock()
+        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}5.234\n")
+        mock_mdrun_app.return_value = mock_mdrun
+
+        # Base config opts OUT of exclusive — the sweep must still opt IN.
+        cfg = SlurmExecutorConfig(account="acct", partition="cpu", exclusive=False)
+
+        run_benchmark_sweep(sim_dir, cfg, BenchmarkConfig(cpu_counts=[2, 4]))
+
+        allocation_config = mock_session.call_args.args[0]
+        assert allocation_config.exclusive is True
+        # ...and the base config object is not mutated.
+        assert cfg.exclusive is False
+
+    @patch("mdfactory.orchestration.trajectory.find_structure_file")
+    @patch("mdfactory.orchestration.session.parsl_session")
+    @patch("mdfactory.orchestration.apps.get_grompp_app")
+    @patch("mdfactory.orchestration.apps.get_mdrun_app")
     def test_trial_md_mdp_resolves_to_benchmark_mdp(
         self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
