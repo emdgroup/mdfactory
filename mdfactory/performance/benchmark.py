@@ -212,6 +212,17 @@ class BenchmarkConfig(BaseModel, frozen=True):
     def _cpu_counts_nonempty(cls, v: list[int]) -> list[int]:
         if not v:
             raise ValueError("cpu_counts must not be empty")
+        if any(c < 1 for c in v):
+            # A 0/negative core count would make ntasks floor to the
+            # auto-detect sentinel, mislabeling the trial (finding 1).
+            raise ValueError("cpu_counts values must be >= 1")
+        return v
+
+    @field_validator("gpu_replicas")
+    @classmethod
+    def _gpu_replicas_positive(cls, v: list[int]) -> list[int]:
+        if any(g < 1 for g in v):
+            raise ValueError("gpu_replicas values must be >= 1")
         return v
 
     @field_validator("duration_ps")
@@ -282,7 +293,15 @@ def _generate_benchmark_mdp(
     if extra_overrides:
         for key, value in extra_overrides.items():
             norm_key = key.lower().replace("-", "_")
-            parsed = modify_mdp_value(parsed, norm_key, value)
+            if get_mdp_value(parsed, norm_key) is None:
+                # modify_mdp_value only replaces existing lines; an override
+                # naming a key absent from the source MDP would be silently
+                # dropped (finding 4).  Append it so the override actually
+                # takes effect, matching the documented behavior.
+                parsed.append((f"{key} = {value}", norm_key, value))
+                logger.debug(f"Benchmark MDP override appended: {key} = {value}")
+            else:
+                parsed = modify_mdp_value(parsed, norm_key, value)
 
     write_mdp(parsed, output_mdp)
     logger.debug(f"Benchmark MDP: {output_mdp} (nsteps={nsteps}, dt={dt})")
@@ -328,6 +347,20 @@ def _build_sweep_configs(
     for cpu_count in benchmark_config.cpu_counts:
         if benchmark_config.gpu_replicas:
             for gpu_rep in benchmark_config.gpu_replicas:
+                # Each of the ``gpu_rep`` replicas must get >= 1 thread within
+                # the point's labeled CPU budget, so a point needs
+                # cpu_count >= gpu_replicas.  Otherwise the per-replica
+                # ``cpus // workers`` would floor to 0 (the auto-detect
+                # sentinel) and run node-wide threads under a false label
+                # (finding 1).  Skip infeasible points rather than record a
+                # mislabeled trial.
+                if cpu_count < gpu_rep:
+                    logger.warning(
+                        f"Skipping sweep point cpus={cpu_count}, "
+                        f"gpu_replicas={gpu_rep}: needs cpu_count >= gpu_replicas "
+                        "so each replica gets >= 1 thread"
+                    )
+                    continue
                 points.append(
                     {
                         "cpu_count": cpu_count,
@@ -352,6 +385,13 @@ def _build_sweep_configs(
                     },
                 }
             )
+
+    if not points:
+        raise ValueError(
+            "No feasible sweep points: every CPU x GPU combination needs "
+            "cpu_count >= gpu_replicas so each replica gets >= 1 thread. "
+            "Widen cpu_counts or lower gpu_replicas."
+        )
 
     return points
 
@@ -481,6 +521,22 @@ def run_benchmark_sweep(
             trials=trials,
             selection_criterion=benchmark_config.selection,
         )
+
+    # A GPU replica sweep must actually have a GPU, or every trial would run
+    # CPU-only while labeled as a GPU point and still feed _select_optimum
+    # (finding 5).  Validated here (not before dry-run) so a cluster-free
+    # preview still works — dry-run must run without a GPU/SLURM config.
+    if benchmark_config.gpu_replicas:
+        from mdfactory.orchestration.stages import extract_resource_hints
+
+        if extract_resource_hints(base_config).disable_gpu:
+            gres = getattr(base_config, "gres", None)
+            raise ValueError(
+                f"gpu_replicas={benchmark_config.gpu_replicas} requested but the "
+                f"executor config has no GPU resource (gres={gres!r}); trials would "
+                "run CPU-only while labeled as GPU points. Add a gres field "
+                "(e.g. 'gpu:l40s:1') to the SLURM config."
+            )
 
     # The whole study runs inside ONE allocation sized to the largest requested
     # point, so trial results differ only by mdrun thread count — not by job

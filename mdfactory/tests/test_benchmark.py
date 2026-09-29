@@ -164,6 +164,53 @@ class TestReadPerformanceFile:
         assert read_performance_file(perf) is None
 
 
+class TestPerfExtractProgram:
+    """Execute the worker-side sed program against realistic logs.
+
+    ``_PERF_EXTRACT`` is the sole producer of real ns/day in the live sweep
+    path (the driver reads the sidecar it writes).  The existing script test
+    only asserted the substring ``echo "MARKER$(sed`` was present, so a
+    corrupted pattern would pass CI while every live trial reported "no
+    performance data" (finding 3).  These tests run the actual sed program.
+    """
+
+    def _run_extract(self, tmp_path, log_text: str) -> str:
+        """Run ``{extract} <log> | tail -1`` exactly as the mdrun script does."""
+        import subprocess
+
+        from mdfactory.orchestration.apps import _PERF_EXTRACT
+
+        log = tmp_path / "bench.log"
+        log.write_text(log_text)
+        proc = subprocess.run(
+            ["bash", "-c", f'{_PERF_EXTRACT} "{log}" | tail -1'],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return proc.stdout.strip()
+
+    def test_extracts_ns_per_day_from_log(self, tmp_path):
+        """A normal GROMACS log yields its exact Performance value."""
+        assert self._run_extract(tmp_path, NORMAL_LOG) == "5.234"
+
+    def test_restart_log_yields_last_block(self, tmp_path):
+        """tail -1 collapses multiple Performance blocks to the last one.
+
+        Without tail the output would be two lines (3.100 then 5.234), so this
+        also pins the ``| tail -1`` the script appends."""
+        assert self._run_extract(tmp_path, RESTART_LOG) == "5.234"
+
+    def test_truncated_log_yields_empty(self, tmp_path):
+        """A log with no Performance line yields an empty string (-> error)."""
+        assert self._run_extract(tmp_path, TRUNCATED_LOG) == ""
+
+    def test_extracted_value_round_trips_marker(self, tmp_path):
+        """The sed output feeds the marker parser the driver reads."""
+        value = self._run_extract(tmp_path, NORMAL_LOG)
+        assert parse_performance_marker(f"{MDRUN_PERF_MARKER}{value}") == pytest.approx(5.234)
+
+
 class TestSweepLock:
     """Tests for the concurrent-sweep guard."""
 
@@ -216,6 +263,16 @@ class TestBenchmarkConfig:
         """Empty cpu_counts raises ValueError."""
         with pytest.raises(ValueError, match="must not be empty"):
             BenchmarkConfig(cpu_counts=[])
+
+    def test_zero_cpu_count_rejected(self):
+        """cpu_counts must be >= 1 (0 would trigger auto-detect mislabel)."""
+        with pytest.raises(ValueError, match=">= 1"):
+            BenchmarkConfig(cpu_counts=[0])
+
+    def test_zero_gpu_replicas_rejected(self):
+        """gpu_replicas must be >= 1 when given."""
+        with pytest.raises(ValueError, match=">= 1"):
+            BenchmarkConfig(gpu_replicas=[0])
 
     def test_negative_duration_rejected(self):
         """Non-positive duration_ps raises ValueError."""
@@ -329,6 +386,28 @@ class TestGenerateBenchmarkMdp:
         content = out.read_text()
         assert "99999" in content
 
+    def test_override_appended_when_key_absent(self, tmp_path):
+        """An override naming a key absent from the source MDP is appended.
+
+        modify_mdp_value only replaces existing lines; without appending, the
+        documented ``{"nstxout-compressed": "0"}`` example would be a silent
+        no-op on any md.mdp lacking the key (finding 4)."""
+        from mdfactory.orchestration.mdp import get_mdp_value, parse_mdp
+
+        src = tmp_path / "md.mdp"
+        # Source deliberately omits nstxout-compressed
+        src.write_text(
+            "\n".join(line for line in SAMPLE_MDP.splitlines() if "compressed" not in line)
+        )
+        out = tmp_path / "benchmark.mdp"
+        _generate_benchmark_mdp(
+            src, out, duration_ps=100.0, extra_overrides={"nstxout-compressed": "0"}
+        )
+
+        parsed = parse_mdp(out)
+        # Hyphen form normalized to underscore on parse, value applied
+        assert get_mdp_value(parsed, "nstxout_compressed") == "0"
+
     def test_disabled_outputs_preserved(self, tmp_path):
         """Outputs set to 0 (disabled) are not overridden."""
         src = tmp_path / "md.mdp"
@@ -392,6 +471,29 @@ class TestBuildSweepConfigs:
         assert (4, 2) in combos
         assert (8, 1) in combos
         assert (8, 2) in combos
+
+    def test_infeasible_gpu_points_skipped(self):
+        """Points where cpu_count < gpu_replicas are skipped, not mislabeled.
+
+        Such a point would floor per-replica ntasks to 0 (auto-detect) and
+        run node-wide threads under a false label (finding 1)."""
+        base = MagicMock()
+        cfg = BenchmarkConfig(cpu_counts=[1, 2, 4], gpu_replicas=[2])
+        points = _build_sweep_configs(base, cfg)
+        combos = [(p["cpu_count"], p["gpu_replicas"]) for p in points]
+        # (1, 2) is infeasible: 1 core can't give 2 replicas >= 1 thread each
+        assert (1, 2) not in combos
+        assert (2, 2) in combos
+        assert (4, 2) in combos
+        # Every surviving point can give each replica >= 1 thread
+        assert all(p["cpu_count"] >= p["gpu_replicas"] for p in points)
+
+    def test_all_points_infeasible_raises(self):
+        """When no CPU x GPU combination is feasible, raise a clear error."""
+        base = MagicMock()
+        cfg = BenchmarkConfig(cpu_counts=[1], gpu_replicas=[2])
+        with pytest.raises(ValueError, match="No feasible sweep points"):
+            _build_sweep_configs(base, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +980,17 @@ class TestRunBenchmarkSweepErrors:
 
         with pytest.raises(FileNotFoundError, match="Production MDP not found"):
             run_benchmark_sweep(sim_dir, ExecutorConfig())
+
+    def test_gpu_sweep_without_gres_raises(self, tmp_path):
+        """A GPU replica sweep on a config with no GPU gres fails fast.
+
+        Otherwise every trial would run CPU-only while labeled as a GPU
+        point and still feed _select_optimum (finding 5)."""
+        from mdfactory.orchestration.config import ExecutorConfig
+
+        cfg = ExecutorConfig()  # no gres -> no GPU
+        with pytest.raises(ValueError, match="GPU"):
+            run_benchmark_sweep(tmp_path, cfg, BenchmarkConfig(cpu_counts=[2], gpu_replicas=[1]))
 
     @patch("mdfactory.orchestration.trajectory.find_structure_file")
     def test_missing_structure_file(self, mock_find, tmp_path):
