@@ -694,11 +694,17 @@ def benchmark(
     ],
     cpus: Annotated[
         list[int] | None,
-        Parameter(help="CPU counts to sweep (default: 1 2 4 8).", consume_multiple=True),
+        Parameter(
+            help="CPU counts to sweep (default: 1 2 4 8). CPU-only; ignored when --gpus is set.",
+            consume_multiple=True,
+        ),
     ] = None,
     gpus: Annotated[
         list[int] | None,
-        Parameter(help="GPU sharing replica counts to sweep (optional).", consume_multiple=True),
+        Parameter(
+            help="GPU counts to sweep; one core + one MPI rank per GPU (pure MPI).",
+            consume_multiple=True,
+        ),
     ] = None,
     duration_ps: Annotated[
         float,
@@ -715,8 +721,9 @@ def benchmark(
 ):
     """Benchmark resource configurations to find the optimal deployment.
 
-    Runs short GROMACS production trials across a sweep of CPU counts (and
-    optionally GPU-sharing replica counts), parses throughput from each trial's
+    Runs short GROMACS production trials across a sweep of CPU counts (or, for
+    a GPU scalability study, increasing GPU counts with cores tied 1:1 — one
+    simulation spanning more GPUs), parses throughput from each trial's
     log, and writes a ``benchmark_result.json`` sidecar next to the system with
     the selected optimum.
 
@@ -750,8 +757,12 @@ def benchmark(
 
     from mdfactory.performance.benchmark import BenchmarkConfig, run_benchmark_sweep
 
+    # A GPU sweep ties cores 1:1 to GPUs (one core/MPI rank per GPU, 1 thread
+    # each — pure MPI, no OpenMP hybrid), so the core count comes from --gpus
+    # and --cpus applies only to a CPU-only sweep.
+    benchmark_cpu_counts = list(gpus) if gpus else (cpus or [1, 2, 4, 8])
     benchmark_config = BenchmarkConfig(
-        cpu_counts=cpus or [1, 2, 4, 8],
+        cpu_counts=benchmark_cpu_counts,
         gpu_replicas=gpus or [],
         duration_ps=duration_ps,
         selection=selection,

@@ -97,7 +97,7 @@ def _resolve_thread_flags(is_mpi: "bool | None", has_gpu: bool) -> str:
     return "-nt $NTHR -pin on"
 
 
-def _resolve_gpu_flags(has_gpu: bool, pme_gpu: bool) -> str:
+def _resolve_gpu_flags(has_gpu: bool, pme_gpu: bool, gpus: int = 1) -> str:
     """Return the GPU offload flags for the mdrun invocation.
 
     Parameters
@@ -107,6 +107,11 @@ def _resolve_gpu_flags(has_gpu: bool, pme_gpu: bool) -> str:
     pme_gpu : bool
         Whether PME should run on GPU.  Must be ``False`` for non-dynamical
         integrators (e.g. EM/steep) which GROMACS rejects with PME-GPU.
+    gpus : int, optional
+        Number of MPI ranks the simulation spans (``1`` = single rank).  When
+        ``> 1`` and PME runs on GPU, ``-npme 1`` is appended — GROMACS 2024
+        aborts multi-rank PME-on-GPU without an explicit ``-npme``, and this
+        build lacks cuFFTMp so the value must be >= 1 (not 0).
 
     Returns
     -------
@@ -117,7 +122,17 @@ def _resolve_gpu_flags(has_gpu: bool, pme_gpu: bool) -> str:
     if not has_gpu:
         return ""
     pme_flag = "-pme gpu" if pme_gpu else "-pme cpu"
-    return f"-nb gpu {pme_flag} -gpu_id $GPU_ID"
+    flags = f"-nb gpu {pme_flag} -gpu_id $GPU_ID"
+    if gpus > 1 and pme_gpu:
+        # GROMACS requires an explicit -npme for PME-on-GPU across multiple
+        # ranks.  It must be >= 1 on this build: -npme 0 spreads PME/FFT over
+        # the ranks' GPUs, which needs cuFFTMp support this GROMACS lacks
+        # ("PME tasks were required to run on more than one CUDA-devices ...
+        # build GROMACS with cuFFTMp").  A dedicated PME rank keeps each PME
+        # task on a single GPU.  Caveat: that separate PME rank does gate
+        # scaling — see the ~42.6% "PME wait for PP" in bench.log at 2 ranks.
+        flags += " -npme 1"
+    return flags
 
 
 def _resolve_restart_flags(restart_from_cpt: str) -> str:
@@ -172,6 +187,7 @@ def _assemble_mdrun_command(
     restart_flags: str,
     thread_flags: str,
     gpu_flags: str,
+    launcher: str = "",
 ) -> str:
     """Compose the single concrete mdrun command line.
 
@@ -190,6 +206,11 @@ def _assemble_mdrun_command(
         Thread-count flags (``"-ntomp $NTHR"``, ``"-nt $NTHR"``, etc.).
     gpu_flags : str
         GPU offload flags (``"-nb gpu -pme gpu -gpu_id $GPU_ID"`` or ``""``).
+    launcher : str, optional
+        Prefix that wraps the command, e.g.
+        ``"srun -n 4 --cpus-per-task=$NTHR --gpus-per-task=1 "`` to launch one
+        simulation across multiple GPUs (one MPI rank each).  Empty for a
+        single-rank run.
 
     Returns
     -------
@@ -202,13 +223,19 @@ def _assemble_mdrun_command(
     'gmx mdrun -deffnm min -nt $NTHR'
     >>> _assemble_mdrun_command("gmx_mpi", "prod", "-cpi prod.cpt -append", "-ntomp $NTHR", "")
     'gmx_mpi mdrun -deffnm prod -cpi prod.cpt -append -ntomp $NTHR'
+    >>> _assemble_mdrun_command(
+    ...     "gmx_mpi", "b", "", "-ntomp $NTHR", "",
+    ...     launcher="srun -n 2 --cpus-per-task=$NTHR --gpus-per-task=1 ",
+    ... )
+    'srun -n 2 --cpus-per-task=$NTHR --gpus-per-task=1 gmx_mpi mdrun -deffnm b -ntomp $NTHR'
 
     """
     parts = [binary, "mdrun", f"-deffnm {deffnm}"]
     for flag in (restart_flags, thread_flags, gpu_flags):
         if flag:
             parts.append(flag)
-    return " ".join(parts)
+    command = " ".join(parts)
+    return f"{launcher}{command}" if launcher else command
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +269,8 @@ def _build_env_preamble(work_dir: str, nthr_expr: str, has_gpu: bool) -> str:
     1. ``set -euo pipefail``
     2. ``cd <work_dir>``
     3. ``NTHR=<nthr_expr>``
-    4. ``GPU_ID=${CUDA_VISIBLE_DEVICES%%,*}`` — only when ``has_gpu=True``
+    4. ``GPU_ID=0`` — only when ``has_gpu=True`` (each rank's one pinned GPU
+       is device 0 inside the process).
     5. ``export OMP_NUM_THREADS=$NTHR``
 
     The GPU_ID assignment precedes the export so the export line is always the
@@ -255,9 +283,12 @@ def _build_env_preamble(work_dir: str, nthr_expr: str, has_gpu: bool) -> str:
         f"NTHR={nthr_expr}",
     ]
     if has_gpu:
-        # Use :- instead of %%,* so CUDA_VISIBLE_DEVICES unset → empty string
-        # rather than aborting under set -u on CPU-only hosts.
-        lines.append("GPU_ID=${CUDA_VISIBLE_DEVICES:-}")
+        # Each rank sees exactly one GPU (srun --gpus-per-task=1 for multi-GPU,
+        # or a single-GPU allocation), and CUDA renumbers a pinned device to 0
+        # inside the process — so GROMACS must target device 0.  Using the
+        # CUDA_VISIBLE_DEVICES value would send a physical id that is out of
+        # range for the single visible device.
+        lines.append("GPU_ID=0")
     lines.append("export OMP_NUM_THREADS=$NTHR")
     return "\n".join(lines)
 
@@ -573,6 +604,7 @@ def _build_mdrun_script(
     traj_files: "tuple[str, ...]" = (),
     gmx_binary: str = "auto",
     performance_file: str = "",
+    gpus: int = 1,
 ) -> str:
     """Build the bash script for ``gmx mdrun``.
 
@@ -633,13 +665,23 @@ def _build_mdrun_script(
     is_mpi = _resolve_is_mpi(gmx_binary)
     nthr_expr = _resolve_thread_count_expr(ntasks)
     thread_flags = _resolve_thread_flags(is_mpi, has_gpu)
-    gpu_flags = _resolve_gpu_flags(has_gpu, pme_gpu)
+    gpu_flags = _resolve_gpu_flags(has_gpu, pme_gpu, gpus)
     restart_flags = _resolve_restart_flags(restart_from_cpt)
     binary = _resolve_binary_token(gmx_binary)
     cpt_msg = f" (resuming from {restart_from_cpt})" if restart_from_cpt else ""
 
-    # Layer 2: assemble the single unconditional mdrun command.
-    command = _assemble_mdrun_command(binary, deffnm, restart_flags, thread_flags, gpu_flags)
+    # Layer 2: assemble the single unconditional mdrun command.  For a
+    # multi-GPU point (gpus > 1) wrap it in `srun -n gpus` so one simulation
+    # spans gpus ranks, each pinned to its own GPU via --gpus-per-task=1.
+    # --cpus-per-task=$NTHR pins SLURM_CPUS_PER_TASK to our per-rank thread
+    # count: the cluster's task-prolog exports OMP_NUM_THREADS=
+    # $SLURM_CPUS_PER_TASK for every srun task, and GROMACS 2024 fatal-errors
+    # when that env differs from -ntomp.  Without this the prolog injects the
+    # job-wide cpus-per-task and clashes with our -ntomp.
+    launcher = f"srun -n {gpus} --cpus-per-task=$NTHR --gpus-per-task=1 " if gpus > 1 else ""
+    command = _assemble_mdrun_command(
+        binary, deffnm, restart_flags, thread_flags, gpu_flags, launcher
+    )
 
     # Layer 3 + 4: assemble script sections; join with newlines.
     sections = [_build_env_preamble(work_dir, nthr_expr, has_gpu)]
@@ -775,6 +817,7 @@ def get_mdrun_app():
         traj_files: "tuple[str, ...]" = (),
         gmx_binary: str = "auto",
         performance_file: str = "",
+        gpus: int = 1,
         stdout=None,
         stderr=None,
         inputs=None,
@@ -847,6 +890,7 @@ def get_mdrun_app():
             traj_files,
             gmx_binary,
             performance_file=performance_file,
+            gpus=gpus,
         )
 
     return run_mdrun

@@ -282,13 +282,15 @@ class TestBenchmarkConfig:
     def test_custom_values(self):
         """Custom config values are accepted."""
         cfg = BenchmarkConfig(
-            cpu_counts=[16, 32],
+            cpu_counts=[16],
             gpu_replicas=[1, 2],
             duration_ps=50.0,
             selection="efficiency",
             mdp_overrides={"nstxout-compressed": "0"},
         )
-        assert cfg.cpu_counts == [16, 32]
+        # cpu_counts is stored but ignored for a GPU sweep (cores = GPUs);
+        # it still drives a CPU-only sweep.
+        assert cfg.cpu_counts == [16]
         assert cfg.gpu_replicas == [1, 2]
         assert cfg.selection == "efficiency"
 
@@ -460,40 +462,40 @@ class TestBuildSweepConfigs:
         assert all(p["config_overrides"]["max_workers_per_node"] == 1 for p in points)
         assert [p["config_overrides"]["cpus_per_node"] for p in points] == [1, 2, 4, 8]
 
-    def test_cpu_gpu_sweep(self):
-        """CPU × GPU sweep generates the cross-product."""
+    def test_gpu_sweep_ties_cores_to_gpus(self):
+        """A GPU sweep ties cores 1:1 to GPUs (1 core per GPU, pure MPI)."""
         base = MagicMock()
-        cfg = BenchmarkConfig(cpu_counts=[4, 8], gpu_replicas=[1, 2])
-        points = _build_sweep_configs(base, cfg)
-        assert len(points) == 4  # 2 cpus × 2 gpu
-        combos = [(p["cpu_count"], p["gpu_replicas"]) for p in points]
-        assert (4, 1) in combos
-        assert (4, 2) in combos
-        assert (8, 1) in combos
-        assert (8, 2) in combos
-
-    def test_infeasible_gpu_points_skipped(self):
-        """Points where cpu_count < gpu_replicas are skipped, not mislabeled.
-
-        Such a point would floor per-replica ntasks to 0 (auto-detect) and
-        run node-wide threads under a false label (finding 1)."""
-        base = MagicMock()
-        cfg = BenchmarkConfig(cpu_counts=[1, 2, 4], gpu_replicas=[2])
+        cfg = BenchmarkConfig(gpu_replicas=[1, 2, 4])
         points = _build_sweep_configs(base, cfg)
         combos = [(p["cpu_count"], p["gpu_replicas"]) for p in points]
-        # (1, 2) is infeasible: 1 core can't give 2 replicas >= 1 thread each
-        assert (1, 2) not in combos
-        assert (2, 2) in combos
-        assert (4, 2) in combos
-        # Every surviving point can give each replica >= 1 thread
-        assert all(p["cpu_count"] >= p["gpu_replicas"] for p in points)
+        assert combos == [(1, 1), (2, 2), (4, 4)]
+        # 1 thread per rank: ntasks = cores // ranks = gpu // gpu = 1
+        assert all(
+            p["config_overrides"]["max_workers_per_node"] == p["gpu_replicas"] for p in points
+        )
 
-    def test_all_points_infeasible_raises(self):
-        """When no CPU x GPU combination is feasible, raise a clear error."""
+    def test_gpu_sweep_ignores_cpu_counts(self):
+        """cpu_counts is ignored for a GPU sweep — cores come from --gpus."""
         base = MagicMock()
-        cfg = BenchmarkConfig(cpu_counts=[1], gpu_replicas=[2])
-        with pytest.raises(ValueError, match="No feasible sweep points"):
-            _build_sweep_configs(base, cfg)
+        cfg = BenchmarkConfig(cpu_counts=[64], gpu_replicas=[2])
+        points = _build_sweep_configs(base, cfg)
+        assert [(p["cpu_count"], p["gpu_replicas"]) for p in points] == [(2, 2)]
+
+
+class TestScaleGres:
+    """Tests for _scale_gres (a GPU sweep scales the allocation's gres)."""
+
+    def test_replaces_trailing_count(self):
+        from mdfactory.performance.benchmark import _scale_gres
+
+        assert _scale_gres("gpu:l40s:1", 4) == "gpu:l40s:4"
+        assert _scale_gres("gpu:1", 3) == "gpu:3"
+
+    def test_appends_missing_count(self):
+        from mdfactory.performance.benchmark import _scale_gres
+
+        assert _scale_gres("gpu", 2) == "gpu:2"
+        assert _scale_gres("gpu:l40s", 2) == "gpu:l40s:2"
 
 
 # ---------------------------------------------------------------------------
@@ -725,12 +727,15 @@ class TestRunBenchmarkSweepExecution:
     @patch("mdfactory.orchestration.session.parsl_session")
     @patch("mdfactory.orchestration.apps.get_grompp_app")
     @patch("mdfactory.orchestration.apps.get_mdrun_app")
-    def test_sweep_allocation_is_exclusive(
+    def test_sweep_allocation_forces_exclusive_and_single_block(
         self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
-        """The sweep allocation requests exclusive use of the node so neighbour
-        jobs cannot skew the measurement (a shared node swung the 8-core point
-        ~37% between identical runs)."""
+        """The sweep allocation forces exclusive use AND a single SLURM block.
+
+        Exclusive so neighbour jobs can't skew the measurement (a shared node
+        swung the 8-core point ~37% between identical runs); max_blocks=1 so
+        the sweep can never span multiple allocations.  The base config is
+        left untouched (simulate keeps its multi-block parallelism)."""
         from mdfactory.orchestration.config import SlurmExecutorConfig
 
         sim_dir = _setup_sim_dir(tmp_path)
@@ -746,15 +751,18 @@ class TestRunBenchmarkSweepExecution:
         mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}5.234\n")
         mock_mdrun_app.return_value = mock_mdrun
 
-        # Base config opts OUT of exclusive — the sweep must still opt IN.
-        cfg = SlurmExecutorConfig(account="acct", partition="cpu", exclusive=False)
+        # Base opts OUT of exclusive and allows 4 blocks — the sweep must
+        # still force exclusive=True and max_blocks=1 on its own copy.
+        cfg = SlurmExecutorConfig(account="acct", partition="cpu", exclusive=False, max_blocks=4)
 
         run_benchmark_sweep(sim_dir, cfg, BenchmarkConfig(cpu_counts=[2, 4]))
 
         allocation_config = mock_session.call_args.args[0]
         assert allocation_config.exclusive is True
+        assert allocation_config.max_blocks == 1
         # ...and the base config object is not mutated.
         assert cfg.exclusive is False
+        assert cfg.max_blocks == 4
 
     @patch("mdfactory.orchestration.trajectory.find_structure_file")
     @patch("mdfactory.orchestration.session.parsl_session")
@@ -798,12 +806,11 @@ class TestRunBenchmarkSweepExecution:
     @patch("mdfactory.orchestration.session.parsl_session")
     @patch("mdfactory.orchestration.apps.get_grompp_app")
     @patch("mdfactory.orchestration.apps.get_mdrun_app")
-    def test_gpu_replicas_run_concurrently_with_aggregate_throughput(
+    def test_gpu_point_runs_single_simulation_across_gpus(
         self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
-        """A gpu_replicas=2 point launches two concurrent mdruns sharing the
-        GPU, each with half the threads, and records the aggregate ns/day
-        (findings 3 and 10)."""
+        """A gpu_replicas=R point launches ONE mdrun (gpus=R → srun -n R) with
+        cores tied 1:1 to GPUs (1 thread/rank, pure MPI), gres scaled to R."""
         from mdfactory.orchestration.config import SlurmExecutorConfig
 
         sim_dir = _setup_sim_dir(tmp_path)
@@ -815,64 +822,45 @@ class TestRunBenchmarkSweepExecution:
         mock_grompp.return_value.result.return_value = "ok"
         mock_grompp_app.return_value = mock_grompp
 
-        events = []
-
-        def mdrun_side_effect(**kwargs):
-            events.append(f"submit:{kwargs['deffnm']}")
-            Path(kwargs["work_dir"], kwargs["performance_file"]).write_text(
-                f"{MDRUN_PERF_MARKER}5.234\n"
-            )
-            fut = MagicMock()
-
-            def _join(*args, **_kwargs):
-                events.append(f"join:{kwargs['deffnm']}")
-                return 0
-
-            fut.result.side_effect = _join
-            return fut
-
-        mock_app = MagicMock(side_effect=mdrun_side_effect)
-        mock_mdrun_app.return_value = mock_app
+        mock_mdrun = MagicMock()
+        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}5.234\n")
+        mock_mdrun_app.return_value = mock_mdrun
 
         cfg = SlurmExecutorConfig(account="acct", partition="gpu", gres="gpu:l40s:1")
+        # cpu_counts=[4] must be IGNORED — cores come from gpu_replicas (2).
         bench_cfg = BenchmarkConfig(cpu_counts=[4], gpu_replicas=[2])
 
         result = run_benchmark_sweep(sim_dir, cfg, bench_cfg)
 
-        # One grompp (shared TPR), two concurrent mdruns
+        # ONE grompp, ONE mdrun — a single simulation across R GPUs
         assert mock_grompp.call_count == 1
-        assert mock_app.call_count == 2
-        # Both replicas are submitted before either is joined => concurrent
-        assert events == ["submit:bench_r0", "submit:bench_r1", "join:bench_r0", "join:bench_r1"]
+        assert mock_mdrun.call_count == 1
+        call = mock_mdrun.call_args
+        assert call.kwargs["gpus"] == 2  # script: srun -n 2 --gpus-per-task=1
+        assert call.kwargs["deffnm"] == "bench"
+        assert call.kwargs["ntasks"] == 1  # cores tied 1:1 → 2 cores // 2 ranks
+        assert call.kwargs["disable_gpu"] is False
 
-        mdrun_calls = mock_app.call_args_list
-        # Distinct deffnms and unique perf sidecars per replica
-        assert [c.kwargs["deffnm"] for c in mdrun_calls] == ["bench_r0", "bench_r1"]
-        perf_names = [c.kwargs["performance_file"] for c in mdrun_calls]
-        assert len(set(perf_names)) == 2
-        # Thread division: 4 cpus across 2 replicas => 2 threads each
-        assert [c.kwargs["ntasks"] for c in mdrun_calls] == [2, 2]
-        # GPU stays enabled via the base config's gres
-        assert all(c.kwargs["disable_gpu"] is False for c in mdrun_calls)
-
-        # Allocation sized for the largest point with one worker per replica
+        # Allocation: cores = GPUs (2), gres scaled to 2 GPUs, all visible
+        # (no per-worker pinning), one worker running the multi-rank sim.
         allocation_config = mock_session.call_args.args[0]
-        assert allocation_config.cpus_per_node == 4
-        assert allocation_config.max_workers_per_node == 2
+        assert allocation_config.cpus_per_node == 2  # cores = max GPU count
+        assert allocation_config.gres == "gpu:l40s:2"
+        assert allocation_config.available_accelerators == 0
+        assert allocation_config.max_workers_per_node == 1
 
-        # Aggregate throughput across the two replicas (5.234 + 5.234)
+        # Single simulation throughput (not an aggregate/sum)
         assert len(result.trials) == 1
         trial = result.trials[0]
-        assert trial.cpu_count == 4
+        assert trial.cpu_count == 2  # cores = GPUs; cpu_counts=[4] ignored
         assert trial.gpu_replicas == 2
-        assert trial.ns_per_day == pytest.approx(10.468)
+        assert trial.ns_per_day == pytest.approx(5.234)
         assert trial.error is None
 
-        # Replicas share the single grompp TPR through per-replica symlinks
-        trial_dir = sim_dir / ".benchmark" / "cpus4_gpu2"
-        assert (trial_dir / "bench_r0.tpr").is_symlink()
-        assert (trial_dir / "bench_r1.tpr").is_symlink()
-        assert (trial_dir / "bench_r0.tpr").readlink() == Path("bench.tpr")
+        # Single shared TPR — no per-replica symlinks
+        trial_dir = sim_dir / ".benchmark" / "cpus2_gpu2"
+        assert not (trial_dir / "bench_r0.tpr").exists()
+        assert not (trial_dir / "bench_r1.tpr").exists()
 
     @patch("mdfactory.orchestration.trajectory.find_structure_file")
     @patch("mdfactory.orchestration.session.parsl_session")

@@ -5,9 +5,9 @@
 Discovers optimal resource configuration for a given system size by running
 short production trials across a sweep of executor configs.  The whole study
 runs inside a single :func:`~mdfactory.orchestration.session.parsl_session`;
-each sweep point submits a short mdrun (or several concurrent replicas that
-share the GPU) via the standard Parsl app factories and reads throughput
-(ns/day) from the worker-written performance sidecar.
+each sweep point submits a short mdrun (a single simulation, scaled across
+increasing GPU counts via ``srun``) via the standard Parsl app factories and
+reads throughput (ns/day) from the worker-written performance sidecar.
 """
 
 from __future__ import annotations
@@ -186,10 +186,13 @@ class BenchmarkConfig(BaseModel, frozen=True):
     cpu_counts : list[int]
         Core counts to sweep (e.g. ``[1, 2, 4, 8, 16]``).
     gpu_replicas : list[int]
-        Number of concurrent mdrun replicas sharing the allocation's single
-        GPU to sweep (e.g. ``[1, 2, 4]``).  A point with ``R`` replicas
-        launches ``R`` concurrent trials; the recorded ``ns_per_day`` is the
-        aggregate across them.  An empty list skips the GPU sweep dimension.
+        GPU counts to sweep (e.g. ``[1, 2, 4]``): a point with ``R`` runs ONE
+        simulation across ``R`` GPUs (one MPI rank each, ``srun -n R``, no
+        MPS).  Cores are tied 1:1 to GPUs — each point uses ``R`` cores, one
+        per rank, 1 thread each (pure MPI, no OpenMP hybrid), so threads/rank
+        is constant across the sweep.  ``cpu_counts`` is ignored for a GPU
+        sweep.  The recorded ``ns_per_day`` is that simulation's throughput.
+        An empty list runs a CPU-only sweep.
     duration_ps : float
         Benchmark trial duration in picoseconds.
     selection : str
@@ -333,6 +336,10 @@ def _build_sweep_configs(
 ) -> list[dict]:
     """Generate sweep point descriptors from base config and benchmark params.
 
+    A GPU sweep ties cores 1:1 to GPUs — each point runs one MPI rank per GPU
+    with a single thread (pure MPI, no OpenMP hybrid), so threads/rank is
+    constant across the sweep; ``cpu_counts`` applies only to a CPU-only sweep.
+
     Each descriptor contains the fields needed to create a per-trial
     executor config variant and to record the trial result.
 
@@ -344,34 +351,23 @@ def _build_sweep_configs(
     """
     points = []
 
-    for cpu_count in benchmark_config.cpu_counts:
-        if benchmark_config.gpu_replicas:
-            for gpu_rep in benchmark_config.gpu_replicas:
-                # Each of the ``gpu_rep`` replicas must get >= 1 thread within
-                # the point's labeled CPU budget, so a point needs
-                # cpu_count >= gpu_replicas.  Otherwise the per-replica
-                # ``cpus // workers`` would floor to 0 (the auto-detect
-                # sentinel) and run node-wide threads under a false label
-                # (finding 1).  Skip infeasible points rather than record a
-                # mislabeled trial.
-                if cpu_count < gpu_rep:
-                    logger.warning(
-                        f"Skipping sweep point cpus={cpu_count}, "
-                        f"gpu_replicas={gpu_rep}: needs cpu_count >= gpu_replicas "
-                        "so each replica gets >= 1 thread"
-                    )
-                    continue
-                points.append(
-                    {
-                        "cpu_count": cpu_count,
-                        "gpu_replicas": gpu_rep,
-                        "config_overrides": {
-                            "cpus_per_node": cpu_count,
-                            "max_workers_per_node": gpu_rep,
-                        },
-                    }
-                )
-        else:
+    if benchmark_config.gpu_replicas:
+        # Cores = GPUs: one core and one MPI rank per GPU, 1 thread each.
+        # extract_resource_hints then yields ntasks = gpu_count // gpu_count = 1
+        # (pure MPI), so threads/rank never varies across the sweep.
+        for gpu_count in benchmark_config.gpu_replicas:
+            points.append(
+                {
+                    "cpu_count": gpu_count,  # cores = GPUs (1 core per GPU)
+                    "gpu_replicas": gpu_count,
+                    "config_overrides": {
+                        "cpus_per_node": gpu_count,
+                        "max_workers_per_node": gpu_count,
+                    },
+                }
+            )
+    else:
+        for cpu_count in benchmark_config.cpu_counts:
             points.append(
                 {
                     "cpu_count": cpu_count,
@@ -385,13 +381,6 @@ def _build_sweep_configs(
                     },
                 }
             )
-
-    if not points:
-        raise ValueError(
-            "No feasible sweep points: every CPU x GPU combination needs "
-            "cpu_count >= gpu_replicas so each replica gets >= 1 thread. "
-            "Widen cpu_counts or lower gpu_replicas."
-        )
 
     return points
 
@@ -442,6 +431,35 @@ def _sweep_lock(system_path: Path):
         handle.close()
 
 
+def _scale_gres(gres: str, count: int) -> str:
+    """Return ``gres`` with its trailing device count set to ``count``.
+
+    Handles the common SLURM gres spellings — ``gpu``, ``gpu:1``,
+    ``gpu:l40s``, ``gpu:l40s:1`` — by replacing an existing trailing numeric
+    count or appending one.  Used so a GPU sweep can request ``N`` GPUs on the
+    single sweep allocation (one simulation spanning ``N`` GPUs).
+
+    Parameters
+    ----------
+    gres : str
+        Base gres string from the executor config (e.g. ``"gpu:l40s:1"``).
+    count : int
+        Desired device count.
+
+    Returns
+    -------
+    str
+        gres string with the device count set to ``count``.
+
+    """
+    parts = gres.split(":")
+    if parts[-1].isdigit():
+        parts[-1] = str(count)
+    else:
+        parts.append(str(count))
+    return ":".join(parts)
+
+
 def run_benchmark_sweep(
     system_path: Path,
     base_config: "ExecutorConfig",
@@ -455,9 +473,9 @@ def run_benchmark_sweep(
     count, then runs a short mdrun trial for every sweep point inside it,
     varying only the mdrun thread count.  Keeping the whole study on a single
     allocation/node removes job-placement and queueing variance from the
-    scaling curve.  A GPU point with ``R`` replicas launches ``R`` concurrent
-    mdruns that share the allocation's single GPU.  Reads ns/day from each
-    trial's performance sidecar and selects the optimum.
+    scaling curve.  A GPU point with ``R`` runs one simulation across ``R``
+    GPUs (``gres`` scales to the max; ``srun -n R`` gives each rank one GPU).
+    Reads ns/day from each trial's performance sidecar and selects the optimum.
 
     Parameters
     ----------
@@ -466,10 +484,11 @@ def run_benchmark_sweep(
         structure, and MDP files).
     base_config : ExecutorConfig
         Base executor configuration.  The allocation is derived from it by
-        overriding ``cpus_per_node`` with the maximum sweep value and
-        ``max_workers_per_node`` with the maximum GPU replica count.  When the
-        config supports it (SLURM), the sweep allocation is marked
-        ``exclusive`` so neighbour jobs cannot skew the measurement.
+        overriding ``cpus_per_node`` with the maximum sweep value, forcing
+        ``max_workers_per_node=1``, and — for a GPU sweep — scaling ``gres``
+        to the largest GPU count.  When the config supports it (SLURM), the
+        sweep allocation is marked ``exclusive`` so neighbour jobs cannot skew
+        the measurement.
     benchmark_config : BenchmarkConfig, optional
         Sweep parameters.  Defaults to ``BenchmarkConfig()`` with
         CPU counts ``[1, 2, 4, 8]``.
@@ -480,8 +499,8 @@ def run_benchmark_sweep(
     -------
     BenchmarkResult
         All trial results with the selected optimum.  For a GPU point with
-        ``R`` replicas, ``TrialResult.ns_per_day`` is the aggregate (sum)
-        across the ``R`` concurrent replicas.
+        ``R`` GPUs, ``TrialResult.ns_per_day`` is that single simulation's
+        throughput (one run spanning ``R`` ranks).
 
     Raises
     ------
@@ -545,7 +564,17 @@ def run_benchmark_sweep(
     max_replicas = max((point["gpu_replicas"] for point in sweep_points), default=0)
     allocation_update = {
         "cpus_per_node": max_cpus,
-        "max_workers_per_node": max(1, max_replicas),
+        # One Parsl worker runs the (possibly multi-rank) simulation at a time;
+        # points run sequentially, and a multi-GPU point's ranks are spawned by
+        # srun inside that worker's task.
+        "max_workers_per_node": 1,
+        # Hard-guarantee a SINGLE SLURM allocation for the whole sweep (like
+        # exclusive/gres, overridden only on this copy so `simulate` keeps the
+        # yaml's multi-block parallelism).  The sequential design already keeps
+        # Parsl to one block; pinning max_blocks=1 makes "one allocation" a
+        # guarantee rather than an emergent property, so the sweep can never
+        # span multiple jobs and mix placement/queueing across nodes.
+        "max_blocks": 1,
     }
     # A benchmark must measure the allocation, not our neighbours.  On a
     # shared node other jobs steal cores, which swung the 8-core point ~37%
@@ -554,6 +583,13 @@ def run_benchmark_sweep(
     # the default shared behaviour.  Only SLURM configs carry the field.
     if "exclusive" in type(base_config).model_fields:
         allocation_update["exclusive"] = True
+    # A GPU sweep requests the largest GPU count so the single simulation can
+    # span up to N GPUs.  available_accelerators=0 keeps per-worker pinning off
+    # so the one worker sees all N GPUs and `srun --gpus-per-task=1` hands one
+    # to each rank.  CPU-only sweeps leave gres/available_accelerators alone.
+    if max_replicas > 0 and getattr(base_config, "gres", None):
+        allocation_update["gres"] = _scale_gres(base_config.gres, max_replicas)
+        allocation_update["available_accelerators"] = 0
     allocation_config = base_config.model_copy(update=allocation_update)
     if getattr(allocation_config, "nodes", 1) > 1:
         raise ValueError(
@@ -564,6 +600,7 @@ def run_benchmark_sweep(
     logger.info(
         f"Single allocation: cpus={max_cpus}, "
         f"max_workers_per_node={allocation_config.max_workers_per_node}"
+        + (f", gres={allocation_config.gres}" if getattr(allocation_config, "gres", None) else "")
         + (
             f", exclusive={allocation_config.exclusive}"
             if hasattr(allocation_config, "exclusive")
@@ -620,14 +657,15 @@ def run_benchmark_sweep(
                 trial_config = base_config.model_copy(update=point["config_overrides"])
                 hints = extract_resource_hints(trial_config)
 
-                # A GPU point with R replicas runs R concurrent mdrun
-                # processes sharing the allocation's single GPU (each with
-                # cpu_count // R threads); CPU-only points run one process.
-                n_replicas = max(1, gpu_reps)
+                # A GPU point with R GPUs runs ONE simulation across R MPI
+                # ranks (srun -n R, one GPU each); CPU-only runs one rank.
+                # hints.ntasks is threads per rank = cores // ranks
+                # (cores tied 1:1 to GPUs → 1 thread per rank, pure MPI).
+                gpus = max(1, gpu_reps)
 
                 logger.info(
                     f"Trial: cpus={cpu_count}, gpu_replicas={gpu_reps} "
-                    f"({n_replicas} concurrent replica(s))"
+                    f"({gpus} GPU(s), single simulation)"
                 )
 
                 base_deffnm = "bench"
@@ -663,7 +701,7 @@ def run_benchmark_sweep(
                         if not md_link.exists():
                             bench_link.rename(md_link)
 
-                    # grompp — once per point; every replica shares the TPR.
+                    # grompp — once per point; every rank shares the TPR.
                     grompp_future = grompp_app(
                         work_dir=str(trial_dir),
                         mdp_file=prod_spec.mdp_file,
@@ -675,54 +713,36 @@ def run_benchmark_sweep(
                     )
                     grompp_future.result()
 
-                    # Submit every replica before joining any so they run
-                    # concurrently on the shared GPU.  Each replica gets its
-                    # own deffnm (outputs), TPR symlink, and perf sidecar;
-                    # sidecar names are unique so the driver can never read a
-                    # stale filesystem cache entry.
-                    replica_futures = []
-                    perf_paths = []
-                    for i in range(n_replicas):
-                        replica_deffnm = base_deffnm if n_replicas == 1 else f"{base_deffnm}_r{i}"
-                        if n_replicas > 1:
-                            tpr_link = trial_dir / f"{replica_deffnm}.tpr"
-                            if tpr_link.is_symlink():
-                                tpr_link.unlink()
-                            if not tpr_link.exists():
-                                tpr_link.symlink_to(f"{base_deffnm}.tpr")
-                        perf_name = f"{replica_deffnm}.{uuid.uuid4().hex}.perf"
-                        perf_paths.append(trial_dir / perf_name)
-                        replica_futures.append(
-                            mdrun_app(
-                                work_dir=str(trial_dir),
-                                deffnm=replica_deffnm,
-                                ntasks=hints.ntasks,
-                                disable_gpu=hints.disable_gpu,
-                                gmx_binary=hints.gmx_binary,
-                                performance_file=perf_name,
-                                inputs=[grompp_future],
-                            )
-                        )
+                    # One mdrun task: for R>1 the script launches
+                    # `srun -n R --gpus-per-task=1`, so the single simulation
+                    # spans R GPUs (one rank each).  The sidecar name is unique
+                    # so the driver never reads a stale filesystem cache entry.
+                    perf_name = f"{base_deffnm}.{uuid.uuid4().hex}.perf"
+                    perf_path = trial_dir / perf_name
+                    mdrun_future = mdrun_app(
+                        work_dir=str(trial_dir),
+                        deffnm=base_deffnm,
+                        ntasks=hints.ntasks,
+                        gpus=gpus,
+                        disable_gpu=hints.disable_gpu,
+                        gmx_binary=hints.gmx_binary,
+                        performance_file=perf_name,
+                        inputs=[grompp_future],
+                    )
                     # The mdrun script extracts ns/day on the node that wrote
                     # the log and writes it to the perf sidecar.  Parsing the
                     # log from the driver is unsafe: the shared filesystem can
                     # serve a stale pre-backup inode, which previously
                     # reported a previous trial's throughput.
-                    for replica_future in replica_futures:
-                        replica_future.result()
+                    mdrun_future.result()
 
                     wall_seconds = time.monotonic() - start_time
-                    values = [read_performance_file(p) for p in perf_paths]
-                    missing = [p for p, v in zip(perf_paths, values) if v is None]
+                    ns_per_day = read_performance_file(perf_path)
 
                     error = None
-                    if missing:
-                        ns_per_day = None
-                        error = f"no performance data in {missing[0]}"
+                    if ns_per_day is None:
+                        error = f"no performance data in {perf_path}"
                         logger.warning(f"  {error}")
-                    else:
-                        # Aggregate throughput across concurrent replicas.
-                        ns_per_day = sum(values)
 
                     trials.append(
                         TrialResult(

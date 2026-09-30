@@ -538,6 +538,65 @@ def test_resolve_gpu_flags_no_gpu():
     assert _resolve_gpu_flags(has_gpu=False, pme_gpu=False) == ""
 
 
+def test_resolve_gpu_flags_multi_rank_adds_npme():
+    """Multi-rank + PME-on-GPU appends the mandatory -npme 1 (>= 1, not 0:
+    this GROMACS build lacks cuFFTMp, so -npme 0 spreads PME over multiple
+    CUDA devices and aborts)."""
+    flags = _resolve_gpu_flags(has_gpu=True, pme_gpu=True, gpus=2)
+    assert flags == "-nb gpu -pme gpu -gpu_id $GPU_ID -npme 1"
+
+
+def test_resolve_gpu_flags_multi_rank_no_pme_omits_npme():
+    """Multi-rank with PME-on-CPU needs no -npme (only PME-on-GPU requires it)."""
+    flags = _resolve_gpu_flags(has_gpu=True, pme_gpu=False, gpus=4)
+    assert "-npme" not in flags
+    assert flags == "-nb gpu -pme cpu -gpu_id $GPU_ID"
+
+
+def test_resolve_gpu_flags_single_rank_omits_npme():
+    """Single-rank PME-on-GPU works without -npme (GROMACS only requires it
+    across multiple ranks)."""
+    assert "-npme" not in _resolve_gpu_flags(has_gpu=True, pme_gpu=True, gpus=1)
+
+
+def test_build_mdrun_script_multi_gpu_uses_srun():
+    """gpus > 1 wraps the command in srun so one simulation spans N GPUs.
+
+    --cpus-per-task=$NTHR must be present: the cluster task-prolog exports
+    OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK per srun task, and GROMACS 2024
+    fatal-errors when that env differs from -ntomp.  -npme 1 is present because
+    GROMACS aborts multi-rank PME-on-GPU without an explicit -npme."""
+    script = _build_mdrun_script(
+        deffnm="bench", work_dir="/tmp/wd", disable_gpu=False, gmx_binary="gmx_mpi", gpus=2
+    )
+    assert "srun -n 2 --cpus-per-task=$NTHR --gpus-per-task=1 gmx_mpi mdrun" in script
+    assert "-ntomp $NTHR" in script  # matches the prolog-provided OMP value
+    assert "-npme 1" in script  # mandatory for multi-rank PME-on-GPU
+
+
+def test_build_mdrun_script_single_rank_no_srun():
+    """gpus <= 1 runs a single rank (no srun wrapper)."""
+    script = _build_mdrun_script(
+        deffnm="bench", work_dir="/tmp/wd", disable_gpu=False, gmx_binary="gmx_mpi", gpus=1
+    )
+    assert "srun" not in script
+    assert "gmx_mpi mdrun" in script
+
+
+def test_build_mdrun_script_gpu_id_is_zero():
+    """Each rank's one pinned GPU is device 0 inside the process (CUDA
+    renumbers a pinned device, so a physical id would be out of range)."""
+    script = _build_mdrun_script(deffnm="bench", work_dir="/tmp/wd", disable_gpu=False)
+    assert "GPU_ID=0" in script
+    assert "CUDA_VISIBLE_DEVICES" not in script
+
+
+def test_build_mdrun_script_cpu_omits_gpu_id():
+    """CPU-only scripts never reference GPU_ID."""
+    script = _build_mdrun_script(deffnm="min", work_dir="/tmp/wd", disable_gpu=True)
+    assert "GPU_ID" not in script
+
+
 def test_resolve_is_mpi():
     """Binary selector resolves to expected is_mpi values."""
     assert _resolve_is_mpi("gmx_mpi") is True

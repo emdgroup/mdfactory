@@ -87,3 +87,23 @@ def test_benchmark_command_forwards_dry_run(tmp_path):
 
     assert mock_sweep.call_count == 1
     assert mock_sweep.call_args.kwargs["dry_run"] is True
+
+
+def test_benchmark_command_gpu_ties_cores_to_gpus(tmp_path):
+    """--gpus sets cores 1:1 to GPUs; an explicit --cpus is ignored."""
+    (tmp_path / "system.pdb").touch()
+    config_path = tmp_path / "slurm.yaml"
+    config_path.write_text("provider: slurm\n")
+
+    with (
+        patch("mdfactory.cli._load_executor_config") as mock_load,
+        patch("mdfactory.performance.benchmark.run_benchmark_sweep") as mock_sweep,
+        patch("mdfactory.cli._report_benchmark_result"),
+    ):
+        mock_load.return_value = MagicMock(cpus_per_node=8)
+        mock_sweep.return_value = MagicMock()
+        benchmark(source=tmp_path, slurm=str(config_path), cpus=[8], gpus=[1, 2])
+
+    _, _, benchmark_config = mock_sweep.call_args.args
+    assert benchmark_config.cpu_counts == [1, 2]  # cores = GPUs, --cpus ignored
+    assert benchmark_config.gpu_replicas == [1, 2]
