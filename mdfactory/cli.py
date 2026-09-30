@@ -37,6 +37,7 @@ from .workflows import run_build_from_dict, run_build_from_file
 
 if TYPE_CHECKING:
     from .orchestration import ExecutorConfig
+    from .performance.benchmark import BenchmarkResult
 
 app = App(name="MDFactory", version=__version__)
 
@@ -679,6 +680,118 @@ def _report_simulation_results(results: list[dict]):
     for r in results:
         if r.get("status") == "failed":
             logger.error(f"  {r.get('hash', 'unknown')}: {r.get('error', 'unknown error')}")
+
+
+@app.command(name="benchmark", group="Simulation")
+def benchmark(
+    source: Annotated[
+        Path,
+        Parameter(help="Prepared simulation directory or summary YAML to benchmark."),
+    ],
+    slurm: Annotated[
+        str,
+        Parameter(help="SLURM executor config YAML or 'tui' for interactive setup."),
+    ],
+    cpus: Annotated[
+        list[int] | None,
+        Parameter(
+            help="CPU counts to sweep (default: 1 2 4 8). CPU-only; ignored when --gpus is set.",
+            consume_multiple=True,
+        ),
+    ] = None,
+    gpus: Annotated[
+        list[int] | None,
+        Parameter(
+            help="GPU counts to sweep; one core + one MPI rank per GPU (pure MPI).",
+            consume_multiple=True,
+        ),
+    ] = None,
+    duration_ps: Annotated[
+        float,
+        Parameter(help="Duration of each benchmark trial in ps (default: 100)."),
+    ] = 100.0,
+    selection: Annotated[
+        Literal["ns_per_day", "efficiency"],
+        Parameter(help="Criterion for choosing the optimum configuration."),
+    ] = "ns_per_day",
+    dry_run: Annotated[
+        bool,
+        Parameter(help="Print the sweep plan without submitting any work."),
+    ] = False,
+):
+    """Benchmark resource configurations to find the optimal deployment.
+
+    Runs short GROMACS production trials across a sweep of CPU counts (or, for
+    a GPU scalability study, increasing GPU counts with cores tied 1:1 — one
+    simulation spanning more GPUs), parses throughput from each trial's
+    log, and writes a ``benchmark_result.json`` sidecar next to the system with
+    the selected optimum.
+
+    A SLURM executor is required: every trial is submitted to the cluster, so
+    no heavy work runs on the submitting node.
+
+    Examples
+    --------
+    CPU sweep::
+
+        mdfactory benchmark output_dir/abc123 --slurm slurm_cpu.yaml --cpus 1 2 4 8
+
+    Optimize throughput per core::
+
+        mdfactory benchmark output_dir/abc123 --slurm slurm_cpu.yaml --selection efficiency
+
+    Dry-run preview (no submission)::
+
+        mdfactory benchmark output_dir/abc123 --slurm slurm_cpu.yaml --dry-run
+
+    """
+    source = source.resolve()
+    try:
+        sim_paths = _resolve_sim_paths_for_simulate(source)
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
+    config = _resolve_slurm_flag(slurm, stages=())
+    executor_config = _load_executor_config(config)
+
+    from mdfactory.performance.benchmark import BenchmarkConfig, run_benchmark_sweep
+
+    # A GPU sweep ties cores 1:1 to GPUs (one core/MPI rank per GPU, 1 thread
+    # each — pure MPI, no OpenMP hybrid), so the core count comes from --gpus
+    # and --cpus applies only to a CPU-only sweep.
+    benchmark_cpu_counts = list(gpus) if gpus else (cpus or [1, 2, 4, 8])
+    benchmark_config = BenchmarkConfig(
+        cpu_counts=benchmark_cpu_counts,
+        gpu_replicas=gpus or [],
+        duration_ps=duration_ps,
+        selection=selection,
+    )
+
+    for sim_path in sim_paths:
+        logger.info(f"Benchmarking {sim_path}")
+        result = run_benchmark_sweep(sim_path, executor_config, benchmark_config, dry_run=dry_run)
+        _report_benchmark_result(result)
+
+
+def _report_benchmark_result(result: "BenchmarkResult") -> None:
+    """Log the outcomes of a benchmark sweep and its selected optimum."""
+    for trial in result.trials:
+        ns_per_day = f"{trial.ns_per_day:.3f}" if trial.ns_per_day is not None else "N/A"
+        logger.info(
+            f"  cpus={trial.cpu_count} gpu_replicas={trial.gpu_replicas}: {ns_per_day} ns/day"
+            + (f" ({trial.error})" if trial.error else "")
+        )
+
+    if result.optimum is None:
+        logger.warning(f"No successful trial for {result.system_path}")
+        return
+
+    opt = result.optimum
+    logger.info(
+        f"Optimum ({result.selection_criterion}): cpus={opt.cpu_count}, "
+        f"gpu_replicas={opt.gpu_replicas} -> {opt.ns_per_day:.3f} ns/day"
+    )
 
 
 @app.command(name="clean")
