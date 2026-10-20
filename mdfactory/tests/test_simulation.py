@@ -706,5 +706,7 @@ def test_artifact_registry_has_defaults():
     """Test ARTIFACT_REGISTRY includes expected artifact entries."""
     assert "bilayer" in ARTIFACT_REGISTRY
     assert "mixedbox" in ARTIFACT_REGISTRY
+    assert "protein_mixedbox" in ARTIFACT_REGISTRY
     assert "last_frame_pdb" in ARTIFACT_REGISTRY["bilayer"]
     assert "last_frame_pdb" in ARTIFACT_REGISTRY["mixedbox"]
+    assert "last_frame_pdb" in ARTIFACT_REGISTRY["protein_mixedbox"]

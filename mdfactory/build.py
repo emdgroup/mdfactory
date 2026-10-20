@@ -1,9 +1,11 @@
 # ABOUTME: Core build pipeline for constructing MD simulation systems
-# ABOUTME: Dispatches to mixedbox, bilayer, and LNP build routines
+# ABOUTME: Dispatches to mixedbox, bilayer, LNP, and proteinbox build routines
 """Core build pipeline for constructing MD simulation systems."""
 
+import json
 import os
 from functools import partial
+from pathlib import Path
 
 import MDAnalysis as mda
 import numpy as np
@@ -22,7 +24,11 @@ from .models.parametrization import SmirnoffConfig
 from .models.species import SingleMoleculeSpecies
 from .run_schedules import RunScheduleManager
 from .setup.solvation import ionize, solvate
-from .utils.setup_utilities import create_bilayer_from_model, create_mixed_box_universe
+from .utils.setup_utilities import (
+    N_AVOGADRO,
+    create_bilayer_from_model,
+    create_mixed_box_universe,
+)
 from .utils.utilities import working_directory
 
 
@@ -620,7 +626,7 @@ def merge_lnp_components(
     return u_equil
 
 
-def ionize_solvated_system(ion_config, u_solvated, total_charge):
+def ionize_solvated_system(ion_config, u_solvated, total_charge, solvent_volume_a3=None):
     """Add ions for neutralization and salt concentration.
 
     Parameters
@@ -631,6 +637,20 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge):
         Solvated system universe
     total_charge : int
         Total charge of the system before ionization
+    solvent_volume_a3 : float or None, optional
+        Volume in Å³ to resolve the salt concentration against. When given, the
+        salt pair count is ``round(concentration · volume · N_A)`` on that volume
+        (the protein_mixedbox concentration-volume basis). When None, the count
+        is estimated from the water-molecule count as ``ceil(c · n_water / 55.55)``.
+
+    Notes
+    -----
+    The resolved salt is added *on top of* neutralization and any ions already
+    packed as explicit solution species -- it is not a target total ionic
+    strength. So the final Na+/Cl- counts are ``salt_pairs + neutralizing_ions``
+    plus whatever ion species were packed. Set ``ion_config.concentration = 0``
+    to add no salt and control ionic strength purely through packed ion species
+    (neutralization still applies unless ``neutralize`` is also disabled).
 
     Returns
     -------
@@ -664,8 +684,13 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge):
     n_water = len(u_solvated.select_atoms("water").residues)
     if n_water == 0:
         raise ValueError("Cannot ionize system without water.")
-    M_water = 55.55  # mol/l
-    n_ions = np.ceil(c_ions * n_water / M_water).astype(int)
+    if solvent_volume_a3 is not None:
+        # 1 Å³ = 1e-27 L, so n_salt = concentration[mol/L] * V[L] * N_A.
+        v_liters = solvent_volume_a3 * 1e-27
+        n_ions = int(round(c_ions * v_liters * N_AVOGADRO))
+    else:
+        M_water = 55.55  # mol/l
+        n_ions = np.ceil(c_ions * n_water / M_water).astype(int)
 
     num_na = n_ions + add_na
     num_cl = n_ions + add_cl
@@ -693,3 +718,686 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge):
     if num_cl > 0:
         additional_species.append(SingleMoleculeSpecies(count=num_cl, smiles="[Cl-]", resname="CL"))
     return u_ionized, additional_species
+
+
+def _ion_counts(ion_species) -> tuple[int, int]:
+    """Return ``(num_na, num_cl)`` from the species ``ionize_solvated_system`` added.
+
+    ``ionize_solvated_system`` returns only the ion species it actually added, so
+    one-sided neutralization yields a single species. Counts are therefore looked
+    up by residue name; indexing by position would report a lone Cl- as Na+.
+    """
+    counts = {spec.resname: spec.count for spec in ion_species}
+    return counts.get("NA", 0), counts.get("CL", 0)
+
+
+def _center_in_cubic_box(u: mda.Universe, padding: float) -> float:
+    """Center atoms in a cubic box leaving at least ``padding`` on every face.
+
+    The box is centered on the atoms' bounding-box center (not the center of
+    geometry), so an asymmetric molecule keeps the requested clearance to each
+    face. Returns the cubic box edge length in Angstroms.
+    """
+    bbox_min = u.atoms.positions.min(axis=0)
+    bbox_max = u.atoms.positions.max(axis=0)
+    extent = bbox_max - bbox_min
+    box_size = float(extent.max() + 2 * padding)
+    u.dimensions = [box_size, box_size, box_size, 90, 90, 90]
+    box_center = np.array([box_size / 2, box_size / 2, box_size / 2])
+    bbox_center = (bbox_min + bbox_max) / 2
+    u.atoms.translate(box_center - bbox_center)
+    return box_size
+
+
+@validate_call
+def build_proteinbox(inp: BuildInput):
+    """Build a protein-in-waterbox system: clean, parametrize, solvate, ionize, relax."""
+    import shutil
+
+    from loguru import logger
+
+    from .models.composition import ProteinBoxComposition
+    from .models.parametrization import Pdb2gmxConfig
+    from .setup.protein import (
+        bundle_forcefield_into_topology,
+        check_gmx_available,
+        clean_pdb,
+        run_pdb2gmx,
+        update_topology_molecules,
+        validate_with_grompp,
+    )
+
+    if not isinstance(inp.system, ProteinBoxComposition):
+        raise TypeError("System must specify a ProteinBoxComposition.")
+
+    if not isinstance(inp.parametrization_config, Pdb2gmxConfig):
+        raise TypeError("Parametrization config must be Pdb2gmxConfig for proteinbox.")
+
+    # 1. Verify GROMACS is available
+    gmx_path = check_gmx_available()
+    logger.info(f"Using GROMACS: {gmx_path}")
+
+    protein = inp.system.protein
+    config = inp.parametrization_config
+
+    # 2. Clean PDB
+    pdb_input = protein.pdb_path
+    if not pdb_input.is_absolute():
+        pdb_input = pdb_input.resolve()
+
+    cleaned_pdb = Path("cleaned.pdb")
+    clean_pdb(pdb_input, cleaned_pdb)
+
+    # 3. Run pdb2gmx
+    pdb2gmx_dir = Path("pdb2gmx_output")
+    params = run_pdb2gmx(
+        pdb_path=cleaned_pdb,
+        config=config,
+        disulfide_bonds=protein.disulfide_bonds,
+        protonation_states=protein.protonation_states,
+        output_dir=pdb2gmx_dir,
+        chains=protein.chains,
+    )
+    logger.info(f"pdb2gmx output: {params.structure_file}")
+
+    # 4. Center protein in cubic box
+    u = mda.Universe(str(params.structure_file))
+    box_size = _center_in_cubic_box(u, inp.system.padding)
+    logger.info(f"Protein centered in cubic box: {box_size:.1f} A")
+
+    # 5. Solvate (reuse existing solvation)
+    u_solvated = solvate(u, prune_in_z=False)
+    u_solvated.dimensions = u.dimensions
+    n_water = len(u_solvated.select_atoms("water").residues)
+    logger.info(f"Solvation added {n_water} water molecules.")
+
+    if n_water == 0:
+        raise ValueError("Solvation did not add any water molecules.")
+
+    # 6. Ionize (reuse existing ionization)
+    protein_charge = params.total_charge
+    u_ionized, ion_species = ionize_solvated_system(
+        inp.system.ionization, u_solvated, protein_charge
+    )
+    num_na, num_cl = _ion_counts(ion_species)
+    n_water_final = len(u_ionized.select_atoms("water").residues)
+
+    # 7. Update topology [ molecules ] section
+    topology_dest = Path("topology.top")
+    shutil.copy(params.topology_file, topology_dest)
+    # topol.top references its per-chain and posre .itp files by bare name, so they
+    # must sit alongside it.
+    for include_file in params.topology_include_files:
+        shutil.copy(include_file, Path(include_file.name))
+    ff_dir_name = bundle_forcefield_into_topology(topology_dest)
+    update_topology_molecules(topology_dest, n_water_final, num_na, num_cl)
+
+    # 8. Write coordinates for OpenMM relaxation
+    pre_relax_structure = Path("system_pre_relax.pdb").resolve()
+    u_ionized.atoms.write(str(pre_relax_structure))
+
+    # 9. OpenMM relaxation with protein position restraints
+    protein_atoms = u_ionized.select_atoms("protein and not name H*")
+    protein_indices = protein_atoms.indices.tolist()
+    topology_dest = topology_dest.resolve()
+    include_files = [f.resolve() for f in params.topology_include_files]
+
+    with working_directory("relaxation", create=True, cleanup=True) as wd:
+        shutil.copy(pre_relax_structure, wd / "system.pdb")
+        shutil.copy(topology_dest, wd / "topology.top")
+        for include_file in include_files:
+            shutil.copy(include_file, wd / include_file.name)
+
+        # OpenMM's GromacsTopFile resolves #includes relative to the topology's
+        # directory, so bundle the force field next to the copied topology.
+        if ff_dir_name is not None:
+            shutil.copytree(
+                topology_dest.parent / ff_dir_name, wd / ff_dir_name, dirs_exist_ok=True
+            )
+
+        from .simulation.openmm_utils import relax_with_protein_restraints
+
+        u_relaxed = relax_with_protein_restraints(
+            u_ionized,
+            wd / "system.pdb",
+            wd / "topology.top",
+            protein_indices=protein_indices,
+            steps=inp.system.relax_steps,
+        )
+
+    logger.info("OpenMM relaxation complete.")
+
+    # 10. Write final output
+    u_relaxed.atoms.write("system.pdb")
+    logger.info("Final system written to system.pdb")
+
+    # 11. Validate with grompp (if em.mdp is available)
+    manager = RunScheduleManager()
+    manager.copy_run_files_with_check(
+        engine=inp.engine, system_type="proteinbox", target_folder=os.getcwd(), force_copy=True
+    )
+    logger.info("Run schedule files copied.")
+
+    em_mdp = Path("em.mdp")
+    if em_mdp.is_file():
+        validate_with_grompp(topology_dest, Path("system.pdb"), em_mdp, Path.cwd())
+
+    # Remove the pdb2gmx-specific loose intermediates, which have no counterpart in
+    # the small-molecule builds. solvated.pdb and the relaxation/ working dir are
+    # left in place, matching how the bilayer build leaves solvated.pdb and its
+    # bilayer_squeeze/ dir. Only runs on success; a failure earlier keeps the
+    # intermediates for debugging.
+    Path(cleaned_pdb).unlink(missing_ok=True)
+    pre_relax_structure.unlink(missing_ok=True)
+    shutil.rmtree(pdb2gmx_dir, ignore_errors=True)
+
+    logger.info("Proteinbox build complete.")
+
+
+# Post-compression protein verification thresholds.
+PROTEIN_MIXEDBOX_RMSD_TOLERANCE_A = 0.5
+PROTEIN_MIXEDBOX_CLASH_CUTOFF_A = 0.8
+
+
+def _protein_internal_rmsd(protein_positions, protein_reference) -> float:
+    """Return the protein RMSD after best-fit translation and rotation."""
+    from MDAnalysis.analysis.rms import rmsd
+
+    return float(rmsd(protein_positions, protein_reference, center=True, superposition=True))
+
+
+def _reimage_protein_centered(u: mda.Universe, n_protein_atoms: int, protein_reference) -> None:
+    """Make the protein whole across PBC, center it, and wrap the solution by residue.
+
+    The barostat can translate the RMSD-restrained protein with the changing box,
+    potentially placing it across a periodic boundary. Rebuild it whole from the
+    reference shape (anchor to protein atom 0 and correct each atom's displacement
+    from the anchor to the reference by whole box vectors), translate the whole
+    system so the protein bounding box is centered, then wrap only the non-protein
+    residues back into the box.
+
+    Mutates ``u`` in place. ``protein_reference`` is the protein's pre-compression
+    coordinates (the restraint reference), ordered like the first
+    ``n_protein_atoms`` atoms of ``u``.
+
+    The per-atom ``round(delta / box)`` correction assumes the protein moved as a
+    rigid translation plus PBC image jumps: RMSDForce restrains shape but not
+    orientation, so a large rigid rotation during compression would not be undone
+    here. That case is caught downstream rather than passed on silently -- the
+    caller compares ``_protein_internal_rmsd`` against
+    ``PROTEIN_MIXEDBOX_RMSD_TOLERANCE_A`` and runs ``_check_no_protein_clashes``,
+    both of which fail the build instead of emitting a corrupted structure.
+    """
+    box = u.dimensions[:3].copy()
+    pos = u.atoms.positions.copy()
+    protein = pos[:n_protein_atoms]
+
+    reference_displacement = protein_reference - protein_reference[0]
+    current_displacement = protein - protein[0]
+    delta = current_displacement - reference_displacement
+    protein_whole = protein - box * np.round(delta / box)
+
+    bbox_center = (protein_whole.min(axis=0) + protein_whole.max(axis=0)) / 2.0
+    shift = box / 2.0 - bbox_center
+    pos[:n_protein_atoms] = protein_whole
+    pos += shift
+    u.atoms.positions = pos
+
+    if n_protein_atoms < u.atoms.n_atoms:
+        solution = u.atoms[n_protein_atoms:]
+        solution.positions = solution.wrap(compound="residues")
+
+
+def _check_no_protein_clashes(
+    u: mda.Universe, n_protein_atoms: int, cutoff: float = PROTEIN_MIXEDBOX_CLASH_CUTOFF_A
+) -> None:
+    """Raise if any protein atom sits closer than ``cutoff`` Å to a solution atom.
+
+    Guards against a mis-imaged protein: after re-centering, a make-whole error
+    would fold protein atoms onto the packed solvent. Uses periodic distances so
+    contacts across the box boundary are caught too.
+    """
+    if n_protein_atoms >= u.atoms.n_atoms:
+        return
+    from MDAnalysis.lib.distances import capped_distance
+
+    protein_positions = u.atoms.positions[:n_protein_atoms]
+    solution_positions = u.atoms.positions[n_protein_atoms:]
+    pairs, _ = capped_distance(
+        protein_positions, solution_positions, max_cutoff=cutoff, box=u.dimensions
+    )
+    if len(pairs) > 0:
+        raise ValueError(
+            f"{len(pairs)} protein-solution atom pairs are closer than {cutoff} Å after "
+            "re-imaging; the protein was likely mis-imaged across the PBC boundary."
+        )
+
+
+def _check_no_solution_clashes(
+    u: mda.Universe, n_protein_atoms: int, cutoff: float = PROTEIN_MIXEDBOX_CLASH_CUTOFF_A
+) -> None:
+    """Raise when atoms from different solution residues overlap under PBC."""
+    if n_protein_atoms >= u.atoms.n_atoms:
+        return
+    from MDAnalysis.lib.distances import capped_distance
+
+    solution = u.atoms[n_protein_atoms:]
+    pairs, _ = capped_distance(
+        solution.positions, solution.positions, max_cutoff=cutoff, box=u.dimensions
+    )
+    if len(pairs) == 0:
+        return
+    different_residues = solution.resindices[pairs[:, 0]] != solution.resindices[pairs[:, 1]]
+    unique_pairs = pairs[:, 0] < pairs[:, 1]
+    n_clashes = int(np.count_nonzero(different_residues & unique_pairs))
+    if n_clashes:
+        raise ValueError(
+            f"{n_clashes} solution-solution atom pairs from different residues are "
+            f"closer than {cutoff} Å."
+        )
+
+
+@validate_call
+def build_protein_mixedbox(inp: BuildInput):
+    """Build a protein packed with water, ions, and SMILES solutes under CHARMM/CGenFF.
+
+    Prepares the protein with pdb2gmx, packs the solution molecules around it in a
+    dilute cubic box, compresses to the target box or density with the protein's
+    internal structure restrained, re-images the protein whole and centered,
+    ionizes on the chosen concentration-volume basis, and relaxes with the protein
+    restrained before writing the final composite topology and structure.
+    """
+    import shutil
+
+    from loguru import logger
+
+    from .models.composition import (
+        CountDensitySizing,
+        FixedBoxSizing,
+        ProteinMixedBoxComposition,
+    )
+    from .models.parametrization import CharmmConfig, Pdb2gmxConfig
+    from .parametrize import (
+        generate_gromacs_topology_with_protein,
+        parametrize_cgenff_gromacs,
+    )
+    from .setup.protein import (
+        bundle_forcefield_into_topology,
+        check_gmx_available,
+        clean_pdb,
+        extract_mass_from_topology,
+        run_pdb2gmx,
+        validate_with_grompp,
+    )
+    from .simulation.openmm_utils import compress_box, relax_with_protein_restraints
+    from .utils.setup_utilities import (
+        PROTEIN_MIXEDBOX_DILUTION_FACTOR,
+        charmm_native_atom_names,
+        create_protein_mixedbox_universe,
+        cubic_box_edge_for_density,
+        protein_displaced_volume_a3,
+        resolve_solution_counts,
+    )
+
+    if not isinstance(inp.system, ProteinMixedBoxComposition):
+        raise TypeError("System must specify a ProteinMixedBoxComposition.")
+    if not isinstance(inp.parametrization_config, CharmmConfig):
+        raise TypeError("Parametrization config must be CharmmConfig for protein_mixedbox.")
+
+    system = inp.system
+    config = inp.parametrization_config
+
+    # 1. Verify GROMACS is available
+    gmx_path = check_gmx_available()
+    logger.info(f"Using GROMACS: {gmx_path}")
+
+    # 2. Clean PDB
+    protein = system.protein
+    pdb_input = protein.pdb_path
+    if not pdb_input.is_absolute():
+        pdb_input = pdb_input.resolve()
+    cleaned_pdb = Path("cleaned.pdb")
+    clean_pdb(pdb_input, cleaned_pdb)
+
+    # 3. Run pdb2gmx. CharmmConfig carries the same protein-prep fields as
+    #    Pdb2gmxConfig; build one so run_pdb2gmx's contract stays unchanged.
+    pdb2gmx_config = Pdb2gmxConfig(
+        forcefield=config.forcefield,
+        water_model=config.water_model,
+        ignore_hydrogens=config.ignore_hydrogens,
+        merge_all=config.merge_all,
+    )
+    pdb2gmx_dir = Path("pdb2gmx_output")
+    params = run_pdb2gmx(
+        pdb_path=cleaned_pdb,
+        config=pdb2gmx_config,
+        disulfide_bonds=protein.disulfide_bonds,
+        protonation_states=protein.protonation_states,
+        output_dir=pdb2gmx_dir,
+        chains=protein.chains,
+    )
+    logger.info(f"pdb2gmx output: {params.structure_file}")
+
+    # Bundle the selected force field immediately. Native water/ion parameters
+    # and CGenFF compatibility checks must use this exact directory rather than
+    # an unrelated force field shipped with the global CGenFF installation.
+    protein_ff_name = bundle_forcefield_into_topology(params.topology_file)
+    if protein_ff_name is None:
+        raise RuntimeError("pdb2gmx topology does not include a CHARMM force field.")
+    protein_ff_dir = params.topology_file.parent / protein_ff_name
+
+    # 4. Protein mass and charge from the generated topology
+    protein_mass = extract_mass_from_topology(params.topology_file)
+    protein_charge = params.total_charge
+    logger.info(f"Protein mass {protein_mass:.1f} Da, charge {protein_charge}.")
+
+    # 5. Determine the final cubic box edge.
+    if isinstance(system.sizing, FixedBoxSizing):
+        box_edge = float(system.sizing.box_size)
+    elif isinstance(system.sizing, CountDensitySizing):
+        species_mass = sum(spec.mass * spec.count for spec in system.species)
+        box_edge = cubic_box_edge_for_density(
+            protein_mass + species_mass, system.sizing.target_density
+        )
+    else:
+        raise TypeError(f"Unsupported sizing config: {type(system.sizing).__name__}.")
+    box_volume_a3 = box_edge**3
+    logger.info(f"Final cubic box edge {box_edge:.1f} Å ({box_volume_a3:.3e} Å³).")
+
+    # 6. Reject a box that cannot hold the protein with the requested padding.
+    u_protein = mda.Universe(str(params.structure_file))
+    extent = float(
+        (u_protein.atoms.positions.max(axis=0) - u_protein.atoms.positions.min(axis=0)).max()
+    )
+    if box_edge < extent + 2 * system.padding:
+        raise ValueError(
+            f"Protein extent {extent:.1f} Å needs a box of at least "
+            f"{extent + 2 * system.padding:.1f} Å (extent + 2 × padding {system.padding} Å), "
+            f"but the final box is {box_edge:.1f} Å. Use a larger box or less padding."
+        )
+
+    # 7. Resolve each solution species to a molecule count on the chosen basis.
+    counts = resolve_solution_counts(
+        system.species,
+        box_volume_a3,
+        protein_mass,
+        system.partial_specific_volume,
+        system.concentration_volume_basis,
+    )
+
+    # 8. Parametrize the solution species with CGenFF (native water/ions short-circuit).
+    decorate = retrieve_or_deposit_parameters(engine="gromacs", parametrization="cgenff")
+    parametrize_with_db = decorate(
+        partial(parametrize_cgenff_gromacs, native_forcefield_dir=protein_ff_dir)
+    )
+    parameters = [parametrize_with_db(spec) for spec in system.species]
+    logger.info("Solution-species parametrization complete.")
+
+    # Drop species that resolve to zero copies from packing and topology alike.
+    packed = [
+        (spec, par, count)
+        for spec, par, count in zip(system.species, parameters, counts)
+        if count > 0
+    ]
+    packed_species = [spec for spec, _, _ in packed]
+    packed_parameters = [par for _, par, _ in packed]
+    packed_counts = [count for _, _, count in packed]
+
+    n_protein_atoms = u_protein.atoms.n_atoms
+    protein_indices = list(range(n_protein_atoms))
+
+    # 9. Pack the solution molecules around the centered protein in a dilute cubic
+    #    box (0.1× density idiom), then compress it down to the target box.
+    dilute_edge = box_edge / PROTEIN_MIXEDBOX_DILUTION_FACTOR ** (1.0 / 3.0)
+
+    with working_directory("compression", create=True, cleanup=True) as wd:
+        u_packed = create_protein_mixedbox_universe(
+            u_protein,
+            [spec.openff_molecule for spec in packed_species],
+            packed_counts,
+            [spec.resname for spec in packed_species],
+            dilute_edge,
+            wd / "packmol",
+            native_atom_names=[charmm_native_atom_names(spec.smiles) for spec in packed_species],
+        )
+        logger.info(
+            f"Packed {sum(packed_counts)} solution molecules around the protein "
+            f"in a {dilute_edge:.1f} Å dilute box."
+        )
+
+        # The centered protein positions are the compression restraint reference,
+        # used to make the protein whole after compression.
+        protein_reference = u_packed.atoms.positions[:n_protein_atoms].copy()
+
+        # Composite compression topology carrying the packed counts.
+        comp_top_src = wd / "topol_protein.top"
+        shutil.copy(params.topology_file, comp_top_src)
+        shutil.copytree(protein_ff_dir, wd / protein_ff_name, dirs_exist_ok=True)
+        for include_file in params.topology_include_files:
+            shutil.copy(include_file, wd / include_file.name)
+        comp_ff_name = bundle_forcefield_into_topology(comp_top_src)
+        comp_topology = wd / "topology.top"
+        generate_gromacs_topology_with_protein(
+            comp_top_src,
+            wd / comp_ff_name,
+            packed_species,
+            packed_parameters,
+            packed_counts,
+            "protein_mixedbox",
+            out_path=comp_topology,
+        )
+
+        packed_pdb = wd / "packed.pdb"
+        u_packed.atoms.write(str(packed_pdb))
+
+        if isinstance(system.sizing, FixedBoxSizing):
+            u_compressed = compress_box(
+                u_packed,
+                packed_pdb,
+                comp_topology,
+                target_volume=box_volume_a3,
+                protein_indices=protein_indices,
+            )
+        else:
+            u_compressed = compress_box(
+                u_packed,
+                packed_pdb,
+                comp_topology,
+                target_density=system.sizing.target_density,
+                protein_indices=protein_indices,
+            )
+    logger.info("Compression complete.")
+
+    # 10. Re-image: make the protein whole across PBC, center it, and wrap the
+    #     solution molecules by residue.
+    _reimage_protein_centered(u_compressed, n_protein_atoms, protein_reference)
+
+    # Verify the protein geometry survived compression and re-imaging.
+    protein_now = u_compressed.atoms.positions[:n_protein_atoms]
+    protein_rmsd = _protein_internal_rmsd(protein_now, protein_reference)
+    if protein_rmsd > PROTEIN_MIXEDBOX_RMSD_TOLERANCE_A:
+        raise ValueError(
+            f"Protein RMSD {protein_rmsd:.2f} Å after compression exceeds the "
+            f"{PROTEIN_MIXEDBOX_RMSD_TOLERANCE_A} Å tolerance; the restraints did not hold."
+        )
+    _check_no_protein_clashes(u_compressed, n_protein_atoms)
+    _check_no_solution_clashes(u_compressed, n_protein_atoms)
+    logger.info(f"Protein re-imaged whole and centered (RMSD {protein_rmsd:.2f} Å).")
+
+    # 11. Charge from the protein topology plus the actually packed species.
+    species_charge = sum(
+        count * (spec.charge or 0) for spec, count in zip(packed_species, packed_counts)
+    )
+    total_charge = protein_charge + species_charge
+
+    # 12. Ionize by replacing water on the chosen concentration-volume basis.
+    actual_box_volume_a3 = float(u_compressed.trajectory.ts.volume)
+    if system.concentration_volume_basis == "protein_excluded":
+        solvent_volume_a3 = actual_box_volume_a3 - protein_displaced_volume_a3(
+            protein_mass, system.partial_specific_volume
+        )
+    else:
+        solvent_volume_a3 = actual_box_volume_a3
+    if solvent_volume_a3 <= 0:
+        raise ValueError(
+            "The actual compressed box volume is not larger than the estimated "
+            "protein displacement volume."
+        )
+    u_ionized, ion_species = ionize_solvated_system(
+        system.ionization, u_compressed, total_charge, solvent_volume_a3=solvent_volume_a3
+    )
+    n_replaced = sum(spec.count for spec in ion_species)
+
+    # 13. Final [ molecules ] counts, positionally aligned with the ionize output
+    #     order (protein → packed solution with water reduced by the replaced count
+    #     → Na → Cl). Track by position, not resname, so an explicit ion species
+    #     that shares a resname with the ionization ions is not double-counted.
+    final_species = list(packed_species)
+    final_parameters = list(packed_parameters)
+    final_counts = list(packed_counts)
+    for i, spec in enumerate(final_species):
+        if spec.is_water:
+            final_counts[i] -= n_replaced
+            break
+    for ion_spec in ion_species:
+        final_species.append(ion_spec)
+        final_parameters.append(parametrize_with_db(ion_spec))
+        final_counts.append(ion_spec.count)
+
+    # Preserve the final count corresponding to each requested input species for
+    # the achieved-concentration build report. Ionization species are reported
+    # separately because they were not part of the requested packed composition.
+    final_input_counts = []
+    packed_index = 0
+    for resolved_count in counts:
+        if resolved_count > 0:
+            final_input_counts.append(final_counts[packed_index])
+            packed_index += 1
+        else:
+            final_input_counts.append(0)
+
+    # 14. Write the final composite topology in the build directory.
+    top_src = Path("topol_protein.top")
+    shutil.copy(params.topology_file, top_src)
+    shutil.copytree(protein_ff_dir, Path(protein_ff_name), dirs_exist_ok=True)
+    for include_file in params.topology_include_files:
+        shutil.copy(include_file, Path(include_file.name))
+    ff_dir_name = bundle_forcefield_into_topology(top_src)
+    topology_dest = Path("topology.top")
+    generate_gromacs_topology_with_protein(
+        top_src,
+        Path(ff_dir_name),
+        final_species,
+        final_parameters,
+        final_counts,
+        "protein_mixedbox",
+        out_path=topology_dest,
+    )
+
+    # 15. Restrained relaxation of the solution around the fixed protein.
+    pre_relax_structure = Path("system_pre_relax.pdb").resolve()
+    u_ionized.atoms.write(str(pre_relax_structure))
+    topology_dest = topology_dest.resolve()
+    build_dir = Path.cwd()
+    # The composite topology includes the per-chain/posre itps, the merged CGenFF
+    # parameters, and each small-molecule itp; all sit beside topology.top.
+    include_itps = [f.resolve() for f in build_dir.glob("*.itp")]
+    ff_dir_abs = (build_dir / ff_dir_name).resolve() if ff_dir_name is not None else None
+
+    with working_directory("relaxation", create=True, cleanup=True) as wd:
+        shutil.copy(pre_relax_structure, wd / "system.pdb")
+        shutil.copy(topology_dest, wd / "topology.top")
+        for itp in include_itps:
+            shutil.copy(itp, wd / itp.name)
+        # OpenMM's GromacsTopFile resolves #includes relative to the topology's
+        # directory, so bundle the force field next to the copied topology.
+        if ff_dir_abs is not None:
+            shutil.copytree(ff_dir_abs, wd / ff_dir_abs.name, dirs_exist_ok=True)
+
+        u_relaxed = relax_with_protein_restraints(
+            u_ionized,
+            wd / "system.pdb",
+            wd / "topology.top",
+            protein_indices=protein_indices,
+            steps=system.relax_steps,
+            pressure=None if isinstance(system.sizing, FixedBoxSizing) else 1.0,
+        )
+    logger.info("OpenMM relaxation complete.")
+
+    # Make the protein whole and centered one final time and validate every
+    # intermolecular contact before writing output.
+    _reimage_protein_centered(u_relaxed, n_protein_atoms, protein_reference)
+    relaxed_protein = u_relaxed.atoms.positions[:n_protein_atoms]
+    relaxed_rmsd = _protein_internal_rmsd(relaxed_protein, protein_reference)
+    if relaxed_rmsd > PROTEIN_MIXEDBOX_RMSD_TOLERANCE_A:
+        raise ValueError(
+            f"Protein RMSD {relaxed_rmsd:.2f} Å after relaxation exceeds the "
+            f"{PROTEIN_MIXEDBOX_RMSD_TOLERANCE_A} Å tolerance."
+        )
+    _check_no_protein_clashes(u_relaxed, n_protein_atoms)
+    _check_no_solution_clashes(u_relaxed, n_protein_atoms)
+
+    # 16. Write final output
+    u_relaxed.atoms.write("system.pdb")
+    logger.info("Final system written to system.pdb")
+
+    final_box_volume_a3 = float(u_relaxed.trajectory.ts.volume)
+    if system.concentration_volume_basis == "protein_excluded":
+        final_concentration_volume_a3 = final_box_volume_a3 - protein_displaced_volume_a3(
+            protein_mass, system.partial_specific_volume
+        )
+    else:
+        final_concentration_volume_a3 = final_box_volume_a3
+    if final_concentration_volume_a3 <= 0:
+        raise ValueError("Final concentration reference volume must be positive.")
+    final_concentration_volume_l = final_concentration_volume_a3 * 1e-27
+    build_report = {
+        "simulation_type": "protein_mixedbox",
+        "requested_box_volume_a3": box_volume_a3,
+        "compressed_box_volume_a3": actual_box_volume_a3,
+        "final_box_volume_a3": final_box_volume_a3,
+        "concentration_volume_basis": system.concentration_volume_basis,
+        "final_concentration_volume_a3": final_concentration_volume_a3,
+        "species": [
+            {
+                "resname": spec.resname,
+                "smiles": spec.smiles,
+                "requested_count": spec.count,
+                "requested_concentration_molar": spec.concentration,
+                "resolved_count": resolved_count,
+                "final_count": final_count,
+                "achieved_concentration_molar": final_count
+                / (final_concentration_volume_l * N_AVOGADRO),
+            }
+            for spec, resolved_count, final_count in zip(system.species, counts, final_input_counts)
+        ],
+        "ionization_species": [
+            {"resname": spec.resname, "smiles": spec.smiles, "count": spec.count}
+            for spec in ion_species
+        ],
+    }
+    Path("build_metadata.json").write_text(json.dumps(build_report, indent=2) + "\n")
+    logger.info("Resolved counts and achieved concentrations written to build_metadata.json.")
+
+    # 17. Install the run schedule and validate with grompp (if em.mdp is available).
+    manager = RunScheduleManager()
+    manager.copy_run_files_with_check(
+        engine=inp.engine,
+        system_type="protein_mixedbox",
+        target_folder=os.getcwd(),
+        force_copy=True,
+    )
+    logger.info("Run schedule files copied.")
+
+    em_mdp = Path("em.mdp")
+    if em_mdp.is_file():
+        validate_with_grompp(topology_dest, Path("system.pdb"), em_mdp, Path.cwd())
+
+    # Remove the pdb2gmx-specific loose intermediates, matching build_proteinbox.
+    # Only runs on success; a failure earlier keeps the intermediates for debugging.
+    Path(cleaned_pdb).unlink(missing_ok=True)
+    pre_relax_structure.unlink(missing_ok=True)
+    top_src.unlink(missing_ok=True)
+    shutil.rmtree(pdb2gmx_dir, ignore_errors=True)
+
+    logger.info("Protein_mixedbox build complete.")

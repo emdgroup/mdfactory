@@ -9,6 +9,48 @@ import pandas as pd
 
 from .models.input import BuildInput
 
+# Protein fields that are lists/dicts and therefore optional: a CSV row may leave
+# them blank. They are excluded from the strict all-columns NaN check and dropped
+# per row when empty so heterogeneous proteins can share one CSV.
+OPTIONAL_PROTEIN_FIELD_PREFIXES = (
+    "system.protein.chains",
+    "system.protein.disulfide_bonds",
+    "system.protein.protonation_states",
+)
+
+
+def _parse_delimited_protein_fields(nested: dict) -> None:
+    """Parse a proteinbox row's delimited list cells into lists in place.
+
+    ``chains`` is a ``;``-separated list of chain ids ("A;B"). ``disulfide_bonds``
+    is a ``;``-separated list of ``RESNAME<id>-RESNAME<id>`` pairs
+    ("CYS6-CYS127;CYS30-CYS115"). ``protonation_states`` is expressed as nested
+    dotted columns (system.protein.protonation_states.HIS15) and needs no parsing.
+    """
+    protein = nested.get("system", {}).get("protein")
+    if not isinstance(protein, dict):
+        return
+
+    chains = protein.get("chains")
+    if isinstance(chains, str):
+        protein["chains"] = [c.strip() for c in chains.split(";") if c.strip()]
+
+    bonds = protein.get("disulfide_bonds")
+    if isinstance(bonds, str):
+        parsed = []
+        for raw_token in bonds.split(";"):
+            token = raw_token.strip()
+            if not token:
+                continue
+            first, sep, second = token.partition("-")
+            if not sep:
+                raise ValueError(
+                    f"Invalid disulfide bond '{token}'. Expected "
+                    "'RESNAME<id>-RESNAME<id>', e.g. 'CYS6-CYS127'."
+                )
+            parsed.append((first.strip(), second.strip()))
+        protein["disulfide_bonds"] = parsed
+
 
 def dict_to_nested_dict_with_species_prefix(dct: dict) -> dict:
     """Convert a flat dot-separated key dict into a nested dict with species grouping.
@@ -59,7 +101,9 @@ def dict_to_nested_dict_with_species_prefix(dct: dict) -> dict:
             {"resname": resname, **props} for resname, props in species_data.items() if props
         ]
 
-    return dict(result)
+    nested = dict(result)
+    _parse_delimited_protein_fields(nested)
+    return nested
 
 
 def df_to_build_input_models(
@@ -78,7 +122,10 @@ def df_to_build_input_models(
         (valid_models, {row_index: error_message} for failed rows)
 
     """
-    if df.isnull().values.any():
+    # Optional protein list/dict fields may legitimately be blank for some proteins,
+    # so exclude them from the strict NaN check and drop them per row when empty.
+    required_cols = [c for c in df.columns if not c.startswith(OPTIONAL_PROTEIN_FIELD_PREFIXES)]
+    if df[required_cols].isnull().values.any():
         raise ValueError("Cannot process data frame with NaN values.")
     if df.duplicated(keep=False).any():
         raise ValueError("Data frame contains duplicate rows.")
@@ -86,7 +133,7 @@ def df_to_build_input_models(
     errors = {}
     for ii, row in df.iterrows():
         try:
-            inp = BuildInput(**dict_to_nested_dict_with_species_prefix(row))
+            inp = BuildInput(**dict_to_nested_dict_with_species_prefix(row.dropna()))
             ret.append(inp)
         except Exception as e:
             errors[ii] = str(e)

@@ -45,6 +45,10 @@ class Settings:
             "cgenff": {
                 "SILCSBIODIR": "",
             },
+            "gromacs": {
+                "GMX_PATH": "",
+                "FORCEFIELD_DIR": str(data_dir / "forcefields"),
+            },
             "storage": {
                 "PARAMETERS": str(data_dir / "parameters"),
             },
@@ -81,6 +85,7 @@ class Settings:
     # Keep DEFAULT_CONFIG as class attribute for backward compat in tests
     DEFAULT_CONFIG = {
         "cgenff": {"SILCSBIODIR": ""},
+        "gromacs": {"GMX_PATH": "", "FORCEFIELD_DIR": ""},
         "storage": {"PARAMETERS": ""},
         "database": {"TYPE": "sqlite"},
         "databases": {
@@ -117,6 +122,10 @@ class Settings:
         self._load_config()
         if "cgenff" in self.config:
             os.environ.setdefault("SILCSBIODIR", str(self.cgenff_dir))
+        if "gromacs" in self.config:
+            env = self.gromacs_env(os.environ)
+            if "GMXLIB" in env:
+                os.environ["GMXLIB"] = env["GMXLIB"]
 
     def _load_config(self):
         """Load configuration from defaults, then user config, then env overrides."""
@@ -158,6 +167,7 @@ class Settings:
         get_config_dir().mkdir(parents=True, exist_ok=True)
         get_data_dir().mkdir(parents=True, exist_ok=True)
         self.parameter_store.mkdir(parents=True, exist_ok=True)
+        self.gromacs_forcefield_dir.mkdir(parents=True, exist_ok=True)
 
     # --- CGenFF properties ---
 
@@ -170,6 +180,37 @@ class Settings:
     def cgenff_dir(self) -> Path:
         """Return the CGenFF directory (SILCSBIODIR)."""
         return Path(self.config["cgenff"].get("SILCSBIODIR", "")).resolve()
+
+    # --- GROMACS properties ---
+
+    @property
+    def gromacs_gmx_path(self) -> Path | None:
+        """Return the configured gmx binary path, or None to use PATH lookup."""
+        raw = self.config["gromacs"].get("GMX_PATH", "")
+        if not raw:
+            return None
+        return Path(self._resolve_local_path(raw))
+
+    @property
+    def gromacs_forcefield_dir(self) -> Path:
+        """Return the directory where downloaded force fields are stored."""
+        raw = self.config["gromacs"].get("FORCEFIELD_DIR", "")
+        if raw:
+            return Path(self._resolve_local_path(raw))
+        return get_data_dir() / "forcefields"
+
+    def gromacs_env(self, base_env: dict[str, str] | None = None) -> dict[str, str]:
+        """Return an environment with configured GROMACS force fields on GMXLIB."""
+        env = dict(os.environ if base_env is None else base_env)
+        forcefield_dir = str(self.gromacs_forcefield_dir)
+        if not forcefield_dir:
+            return env
+
+        paths = [p for p in env.get("GMXLIB", "").split(":") if p]
+        if forcefield_dir not in paths:
+            paths.insert(0, forcefield_dir)
+        env["GMXLIB"] = ":".join(paths)
+        return env
 
     # --- Storage properties ---
 

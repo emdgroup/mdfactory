@@ -54,4 +54,10 @@ ARTIFACT_REGISTRY: dict[str, dict[str, Callable]] = {
     "mixedbox": {
         "last_frame_pdb": create_last_frame_pdb_artifact,
     },
+    "proteinbox": {
+        "last_frame_pdb": create_last_frame_pdb_artifact,
+    },
+    "protein_mixedbox": {
+        "last_frame_pdb": create_last_frame_pdb_artifact,
+    },
 }

@@ -473,7 +473,120 @@ def extract_reusable_parts_from_cgenff_gmx_top(
     return "".join(lines[start:stop]), parameter_str, sections
 
 
-def merge_extra_parameter_itps(prm_files: list[str | Path]):
+def _atomtype_signature(line: str) -> tuple[str, ...]:
+    """Return the physical parameter columns from a GROMACS atom-type line."""
+    fields = line.split(";", 1)[0].split()
+    if len(fields) < 6:
+        raise ValueError(f"Malformed GROMACS atom-type definition: {line!r}")
+    signature = []
+    for value in fields[-5:]:
+        try:
+            signature.append(f"{float(value):.12g}")
+        except ValueError:
+            signature.append(value.lower())
+    return tuple(signature)
+
+
+def collect_forcefield_atomtype_definitions(
+    ff_dir: str | Path,
+) -> dict[str, tuple[str, ...]]:
+    """Return atom-type names and physical parameters from a force-field directory.
+
+    Honors ``#ifdef``/``#ifndef``/``#else``/``#endif`` the way ``grompp`` does.
+    mdfactory builds without hydrogen-mass repartitioning, so no force-field
+    macros are defined and the ``#ifdef HEAVY_H`` water-hydrogen variants are
+    inactive. Without this, a type such as ``HT`` (defined once per branch with
+    a different mass) would read as an inconsistent redefinition.
+    """
+    defined_macros: set[str] = set()
+    definitions: dict[str, tuple[str, ...]] = {}
+    for itp in sorted(Path(ff_dir).glob("*.itp")):
+        in_atomtypes = False
+        branch_active: list[bool] = []
+        with open(itp) as fb:
+            for line in fb:
+                stripped = line.strip()
+                if not stripped or stripped.startswith(";"):
+                    continue
+                if stripped.startswith("#"):
+                    directive, _, rest = stripped.partition(" ")
+                    if directive == "#ifdef":
+                        branch_active.append(rest.strip() in defined_macros)
+                    elif directive == "#ifndef":
+                        branch_active.append(rest.strip() not in defined_macros)
+                    elif directive == "#else" and branch_active:
+                        branch_active[-1] = not branch_active[-1]
+                    elif directive == "#endif" and branch_active:
+                        branch_active.pop()
+                    continue
+                if not all(branch_active):
+                    continue
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    in_atomtypes = stripped[1:-1].strip() == "atomtypes"
+                    continue
+                if in_atomtypes:
+                    name = stripped.split()[0]
+                    signature = _atomtype_signature(stripped)
+                    previous = definitions.get(name)
+                    if previous is not None and previous != signature:
+                        raise ValueError(f"Force field defines atom type '{name}' inconsistently.")
+                    definitions[name] = signature
+    return definitions
+
+
+def collect_forcefield_atomtypes(ff_dir: str | Path) -> set[str]:
+    """Return the atom type names defined by a bundled GROMACS force-field directory.
+
+    Scans every ``.itp`` file in ``ff_dir`` for ``[ atomtypes ]`` sections and
+    collects the first column (the type name) of each data line. Used to
+    deduplicate CGenFF small-molecule parameters against a CHARMM force field
+    that already bundles CGenFF, so a redefined atom type does not fail
+    ``grompp -maxwarn 0``.
+
+    Parameters
+    ----------
+    ff_dir : str or Path
+        Path to a bundled GROMACS ``.ff`` directory.
+
+    Returns
+    -------
+    set[str]
+        Atom type names defined anywhere in the force field.
+
+    """
+    return set(collect_forcefield_atomtype_definitions(ff_dir))
+
+
+def validate_cgenff_atomtype_compatibility(prm_files: list[str | Path], ff_dir: str | Path) -> None:
+    """Reject CGenFF atom types that conflict with the selected CHARMM bundle."""
+    forcefield_types = collect_forcefield_atomtype_definitions(ff_dir)
+    for prm in prm_files:
+        *_, sections = extract_reusable_parts_from_cgenff_gmx_top(prm, must_have_moleculetype=False)
+        for section_name, section_text in sections:
+            if section_name != "atomtypes":
+                continue
+            for line in section_text.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith((";", "[")):
+                    continue
+                name = stripped.split()[0]
+                existing = forcefield_types.get(name)
+                if existing is None:
+                    continue
+                generated = _atomtype_signature(stripped)
+                if generated != existing:
+                    raise ValueError(
+                        f"CGenFF atom type '{name}' conflicts with the selected CHARMM "
+                        f"force-field bundle ({generated} != {existing}). Use a CGenFF "
+                        "installation matching the registered charmm36m bundle."
+                    )
+
+
+def merge_extra_parameter_itps(
+    prm_files: list[str | Path],
+    exclude_atomtypes: set[str] | None = None,
+    drop_defaults: bool = False,
+):
     """Merge parameter sections from multiple CGenFF topology files.
 
     Extract parameter sections (atomtypes, bondtypes, etc.) from each file,
@@ -483,6 +596,13 @@ def merge_extra_parameter_itps(prm_files: list[str | Path]):
     ----------
     prm_files : list of str or Path
         Paths to GROMACS topology files containing parameter sections.
+    exclude_atomtypes : set[str] or None, optional
+        Atom type names to drop from the merged ``[ atomtypes ]`` section
+        because a bundled force field already defines them. The section header
+        is kept. Default is None (keep all atom types).
+    drop_defaults : bool, optional
+        If True, drop the ``[ defaults ]`` section entirely, because a bundled
+        force field already provides it. Default is False.
 
     Returns
     -------
@@ -494,10 +614,19 @@ def merge_extra_parameter_itps(prm_files: list[str | Path]):
     for prm in prm_files:
         *_, sections = extract_reusable_parts_from_cgenff_gmx_top(prm, must_have_moleculetype=False)
         for sn, sv in sections:
+            if drop_defaults and sn == "defaults":
+                continue
             sv_lines = [
                 line for line in sv.split("\n") if len(line) > 0 and not line.startswith(";")
             ]
             for svl in sv_lines:
+                if (
+                    exclude_atomtypes
+                    and sn == "atomtypes"
+                    and not svl.startswith("[")
+                    and svl.split()[0] in exclude_atomtypes
+                ):
+                    continue
                 if svl not in section_dict[sn]:
                     section_dict[sn].append(svl)
     params_clean = ""

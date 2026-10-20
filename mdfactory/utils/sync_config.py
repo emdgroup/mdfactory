@@ -285,6 +285,23 @@ def run_config_wizard() -> None:
             logger.info("Using existing user config. No changes made.")
             return
 
+    # GROMACS setup (optional)
+    use_gromacs = questionary.confirm("Do you use GROMACS (pdb2gmx)?", default=True).ask()
+    gmx_path = ""
+    forcefield_dir = str(data_dir / "forcefields")
+    if use_gromacs:
+        gmx_path = questionary.text(
+            "Path to gmx binary (leave empty to use PATH):",
+            default="",
+        ).ask()
+        forcefield_dir = questionary.text(
+            "Force field download directory:",
+            default=str(data_dir / "forcefields"),
+        ).ask()
+        download_ffs = questionary.confirm(
+            "Download CHARMM36m force field now?", default=True
+        ).ask()
+
     # CGenFF setup (optional)
     use_cgenff = questionary.confirm("Do you use CGenFF (SILCSBIO)?", default=False).ask()
     silcsbiodir = ""
@@ -312,6 +329,8 @@ def run_config_wizard() -> None:
         for key, value in options.items():
             config[section][key] = str(value)
 
+    config["gromacs"]["GMX_PATH"] = gmx_path
+    config["gromacs"]["FORCEFIELD_DIR"] = normalize_local_path(forcefield_dir)
     config["cgenff"]["SILCSBIODIR"] = silcsbiodir
     config["storage"]["PARAMETERS"] = normalize_local_path(param_dir)
     config["database"]["TYPE"] = backend
@@ -329,6 +348,14 @@ def run_config_wizard() -> None:
 
     cfg.ensure_dirs()
     cfg.reload()
+
+    # Download force fields if requested
+    if use_gromacs and download_ffs:
+        from ..setup.protein import download_all_forcefields
+
+        logger.info("Downloading registered force fields...")
+        download_all_forcefields()
+        logger.success("Force fields downloaded.")
 
     init_default = backend in {"sqlite", "csv"}
     if not questionary.confirm(

@@ -92,6 +92,16 @@ def df_models_from_input_csv(input):
     df = pd.read_csv(input)
     # remove 'unnamed' CSV columns
     df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
+    # Resolve relative protein PDB paths against the CSV's own directory so the
+    # emitted per-system YAMLs carry absolute paths regardless of where the build
+    # later runs.
+    pdb_col = "system.protein.pdb_path"
+    if pdb_col in df.columns:
+        df[pdb_col] = df[pdb_col].apply(
+            lambda p: p
+            if pd.isna(p) or Path(p).is_absolute()
+            else str((input.parent / p).resolve())
+        )
     models, errors = df_to_build_input_models(df)
     return df, models, errors
 
@@ -129,7 +139,9 @@ def _prepare_system_directories(
         yml_path = build_dir / f"{model.hash}.yaml"
         if not yml_path.exists():
             with open(yml_path, "w") as f:
-                yaml.safe_dump(model.model_dump(), f)
+                # mode="json" so Path and tuple fields (e.g. proteinbox pdb_path and
+                # disulfide_bonds) serialize to plain str/list that yaml.safe_dump can write.
+                yaml.safe_dump(model.model_dump(mode="json"), f)
         dirs.append(str(build_dir.resolve()))
 
     summary_path = output / f"{input_path.stem}.yaml"

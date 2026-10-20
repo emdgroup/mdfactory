@@ -25,6 +25,7 @@ def test_defaults_loaded():
     assert "csv" in s.config
     assert "foundry" in s.config
     assert "cgenff" in s.config
+    assert "gromacs" in s.config
     assert "storage" in s.config
     assert s.config["database"]["TYPE"] == "sqlite"
 
@@ -51,6 +52,25 @@ def test_cgenff_dir_default():
     s = Settings()
     # Empty SILCSBIODIR resolves to cwd (or .)
     assert s.cgenff_dir is not None
+
+
+def test_gromacs_env_prepends_forcefield_dir(tmp_path, monkeypatch):
+    """gromacs_env should add the configured force field directory to GMXLIB."""
+    monkeypatch.setenv("MDFACTORY_DATA_DIR", str(tmp_path / "data"))
+    s = Settings()
+    env = s.gromacs_env({"GMXLIB": "/existing/path"})
+    assert env["GMXLIB"].split(":") == [
+        str(tmp_path / "data" / "forcefields"),
+        "/existing/path",
+    ]
+
+
+def test_config_template_documents_gromacs_section():
+    """The sample config should expose all user-facing GROMACS settings."""
+    template = Path("config_templates/config.ini").read_text()
+    assert "[gromacs]" in template
+    assert "GMX_PATH =" in template
+    assert "FORCEFIELD_DIR =" in template
 
 
 def test_reload():
