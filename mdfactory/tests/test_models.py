@@ -12,14 +12,13 @@ from rdkit.Chem import AllChem
 from mdfactory.models.composition import (
     BilayerComposition,
     CoreComposition,
+    IonizationConfig,
+    MixedBoxComposition,
     ShellComposition,
     SystemComposition,
     distribute_counts,
 )
-from mdfactory.models.input import (
-    BuildInput,
-    MixedBoxComposition,
-)
+from mdfactory.models.input import BuildInput
 from mdfactory.models.species import LipidSpecies, SingleMoleculeSpecies, Species
 from mdfactory.utils.utilities import working_directory
 
@@ -229,6 +228,41 @@ def test_generate_input_model_from_dict():
             simulation_type="bilayer",
             system=comp,
         )
+
+
+@pytest.mark.parametrize("disabled", [None, False])
+def test_ionization_can_be_explicitly_disabled(disabled):
+    spec = SingleMoleculeSpecies(smiles="O", count=10, resname="SOL")
+    comp = MixedBoxComposition(species=[spec], ionization=disabled)
+
+    assert comp.ionization is None
+
+
+def test_disabled_ionization_build_input_round_trip():
+    input_data = {
+        "simulation_type": "mixedbox",
+        "system": {
+            "species": [{"smiles": "O", "count": 10, "resname": "SOL"}],
+            "ionization": False,
+        },
+    }
+
+    inp = BuildInput(**input_data)
+    assert inp.system.ionization is None
+    assert inp.metadata["system_specific"]["ionization"] is None
+
+    restored = BuildInput.from_data_row(inp.to_data_row())
+    assert restored.system.ionization is None
+    assert restored == inp
+
+
+def test_ionization_defaults_when_omitted():
+    spec = SingleMoleculeSpecies(smiles="O", count=10, resname="SOL")
+    comp = MixedBoxComposition(species=[spec])
+
+    assert isinstance(comp.ionization, IonizationConfig)
+    assert comp.ionization.neutralize is True
+    assert comp.ionization.concentration == 0.15
 
 
 def test_parameter_set_dump(tmp_path):

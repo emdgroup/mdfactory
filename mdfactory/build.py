@@ -676,10 +676,14 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge, solvent_volume_
             f"{add_cl} Cl- ions for neutralization."
         )
 
+    c_ions = ion_config.concentration  # mol/l
+    if c_ions == 0 and add_na == 0 and add_cl == 0:
+        logger.info("No ions to add; skipping ionization.")
+        return u_solvated, []
+
     n_water = len(u_solvated.select_atoms("water").residues)
     if n_water == 0:
         raise ValueError("Cannot ionize system without water.")
-    c_ions = ion_config.concentration  # mol/l
     if solvent_volume_a3 is not None:
         # 1 Å³ = 1e-27 L, so n_salt = concentration[mol/L] * V[L] * N_A.
         v_liters = solvent_volume_a3 * 1e-27
@@ -694,6 +698,10 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge, solvent_volume_
         f"Adding {num_na} Na+ and {num_cl} Cl- ions to the system for neutralization "
         f"and {c_ions} M salt concentration."
     )
+    if num_na == 0 and num_cl == 0:
+        logger.info("No ions to add; skipping ionization.")
+        return u_solvated, []
+
     u_ionized = ionize(
         u_solvated,
         num_na=num_na,
@@ -704,9 +712,23 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge, solvent_volume_
     u_ionized.dimensions = u_solvated.dimensions
     logger.info(f"Added {n_ions} Na+/Cl- ions.")
 
-    na_spec = SingleMoleculeSpecies(count=num_na, smiles="[Na+]", resname="NA")
-    cl_spec = SingleMoleculeSpecies(count=num_cl, smiles="[Cl-]", resname="CL")
-    return u_ionized, [na_spec, cl_spec]
+    additional_species = []
+    if num_na > 0:
+        additional_species.append(SingleMoleculeSpecies(count=num_na, smiles="[Na+]", resname="NA"))
+    if num_cl > 0:
+        additional_species.append(SingleMoleculeSpecies(count=num_cl, smiles="[Cl-]", resname="CL"))
+    return u_ionized, additional_species
+
+
+def _ion_counts(ion_species) -> tuple[int, int]:
+    """Return ``(num_na, num_cl)`` from the species ``ionize_solvated_system`` added.
+
+    ``ionize_solvated_system`` returns only the ion species it actually added, so
+    one-sided neutralization yields a single species. Counts are therefore looked
+    up by residue name; indexing by position would report a lone Cl- as Na+.
+    """
+    counts = {spec.resname: spec.count for spec in ion_species}
+    return counts.get("NA", 0), counts.get("CL", 0)
 
 
 def _center_in_cubic_box(u: mda.Universe, padding: float) -> float:
@@ -797,8 +819,7 @@ def build_proteinbox(inp: BuildInput):
     u_ionized, ion_species = ionize_solvated_system(
         inp.system.ionization, u_solvated, protein_charge
     )
-    num_na = ion_species[0].count if len(ion_species) > 0 else 0
-    num_cl = ion_species[1].count if len(ion_species) > 1 else 0
+    num_na, num_cl = _ion_counts(ion_species)
     n_water_final = len(u_ionized.select_atoms("water").residues)
 
     # 7. Update topology [ molecules ] section

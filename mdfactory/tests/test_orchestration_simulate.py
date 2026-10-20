@@ -17,16 +17,15 @@ from mdfactory.orchestration.apps import (
     _resolve_thread_count_expr,
     _resolve_thread_flags,
 )
+from mdfactory.orchestration.checkpoint import _detect_needed_stages
 from mdfactory.orchestration.config import ExecutorConfig
+from mdfactory.orchestration.execution import _execute_stage_list, _validate_stage_prerequisites
 from mdfactory.orchestration.simulate import (
-    _detect_needed_stages,
-    _execute_stage_list,
     _log_dry_run_plan,
     _missing_build_files,
-    _validate_stage_prerequisites,
-    _validate_trajectory_complete,
     run_simulations,
 )
+from mdfactory.orchestration.trajectory import _validate_trajectory_complete
 
 
 @pytest.fixture
@@ -153,7 +152,7 @@ def test_checkpoint_force_never_skips(mock_sim_dir):
     assert "EM" in needed
 
 
-@patch("mdfactory.orchestration.simulate._validate_trajectory_complete", return_value=True)
+@patch("mdfactory.orchestration.checkpoint._validate_trajectory_complete", return_value=True)
 def test_checkpoint_all_stages_complete(mock_validate, mock_sim_dir):
     """All stages skipped when outputs AND prerequisite checkpoints exist."""
     (mock_sim_dir / "min.gro").write_text("FAKE")
@@ -292,7 +291,9 @@ def test_multiple_simulations_mixed_states(tmp_path):
     (sim3 / "prod.xtc").write_text("FAKE")  # Trajectory present
 
     # Mock trajectory validation so fake XTC counts as complete
-    with patch("mdfactory.orchestration.simulate._validate_trajectory_complete", return_value=True):
+    with patch(
+        "mdfactory.orchestration.checkpoint._validate_trajectory_complete", return_value=True
+    ):
         results = run_simulations([sim1, sim2, sim3], ExecutorConfig(), dry_run=True)
 
     assert len(results) == 3
@@ -301,7 +302,7 @@ def test_multiple_simulations_mixed_states(tmp_path):
     assert results[2]["stages"] == []
 
 
-@patch("mdfactory.orchestration.simulate._validate_trajectory_complete", return_value=True)
+@patch("mdfactory.orchestration.checkpoint._validate_trajectory_complete", return_value=True)
 def test_checkpoint_production_output(mock_validate, mock_sim_dir):
     """Production stage skipped when prod.xtc is validated as complete."""
     (mock_sim_dir / "min.gro").write_text("FAKE")
@@ -318,41 +319,6 @@ def test_stage_order_preservation(mock_sim_dir):
     """Requested stages maintain order."""
     needed = _detect_needed_stages(mock_sim_dir, ["Production", "NPT", "EM", "NVT"], "force")
     assert needed == ["Production", "NPT", "EM", "NVT"]
-
-
-@patch("mdfactory.orchestration.simulate.parsl_session")
-@patch("mdfactory.orchestration.simulate._execute_stage_list")
-def test_wait_false_returns_futures(mock_execute, mock_session, mock_sim_dir):
-    """When wait=False, returns raw futures."""
-    mock_future = MagicMock()
-    mock_execute.return_value = mock_future
-
-    mock_session_obj = MagicMock()
-    mock_session.return_value.__enter__.return_value = mock_session_obj
-
-    results = run_simulations([mock_sim_dir], ExecutorConfig(), wait=False)
-
-    # Should return futures, not results
-    assert results == [mock_future]
-    # Session should be detached
-    mock_session_obj.detach.assert_called_once()
-
-
-@patch("mdfactory.orchestration.simulate.parsl_session")
-@patch("mdfactory.orchestration.simulate._execute_stage_list")
-def test_wait_false_emits_warning(mock_execute, mock_session, mock_sim_dir):
-    """wait=False logs a warning that raw futures resolve to None, not dicts."""
-    mock_execute.return_value = MagicMock()
-    mock_session.return_value.__enter__.return_value = MagicMock()
-
-    with patch("mdfactory.orchestration.simulate.logger") as mock_logger:
-        run_simulations([mock_sim_dir], ExecutorConfig(), wait=False)
-
-    # Warning must be emitted and mention the None / parsl.clear() contract
-    mock_logger.warning.assert_called()
-    warning_text = " ".join(str(a) for call in mock_logger.warning.call_args_list for a in call[0])
-    assert "None" in warning_text or "raw" in warning_text
-    assert "parsl.clear()" in warning_text
 
 
 def test_empty_sim_list():
@@ -403,7 +369,7 @@ def test_checkpoint_production_requires_npt_cpt(mock_sim_dir):
     assert "Production" in needed
 
 
-@patch("mdfactory.orchestration.simulate._validate_trajectory_complete", return_value=True)
+@patch("mdfactory.orchestration.checkpoint._validate_trajectory_complete", return_value=True)
 def test_checkpoint_production_skips_with_all_files(mock_validate, mock_sim_dir):
     """Production skipped when both prod.xtc AND npt.cpt exist (trajectory validated)."""
     (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")
@@ -414,7 +380,7 @@ def test_checkpoint_production_skips_with_all_files(mock_validate, mock_sim_dir)
     assert "Production" not in needed
 
 
-@patch("mdfactory.orchestration.simulate._validate_trajectory_complete", return_value=True)
+@patch("mdfactory.orchestration.checkpoint._validate_trajectory_complete", return_value=True)
 def test_checkpoint_production_complete_with_trr_only(mock_validate, mock_sim_dir):
     """Production marked complete when only prod.trr exists (TRR-only MDP config)."""
     (mock_sim_dir / "npt.cpt").write_text("FAKE CPT")
@@ -681,7 +647,7 @@ def test_execute_stage_list_validates_unknown_stage():
         _execute_stage_list(Path("/tmp/test"), ["Equilibration"], None, None, max_rescue=0)
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_em_only(mock_run_stage):
     """Execute stage list dispatches EM via run_stage with correct spec and no prev_future."""
     mock_future = MagicMock()
@@ -696,7 +662,7 @@ def test_execute_stage_list_em_only(mock_run_stage):
     assert result == mock_future
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_em_nvt_chain(mock_run_stage):
     """Execute stage list chains EM → NVT: NVT receives EM's future as prev_future."""
     em_future = MagicMock()
@@ -720,7 +686,7 @@ def test_execute_stage_list_em_nvt_chain(mock_run_stage):
     assert result == nvt_future
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_full_pipeline(mock_run_stage):
     """Execute stage list chains all 4 stages via run_stage with correct futures."""
     stage_futures = [MagicMock() for _ in range(4)]
@@ -748,7 +714,7 @@ def test_execute_stage_list_full_pipeline(mock_run_stage):
     assert result is stage_futures[3]
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_partial_pipeline_from_checkpoint(mock_run_stage):
     """Checkpoint resume: first stage is not EM; prev_future starts as None."""
     nvt_fut = MagicMock()
@@ -770,7 +736,7 @@ def test_execute_stage_list_partial_pipeline_from_checkpoint(mock_run_stage):
 
 
 @patch("mdfactory.orchestration.rescue.execute_stage_with_rescue")
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_routes_to_rescue_when_enabled(mock_run_stage, mock_rescue):
     """Rescue-eligible stages dispatch to execute_stage_with_rescue when max_rescue > 0."""
     rescue_future = MagicMock()
@@ -785,7 +751,7 @@ def test_execute_stage_list_routes_to_rescue_when_enabled(mock_run_stage, mock_r
 
 
 @patch("mdfactory.orchestration.rescue.execute_stage_with_rescue")
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_production_bypasses_rescue(mock_run_stage, mock_rescue):
     """Production stage uses run_stage even when max_rescue > 0."""
     prod_future = MagicMock()
@@ -989,7 +955,7 @@ def test_validate_trajectory_returns_false_for_non_parseable_file(mock_sim_dir):
     assert result is False
 
 
-@patch("mdfactory.orchestration.simulate.mda")
+@patch("mdfactory.orchestration.trajectory.mda")
 def test_validate_trajectory_with_mdanalysis_complete(mock_mda, mock_sim_dir):
     """Trajectory validation uses MDAnalysis to count frames (complete)."""
 
@@ -1009,7 +975,7 @@ def test_validate_trajectory_with_mdanalysis_complete(mock_mda, mock_sim_dir):
     assert result is True
 
 
-@patch("mdfactory.orchestration.simulate.mda")
+@patch("mdfactory.orchestration.trajectory.mda")
 def test_validate_trajectory_with_mdanalysis_incomplete(mock_mda, mock_sim_dir):
     """Trajectory validation detects incomplete trajectories."""
 
@@ -1029,7 +995,7 @@ def test_validate_trajectory_with_mdanalysis_incomplete(mock_mda, mock_sim_dir):
     assert result is False
 
 
-@patch("mdfactory.orchestration.simulate.mda")
+@patch("mdfactory.orchestration.trajectory.mda")
 def test_validate_trajectory_without_expected_frames(mock_mda, mock_sim_dir):
     """Trajectory validation without expected_frames checks readability only."""
 
@@ -1051,7 +1017,7 @@ def test_validate_trajectory_without_expected_frames(mock_mda, mock_sim_dir):
 
 def test_find_structure_file_priority_order(mock_sim_dir):
     """Find structure file uses correct priority order."""
-    from mdfactory.orchestration.simulate import find_structure_file
+    from mdfactory.orchestration.trajectory import find_structure_file
 
     # Create files in reverse priority order
     (mock_sim_dir / "system.pdb").write_text("FAKE")
@@ -1065,7 +1031,7 @@ def test_find_structure_file_priority_order(mock_sim_dir):
 
 def test_find_structure_file_returns_none_if_missing(tmp_path):
     """Find structure file returns None if no candidates exist."""
-    from mdfactory.orchestration.simulate import find_structure_file
+    from mdfactory.orchestration.trajectory import find_structure_file
 
     # Create empty directory with no structure files
     empty_dir = tmp_path / "empty"
@@ -1077,8 +1043,8 @@ def test_find_structure_file_returns_none_if_missing(tmp_path):
 
 def test_find_structure_file_candidates_derived_from_registry():
     """_STRUCTURE_CANDIDATES matches the current STAGE_REGISTRY gro_out fields."""
-    from mdfactory.orchestration.simulate import _STRUCTURE_CANDIDATES
     from mdfactory.orchestration.stages import STAGE_REGISTRY
+    from mdfactory.orchestration.trajectory import _STRUCTURE_CANDIDATES
 
     expected = [spec.gro_out for spec in reversed(STAGE_REGISTRY) if spec.gro_out] + ["system.pdb"]
     assert _STRUCTURE_CANDIDATES == expected
@@ -1086,12 +1052,12 @@ def test_find_structure_file_candidates_derived_from_registry():
 
 def test_find_structure_file_picks_up_new_stage_gro(tmp_path, monkeypatch):
     """find_structure_file returns a new stage's .gro when _STRUCTURE_CANDIDATES is extended."""
-    import mdfactory.orchestration.simulate as sim_module
-    from mdfactory.orchestration.simulate import find_structure_file
+    import mdfactory.orchestration.trajectory as traj_module
+    from mdfactory.orchestration.trajectory import find_structure_file
 
     # Simulate a hypothetical future 'Heating' stage by patching the candidate list.
-    extended = ["heat.gro"] + sim_module._STRUCTURE_CANDIDATES
-    monkeypatch.setattr(sim_module, "_STRUCTURE_CANDIDATES", extended)
+    extended = ["heat.gro"] + traj_module._STRUCTURE_CANDIDATES
+    monkeypatch.setattr(traj_module, "_STRUCTURE_CANDIDATES", extended)
 
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()
@@ -1103,7 +1069,7 @@ def test_find_structure_file_picks_up_new_stage_gro(tmp_path, monkeypatch):
 
 def test_extract_expected_frames_from_mdp(mock_sim_dir):
     """Extract expected frames from MDP file."""
-    from mdfactory.orchestration.simulate import _extract_expected_frames_from_mdp
+    from mdfactory.orchestration.trajectory import _extract_expected_frames_from_mdp
 
     # Create MDP with nsteps and nstxout-compressed
     mdp_content = """
@@ -1122,7 +1088,7 @@ def test_extract_expected_frames_from_mdp(mock_sim_dir):
 
 def test_extract_expected_frames_handles_comments(mock_sim_dir):
     """MDP parser ignores comments correctly."""
-    from mdfactory.orchestration.simulate import _extract_expected_frames_from_mdp
+    from mdfactory.orchestration.trajectory import _extract_expected_frames_from_mdp
 
     mdp_content = """
     ; nsteps = 999999  ; This is a comment
@@ -1140,7 +1106,7 @@ def test_extract_expected_frames_handles_comments(mock_sim_dir):
 
 def test_extract_expected_frames_returns_none_for_missing_file(mock_sim_dir):
     """MDP parser returns None if file doesn't exist."""
-    from mdfactory.orchestration.simulate import _extract_expected_frames_from_mdp
+    from mdfactory.orchestration.trajectory import _extract_expected_frames_from_mdp
 
     result = _extract_expected_frames_from_mdp(mock_sim_dir, "Production")
     assert result is None
@@ -1148,7 +1114,7 @@ def test_extract_expected_frames_returns_none_for_missing_file(mock_sim_dir):
 
 def test_extract_expected_frames_returns_none_for_incomplete_mdp(mock_sim_dir):
     """MDP parser returns None if required parameters missing."""
-    from mdfactory.orchestration.simulate import _extract_expected_frames_from_mdp
+    from mdfactory.orchestration.trajectory import _extract_expected_frames_from_mdp
 
     # Only nsteps, no nstxout-compressed
     (mock_sim_dir / "md.mdp").write_text("nsteps = 100000\n")
@@ -1241,7 +1207,7 @@ def test_get_gromacs_detect_script_prefers_gmx_over_gmx_mpi():
 # === Decision 7: Restart wiring through stage functions and execute_stage_list ===
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_passes_restart_to_stage_fn(mock_run_stage):
     """_execute_stage_list forwards stage_restarts to run_stage as restart_from_cpt."""
     mock_run_stage.return_value = MagicMock()
@@ -1260,7 +1226,7 @@ def test_execute_stage_list_passes_restart_to_stage_fn(mock_run_stage):
     assert call_kwargs.get("restart_from_cpt") == "/sim/nvt.cpt"
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_restart_only_for_matching_stage(mock_run_stage):
     """Only the stage with a cpt entry gets a non-empty restart_from_cpt."""
     nvt_fut = MagicMock()
@@ -1355,7 +1321,7 @@ def test_production_stage_skips_grompp_on_restart():
 # === Decision 6: Per-stage resource config wiring tests ===
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_passes_stage_config_when_slurm(mock_run_stage):
     """_execute_stage_list resolves per-stage config and forwards as stage_config to run_stage."""
     from mdfactory.orchestration.config import SlurmExecutorConfig
@@ -1378,7 +1344,7 @@ def test_execute_stage_list_passes_stage_config_when_slurm(mock_run_stage):
     assert em_cfg.cpus_per_node == 4
 
 
-@patch("mdfactory.orchestration.simulate.run_stage")
+@patch("mdfactory.orchestration.execution.run_stage")
 def test_execute_stage_list_no_stage_config_for_local(mock_run_stage):
     """_execute_stage_list does not inject stage_config for LocalProvider (no overrides)."""
     from mdfactory.orchestration.config import ExecutorConfig
@@ -1503,7 +1469,7 @@ def test_mdrun_app_cpt_log_message_mentions_file():
 
 def test_detect_stage_state_partial_restart_nvt(tmp_path):
     """Partial NVT: .cpt + .tpr present, .gro absent → status=partial, restart=True."""
-    from mdfactory.orchestration.simulate import _detect_stage_state
+    from mdfactory.orchestration.checkpoint import _detect_stage_state
 
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()
@@ -1520,7 +1486,7 @@ def test_detect_stage_state_partial_restart_nvt(tmp_path):
 
 def test_detect_stage_state_partial_restart_em(tmp_path):
     """Partial EM: min.cpt + min.tpr present, min.gro absent → status=partial."""
-    from mdfactory.orchestration.simulate import _detect_stage_state
+    from mdfactory.orchestration.checkpoint import _detect_stage_state
 
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()
@@ -1536,7 +1502,7 @@ def test_detect_stage_state_partial_restart_em(tmp_path):
 
 def test_detect_stage_state_not_started_when_no_files(tmp_path):
     """Empty directory → status=not_started, restart=False."""
-    from mdfactory.orchestration.simulate import _detect_stage_state
+    from mdfactory.orchestration.checkpoint import _detect_stage_state
 
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()
@@ -1550,7 +1516,7 @@ def test_detect_stage_state_not_started_when_no_files(tmp_path):
 
 def test_detect_needed_stages_with_restart_info_partial(tmp_path):
     """Restart info propagated into the work-plan when partial progress exists."""
-    from mdfactory.orchestration.simulate import _detect_needed_stages_with_restart_info
+    from mdfactory.orchestration.checkpoint import _detect_needed_stages_with_restart_info
 
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()
@@ -1565,9 +1531,12 @@ def test_detect_needed_stages_with_restart_info_partial(tmp_path):
     assert items[0]["cpt_file"] == sim_dir / "nvt.cpt"
 
 
+@patch("mdfactory.orchestration.progress.display_stage_progress")
 @patch("mdfactory.orchestration.simulate.parsl_session")
 @patch("mdfactory.orchestration.simulate._execute_stage_list")
-def test_run_simulations_propagates_stage_restarts(mock_execute, mock_session, tmp_path):
+def test_run_simulations_propagates_stage_restarts(
+    mock_execute, mock_session, mock_display, tmp_path
+):
     """stage_restarts dict assembled from checkpoint detection is passed to _execute_stage_list."""
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()
@@ -1585,7 +1554,7 @@ def test_run_simulations_propagates_stage_restarts(mock_execute, mock_session, t
 
     from mdfactory.orchestration.config import ExecutorConfig
 
-    run_simulations([sim_dir], ExecutorConfig(), wait=False)
+    run_simulations([sim_dir], ExecutorConfig())
 
     # _execute_stage_list must be called; assert stage_restarts contains NVT entry
     assert mock_execute.called
@@ -2018,7 +1987,7 @@ def test_clean_simulation_outputs_dry_run(tmp_path):
 
 def test_detect_stage_state_trajectory_stale_cpt(tmp_path):
     """Production with cpt+tpr but no trajectory → not_started (stale-cpt fix)."""
-    from mdfactory.orchestration.simulate import _detect_stage_state
+    from mdfactory.orchestration.checkpoint import _detect_stage_state
 
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()
@@ -2035,7 +2004,7 @@ def test_detect_stage_state_trajectory_stale_cpt(tmp_path):
 
 def test_detect_stage_state_structure_partial_cpt_unchanged(tmp_path):
     """EM with cpt+tpr but no gro → still partial (structure stages unchanged)."""
-    from mdfactory.orchestration.simulate import _detect_stage_state
+    from mdfactory.orchestration.checkpoint import _detect_stage_state
 
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()

@@ -5,7 +5,8 @@
 from .build import build_systems
 from .config import ExecutorConfig, SlurmExecutorConfig
 from .environment import EnvironmentConfig, get_global_environment_path
-from .simulate import clean_simulation_outputs, find_structure_file, run_simulations
+from .simulate import clean_simulation_outputs, run_simulations
+from .trajectory import find_structure_file
 from .tui import (
     configure_and_save_environment,
     configure_and_save_slurm,

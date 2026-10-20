@@ -14,11 +14,11 @@ import pytest
 import yaml
 
 from mdfactory import workflows
-from mdfactory.build import _center_in_cubic_box
+from mdfactory.build import _center_in_cubic_box, _ion_counts
 from mdfactory.models.composition import ProteinBoxComposition
 from mdfactory.models.input import BuildInput
 from mdfactory.models.parametrization import Pdb2gmxConfig
-from mdfactory.models.species import ProteinSpecies
+from mdfactory.models.species import ProteinSpecies, SingleMoleculeSpecies
 from mdfactory.setup import protein
 from mdfactory.setup.protein import (
     _apply_protonation_states,
@@ -972,3 +972,25 @@ class TestCenterInCubicBox:
         long_axis = int(np.argmax(bbox_max - bbox_min))
         assert abs(bbox_min[long_axis] - padding) < 1e-3
         assert abs((box_size - bbox_max[long_axis]) - padding) < 1e-3
+
+
+class TestIonCounts:
+    """ionize_solvated_system returns only the ions it added; counts map by resname."""
+
+    @staticmethod
+    def _ion(smiles, resname, count):
+        return SingleMoleculeSpecies(count=count, smiles=smiles, resname=resname)
+
+    def test_both_ions(self):
+        species = [self._ion("[Na+]", "NA", 7), self._ion("[Cl-]", "CL", 9)]
+        assert _ion_counts(species) == (7, 9)
+
+    def test_chloride_only_is_not_reported_as_sodium(self):
+        # Positive protein with no salt: only Cl- is added.
+        assert _ion_counts([self._ion("[Cl-]", "CL", 3)]) == (0, 3)
+
+    def test_sodium_only(self):
+        assert _ion_counts([self._ion("[Na+]", "NA", 4)]) == (4, 0)
+
+    def test_no_ions(self):
+        assert _ion_counts([]) == (0, 0)

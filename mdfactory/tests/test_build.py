@@ -2,13 +2,18 @@
 # ABOUTME: assembly, composition validation, and buildability checks.
 """Tests for bilayer and mixed-box system building, including structure."""
 
-import MDAnalysis as mda
+from pathlib import Path
+from unittest.mock import patch
 
-from mdfactory.build import build_bilayer, build_mixedbox
+import MDAnalysis as mda
+import pytest
+
+from mdfactory.build import build_bilayer, build_mixedbox, ionize_solvated_system
 from mdfactory.check import check_bilayer_buildable
-from mdfactory.models.composition import BilayerComposition, MixedBoxComposition
+from mdfactory.models.composition import BilayerComposition, IonizationConfig, MixedBoxComposition
 from mdfactory.models.input import BuildInput
 from mdfactory.models.species import LipidSpecies, SingleMoleculeSpecies
+from mdfactory.setup import solvation
 from mdfactory.utils.setup_utilities import create_bilayer_from_model, create_mixed_box_universe
 from mdfactory.utils.utilities import working_directory
 
@@ -50,6 +55,46 @@ def test_create_mixedbox_universe():
     n_met = sum(1 for res in residues if res.resname == "MET")
     assert n_sol == 180
     assert n_met == 20
+
+
+def test_ionize_solvated_system_skips_zero_ions():
+    u = mda.Universe(Path(solvation.__file__).parent / "data" / "spc216.gro")
+    ion_config = IonizationConfig(concentration=0.0, neutralize=False)
+
+    with patch("mdfactory.build.ionize") as ionize:
+        ionized, additional_species = ionize_solvated_system(ion_config, u, total_charge=0)
+
+    assert ionized is u
+    assert additional_species == []
+    ionize.assert_not_called()
+
+
+def test_ionize_solvated_system_skips_water_check_when_no_ions_are_requested():
+    u = SingleMoleculeSpecies(smiles="CCO", count=1, resname="ETH").universe
+    ion_config = IonizationConfig(concentration=0.0, neutralize=False)
+
+    with patch("mdfactory.build.ionize") as ionize:
+        ionized, additional_species = ionize_solvated_system(ion_config, u, total_charge=0)
+
+    assert ionized is u
+    assert additional_species == []
+    ionize.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("total_charge", "ion_resname", "ion_count"),
+    [(2, "CL", 2), (-2, "NA", 2)],
+)
+def test_ionize_solvated_system_adds_one_sided_counterions(total_charge, ion_resname, ion_count):
+    u = mda.Universe(Path(solvation.__file__).parent / "data" / "spc216.gro")
+    ion_config = IonizationConfig(concentration=0.0, neutralize=True, seed=0)
+
+    ionized, additional_species = ionize_solvated_system(ion_config, u, total_charge)
+
+    assert len(ionized.select_atoms(f"resname {ion_resname}")) == ion_count
+    assert len(additional_species) == 1
+    assert additional_species[0].resname == ion_resname
+    assert additional_species[0].count == ion_count
 
 
 def test_build_mixedbox(tmp_path):
