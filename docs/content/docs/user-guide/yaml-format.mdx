@@ -109,6 +109,17 @@ Defaults:
 - `min_distance: 5.0`
 - `seed: null`
 
+To disable ionization explicitly, set the field to `null` or `false`:
+
+```yaml
+system:
+  ionization: false  # `null` is equivalent
+```
+
+Both forms skip ion placement. If ionization is omitted, the defaults above are
+applied. A configured `concentration: 0.0` with `neutralize: false` likewise leaves
+the system unchanged without attempting to add zero ions.
+
 ## Full examples by simulation type
 
 These examples intentionally use compounds from the repository example inputs under `examples/` so docs stay aligned with tested/public examples.

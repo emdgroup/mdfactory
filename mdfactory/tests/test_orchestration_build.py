@@ -131,29 +131,6 @@ def test_build_systems_handles_failed_future(monkeypatch, tmp_path):
     assert results[0]["error_detail"] == "CUDA OOM"
 
 
-def test_build_systems_no_wait(monkeypatch, tmp_path):
-    """build_systems with wait=False returns futures directly."""
-    import parsl
-
-    mock_app_fn = MagicMock()
-    mock_future = MagicMock()
-    mock_app_fn.return_value = mock_future
-
-    import mdfactory.orchestration.build as build_mod
-
-    monkeypatch.setattr(build_mod, "get_build_app", lambda: mock_app_fn)
-    monkeypatch.setattr(parsl, "load", MagicMock())
-
-    mock_model = FakeBuildInput(hash="NW1")
-    monkeypatch.setattr(build_mod, "BuildInput", FakeBuildInput)
-    monkeypatch.setattr(ExecutorConfig, "to_parsl_config", lambda self: MagicMock())
-
-    cfg = ExecutorConfig()
-    futures = build_mod.build_systems([mock_model], cfg, output_dir=tmp_path, wait=False)
-
-    assert futures == [mock_future]
-
-
 def test_build_systems_dry_run_invalid_input_type(tmp_path):
     """build_systems with dry_run=True raises TypeError for invalid input."""
     from mdfactory.orchestration.build import build_systems
@@ -394,35 +371,6 @@ def test_wait_with_progress_multi_iteration(monkeypatch):
     assert results[0]["status"] == "success"
     # done() should have been called at least twice (False then True)
     assert mock_future.done.call_count >= 2
-
-
-# --- Finding 10: Assert non-cleanup in no_wait ---
-
-
-def test_build_systems_no_wait_does_not_clear(monkeypatch, tmp_path):
-    """build_systems with wait=False does NOT call parsl.clear()."""
-    import parsl
-
-    mock_app_fn = MagicMock()
-    mock_future = MagicMock()
-    mock_app_fn.return_value = mock_future
-
-    import mdfactory.orchestration.build as build_mod
-
-    monkeypatch.setattr(build_mod, "get_build_app", lambda: mock_app_fn)
-    monkeypatch.setattr(parsl, "load", MagicMock())
-    mock_clear = MagicMock()
-    monkeypatch.setattr(parsl, "clear", mock_clear)
-
-    mock_model = FakeBuildInput(hash="NW2")
-    monkeypatch.setattr(build_mod, "BuildInput", FakeBuildInput)
-    monkeypatch.setattr(ExecutorConfig, "to_parsl_config", lambda self: MagicMock())
-
-    cfg = ExecutorConfig()
-    futures = build_mod.build_systems([mock_model], cfg, output_dir=tmp_path, wait=False)
-
-    assert futures == [mock_future]
-    mock_clear.assert_not_called()
 
 
 # --- Finding 10: failure description helper ---

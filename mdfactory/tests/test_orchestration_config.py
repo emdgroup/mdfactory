@@ -43,6 +43,7 @@ def test_slurm_executor_config_defaults():
     assert cfg.cpus_per_node == 12
     assert cfg.gres is None
     assert cfg.mem is None
+    assert cfg.exclusive is False
 
 
 def test_executor_config_from_yaml_local(tmp_path):
@@ -189,6 +190,44 @@ def test_raw_scheduler_options_appended():
     provider = result.executors[0].provider
     assert "#SBATCH --gres=gpu:1" in provider.scheduler_options
     assert "#SBATCH --exclusive" in provider.scheduler_options
+
+
+def test_slurm_exclusive_default_false():
+    """Default SlurmProvider does NOT request exclusive (whole-node) allocations.
+
+    Regression test for issue #45: Parsl's SlurmProvider defaults to
+    exclusive=True, which adds ``#SBATCH --exclusive`` and bills the entire
+    node for partial-node requests (e.g. 4 CPUs, 1 GPU). MDFactory must
+    default to shared allocations so only requested resources are used.
+    """
+    cfg = SlurmExecutorConfig(account="acc", gres="gpu:l40s:1")
+    result = cfg.to_parsl_config()
+
+    provider = result.executors[0].provider
+    assert provider.exclusive is False
+    assert "#SBATCH --exclusive" not in provider.scheduler_options
+
+
+def test_slurm_exclusive_true_opt_in():
+    """exclusive=True opts back into a whole-node allocation."""
+    cfg = SlurmExecutorConfig(account="acc", gres="gpu:1", exclusive=True)
+    result = cfg.to_parsl_config()
+
+    provider = result.executors[0].provider
+    assert provider.exclusive is True
+    assert "#SBATCH --exclusive" in provider.scheduler_options
+
+
+def test_exclusive_yaml_roundtrip(tmp_path):
+    """exclusive survives a YAML round-trip."""
+    original = SlurmExecutorConfig(account="acc", exclusive=True)
+    cfg_path = tmp_path / "exclusive.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(original.model_dump(), f)
+
+    loaded = ExecutorConfig.from_yaml(cfg_path)
+    assert isinstance(loaded, SlurmExecutorConfig)
+    assert loaded.exclusive is True
 
 
 def test_run_dir_default_and_expanduser():

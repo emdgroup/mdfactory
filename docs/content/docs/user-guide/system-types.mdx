@@ -51,7 +51,7 @@ system:
 | `species` | list of `SingleMoleculeSpecies` | — | Molecules in the system |
 | `total_count` | int \| null | null | Total molecule count (used with fractions) |
 | `target_density` | float | 1.0 | Target density in g/cm³ |
-| `ionization` | IonizationConfig | see below | Ion placement settings |
+| `ionization` | IonizationConfig \| null \| false | see below | Ion placement settings; `null` or `false` disables ionization |
 
 ### Tips
 
@@ -107,7 +107,7 @@ system:
 | `total_count` | int \| null | null | Total lipid count (used with fractions) |
 | `z_padding` | float | 20.0 | Water padding above/below bilayer in Å |
 | `monolayer` | bool | false | Build a monolayer instead of bilayer |
-| `ionization` | IonizationConfig | see below | Ion placement settings |
+| `ionization` | IonizationConfig \| null \| false | see below | Ion placement settings; `null` or `false` disables ionization |
 
 ### LipidSpecies fields
 
@@ -194,7 +194,7 @@ system:
 | `padding` | float | 25.0 | Water padding around the nanoparticle in Å |
 | `core` | CoreComposition | — | Core composition |
 | `shell` | ShellComposition | — | Shell composition |
-| `ionization` | IonizationConfig | see below | Ion placement settings |
+| `ionization` | IonizationConfig \| null \| false | see below | Ion placement settings; `null` or `false` disables ionization |
 
 ### CoreComposition fields
 
@@ -230,6 +230,11 @@ All system types support ionization configuration:
 | `concentration` | float | 0.15 | Ion concentration in mol/L |
 | `min_distance` | float | 5.0 | Minimum distance between ions in Å |
 | `seed` | int \| null | null | Random seed for ion placement |
+
+To disable ionization explicitly, set `ionization` to `null` or `false`. Both forms
+skip ion placement and are normalized to the same disabled state. Omitting the field
+keeps the default `IonizationConfig`; a configuration with zero concentration and
+`neutralize: false` also performs no ion placement.
 
 ## SingleMoleculeSpecies fields (shared)
 

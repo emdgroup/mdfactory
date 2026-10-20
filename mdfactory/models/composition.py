@@ -5,7 +5,15 @@
 from typing import Annotated, Literal, Optional
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Discriminator,
+    Field,
+    Tag,
+    model_validator,
+)
 
 from .species import (
     LipidSpecies,
@@ -71,6 +79,19 @@ class IonizationConfig(BaseModel):
     seed: Optional[int] = Field(None, description="Random seed for reproducibility.")
 
 
+def _normalize_ionization(value: object) -> object:
+    """Normalize boolean false to the disabled ionization representation."""
+    if value is False:
+        return None
+    return value
+
+
+IonizationSetting = Annotated[
+    IonizationConfig | None,
+    BeforeValidator(_normalize_ionization),
+]
+
+
 class SystemComposition(BaseModel):
     """Define a system composition as a list of species with fractional or absolute counts."""
 
@@ -122,18 +143,9 @@ class MixedBoxComposition(SystemComposition):
 
     species: list[SingleMoleculeSpecies]
     target_density: float = Field(1.0, description="Packing density of the box in g/cm^3.")
-    ionization: IonizationConfig = Field(
+    ionization: IonizationSetting = Field(
         default_factory=IonizationConfig, description="Configuration for ionization."
     )
-
-    # @field_validator("ionization")
-    # @classmethod
-    # def validate_ionization(cls, v: Any):
-    #     if v == None or v == "None":
-    #         return None
-    #     elif v == "auto":
-    #         return IonizationConfig()
-    #     return v
 
 
 class BilayerComposition(SystemComposition):
@@ -144,7 +156,7 @@ class BilayerComposition(SystemComposition):
         20.0, description="Z-direction box padding above and below the bilayer in A.", ge=0.0
     )
     monolayer: bool = Field(False, description="Whether to just build a monolayer.")
-    ionization: IonizationConfig = Field(
+    ionization: IonizationSetting = Field(
         default_factory=IonizationConfig, description="Configuration for ionization."
     )
 
@@ -318,7 +330,7 @@ class LNPComposition(BaseModel):
     core: CoreComposition
     shell: ShellComposition
     padding: float = Field(25.0, description="Solvation padding around LNP in Angstroms.", ge=0)
-    ionization: IonizationConfig = Field(
+    ionization: IonizationSetting = Field(
         default_factory=IonizationConfig, description="Configuration for ionization."
     )
 
