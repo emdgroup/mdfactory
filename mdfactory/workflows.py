@@ -13,7 +13,7 @@ from .build import (
     build_proteinbox,
 )
 from .models.input import BuildInput
-from .prepare import resolve_protein_pdb_path as _resolve_proteinbox_pdb_path
+from .prepare import resolve_protein_pdb_path
 from .utils.utilities import load_yaml_file
 
 DISPATCH_BUILD = {
@@ -62,5 +62,5 @@ def run_build_from_file(fname: Path):
 
     """
     dct = load_yaml_file(fname)
-    _resolve_proteinbox_pdb_path(dct, Path(fname).parent)
+    resolve_protein_pdb_path(dct, Path(fname).parent)
     run_build_from_dict(dct)

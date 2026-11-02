@@ -69,7 +69,7 @@ def prepare_build(input: Path, output: Path = Path(".")):
         )
         shutil.copy(yml_build_path, yml_bak)
 
-    df, models, errors = df_models_from_input_csv(input)
+    df, models, errors = load_build_input_csv(input)
     for m in models:
         if check_run_exists(m):
             raise ValueError("This system has already been built and is in the database:")
@@ -86,13 +86,6 @@ def prepare_build(input: Path, output: Path = Path(".")):
     logger.info("Created DataFrame for systems:\n{}", df)
 
     _prepare_system_directories(models, input, output, exist_ok=False)
-
-
-def df_models_from_input_csv(input):
-    # Shared with push/discovery: relative protein PDB paths are resolved against
-    # the CSV's own directory, so the emitted per-system YAMLs carry absolute paths
-    # and every CSV consumer computes the same hashes.
-    return load_build_input_csv(input)
 
 
 def _prepare_system_directories(
@@ -285,7 +278,7 @@ def _build_from_csv(
     dry_run: bool = False,
 ):
     """Handle CSV input for the build command."""
-    df, models, errors = df_models_from_input_csv(input)
+    df, models, errors = load_build_input_csv(input)
     if errors:
         logger.error("Errors building models from CSV:")
         for k, v in errors.items():
@@ -748,7 +741,7 @@ def check_csv(input: Path):
 
     """
     input = input.resolve()
-    _, models, errors = df_models_from_input_csv(input)
+    _, models, errors = load_build_input_csv(input)
     if errors:
         logger.error("Error occured in building models from CSV data.")
         for k, v in errors.items():

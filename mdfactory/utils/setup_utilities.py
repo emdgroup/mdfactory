@@ -757,6 +757,26 @@ def cubic_box_edge_for_density(total_mass_dalton: float, target_density: float) 
     return float(volume_a3 ** (1.0 / 3.0))
 
 
+def concentration_reference_volume_a3(
+    box_volume_a3: float, protein_mass_dalton: float, partial_specific_volume: float, basis: str
+) -> float:
+    """Return the volume (Å³) that molar concentrations refer to.
+
+    This is ``box_volume_a3`` for ``basis="box"`` and the box minus the protein's
+    displaced volume for ``basis="protein_excluded"``. Raises ``ValueError`` if
+    the result is not positive.
+    """
+    volume_a3 = box_volume_a3
+    if basis == "protein_excluded":
+        volume_a3 -= protein_displaced_volume_a3(protein_mass_dalton, partial_specific_volume)
+    if volume_a3 <= 0:
+        raise ValueError(
+            f"Concentration reference volume is non-positive ({volume_a3:.1f} Å³): the "
+            "protein does not fit in the box. A larger box is required."
+        )
+    return volume_a3
+
+
 def resolve_solution_counts(
     species,
     box_volume_a3: float,
@@ -792,17 +812,9 @@ def resolve_solution_counts(
         Counts aligned with ``species``.
 
     """
-    if basis == "protein_excluded":
-        v_basis_a3 = box_volume_a3 - protein_displaced_volume_a3(
-            protein_mass_dalton, partial_specific_volume
-        )
-    else:
-        v_basis_a3 = box_volume_a3
-    if v_basis_a3 <= 0:
-        raise ValueError(
-            f"Concentration reference volume is non-positive ({v_basis_a3:.1f} Å³): the "
-            "protein does not fit in the requested box. A larger box is required."
-        )
+    v_basis_a3 = concentration_reference_volume_a3(
+        box_volume_a3, protein_mass_dalton, partial_specific_volume, basis
+    )
     # 1 Å³ = 1e-27 L, so count = concentration[mol/L] * V[L] * N_A.
     v_basis_liters = v_basis_a3 * 1e-27
     counts = []
@@ -827,17 +839,14 @@ def create_protein_mixedbox_universe(
     resnames,
     box_edge: float,
     working_dir,
-    tolerance_a: float = 2.0,
-    native_atom_names=None,
+    native_atom_names,
 ) -> mda.Universe:
     """Pack solution molecules around a fixed protein with packmol.
 
-    The protein is centered in a cubic box of edge ``box_edge`` (Å) and handed to
-    packmol as a fixed solute (``fixed 0. 0. 0. 0. 0. 0.``), so it appears exactly
-    once and its pdb2gmx atom order is preserved. The requested molecules are
-    packed around it with a ``tolerance_a`` non-overlap distance. This drives
-    packmol's lower-level primitives directly rather than ``pack_box(solute=...)``,
-    which would route the protein through an OpenFF Topology and reorder its atoms.
+    The protein is centered in a cubic box of edge ``box_edge`` and handed to
+    packmol as a fixed solute, so its pdb2gmx atom order is preserved. This drives
+    packmol's lower-level primitives directly because ``pack_box(solute=...)``
+    would route the protein through an OpenFF Topology and reorder its atoms.
 
     Parameters
     ----------
@@ -846,27 +855,22 @@ def create_protein_mixedbox_universe(
     molecules : list
         OpenFF molecules for each solution species, in packing order.
     number_of_copies : list[int]
-        Copies to pack for each molecule, aligned with ``molecules``.
+        Copies to pack for each molecule.
     resnames : list[str]
-        Residue name for each molecule, aligned with ``molecules``.
+        Residue name for each molecule.
     box_edge : float
         Cubic box edge length in Å (the dilute packing box).
     working_dir : str or Path
         Directory the packmol working files are written into.
-    tolerance_a : float, optional
-        Packmol non-overlap tolerance in Å. Default 2.0 (matches pack_box).
-    native_atom_names : list[list[str] | None] or None, optional
-        Topology atom names for each species, aligned with ``molecules`` (see
-        :func:`topology_atom_names`). They replace the generic OpenFF PDB names,
-        e.g. CHARMM names for native water and ions and the ITP names for CGenFF
-        solutes. Use ``None`` to keep the packed names.
+    native_atom_names : list[list[str] | None]
+        Topology atom names for each species (see :func:`topology_atom_names`),
+        replacing the generic OpenFF PDB names; ``None`` keeps the packed names.
 
     Returns
     -------
     mda.Universe
-        Protein atoms first (authoritative names/positions), followed by the
-        packed solution molecules with residue names set, with cubic box
-        dimensions of ``box_edge``.
+        Protein atoms first, followed by the packed solution molecules with one
+        residue each, in a cubic box of ``box_edge``.
 
     """
     import subprocess  # noqa: PLC0415
@@ -901,7 +905,7 @@ def create_protein_mixedbox_universe(
             number_of_copies,
             str(protein_pdb),
             box_size,
-            Quantity(tolerance_a, "angstrom"),
+            Quantity(2.0, "angstrom"),  # matches pack_box
             rectangular=True,
         )
 
@@ -916,11 +920,6 @@ def create_protein_mixedbox_universe(
         # take those from the authoritative protein universe and only the packed
         # solution atoms from packmol's output.
         u_packed = mda.Universe(str(wd / output_file_path))
-
-    if native_atom_names is None:
-        native_atom_names = [None] * len(molecules)
-    if not (len(molecules) == len(number_of_copies) == len(resnames) == len(native_atom_names)):
-        raise ValueError("molecules, number_of_copies, resnames, and native_atom_names must align.")
 
     solution_residue_data = []
     for molecule, resname, count, atom_names in zip(
@@ -944,15 +943,11 @@ def create_protein_mixedbox_universe(
     solution_resnames: list[str] = []
     atom_resindex: list[int] = []
     for residue_index, (resname, n_atoms, atom_names) in enumerate(solution_residue_data):
-        packed_names = list(u_packed.atoms.names[atom_offset : atom_offset + n_atoms])
-        if atom_names is not None:
-            if len(atom_names) != n_atoms:
-                raise ValueError(
-                    f"Native residue {resname} has {n_atoms} atoms, but "
-                    f"{len(atom_names)} CHARMM atom names were supplied."
-                )
-            packed_names = atom_names
-        solution_names.extend(packed_names)
+        solution_names.extend(
+            u_packed.atoms.names[atom_offset : atom_offset + n_atoms]
+            if atom_names is None
+            else atom_names
+        )
         solution_resnames.append(resname)
         atom_resindex.extend([residue_index] * n_atoms)
         atom_offset += n_atoms

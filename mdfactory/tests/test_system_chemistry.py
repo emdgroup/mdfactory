@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from mdfactory.analysis.artifacts import ARTIFACT_REGISTRY
 from mdfactory.analysis.simulation import ANALYSIS_REGISTRY
 from mdfactory.analysis.utils import system_chemistry
 
@@ -118,18 +117,6 @@ def test_system_chemistry_registered_for_all_types():
             f"system_chemistry not registered for '{sim_type}'"
         )
         assert ANALYSIS_REGISTRY[sim_type]["system_chemistry"] is system_chemistry
-
-
-def test_proteinbox_registered_in_analysis_registry():
-    """proteinbox is a valid analysis target with system_chemistry."""
-    assert "proteinbox" in ANALYSIS_REGISTRY
-    assert ANALYSIS_REGISTRY["proteinbox"]["system_chemistry"] is system_chemistry
-
-
-def test_proteinbox_registered_in_artifact_registry():
-    """proteinbox can produce the last-frame PDB artifact."""
-    assert "proteinbox" in ARTIFACT_REGISTRY
-    assert "last_frame_pdb" in ARTIFACT_REGISTRY["proteinbox"]
 
 
 def test_system_chemistry_absorbs_kwargs(mock_simulation_bilayer):

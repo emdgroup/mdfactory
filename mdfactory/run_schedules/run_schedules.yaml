@@ -53,6 +53,7 @@
 - engine: gromacs
   system_type: protein_mixedbox
   version: 1.0
+  template_dir: proteinbox
   run_files:
     - em.mdp
     - nvt.mdp

@@ -423,11 +423,6 @@ class ProteinBoxComposition(BaseModel):
         """Return 1 (one protein) for metadata compatibility."""
         return 1
 
-    @property
-    def charge(self) -> int:
-        """Protein charge is not pre-computable; return 0 as placeholder."""
-        return 0
-
 
 class FixedBoxSizing(BaseModel):
     """Size the box to an explicit cubic edge; the final density is emergent."""
@@ -538,14 +533,3 @@ class ProteinMixedBoxComposition(BaseModel):
         if any(s.count is None for s in self.species):
             return None
         return 1 + sum(s.count for s in self.species)
-
-    @property
-    def charge(self) -> int:
-        """Charge from solution species with resolved counts (ions).
-
-        The protein charge (unknown until pdb2gmx) and concentration-derived counts
-        are excluded; this mirrors ProteinBoxComposition's placeholder charge.
-        """
-        return sum(
-            s.count * s.charge for s in self.species if s.count is not None and s.charge is not None
-        )

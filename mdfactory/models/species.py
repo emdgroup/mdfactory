@@ -7,7 +7,7 @@ import io
 import warnings
 from functools import cached_property
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 from rdkit import Chem
@@ -81,7 +81,7 @@ class SingleMoleculeSpecies(Species):
                 f"Attempted to build lipid, but it didn't work: {e}. Continuing with normal code..."
             )
         if head_index is not None and len(tail_indices):
-            from ..utils.setup_utilities import generate_lipid_structure  # noqa: PLC0415
+            from ..utils.setup_utilities import generate_lipid_structure
 
             try:
                 mol = generate_lipid_structure(
@@ -120,7 +120,7 @@ class SingleMoleculeSpecies(Species):
     @property
     def openff_molecule(self):
         """Return an OpenFF Molecule with residue name set."""
-        from openff.toolkit.topology import Molecule  # noqa: PLC0415
+        from openff.toolkit.topology import Molecule
 
         ret = Molecule.from_rdkit(
             self.rdkit_molecule,
@@ -133,7 +133,7 @@ class SingleMoleculeSpecies(Species):
     @property
     def universe(self):
         """Return an MDAnalysis Universe built from the molecule's PDB representation."""
-        import MDAnalysis as mda  # noqa: PLC0415
+        import MDAnalysis as mda
 
         pdb = Chem.MolToPDBBlock(self.rdkit_molecule)
         u = mda.Universe(io.StringIO(pdb), format="pdb")
@@ -218,7 +218,7 @@ class LipidSpecies(SingleMoleculeSpecies):
     @cached_property
     def rdkit_molecule(self) -> "Chem.rdchem.Mol":
         """Return an RDKit molecule with lipid-specific 3D coordinate generation."""
-        from ..utils.setup_utilities import generate_lipid_structure  # noqa: PLC0415
+        from ..utils.setup_utilities import generate_lipid_structure
 
         mol = generate_lipid_structure(
             self.smiles, head_indices=self.head_atoms, tail_indices=self.tail_atoms
@@ -240,8 +240,10 @@ class LipidSpecies(SingleMoleculeSpecies):
 class ProteinSpecies(Species):
     """Represent a protein species identified by a PDB structure file."""
 
-    count: Optional[int] = Field(1, description="Number of protein copies (always 1).")
-    fraction: Optional[float] = Field(1.0, description="Fraction (always 1.0 for protein).")
+    # A protein species is exactly one copy: the builder produces a single structure
+    # and metadata reports a total count of 1.
+    count: Literal[1] = Field(1, description="Number of protein copies (always 1).")
+    fraction: Literal[1.0] = Field(1.0, description="Fraction (always 1.0 for protein).")
     pdb_path: Path = Field(..., description="Path to the input PDB file.")
     chains: list[str] = Field(
         default_factory=list,
@@ -271,24 +273,6 @@ class ProteinSpecies(Species):
             "3-character states are expressible (histidine tautomers, neutral lysine)."
         ),
     )
-
-    @model_validator(mode="after")
-    def check_single_copy(self) -> "ProteinSpecies":
-        """Enforce that a protein species describes exactly one copy.
-
-        The builder produces a single protein structure and metadata reports a
-        total count of 1, so a count or fraction other than one would silently
-        contradict what is built.
-        """
-        if self.count != 1:
-            raise ValueError(
-                f"ProteinSpecies represents one protein; count must be 1, got {self.count}."
-            )
-        if self.fraction != 1.0:
-            raise ValueError(
-                f"ProteinSpecies represents one protein; fraction must be 1.0, got {self.fraction}."
-            )
-        return self
 
     @property
     def charge(self) -> int | None:

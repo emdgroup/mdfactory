@@ -175,35 +175,6 @@ def resolve_protein_pdb_path(dct: Any, base_dir: Path) -> None:
     protein["pdb_path"] = str((Path(base_dir) / pdb_path).resolve())
 
 
-def resolve_csv_protein_pdb_paths(df: pd.DataFrame, base_dir: Path) -> pd.DataFrame:
-    """Resolve relative protein PDB paths in a flat build DataFrame.
-
-    Relative ``system.protein.pdb_path`` cells are made absolute against
-    ``base_dir`` (the CSV's own directory), so every consumer of the CSV derives
-    the same ``BuildInput`` and therefore the same hash. Blank cells and absolute
-    paths are kept as they are.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Flat build specification, one row per system
-    base_dir : Path
-        Directory that relative paths are resolved against
-
-    Returns
-    -------
-    pd.DataFrame
-        The DataFrame with resolved paths (modified in place and returned)
-
-    """
-    if PROTEIN_PDB_PATH_COLUMN in df.columns:
-        base_dir = Path(base_dir)
-        df[PROTEIN_PDB_PATH_COLUMN] = df[PROTEIN_PDB_PATH_COLUMN].apply(
-            lambda p: p if pd.isna(p) or Path(p).is_absolute() else str((base_dir / p).resolve())
-        )
-    return df
-
-
 def load_build_input_csv(
     csv_path: Path,
 ) -> tuple[pd.DataFrame, list[BuildInput], dict[int, str]]:
@@ -228,6 +199,11 @@ def load_build_input_csv(
     csv_path = Path(csv_path)
     df = pd.read_csv(csv_path)
     df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
-    df = resolve_csv_protein_pdb_paths(df, csv_path.parent)
+    if PROTEIN_PDB_PATH_COLUMN in df.columns:
+        df[PROTEIN_PDB_PATH_COLUMN] = df[PROTEIN_PDB_PATH_COLUMN].apply(
+            lambda p: (
+                p if pd.isna(p) or Path(p).is_absolute() else str((csv_path.parent / p).resolve())
+            )
+        )
     models, errors = df_to_build_input_models(df)
     return df, models, errors

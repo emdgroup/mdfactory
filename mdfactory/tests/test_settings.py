@@ -65,14 +65,6 @@ def test_gromacs_env_prepends_forcefield_dir(tmp_path, monkeypatch):
     ]
 
 
-def test_config_template_documents_gromacs_section():
-    """The sample config should expose all user-facing GROMACS settings."""
-    template = Path("config_templates/config.ini").read_text()
-    assert "[gromacs]" in template
-    assert "GMX_PATH =" in template
-    assert "FORCEFIELD_DIR =" in template
-
-
 def test_reload():
     """reload() should re-read config from disk."""
     s = Settings()

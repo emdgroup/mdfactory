@@ -17,7 +17,7 @@ from mdfactory.simulation.openmm_utils import finish_compression, rescale_to_vol
 from mdfactory.utils.setup_utilities import topology_atom_names
 from mdfactory.utils.topology_utilities import read_itp_atoms
 
-ETHANOL_ITP = """\
+_ETHANOL_ITP = """\
 [ moleculetype ]
 ; Name            nrexcl
 MOL               3
@@ -97,94 +97,60 @@ class TestRescaleToVolume:
             rescale_to_volume(context, 20.0)
 
 
+def _finish(context, target, **kwargs):
+    """Call finish_compression with a converged, strict, 15%-tolerance default."""
+    kwargs.setdefault("converged", True)
+    kwargs.setdefault("require_convergence", True)
+    kwargs.setdefault("overshoot_tolerance", 0.15)
+    kwargs.setdefault("not_reached_message", "did not reach")
+    return finish_compression(context, target, **kwargs)
+
+
 class TestFinishCompression:
-    def test_corrects_volume_overshoot_within_tolerance(self):
+    def test_corrects_overshoot_within_tolerance(self):
         context = _three_dimer_context()  # 27 nm³, i.e. 4.5% below a 28.27 nm³ target
-        overshoot = finish_compression(
-            context,
-            28.27,
-            density_target=False,
-            converged=True,
-            require_convergence=True,
-            tolerance=0.15,
-        )
-        assert overshoot == pytest.approx(1 - 27.0 / 28.27)
+        overshoot = _finish(context, 28.27)
+        assert overshoot == pytest.approx(28.27 / 27.0 - 1)
         assert _volume(context) == pytest.approx(28.27)
 
-    def test_corrects_density_overshoot(self):
-        context = _three_dimer_context()
-        finish_compression(
-            context,
-            27.0 * 1.031,
-            density_target=True,
-            converged=True,
-            require_convergence=True,
-            tolerance=0.15,
-        )
-        assert _volume(context) == pytest.approx(27.0 * 1.031)
-
     def test_raises_beyond_tolerance(self):
-        context = _three_dimer_context()
-        with pytest.raises(RuntimeError, match="overshot the target volume"):
-            finish_compression(
-                context,
-                40.0,
-                density_target=False,
-                converged=True,
-                require_convergence=True,
-                tolerance=0.15,
-            )
+        with pytest.raises(RuntimeError, match="overshot the target density"):
+            _finish(_three_dimer_context(), 40.0)
 
     def test_unreached_target_raises_or_warns(self, capsys):
         context = _three_dimer_context()
         with pytest.raises(RuntimeError, match="did not reach"):
-            finish_compression(
-                context,
-                20.0,
-                density_target=True,
-                converged=False,
-                require_convergence=True,
-                tolerance=0.15,
-                not_reached_message="did not reach",
-            )
-        result = finish_compression(
-            context,
-            20.0,
-            density_target=True,
-            converged=False,
-            require_convergence=False,
-            tolerance=0.15,
-            not_reached_message="did not reach",
-        )
-        assert result is None
+            _finish(context, 20.0, converged=False)
+        assert _finish(context, 20.0, converged=False, require_convergence=False) is None
         assert _volume(context) == pytest.approx(27.0)
         assert "WARNING" in capsys.readouterr().out
 
 
+ETHANOL_ATOM_NAMES = ["C1", "C2", "O3", "H4", "H5", "H6", "H7", "H8", "H9"]
+
+
+@pytest.fixture
+def ethanol_itp(tmp_path):
+    itp = tmp_path / "mol.itp"
+    itp.write_text(_ETHANOL_ITP)
+    return itp
+
+
 class TestTopologyAtomNames:
-    def test_read_itp_atoms(self, tmp_path):
-        itp = tmp_path / "mol.itp"
-        itp.write_text(ETHANOL_ITP)
-        atoms = read_itp_atoms(itp)
-        assert [name for name, _ in atoms] == [
-            "C1", "C2", "O3", "H4", "H5", "H6", "H7", "H8", "H9",
-        ]  # fmt: skip
+    def test_read_itp_atoms(self, ethanol_itp):
+        atoms = read_itp_atoms(ethanol_itp)
+        assert [name for name, _ in atoms] == ETHANOL_ATOM_NAMES
         assert atoms[2][1] == pytest.approx(15.9994)
 
-    def test_cgenff_solute_uses_itp_names(self, tmp_path):
-        itp = tmp_path / "mol.itp"
-        itp.write_text(ETHANOL_ITP)
+    def test_cgenff_solute_uses_itp_names(self, ethanol_itp, tmp_path):
         species = SingleMoleculeSpecies(smiles="CCO", resname="ETH", count=1)
-        params = SimpleNamespace(itp=itp, parameter_itp=tmp_path / "extra.itp")
-        assert topology_atom_names(species, params) == [
-            "C1", "C2", "O3", "H4", "H5", "H6", "H7", "H8", "H9",
-        ]  # fmt: skip
+        params = SimpleNamespace(itp=ethanol_itp, parameter_itp=tmp_path / "extra.itp")
+        assert topology_atom_names(species, params) == ETHANOL_ATOM_NAMES
 
-    def test_mismatched_atom_order_raises(self, tmp_path):
-        itp = tmp_path / "mol.itp"
-        itp.write_text(ETHANOL_ITP.replace("12.011", "15.9994", 1))
+    def test_mismatched_atom_order_raises(self, ethanol_itp, tmp_path):
+        ethanol_itp.write_text(_ETHANOL_ITP.replace("12.011", "15.9994", 1))
         species = SingleMoleculeSpecies(smiles="CCO", resname="ETH", count=1)
-        params = SimpleNamespace(itp=itp, parameter_itp=tmp_path / "extra.itp")
+        params = SimpleNamespace(itp=ethanol_itp, parameter_itp=tmp_path / "extra.itp")
         with pytest.raises(ValueError, match="atom orders differ"):
             topology_atom_names(species, params)
 
@@ -208,17 +174,23 @@ WARNING 1 [file topology.top, line 18492]:
 There was 1 WARNING
 """
 
-NAME_MISMATCH_OUTPUT = """\
+NAME_MISMATCH_WARNING = """\
 WARNING 1 [file topology.top, line 18499]:
   1498 non-matching atom names
   atom names from topology.top will be used
 
+"""
+
+NAME_MISMATCH_OUTPUT = (
+    NAME_MISMATCH_WARNING
+    + """\
 WARNING 2 [file topology.top, line 18492]:
   You are using Ewald electrostatics in a system with net charge. This can
   lead to severe artifacts.
 
 There were 2 WARNINGs
 """
+)
 
 
 class TestValidateWithGromppNetCharge:
@@ -242,37 +214,35 @@ class TestValidateWithGromppNetCharge:
 
         return install
 
+    @staticmethod
+    def _validate(tmp_path, **kwargs):
+        protein.validate_with_grompp(
+            Path("t.top"), Path("s.pdb"), Path("em.mdp"), tmp_path, **kwargs
+        )
+
     def test_net_charge_warning_rejected_by_default(self, fake_grompp, tmp_path):
         calls = fake_grompp(NET_CHARGE_OUTPUT)
         with pytest.raises(RuntimeError, match="grompp validation failed"):
-            protein.validate_with_grompp(Path("t.top"), Path("s.pdb"), Path("em.mdp"), tmp_path)
+            self._validate(tmp_path)
         assert calls == [0]
 
     def test_net_charge_warning_accepted_when_allowed(self, fake_grompp, tmp_path):
         calls = fake_grompp(NET_CHARGE_OUTPUT)
-        protein.validate_with_grompp(
-            Path("t.top"), Path("s.pdb"), Path("em.mdp"), tmp_path, allow_net_charge=True
-        )
+        self._validate(tmp_path, allow_net_charge=True)
         # one grompp call only: a failing gmx_mpi call can abort an enclosing srun step
         assert calls == [1]
 
     def test_allowed_but_neutral_system_passes(self, fake_grompp, tmp_path):
         calls = fake_grompp("There were 0 warnings\n")
-        protein.validate_with_grompp(
-            Path("t.top"), Path("s.pdb"), Path("em.mdp"), tmp_path, allow_net_charge=True
-        )
+        self._validate(tmp_path, allow_net_charge=True)
         assert calls == [1]
 
     def test_other_warning_rejected_even_within_maxwarn(self, fake_grompp, tmp_path):
-        fake_grompp(NAME_MISMATCH_OUTPUT.split("\nWARNING 2")[0] + "\n")
+        fake_grompp(NAME_MISMATCH_WARNING)
         with pytest.raises(RuntimeError, match="other than the accepted net-charge"):
-            protein.validate_with_grompp(
-                Path("t.top"), Path("s.pdb"), Path("em.mdp"), tmp_path, allow_net_charge=True
-            )
+            self._validate(tmp_path, allow_net_charge=True)
 
     def test_net_charge_plus_other_warning_fails(self, fake_grompp, tmp_path):
         fake_grompp(NAME_MISMATCH_OUTPUT)
         with pytest.raises(RuntimeError, match="grompp validation failed"):
-            protein.validate_with_grompp(
-                Path("t.top"), Path("s.pdb"), Path("em.mdp"), tmp_path, allow_net_charge=True
-            )
+            self._validate(tmp_path, allow_net_charge=True)

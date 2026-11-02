@@ -175,3 +175,53 @@ def temp_analysis_db(tmp_path, monkeypatch):
 
     init_analysis_database()
     return db_path
+
+
+@pytest.fixture()
+def protein_pdb(tmp_path) -> Path:
+    """One-atom ALA PDB so ProteinSpecies has an existing (unvalidated) pdb_path."""
+    path = tmp_path / "test.pdb"
+    path.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+    return path
+
+
+def protein_input_data(
+    sim_type: str,
+    pdb: Path,
+    *,
+    config: dict[str, Any] | None = None,
+    protein: dict[str, Any] | None = None,
+    **top_level: Any,
+) -> dict[str, Any]:
+    """Return minimal valid BuildInput data for a protein simulation type.
+
+    Parameters
+    ----------
+    sim_type : str
+        ``"proteinbox"`` or ``"protein_mixedbox"``.
+    pdb : Path
+        Path to an existing PDB file.
+    config : dict, optional
+        Entries for ``parametrization_config`` (its ``type`` defaults to the parametrization).
+    protein : dict, optional
+        Overrides merged into the ``system.protein`` mapping.
+    **top_level
+        Overrides replacing top-level keys (e.g. ``parametrization="cgenff"``).
+    """
+    parametrization = "pdb2gmx" if sim_type == "proteinbox" else "charmm"
+    system: dict[str, Any] = {
+        "protein": {"resname": "LYZ", "pdb_path": str(pdb), **(protein or {})},
+        "padding": 12.0,
+    }
+    if sim_type == "protein_mixedbox":
+        system["species"] = [{"smiles": "O", "resname": "SOL", "count": 10}]
+        system["sizing"] = {"type": "fixed_box", "box_size": 72.0}
+    data: dict[str, Any] = {
+        "simulation_type": sim_type,
+        "parametrization": parametrization,
+        "system": system,
+    }
+    if config is not None:
+        data["parametrization_config"] = {"type": parametrization, **config}
+    data.update(top_level)
+    return data
