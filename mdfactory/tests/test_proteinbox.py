@@ -946,6 +946,100 @@ class TestPdbPathResolution:
         assert captured["system"]["protein"]["pdb_path"] == str(pdb.resolve())
 
 
+_VALID_PROTEINBOX_YAML = textwrap.dedent("""\
+    simulation_type: proteinbox
+    engine: gromacs
+    parametrization: pdb2gmx
+    parametrization_config:
+      type: pdb2gmx
+      forcefield: charmm36m
+      water_model: tip3p
+    system:
+      protein:
+        resname: LYZ
+        pdb_path: prot.pdb
+        chains: [A]
+      padding: 12.0
+    """)
+
+
+def _write_spec_dir(tmp_path):
+    """Create a spec dir with a PDB, plus an unrelated cwd to run from."""
+    spec_dir = tmp_path / "specs"
+    spec_dir.mkdir()
+    pdb = spec_dir / "prot.pdb"
+    pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    return spec_dir, pdb, elsewhere
+
+
+class TestRelativePdbPathAcrossEntryPoints:
+    """Every entry point must resolve a relative pdb_path the same way (same hash)."""
+
+    def test_csv_push_and_prepare_compute_identical_hashes(self, tmp_path, monkeypatch):
+        from mdfactory.cli import df_models_from_input_csv
+        from mdfactory.utils.push import load_models_from_csv
+
+        spec_dir, pdb, elsewhere = _write_spec_dir(tmp_path)
+        csv_path = spec_dir / "proteins.csv"
+        csv_path.write_text(
+            "simulation_type,engine,parametrization,parametrization_config.type,"
+            "parametrization_config.forcefield,parametrization_config.water_model,"
+            "system.protein.resname,system.protein.pdb_path,system.protein.chains,system.padding\n"
+            "proteinbox,gromacs,pdb2gmx,pdb2gmx,charmm36m,tip3p,LYZ,prot.pdb,A,12.0\n"
+        )
+        # Run from an unrelated directory so cwd-relative resolution would differ.
+        monkeypatch.chdir(elsewhere)
+
+        _, prepared, prep_errors = df_models_from_input_csv(csv_path)
+        pushed, push_errors = load_models_from_csv(csv_path)
+
+        assert prep_errors == {} and push_errors == {}
+        assert prepared[0].system.protein.pdb_path == pdb.resolve()
+        assert [m.hash for m in pushed] == [m.hash for m in prepared]
+
+    def test_yaml_with_config_or_dry_run_resolves_before_dispatch(self, tmp_path, monkeypatch):
+        import mdfactory.orchestration
+        from mdfactory.cli import _build_from_yaml
+
+        spec_dir, pdb, elsewhere = _write_spec_dir(tmp_path)
+        yaml_file = spec_dir / "build.yaml"
+        yaml_file.write_text(_VALID_PROTEINBOX_YAML)
+        monkeypatch.chdir(elsewhere)
+
+        captured = []
+        monkeypatch.setattr(
+            mdfactory.orchestration,
+            "build_systems",
+            lambda models, *args, **kwargs: captured.extend(models) or [],
+        )
+        _build_from_yaml(yaml_file, tmp_path / "out", dry_run=True)
+
+        assert len(captured) == 1
+        assert captured[0].system.protein.pdb_path == pdb.resolve()
+
+    def test_yaml_sequential_build_dir_matches_built_model_hash(self, tmp_path, monkeypatch):
+        from mdfactory import cli
+
+        spec_dir, _, elsewhere = _write_spec_dir(tmp_path)
+        yaml_file = spec_dir / "build.yaml"
+        yaml_file.write_text(_VALID_PROTEINBOX_YAML)
+        monkeypatch.chdir(elsewhere)
+
+        built = {}
+
+        def fake_run_build_from_dict(dct):
+            built["hash"] = BuildInput(**dct).hash
+            built["cwd"] = Path.cwd()
+
+        monkeypatch.setattr(workflows, "run_build_from_dict", fake_run_build_from_dict)
+        out = tmp_path / "out"
+        cli._build_from_yaml(yaml_file, out)
+
+        assert built["cwd"] == (out / built["hash"]).resolve()
+
+
 class TestCenterInCubicBox:
     def test_padding_guaranteed_on_every_face(self):
         # Asymmetric molecule: long in x, short in y/z, offset from the origin.

@@ -13,6 +13,7 @@ from .build import (
     build_proteinbox,
 )
 from .models.input import BuildInput
+from .prepare import resolve_protein_pdb_path as _resolve_proteinbox_pdb_path
 from .utils.utilities import load_yaml_file
 
 DISPATCH_BUILD = {
@@ -22,9 +23,6 @@ DISPATCH_BUILD = {
     "proteinbox": build_proteinbox,
     "protein_mixedbox": build_protein_mixedbox,
 }
-
-# Simulation types whose system carries a protein with a pdb_path to resolve.
-_PROTEIN_PDB_SIMULATION_TYPES = frozenset({"proteinbox", "protein_mixedbox"})
 
 
 def run_build_from_dict(inp_dict: dict[Any, Any] | BuildInput):
@@ -66,20 +64,3 @@ def run_build_from_file(fname: Path):
     dct = load_yaml_file(fname)
     _resolve_proteinbox_pdb_path(dct, Path(fname).parent)
     run_build_from_dict(dct)
-
-
-def _resolve_proteinbox_pdb_path(dct: Any, base_dir: Path) -> None:
-    """Rewrite a relative protein pdb_path to be absolute against base_dir.
-
-    Applies to protein-carrying system types (proteinbox and protein_mixedbox),
-    whose ``system.protein.pdb_path`` may be given relative to the YAML file.
-    """
-    if not isinstance(dct, dict) or dct.get("simulation_type") not in _PROTEIN_PDB_SIMULATION_TYPES:
-        return
-    protein = (dct.get("system") or {}).get("protein")
-    if not isinstance(protein, dict):
-        return
-    pdb_path = protein.get("pdb_path")
-    if pdb_path is None or Path(pdb_path).is_absolute():
-        return
-    protein["pdb_path"] = str((base_dir / pdb_path).resolve())

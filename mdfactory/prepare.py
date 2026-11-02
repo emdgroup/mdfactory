@@ -4,10 +4,18 @@
 
 from collections import defaultdict
 from functools import reduce
+from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
 from .models.input import BuildInput
+
+# Simulation types whose system carries a protein with a pdb_path to resolve.
+PROTEIN_PDB_SIMULATION_TYPES = frozenset({"proteinbox", "protein_mixedbox"})
+
+# CSV column holding the protein PDB path (flat, dotted notation).
+PROTEIN_PDB_PATH_COLUMN = "system.protein.pdb_path"
 
 # Protein fields that are lists/dicts and therefore optional: a CSV row may leave
 # them blank. They are excluded from the strict all-columns NaN check and dropped
@@ -138,3 +146,88 @@ def df_to_build_input_models(
         except Exception as e:
             errors[ii] = str(e)
     return ret, errors
+
+
+def resolve_protein_pdb_path(dct: Any, base_dir: Path) -> None:
+    """Rewrite a relative protein ``pdb_path`` in a build dict to be absolute.
+
+    Applies to protein-carrying system types (proteinbox and protein_mixedbox),
+    whose ``system.protein.pdb_path`` may be given relative to the input file.
+    The dict is modified in place; other system types and absolute paths are
+    left untouched.
+
+    Parameters
+    ----------
+    dct : Any
+        Raw (nested) build specification, typically loaded from YAML
+    base_dir : Path
+        Directory that relative paths are resolved against
+
+    """
+    if not isinstance(dct, dict) or dct.get("simulation_type") not in PROTEIN_PDB_SIMULATION_TYPES:
+        return
+    protein = (dct.get("system") or {}).get("protein")
+    if not isinstance(protein, dict):
+        return
+    pdb_path = protein.get("pdb_path")
+    if pdb_path is None or Path(pdb_path).is_absolute():
+        return
+    protein["pdb_path"] = str((Path(base_dir) / pdb_path).resolve())
+
+
+def resolve_csv_protein_pdb_paths(df: pd.DataFrame, base_dir: Path) -> pd.DataFrame:
+    """Resolve relative protein PDB paths in a flat build DataFrame.
+
+    Relative ``system.protein.pdb_path`` cells are made absolute against
+    ``base_dir`` (the CSV's own directory), so every consumer of the CSV derives
+    the same ``BuildInput`` and therefore the same hash. Blank cells and absolute
+    paths are kept as they are.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Flat build specification, one row per system
+    base_dir : Path
+        Directory that relative paths are resolved against
+
+    Returns
+    -------
+    pd.DataFrame
+        The DataFrame with resolved paths (modified in place and returned)
+
+    """
+    if PROTEIN_PDB_PATH_COLUMN in df.columns:
+        base_dir = Path(base_dir)
+        df[PROTEIN_PDB_PATH_COLUMN] = df[PROTEIN_PDB_PATH_COLUMN].apply(
+            lambda p: p if pd.isna(p) or Path(p).is_absolute() else str((base_dir / p).resolve())
+        )
+    return df
+
+
+def load_build_input_csv(
+    csv_path: Path,
+) -> tuple[pd.DataFrame, list[BuildInput], dict[int, str]]:
+    """Read a build CSV and validate its rows into BuildInput models.
+
+    This is the single CSV entry point shared by ``prepare-build``/``build`` and
+    ``push``/discovery, so all of them compute identical hashes for a row.
+    ``Unnamed`` index columns are dropped and relative protein PDB paths are
+    resolved against the CSV's directory.
+
+    Parameters
+    ----------
+    csv_path : Path
+        Path to the CSV file
+
+    Returns
+    -------
+    tuple[pd.DataFrame, list[BuildInput], dict[int, str]]
+        (cleaned DataFrame, valid models, {row_index: error_message} for failed rows)
+
+    """
+    csv_path = Path(csv_path)
+    df = pd.read_csv(csv_path)
+    df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
+    df = resolve_csv_protein_pdb_paths(df, csv_path.parent)
+    models, errors = df_to_build_input_models(df)
+    return df, models, errors
