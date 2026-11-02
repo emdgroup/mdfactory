@@ -178,10 +178,18 @@ def test_flatten_species_composition() -> None:
     assert result["sys_WAT_fraction"] == 0.5
 
 
-def test_extract_all_species_concentration_based_total_is_none() -> None:
-    """A concentration-based species has no count, so the total is None, not a crash."""
+@pytest.mark.parametrize(
+    ("sol_kwargs", "expected_sol", "expected_total"),
+    [
+        # A concentration-based species has no count, so the total is None, not a crash.
+        ({"concentration": 55.0}, None, None),
+        # When every species has a count, the total is their sum.
+        ({"count": 10000}, 10000, 10200),
+    ],
+)
+def test_extract_all_species_total_molecule_count(sol_kwargs, expected_sol, expected_total) -> None:
     species = [
-        SolutionSpecies(smiles="O", resname="SOL", concentration=55.0),
+        SolutionSpecies(smiles="O", resname="SOL", **sol_kwargs),
         SolutionSpecies(smiles="CCO", resname="ETH", count=200),
     ]
     build_input = SimpleNamespace(
@@ -191,26 +199,10 @@ def test_extract_all_species_concentration_based_total_is_none() -> None:
 
     result = extract_all_species(build_input)
 
-    assert result["SOL_count"] is None
+    assert result["SOL_count"] == expected_sol
     assert result["ETH_count"] == 200
     assert result["total_species_count"] == 2
-    assert result["total_molecule_count"] is None
-
-
-def test_extract_all_species_count_based_total_sums() -> None:
-    """When every species has a count, the total is their sum."""
-    species = [
-        SolutionSpecies(smiles="O", resname="SOL", count=10000),
-        SolutionSpecies(smiles="CCO", resname="ETH", count=200),
-    ]
-    build_input = SimpleNamespace(
-        simulation_type="protein_mixedbox",
-        system=SimpleNamespace(species=species),
-    )
-
-    result = extract_all_species(build_input)
-
-    assert result["total_molecule_count"] == 10200
+    assert result["total_molecule_count"] == expected_total
 
 
 def test_flatten_system_parameters() -> None:

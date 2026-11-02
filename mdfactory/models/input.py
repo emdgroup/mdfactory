@@ -218,14 +218,13 @@ class BuildInput(BaseModel):
     def set_default_parametrization_config(self) -> "BuildInput":
         """Set default config based on parametrization type if not provided."""
         if self.parametrization_config is None:
-            if self.parametrization == "smirnoff":
-                object.__setattr__(self, "parametrization_config", SmirnoffConfig())
-            elif self.parametrization == "cgenff":
-                object.__setattr__(self, "parametrization_config", CgenffConfig())
-            elif self.parametrization == "pdb2gmx":
-                object.__setattr__(self, "parametrization_config", Pdb2gmxConfig())
-            elif self.parametrization == "charmm":
-                object.__setattr__(self, "parametrization_config", CharmmConfig())
+            config_class = {
+                "smirnoff": SmirnoffConfig,
+                "cgenff": CgenffConfig,
+                "pdb2gmx": Pdb2gmxConfig,
+                "charmm": CharmmConfig,
+            }[self.parametrization]
+            object.__setattr__(self, "parametrization_config", config_class())
         return self
 
     @model_validator(mode="after")

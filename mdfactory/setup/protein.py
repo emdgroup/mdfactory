@@ -4,16 +4,20 @@
 
 import hashlib
 import io
+import itertools
+import math
 import re
 import shutil
 import subprocess
 import tarfile
+from collections.abc import Callable
 from pathlib import Path
 from urllib.request import urlopen
 
 from loguru import logger
 
 from ..models.parametrization import GromacsProteinParameterSet, Pdb2gmxConfig
+from ..settings import settings
 
 _DISULFIDE_CUTOFF_ANGSTROM = 2.2
 _CYSTEINE_RESNAMES = {"CYS", "CYM", "CYX"}
@@ -23,29 +27,13 @@ FORCEFIELD_REGISTRY: dict[str, dict[str, str]] = {
         "url": "https://mackerell.umaryland.edu/download.php?filename=CHARMM_ff_params_files/charmm36-feb2026_cgenff-5.0.ff.tgz",
         "dirname": "charmm36-feb2026_cgenff-5.0.ff",
         "sha256": "c2b0c70e21cced150528ee25d205e5bd3367a5e55e85c2ff0403911980528151",
-        "description": "CHARMM36m protein + CGenFF 5.0 (Feb 2026)",
     },
     "charmm36m-ljpme": {
         "url": "https://mackerell.umaryland.edu/download.php?filename=CHARMM_ff_params_files/charmm36-feb2026_ljpme_cgenff-5.0.ff.tgz",
         "dirname": "charmm36-feb2026_ljpme_cgenff-5.0.ff",
         "sha256": "b2221dcba73066b6b5c30a52b9894216d03ea6c3e68206d9ce43857dd8116c21",
-        "description": "CHARMM36m + CGenFF 5.0, LJ-PME variant (Feb 2026)",
     },
 }
-
-
-def get_forcefield_dir() -> Path:
-    """Return the directory where downloaded force fields are stored."""
-    from ..settings import settings  # noqa: PLC0415
-
-    return settings.gromacs_forcefield_dir
-
-
-def get_gromacs_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
-    """Return an environment with configured GROMACS force fields on GMXLIB."""
-    from ..settings import settings  # noqa: PLC0415
-
-    return settings.gromacs_env(base_env)
 
 
 # AMBER-style protonation residue names mapped to their CHARMM equivalents.
@@ -90,11 +78,12 @@ def _override_matches_residue(resname_prefix: str, current_resname: str) -> bool
     return resname_prefix in _HISTIDINE_RESNAMES and current_resname in _HISTIDINE_RESNAMES
 
 
-def _distance(coords_a: tuple[float, float, float], coords_b: tuple[float, float, float]) -> float:
-    return sum((a - b) ** 2 for a, b in zip(coords_a, coords_b, strict=True)) ** 0.5
-
-
 _ResidueKey = tuple[str, int, str]
+
+
+def _pdb_residue_key(line: str) -> _ResidueKey:
+    """Return the (chain, resid, insertion code) key of a PDB ATOM/HETATM line."""
+    return (line[21].strip(), int(line[22:26]), line[26].strip())
 
 
 def _parse_residue_reference(reference: str) -> tuple[str | None, str, int, str]:
@@ -136,15 +125,12 @@ def _read_cysteine_sg_atoms(pdb_path: Path) -> dict[_ResidueKey, tuple[float, fl
             if atom_name != "SG" or resname not in _CYSTEINE_RESNAMES:
                 continue
 
-            chain = line[21].strip()
-            resid = int(line[22:26].strip())
-            insertion_code = line[26].strip()
+            key = _pdb_residue_key(line)
             coords = (
                 float(line[30:38].strip()),
                 float(line[38:46].strip()),
                 float(line[46:54].strip()),
             )
-            key = (chain, resid, insertion_code)
             if key in atoms:
                 raise ValueError(
                     "Multiple cysteine SG atoms share the residue identifier "
@@ -155,40 +141,52 @@ def _read_cysteine_sg_atoms(pdb_path: Path) -> dict[_ResidueKey, tuple[float, fl
     return atoms
 
 
+def _unique_residue_match(
+    label: str,
+    reference: str,
+    residues: dict[_ResidueKey, str],
+    not_found: str,
+    accepts: Callable[[str], bool] = lambda _name: True,
+) -> _ResidueKey:
+    """Return the single residue key matching a parsed reference, else raise ValueError."""
+    chain, _, resid, insertion_code = _parse_residue_reference(reference)
+    candidates = {
+        key: name
+        for key, name in residues.items()
+        if key[1] == resid
+        and (chain is None or key[0] == chain)
+        and key[2] == insertion_code
+        and accepts(name)
+    }
+    if not candidates:
+        raise ValueError(not_found)
+    if len(candidates) > 1:
+        choices = sorted(_format_residue_key(key, name) for key, name in candidates.items())
+        raise ValueError(
+            f"{label} '{reference}' is ambiguous across chains or insertion codes. "
+            f"Use one of these fully qualified references: {choices}."
+        )
+    return next(iter(candidates))
+
+
 def _resolve_cysteine_reference(
     reference: str,
     sg_atoms: dict[_ResidueKey, tuple[float, float, float]],
     pdb_path: Path,
 ) -> _ResidueKey:
-    """Resolve a cysteine reference to a concrete PDB residue key.
-
-    References without a chain are accepted only when they identify exactly one
-    cysteine. An omitted insertion code means the residue has no insertion code.
-    """
-    chain, resname, resid, insertion_code = _parse_residue_reference(reference)
+    """Resolve a cysteine reference (chain optional) to a unique PDB residue key."""
+    label = "Disulfide residue reference"
+    resname = _parse_residue_reference(reference)[1]
     if resname not in _CYSTEINE_RESNAMES:
         raise ValueError(
-            f"Disulfide residue reference '{reference}' must be a cysteine "
-            f"(one of {sorted(_CYSTEINE_RESNAMES)})."
+            f"{label} '{reference}' must be a cysteine (one of {sorted(_CYSTEINE_RESNAMES)})."
         )
-
-    not_found = (
-        f"Disulfide residue reference '{reference}' is not a cysteine SG atom in {pdb_path}."
+    return _unique_residue_match(
+        label,
+        reference,
+        dict.fromkeys(sg_atoms, resname),
+        f"{label} '{reference}' is not a cysteine SG atom in {pdb_path}.",
     )
-    candidates = [
-        key
-        for key in sg_atoms
-        if key[1] == resid and (chain is None or key[0] == chain) and key[2] == insertion_code
-    ]
-    if not candidates:
-        raise ValueError(not_found)
-    if len(candidates) > 1:
-        choices = sorted(_format_residue_key(key, resname) for key in candidates)
-        raise ValueError(
-            f"Disulfide residue reference '{reference}' is ambiguous across chains or "
-            f"insertion codes. Use one of these fully qualified references: {choices}."
-        )
-    return candidates[0]
 
 
 def _build_disulfide_prompt_input(
@@ -209,12 +207,11 @@ def _build_disulfide_prompt_input(
 
     # pdb2gmx presents -ss prompts in PDB atom encounter order. Do not sort these
     # keys: doing so can attach each y/n answer to a different chain's prompt.
-    candidate_pairs: list[tuple[_ResidueKey, _ResidueKey]] = []
-    keys = list(sg_atoms)
-    for i, key_a in enumerate(keys):
-        for key_b in keys[i + 1 :]:
-            if _distance(sg_atoms[key_a], sg_atoms[key_b]) <= cutoff_angstrom:
-                candidate_pairs.append((key_a, key_b))
+    candidate_pairs = [
+        (key_a, key_b)
+        for key_a, key_b in itertools.combinations(sg_atoms, 2)
+        if math.dist(sg_atoms[key_a], sg_atoms[key_b]) <= cutoff_angstrom
+    ]
 
     candidate_identities = {frozenset(pair) for pair in candidate_pairs}
     missing_pairs = requested - candidate_identities
@@ -241,10 +238,9 @@ def _read_pdb_residues(pdb_path: Path) -> dict[_ResidueKey, str]:
             if not line.startswith(("ATOM", "HETATM")) or len(line) < 27:
                 continue
             try:
-                resid = int(line[22:26].strip())
+                key = _pdb_residue_key(line)
             except ValueError:
                 continue
-            key = (line[21].strip(), resid, line[26].strip())
             resname = line[17:20].strip()
             previous = residues.setdefault(key, resname)
             if previous != resname:
@@ -257,31 +253,17 @@ def _read_pdb_residues(pdb_path: Path) -> dict[_ResidueKey, str]:
 
 def _resolve_protonation_reference(
     reference: str, residues: dict[_ResidueKey, str], pdb_path: Path
-) -> tuple[_ResidueKey, str]:
+) -> _ResidueKey:
     """Resolve a protonation reference to one physical PDB residue."""
-    chain, resname_prefix, resid, insertion_code = _parse_residue_reference(reference)
-    candidates = [
-        (key, current_resname)
-        for key, current_resname in residues.items()
-        if key[1] == resid
-        and (chain is None or key[0] == chain)
-        and key[2] == insertion_code
-        and _override_matches_residue(resname_prefix, current_resname)
-    ]
-    if not candidates:
-        raise ValueError(
-            f"Protonation state override '{reference}' matched no residue in {pdb_path}. "
-            "Check the residue number, insertion code, chain, and name against the input PDB."
-        )
-    if len(candidates) > 1:
-        choices = sorted(
-            _format_residue_key(key, current_resname) for key, current_resname in candidates
-        )
-        raise ValueError(
-            f"Protonation state override '{reference}' is ambiguous across chains or "
-            f"insertion codes. Use one of these fully qualified references: {choices}."
-        )
-    return candidates[0]
+    resname_prefix = _parse_residue_reference(reference)[1]
+    return _unique_residue_match(
+        "Protonation state override",
+        reference,
+        residues,
+        f"Protonation state override '{reference}' matched no residue in {pdb_path}. "
+        "Check the residue number, insertion code, chain, and name against the input PDB.",
+        accepts=lambda name: _override_matches_residue(resname_prefix, name),
+    )
 
 
 def _apply_protonation_states(
@@ -290,43 +272,19 @@ def _apply_protonation_states(
     output_dir: Path,
     forcefield: str | None = None,
 ) -> Path:
-    """Apply protonation state overrides by renaming residues in the PDB.
+    """Rename residues in the PDB so pdb2gmx applies the requested protonation states.
 
-    pdb2gmx selects protonation states based on residue names. This function renames
-    matching residues in the PDB so pdb2gmx applies the requested 3-character residue
-    names without interactive prompts. AMBER-style names are translated to CHARMM
-    names when a CHARMM force field is selected (e.g. HIE -> HSE). Histidine tautomers
-    are matched as a family, so a "HIS<n>" override still applies when the residue is
-    already named HID/HSE/etc. An override that matches no residue raises rather than
-    being silently dropped.
-
-    Parameters
-    ----------
-    pdb_path : Path
-        Input PDB file (absolute path).
-    protonation_states : dict[str, str]
-        Mapping of "RESNAME<resid>" (or chain-qualified "CHAIN:RESNAME<resid>")
-        to target residue name, e.g. {"HIS15": "HIE"} or {"A:HIS15": "HIE"}. An
-        unqualified key that matches the residue in more than one chain is
-        rejected as ambiguous. For CHARMM only 3-character states are
-        expressible (histidine tautomers, neutral lysine).
-    output_dir : Path
-        Directory for the modified PDB.
-    forcefield : str | None
-        Selected pdb2gmx force field, used for force-field-specific aliases.
-
-    Returns
-    -------
-    Path
-        Path to the modified PDB file.
-
+    ``protonation_states`` maps ``RESNAME<resid>`` (or ``CHAIN:RESNAME<resid>``) to a
+    3-character target name; AMBER names are translated for CHARMM force fields.
+    Overrides that match no residue, or resolve to the same residue, raise ValueError.
+    Returns the path to the modified PDB in ``output_dir``.
     """
     output_pdb = output_dir / "protonation_adjusted.pdb"
 
     residues = _read_pdb_residues(pdb_path)
     resolved_overrides: dict[_ResidueKey, tuple[str, str]] = {}
     for reference, new_name in protonation_states.items():
-        residue_key, _ = _resolve_protonation_reference(reference, residues, pdb_path)
+        residue_key = _resolve_protonation_reference(reference, residues, pdb_path)
         target_name = _resolve_protonation_residue_name(new_name, forcefield)
         if residue_key in resolved_overrides:
             previous_reference = resolved_overrides[residue_key][0]
@@ -338,23 +296,15 @@ def _apply_protonation_states(
 
     with open(pdb_path) as f_in, open(output_pdb, "w") as f_out:
         for line in f_in:
-            output_line = line
-            if output_line.startswith(("ATOM", "HETATM")) and len(output_line) >= 27:
+            if line.startswith(("ATOM", "HETATM")) and len(line) >= 27:
                 try:
-                    current_resid = int(output_line[22:26].strip())
+                    override = resolved_overrides.get(_pdb_residue_key(line))
                 except ValueError:
-                    f_out.write(output_line)
-                    continue
-                residue_key = (
-                    output_line[21].strip(),
-                    current_resid,
-                    output_line[26].strip(),
-                )
-                override = resolved_overrides.get(residue_key)
+                    override = None
                 if override is not None:
-                    new_name = override[1]
-                    output_line = output_line[:17] + f"{new_name:<3s}" + output_line[20:]
-            f_out.write(output_line)
+                    f_out.write(line[:17] + f"{override[1]:<3s}" + line[20:])
+                    continue
+            f_out.write(line)
 
     logger.info(f"Protonation states applied: {protonation_states}")
     return output_pdb
@@ -376,8 +326,6 @@ def check_gmx_available() -> Path:
         If gmx is not found.
 
     """
-    from ..settings import settings  # noqa: PLC0415
-
     configured = settings.gromacs_gmx_path
     if configured is not None:
         if configured.is_file():
@@ -423,7 +371,7 @@ def download_forcefield(name: str) -> Path:
         )
 
     entry = FORCEFIELD_REGISTRY[name]
-    ff_dir = get_forcefield_dir()
+    ff_dir = settings.gromacs_forcefield_dir
     ff_dir.mkdir(parents=True, exist_ok=True)
 
     target = ff_dir / entry["dirname"]
@@ -463,10 +411,7 @@ def download_forcefield(name: str) -> Path:
 
 def download_all_forcefields() -> list[Path]:
     """Download all force fields in the registry. Idempotent."""
-    paths = []
-    for name in FORCEFIELD_REGISTRY:
-        paths.append(download_forcefield(name))
-    return paths
+    return [download_forcefield(name) for name in FORCEFIELD_REGISTRY]
 
 
 def _get_gmx_search_paths() -> list[Path]:
@@ -489,7 +434,7 @@ def _get_gmx_search_paths() -> list[Path]:
                 search_paths.append(top_dir)
             break
 
-    gmxlib = get_gromacs_env().get("GMXLIB", "")
+    gmxlib = settings.gromacs_env().get("GMXLIB", "")
     for p in gmxlib.split(":"):
         if p and Path(p).is_dir():
             search_paths.append(Path(p))
@@ -610,18 +555,27 @@ def _parse_protein_molecule_names(top_path: Path) -> list[str]:
     return names
 
 
-def _collect_topology_include_files(output_dir: Path) -> list[Path]:
-    """Return the local .itp files a pdb2gmx topology includes alongside topol.top.
-
-    Covers per-chain moleculetype files (``topol_Protein_chain_*.itp``) and position
-    restraint files (``posre*.itp``); for a single-chain build this is just
-    ``posre.itp``. Force-field library includes live inside the bundled .ff directory
-    and are handled separately.
-    """
-    includes: list[Path] = []
-    for pattern in ("topol_Protein_chain_*.itp", "posre*.itp"):
-        includes.extend(sorted(output_dir.glob(pattern)))
-    return includes
+def _run_gmx(
+    name: str, cmd: list[str], cwd: Path, stdin: str, timeout: int
+) -> subprocess.CompletedProcess:
+    """Run a gmx command with the configured force-field environment; raise on failure."""
+    result = subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        text=True,
+        input=stdin,
+        capture_output=True,
+        timeout=timeout,
+        env=settings.gromacs_env(),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gmx {name} failed (exit code {result.returncode}).\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    return result
 
 
 def run_pdb2gmx(
@@ -713,23 +667,7 @@ def run_pdb2gmx(
 
     logger.info(f"Running pdb2gmx: {' '.join(cmd)}")
 
-    result = subprocess.run(
-        cmd,
-        cwd=str(output_dir),
-        text=True,
-        input=pdb2gmx_input,
-        capture_output=True,
-        timeout=120,
-        env=get_gromacs_env(),
-        check=False,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"gmx pdb2gmx failed (exit code {result.returncode}).\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
+    result = _run_gmx("pdb2gmx", cmd, output_dir, pdb2gmx_input, timeout=120)
 
     logger.info("pdb2gmx completed successfully.")
 
@@ -767,7 +705,13 @@ def run_pdb2gmx(
             "none were declared. List each subunit explicitly via protein.chains."
         )
 
-    include_files = _collect_topology_include_files(output_dir)
+    # Local includes: per-chain moleculetype files and position restraints. Force-field
+    # includes live in the bundled .ff directory and are handled separately.
+    include_files = [
+        path
+        for pattern in ("topol_Protein_chain_*.itp", "posre*.itp")
+        for path in sorted(output_dir.glob(pattern))
+    ]
 
     total_charge = extract_charge_from_topology(topology_file)
     logger.info(f"Protein net charge from topology: {total_charge}")
@@ -783,146 +727,42 @@ def run_pdb2gmx(
     )
 
 
-def extract_charge_from_topology(top_path: Path) -> int:
-    """Parse the topology file to determine the net system charge.
+def _sum_atoms_column(path: Path, column: int, follow_includes: bool = True) -> float:
+    """Sum a 0-based ``[ atoms ]`` column over a topology and its local includes.
 
-    Reads the [ atoms ] section(s) and sums the charge column.
-
-    Parameters
-    ----------
-    top_path : Path
-        Path to the GROMACS .top file.
-
-    Returns
-    -------
-    int
-        Net formal charge (rounded to nearest integer).
-
+    Local ``#include`` files (protein chains, position restraints) are followed one
+    level; force-field library includes (``.ff/``) are skipped.
     """
-    total_charge = 0.0
-    in_atoms = False
-
-    with open(top_path) as f:
-        for line in f:
-            stripped = line.strip()
-
-            if stripped.startswith("#include"):
-                # Follow includes only for local itp files (protein chains,
-                # position restraints), not force field library files
-                include_path = stripped.split('"')[1] if '"' in stripped else None
-                if include_path and ".ff/" not in include_path:
-                    itp_path = top_path.parent / include_path
-                    if itp_path.is_file():
-                        total_charge += _sum_charges_from_itp(itp_path)
-                continue
-
-            if stripped.startswith("["):
-                section = stripped.strip("[] ").lower()
-                in_atoms = section == "atoms"
-                continue
-
-            if in_atoms and stripped and not stripped.startswith(";"):
-                parts = stripped.split()
-                if len(parts) >= 7:
-                    try:
-                        total_charge += float(parts[6])
-                    except (ValueError, IndexError):
-                        pass
-
-    return round(total_charge)
-
-
-def _sum_charges_from_itp(itp_path: Path) -> float:
-    """Sum charges from the [ atoms ] section of an .itp file."""
     total = 0.0
     in_atoms = False
-
-    with open(itp_path) as f:
-        for line in f:
-            stripped = line.strip()
-            if stripped.startswith("["):
-                section = stripped.strip("[] ").lower()
-                in_atoms = section == "atoms"
-                continue
-            if in_atoms and stripped and not stripped.startswith(";"):
-                parts = stripped.split()
-                if len(parts) >= 7:
-                    try:
-                        total += float(parts[6])
-                    except (ValueError, IndexError):
-                        pass
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#include"):
+            include = stripped.split('"')[1] if '"' in stripped else None
+            if follow_includes and include and ".ff/" not in include:
+                itp_path = path.parent / include
+                if itp_path.is_file():
+                    total += _sum_atoms_column(itp_path, column, follow_includes=False)
+        elif stripped.startswith("["):
+            in_atoms = stripped.strip("[] ").lower() == "atoms"
+        elif in_atoms and stripped and not stripped.startswith(";"):
+            parts = stripped.split()
+            if len(parts) > column:
+                try:
+                    total += float(parts[column])
+                except ValueError:
+                    pass
     return total
+
+
+def extract_charge_from_topology(top_path: Path) -> int:
+    """Return the net charge (rounded to an integer) from a topology's ``[ atoms ]`` sections."""
+    return round(_sum_atoms_column(top_path, 6))
 
 
 def extract_mass_from_topology(top_path: Path) -> float:
-    """Parse the topology file to determine the total protein mass in Daltons.
-
-    Reads the [ atoms ] section(s) and sums the mass column (the eighth field),
-    following local ``#include`` files (protein chains) but not force-field
-    library files.
-
-    Parameters
-    ----------
-    top_path : Path
-        Path to the GROMACS .top file.
-
-    Returns
-    -------
-    float
-        Total mass in Daltons.
-
-    """
-    total_mass = 0.0
-    in_atoms = False
-
-    with open(top_path) as f:
-        for line in f:
-            stripped = line.strip()
-
-            if stripped.startswith("#include"):
-                include_path = stripped.split('"')[1] if '"' in stripped else None
-                if include_path and ".ff/" not in include_path:
-                    itp_path = top_path.parent / include_path
-                    if itp_path.is_file():
-                        total_mass += _sum_masses_from_itp(itp_path)
-                continue
-
-            if stripped.startswith("["):
-                section = stripped.strip("[] ").lower()
-                in_atoms = section == "atoms"
-                continue
-
-            if in_atoms and stripped and not stripped.startswith(";"):
-                parts = stripped.split()
-                if len(parts) >= 8:
-                    try:
-                        total_mass += float(parts[7])
-                    except (ValueError, IndexError):
-                        pass
-
-    return total_mass
-
-
-def _sum_masses_from_itp(itp_path: Path) -> float:
-    """Sum masses from the [ atoms ] section of an .itp file."""
-    total = 0.0
-    in_atoms = False
-
-    with open(itp_path) as f:
-        for line in f:
-            stripped = line.strip()
-            if stripped.startswith("["):
-                section = stripped.strip("[] ").lower()
-                in_atoms = section == "atoms"
-                continue
-            if in_atoms and stripped and not stripped.startswith(";"):
-                parts = stripped.split()
-                if len(parts) >= 8:
-                    try:
-                        total += float(parts[7])
-                    except (ValueError, IndexError):
-                        pass
-    return total
+    """Return the total mass in Daltons from a topology's ``[ atoms ]`` sections."""
+    return _sum_atoms_column(top_path, 7)
 
 
 def update_topology_molecules(
@@ -1083,49 +923,27 @@ def validate_with_grompp(
     gmx_bin = str(check_gmx_available())
     tpr_out = cwd / "check.tpr"
 
-    def run_grompp(maxwarn: int) -> subprocess.CompletedProcess:
-        cmd = [
-            gmx_bin,
-            "grompp",
-            "-f",
-            str(mdp),
-            "-c",
-            str(structure),
-            "-p",
-            str(topology),
-            "-o",
-            str(tpr_out),
-            "-maxwarn",
-            str(maxwarn),
-        ]
-        return subprocess.run(
-            cmd,
-            cwd=str(cwd),
-            text=True,
-            input="",
-            capture_output=True,
-            timeout=60,
-            env=get_gromacs_env(),
-            check=False,
-        )
-
+    cmd = [
+        gmx_bin,
+        "grompp",
+        "-f",
+        str(mdp),
+        "-c",
+        str(structure),
+        "-p",
+        str(topology),
+        "-o",
+        str(tpr_out),
+        "-maxwarn",
+        str(1 if allow_net_charge else 0),
+    ]
     # A single grompp call: gmx_mpi aborts through MPI on failure, which can take
     # down an enclosing srun step, so never rely on a failing first attempt.
-    result = run_grompp(1 if allow_net_charge else 0)
-
-    # Clean up grompp artifacts
-    if tpr_out.is_file():
-        tpr_out.unlink()
-    mdout_path = cwd / "mdout.mdp"
-    if mdout_path.is_file():
-        mdout_path.unlink()
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"gmx grompp validation failed (exit code {result.returncode}).\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
+    try:
+        result = _run_gmx("grompp validation", cmd, cwd, "", timeout=60)
+    finally:
+        tpr_out.unlink(missing_ok=True)
+        (cwd / "mdout.mdp").unlink(missing_ok=True)
 
     if allow_net_charge:
         grompp_warnings = _grompp_warnings(result.stdout + result.stderr)

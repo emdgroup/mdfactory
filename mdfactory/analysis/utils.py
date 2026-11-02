@@ -2,6 +2,7 @@
 # ABOUTME: Provides simulation path scanning and species composition flattening
 """Shared analysis utilities for simulation discovery and metadata extraction."""
 
+import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -438,8 +439,6 @@ def system_chemistry(simulation, **kwargs) -> pd.DataFrame:
     if build_metadata_path is not None:
         build_metadata_path = Path(build_metadata_path) / "build_metadata.json"
         if build_metadata_path.is_file():
-            import json  # noqa: PLC0415
-
             build_metadata = json.loads(build_metadata_path.read_text())
             achieved_species = build_metadata.get("species", [])
     rows = []

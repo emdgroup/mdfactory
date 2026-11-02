@@ -6,6 +6,7 @@ import os
 import subprocess
 import warnings
 from collections import defaultdict
+from collections.abc import Collection
 from itertools import groupby
 from pathlib import Path
 
@@ -574,32 +575,18 @@ def read_itp_atoms(itp_path: Path) -> list[tuple[str, float]]:
     return atoms
 
 
-def collect_forcefield_atomtypes(ff_dir: str | Path) -> set[str]:
-    """Return the atom type names defined by a bundled GROMACS force-field directory.
+def validate_cgenff_atomtype_compatibility(
+    prm_files: list[str | Path],
+    ff_dir: str | Path,
+    forcefield_types: dict[str, tuple[str, ...]] | None = None,
+) -> None:
+    """Reject CGenFF atom types that conflict with the selected CHARMM bundle.
 
-    Scans every ``.itp`` file in ``ff_dir`` for ``[ atomtypes ]`` sections and
-    collects the first column (the type name) of each data line. Used to
-    deduplicate CGenFF small-molecule parameters against a CHARMM force field
-    that already bundles CGenFF, so a redefined atom type does not fail
-    ``grompp -maxwarn 0``.
-
-    Parameters
-    ----------
-    ff_dir : str or Path
-        Path to a bundled GROMACS ``.ff`` directory.
-
-    Returns
-    -------
-    set[str]
-        Atom type names defined anywhere in the force field.
-
+    *forcefield_types* may pass the already-parsed result of
+    :func:`collect_forcefield_atomtype_definitions` to avoid re-reading *ff_dir*.
     """
-    return set(collect_forcefield_atomtype_definitions(ff_dir))
-
-
-def validate_cgenff_atomtype_compatibility(prm_files: list[str | Path], ff_dir: str | Path) -> None:
-    """Reject CGenFF atom types that conflict with the selected CHARMM bundle."""
-    forcefield_types = collect_forcefield_atomtype_definitions(ff_dir)
+    if forcefield_types is None:
+        forcefield_types = collect_forcefield_atomtype_definitions(ff_dir)
     for prm in prm_files:
         *_, sections = extract_reusable_parts_from_cgenff_gmx_top(prm, must_have_moleculetype=False)
         for section_name, section_text in sections:
@@ -624,7 +611,7 @@ def validate_cgenff_atomtype_compatibility(prm_files: list[str | Path], ff_dir: 
 
 def merge_extra_parameter_itps(
     prm_files: list[str | Path],
-    exclude_atomtypes: set[str] | None = None,
+    exclude_atomtypes: Collection[str] | None = None,
     drop_defaults: bool = False,
 ):
     """Merge parameter sections from multiple CGenFF topology files.
@@ -636,7 +623,7 @@ def merge_extra_parameter_itps(
     ----------
     prm_files : list of str or Path
         Paths to GROMACS topology files containing parameter sections.
-    exclude_atomtypes : set[str] or None, optional
+    exclude_atomtypes : collection of str or None, optional
         Atom type names to drop from the merged ``[ atomtypes ]`` section
         because a bundled force field already defines them. The section header
         is kept. Default is None (keep all atom types).

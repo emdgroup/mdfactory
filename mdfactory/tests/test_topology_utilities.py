@@ -27,13 +27,6 @@ cgenff_available = cgenff_dir.exists() and (cgenff_dir / "cgenff" / "cgenff_batc
 MOL2_REFERENCES = Path(__file__).parent / "testfiles" / "mol2_references.json"
 
 
-def test_atomtype_signature_ignores_inline_comment():
-    """A trailing ';' comment does not change the physical-parameter signature."""
-    plain = "CG331 6 12.011 0.0 A 0.36 0.28"
-    commented = "CG331 6 12.011 0.0 A 0.36 0.28 ; sp3 carbon"
-    assert _atomtype_signature(commented) == _atomtype_signature(plain)
-
-
 def test_cgenff_atomtype_compatibility_ignores_inline_comment(tmp_path):
     """Matching atom types with a trailing comment on one side are still compatible."""
     ff_dir = tmp_path / "charmm36m.ff"

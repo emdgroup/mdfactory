@@ -4,9 +4,11 @@
 
 import hashlib
 import io
+import shutil
 import tarfile
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import MDAnalysis as mda
 import numpy as np
@@ -15,15 +17,16 @@ import yaml
 
 from mdfactory import workflows
 from mdfactory.build import _center_in_cubic_box, _ion_counts
-from mdfactory.models.composition import ProteinBoxComposition
+from mdfactory.models.composition import ProteinBoxComposition, ProteinMixedBoxComposition
 from mdfactory.models.input import BuildInput
-from mdfactory.models.parametrization import Pdb2gmxConfig
+from mdfactory.models.parametrization import CharmmConfig, Pdb2gmxConfig
 from mdfactory.models.species import ProteinSpecies, SingleMoleculeSpecies
+from mdfactory.prepare import resolve_protein_pdb_path
 from mdfactory.setup import protein
 from mdfactory.setup.protein import (
     _apply_protonation_states,
     _build_disulfide_prompt_input,
-    _sum_charges_from_itp,
+    _sum_atoms_column,
     bundle_forcefield_into_topology,
     check_forcefield_available,
     clean_pdb,
@@ -31,45 +34,73 @@ from mdfactory.setup.protein import (
     run_pdb2gmx,
     update_topology_molecules,
 )
-from mdfactory.workflows import _resolve_proteinbox_pdb_path
+
+from .conftest import protein_input_data
+
+PROTEIN_SIM_TYPES = ["proteinbox", "protein_mixedbox"]
+CONFIG_CLASSES = {"proteinbox": Pdb2gmxConfig, "protein_mixedbox": CharmmConfig}
+COMPOSITION_CLASSES = {
+    "proteinbox": ProteinBoxComposition,
+    "protein_mixedbox": ProteinMixedBoxComposition,
+}
 
 
-def _pdb_atom(serial, atom_name, resname, resid, x, y, z, chain="A", insertion_code=""):
+def _pdb_atom(serial, atom_name, resname, resid, chain="A", x=0.0, insertion_code=""):
     return (
         f"ATOM  {serial:5d} {atom_name:<4s} {resname:>3s} "
         f"{chain:1s}{resid:4d}{insertion_code:1s}   "
-        f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00\n"
+        f"{x:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00\n"
     )
 
 
-def _patch_pdb2gmx_env(monkeypatch):
-    """Stub the gmx binary, force-field, and environment lookups for run_pdb2gmx."""
-    monkeypatch.setattr("mdfactory.setup.protein.check_gmx_available", lambda: Path("/mock/gmx"))
-    monkeypatch.setattr("mdfactory.setup.protein.check_forcefield_available", lambda ff: None)
-    monkeypatch.setattr(
-        "mdfactory.setup.protein.get_gromacs_env", lambda: {"GMXLIB": "/mock/forcefields"}
-    )
+def _write_pdb(tmp_path, *atoms, atom_name="N"):
+    """Write input.pdb from ``(resname, resid[, chain, x, insertion_code])`` atom tuples."""
+    pdb = tmp_path / "input.pdb"
+    pdb.write_text("".join(_pdb_atom(i, atom_name, *a) for i, a in enumerate(atoms, 1)))
+    return pdb
 
 
-def _make_pdb2gmx_run(molecule_names, extra_files=()):
-    """Build a fake subprocess.run writing a topology listing the given molecules."""
+def _patch_pdb2gmx(monkeypatch, molecule_names, extra_files=(), calls=None):
+    """Stub gmx, force-field and environment lookups and fake the pdb2gmx subprocess.
+
+    The fake writes a topology listing *molecule_names* (plus any *extra_files*) and,
+    when *calls* is a dict, records the invocation in it.
+    """
 
     def fake_run(cmd, cwd, text, input, capture_output, timeout, env=None, check=None):
+        if calls is not None:
+            calls.update(cmd=cmd, cwd=cwd, input=input, env=env, check=check)
         output_dir = Path(cwd)
         (output_dir / "processed.gro").write_text("mock gro\n")
         molecules = "".join(f"{name} 1\n" for name in molecule_names)
         (output_dir / "topol.top").write_text(f"[ molecules ]\n{molecules}")
         for name in extra_files:
             (output_dir / name).write_text(f"; {name}\n")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-        class Result:
-            returncode = 0
-            stdout = ""
-            stderr = ""
+    monkeypatch.setattr("mdfactory.setup.protein.subprocess.run", fake_run)
+    monkeypatch.setattr("mdfactory.setup.protein.check_gmx_available", lambda: Path("/mock/gmx"))
+    monkeypatch.setattr("mdfactory.setup.protein.check_forcefield_available", lambda ff: None)
+    monkeypatch.setattr(
+        protein.settings, "gromacs_env", lambda base_env=None: {"GMXLIB": "/mock/forcefields"}
+    )
 
-        return Result()
 
-    return fake_run
+def _run(tmp_path, pdb, **kwargs):
+    """Call run_pdb2gmx with default (empty) disulfide/protonation arguments."""
+    kwargs.setdefault("config", Pdb2gmxConfig(forcefield="charmm36m", water_model="tip3p"))
+    kwargs.setdefault("disulfide_bonds", [])
+    kwargs.setdefault("protonation_states", {})
+    kwargs.setdefault("output_dir", tmp_path / "out")
+    return run_pdb2gmx(pdb_path=pdb, **kwargs)
+
+
+@pytest.fixture
+def gmx_search_paths(monkeypatch):
+    """Patch the GROMACS force-field search path; tests append directories to the list."""
+    paths = []
+    monkeypatch.setattr("mdfactory.setup.protein._get_gmx_search_paths", lambda: paths)
+    return paths
 
 
 def _make_ff_tarball(dirname):
@@ -92,148 +123,87 @@ class _FakeResponse:
 
 
 class TestProteinSpecies:
-    def test_basic_creation(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        spec = ProteinSpecies(resname="LYZ", pdb_path=pdb)
-        assert spec.resname == "LYZ"
-        assert spec.count == 1
-        assert spec.fraction == 1.0
-
-    def test_with_disulfides_and_protonation(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+    def test_creation_with_optional_fields(self, protein_pdb):
         spec = ProteinSpecies(
             resname="LYZ",
-            pdb_path=pdb,
+            pdb_path=protein_pdb,
             disulfide_bonds=[("CYS6", "CYS127"), ("CYS30", "CYS115")],
             protonation_states={"HIS15": "HIE", "GLU35": "GLH"},
+            chains=["H", "L", "Y"],
         )
-        assert len(spec.disulfide_bonds) == 2
-        assert spec.disulfide_bonds[0] == ("CYS6", "CYS127")
-        assert spec.protonation_states["HIS15"] == "HIE"
-
-    def test_charge_is_none(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        spec = ProteinSpecies(resname="LYZ", pdb_path=pdb)
+        assert spec.disulfide_bonds == [("CYS6", "CYS127"), ("CYS30", "CYS115")]
+        assert spec.protonation_states == {"HIS15": "HIE", "GLU35": "GLH"}
+        assert spec.chains == ["H", "L", "Y"]
         assert spec.charge is None
 
-    def test_chains_default_empty_and_declared(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        assert ProteinSpecies(resname="LYZ", pdb_path=pdb).chains == []
-        spec = ProteinSpecies(resname="LYZ", pdb_path=pdb, chains=["H", "L", "Y"])
-        assert spec.chains == ["H", "L", "Y"]
-
-    def test_resname_validation(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+    def test_resname_validation(self, protein_pdb):
         with pytest.raises(ValueError, match="Residue name must be less"):
-            ProteinSpecies(resname="TOOLONG", pdb_path=pdb)
+            ProteinSpecies(resname="TOOLONG", pdb_path=protein_pdb)
 
-    def test_rejects_multiple_copies(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        with pytest.raises(ValueError, match="count must be 1"):
-            ProteinSpecies(resname="LYZ", pdb_path=pdb, count=7)
-        with pytest.raises(ValueError, match="fraction must be 1.0"):
-            ProteinSpecies(resname="LYZ", pdb_path=pdb, fraction=0.25)
-
-    def test_rejects_null_count_or_fraction(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        with pytest.raises(ValueError, match="count must be 1"):
-            ProteinSpecies(resname="LYZ", pdb_path=pdb, count=None)
-        with pytest.raises(ValueError, match="fraction must be 1.0"):
-            ProteinSpecies(resname="LYZ", pdb_path=pdb, fraction=None)
+    @pytest.mark.parametrize(
+        ("overrides", "match"),
+        [
+            ({"count": 7}, "Input should be 1"),
+            ({"count": None}, "Input should be 1"),
+            ({"fraction": 0.25}, "Input should be 1.0"),
+            ({"fraction": None}, "Input should be 1.0"),
+        ],
+    )
+    def test_rejects_multiple_copies_or_null(self, protein_pdb, overrides, match):
+        with pytest.raises(ValueError, match=match):
+            ProteinSpecies(resname="LYZ", pdb_path=protein_pdb, **overrides)
 
 
 class TestProteinBoxComposition:
-    def test_basic_creation(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+    def test_creation_with_custom_ionization(self, protein_pdb):
         comp = ProteinBoxComposition(
-            protein=ProteinSpecies(resname="LYZ", pdb_path=pdb),
+            protein=ProteinSpecies(resname="LYZ", pdb_path=protein_pdb),
             padding=12.0,
-        )
-        assert comp.padding == 12.0
-        assert comp.ionization.neutralize is True
-        assert comp.ionization.concentration == 0.15
-
-    def test_custom_ionization(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        comp = ProteinBoxComposition(
-            protein=ProteinSpecies(resname="LYZ", pdb_path=pdb),
             ionization={"neutralize": True, "concentration": 0.10},
         )
+        assert comp.padding == 12.0
         assert comp.ionization.concentration == 0.10
 
 
-class TestPdb2gmxConfig:
-    def test_defaults(self):
-        config = Pdb2gmxConfig()
-        assert config.forcefield == "charmm36m"
-        assert config.water_model == "tip3p"
-        assert config.ignore_hydrogens is True
-        assert config.merge_all is False
+@pytest.mark.parametrize("config_cls", [Pdb2gmxConfig, CharmmConfig])
+class TestForcefieldConfigs:
+    """Constraints shared by the pdb2gmx and CHARMM parametrization configs."""
 
-    def test_custom(self):
-        config = Pdb2gmxConfig(forcefield="charmm36", water_model="spce")
-        assert config.forcefield == "charmm36"
-        assert config.water_model == "spce"
-
-    def test_frozen(self):
-        config = Pdb2gmxConfig()
+    def test_frozen(self, config_cls):
         with pytest.raises(Exception):
-            config.forcefield = "other"
+            config_cls().forcefield = "other"
 
-    def test_rejects_non_charmm_forcefield(self):
-        with pytest.raises(ValueError, match="CHARMM"):
-            Pdb2gmxConfig(forcefield="amber99sb-ildn")
-
-    def test_rejects_non_three_site_water(self):
-        with pytest.raises(ValueError, match="3-site"):
-            Pdb2gmxConfig(water_model="tip4p")
-
-    def test_rejects_ljpme_forcefield(self):
-        with pytest.raises(ValueError, match="LJ-PME"):
-            Pdb2gmxConfig(forcefield="charmm36m-ljpme")
+    @pytest.mark.parametrize(
+        ("overrides", "match"),
+        [
+            ({"forcefield": "amber99sb-ildn"}, "CHARMM"),
+            ({"water_model": "tip4p"}, "3-site"),
+            ({"forcefield": "charmm36m-ljpme"}, "LJ-PME"),
+        ],
+    )
+    def test_rejects_unsupported_choices(self, config_cls, overrides, match):
+        with pytest.raises(ValueError, match=match):
+            config_cls(**overrides)
 
 
 class TestForceFieldCheck:
-    def test_available_forcefield_passes(self, tmp_path, monkeypatch):
+    def test_available_forcefield_passes(self, tmp_path, gmx_search_paths):
         (tmp_path / "charmm27.ff").mkdir()
-        monkeypatch.setattr(
-            "mdfactory.setup.protein._get_gmx_search_paths",
-            lambda: [tmp_path],
-        )
+        gmx_search_paths.append(tmp_path)
         check_forcefield_available("charmm27")
 
-    def test_unavailable_forcefield_raises(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "mdfactory.setup.protein._get_gmx_search_paths",
-            lambda: [tmp_path],
-        )
-        with pytest.raises(ValueError, match="not found"):
-            check_forcefield_available("nonexistent_ff_xyz")
-
-    def test_error_lists_available_forcefields(self, tmp_path, monkeypatch):
+    def test_unavailable_forcefield_raises_and_lists_available(self, tmp_path, gmx_search_paths):
         (tmp_path / "charmm27.ff").mkdir()
-        monkeypatch.setattr(
-            "mdfactory.setup.protein._get_gmx_search_paths",
-            lambda: [tmp_path],
-        )
-        with pytest.raises(ValueError, match="charmm27") as exc_info:
+        gmx_search_paths.append(tmp_path)
+        with pytest.raises(ValueError, match="not found") as exc_info:
             check_forcefield_available("nonexistent_ff_xyz")
+        assert "charmm27" in str(exc_info.value)
         assert "Available force fields" in str(exc_info.value)
 
-    def test_registered_forcefield_check_does_not_download(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "mdfactory.setup.protein._get_gmx_search_paths",
-            lambda: [tmp_path],
-        )
+    def test_registered_forcefield_check_does_not_download(
+        self, tmp_path, monkeypatch, gmx_search_paths
+    ):
+        gmx_search_paths.append(tmp_path)
         monkeypatch.setattr(
             "mdfactory.setup.protein.download_forcefield",
             lambda name: pytest.fail("check_forcefield_available should not download"),
@@ -249,7 +219,9 @@ class TestForceFieldDownload:
             "mdfactory.setup.protein.urlopen",
             lambda url, timeout=0: _FakeResponse(payload),
         )
-        monkeypatch.setattr("mdfactory.setup.protein.get_forcefield_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.settings", SimpleNamespace(gromacs_forcefield_dir=tmp_path)
+        )
         monkeypatch.setitem(
             protein.FORCEFIELD_REGISTRY,
             "test-ff",
@@ -257,7 +229,6 @@ class TestForceFieldDownload:
                 "url": "https://example.invalid/test.ff.tgz",
                 "dirname": "test.ff",
                 "sha256": sha256,
-                "description": "stub force field",
             },
         )
 
@@ -276,11 +247,44 @@ class TestForceFieldDownload:
         assert not (tmp_path / "test.ff").exists()
 
 
-class TestBuildInputProteinbox:
-    def test_yaml_roundtrip(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+@pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
+class TestProteinInput:
+    """BuildInput validation shared by proteinbox and protein_mixedbox."""
 
+    def test_default_parametrization_config(self, sim_type, protein_pdb):
+        inp = BuildInput(**protein_input_data(sim_type, protein_pdb))
+        assert isinstance(inp.system, COMPOSITION_CLASSES[sim_type])
+        assert isinstance(inp.parametrization_config, CONFIG_CLASSES[sim_type])
+
+    @pytest.mark.parametrize(
+        ("overrides", "match"),
+        [
+            ({"parametrization": "cgenff"}, "not valid for simulation type"),
+            ({"config": {"type": "cgenff"}}, "does not match"),
+            (
+                {
+                    "config": {"merge_all": True},
+                    "protein": {"resname": "INS", "chains": ["A", "B"]},
+                },
+                "merge_all",
+            ),
+        ],
+    )
+    def test_rejects_invalid_combinations(self, sim_type, protein_pdb, overrides, match):
+        with pytest.raises(ValueError, match=match):
+            BuildInput(**protein_input_data(sim_type, protein_pdb, **overrides))
+
+    def test_merge_all_without_declared_chains_allowed(self, sim_type, protein_pdb):
+        data = protein_input_data(
+            sim_type, protein_pdb, config={"merge_all": True}, protein={"resname": "INS"}
+        )
+        inp = BuildInput(**data)
+        assert inp.parametrization_config.merge_all is True
+        assert inp.system.protein.chains == []
+
+
+class TestProteinboxInput:
+    def test_yaml_with_explicit_config_and_protein_extras(self, protein_pdb):
         yaml_str = f"""
 simulation_type: proteinbox
 engine: gromacs
@@ -293,8 +297,7 @@ parametrization_config:
 system:
   protein:
     resname: LYZ
-    count: 1
-    pdb_path: {pdb}
+    pdb_path: {protein_pdb}
     disulfide_bonds:
       - [CYS6, CYS127]
       - [CYS30, CYS115]
@@ -305,77 +308,17 @@ system:
     neutralize: true
     concentration: 0.15
 """
-        data = yaml.safe_load(yaml_str)
-        inp = BuildInput(**data)
-        assert inp.simulation_type == "proteinbox"
+        inp = BuildInput(**yaml.safe_load(yaml_str))
         assert isinstance(inp.system, ProteinBoxComposition)
         assert isinstance(inp.parametrization_config, Pdb2gmxConfig)
-        assert inp.parametrization == "pdb2gmx"
+        assert inp.system.protein.disulfide_bonds == [("CYS6", "CYS127"), ("CYS30", "CYS115")]
+        assert inp.system.protein.protonation_states == {"HIS15": "HIE"}
 
-    def test_default_parametrization_config(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-
-        data = {
-            "simulation_type": "proteinbox",
-            "parametrization": "pdb2gmx",
-            "system": {
-                "protein": {"resname": "LYZ", "count": 1, "pdb_path": str(pdb)},
-            },
-        }
-        inp = BuildInput(**data)
-        assert isinstance(inp.parametrization_config, Pdb2gmxConfig)
-        assert inp.parametrization_config.forcefield == "charmm36m"
-
-    def test_rejects_cgenff_parametrization(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        data = {
-            "simulation_type": "proteinbox",
-            "parametrization": "cgenff",
-            "system": {"protein": {"resname": "LYZ", "count": 1, "pdb_path": str(pdb)}},
-        }
-        with pytest.raises(ValueError, match="not valid for simulation type"):
-            BuildInput(**data)
-
-    def test_rejects_mismatched_config_type(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        data = {
-            "simulation_type": "proteinbox",
-            "parametrization": "pdb2gmx",
-            "parametrization_config": {"type": "cgenff"},
-            "system": {"protein": {"resname": "LYZ", "count": 1, "pdb_path": str(pdb)}},
-        }
-        with pytest.raises(ValueError, match="does not match"):
-            BuildInput(**data)
-
-    def test_rejects_merge_all_with_declared_chains(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        data = {
-            "simulation_type": "proteinbox",
-            "parametrization": "pdb2gmx",
-            "parametrization_config": {"type": "pdb2gmx", "merge_all": True},
-            "system": {
-                "protein": {"resname": "INS", "pdb_path": str(pdb), "chains": ["A", "B"]},
-            },
-        }
-        with pytest.raises(ValueError, match="merge_all"):
-            BuildInput(**data)
-
-    def test_merge_all_without_chains_allowed(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        data = {
-            "simulation_type": "proteinbox",
-            "parametrization": "pdb2gmx",
-            "parametrization_config": {"type": "pdb2gmx", "merge_all": True},
-            "system": {"protein": {"resname": "INS", "pdb_path": str(pdb)}},
-        }
-        inp = BuildInput(**data)
-        assert inp.parametrization_config.merge_all is True
-        assert inp.system.protein.chains == []
+    def test_metadata(self, protein_pdb):
+        meta = BuildInput(**protein_input_data("proteinbox", protein_pdb)).metadata
+        assert meta["simulation_type"] == "proteinbox"
+        assert meta["total_count"] == 1
+        assert meta["system_specific"]["padding"] == 12.0
 
 
 class TestTopologyParsing:
@@ -397,7 +340,7 @@ class TestTopologyParsing:
             1 2
         """)
         )
-        charge = _sum_charges_from_itp(itp)
+        charge = _sum_atoms_column(itp, 6)
         assert abs(charge - (-0.090)) < 1e-6
 
     def test_update_topology_molecules(self, tmp_path):
@@ -423,332 +366,176 @@ class TestTopologyParsing:
         assert "CL" in content
         assert "18" in content
 
-    def test_apply_protonation_states(self, tmp_path):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(
-            textwrap.dedent("""\
-            ATOM      1  N   HIS A  15       1.000   2.000   3.000  1.00  0.00
-            ATOM      2  CA  HIS A  15       1.500   2.500   3.500  1.00  0.00
-            ATOM      3  N   ALA A  16       2.000   3.000   4.000  1.00  0.00
-            ATOM      4  N   GLU A  35       3.000   4.000   5.000  1.00  0.00
-        """)
-        )
-        result = _apply_protonation_states(pdb, {"HIS15": "HIE", "GLU35": "GLH"}, tmp_path)
-        content = result.read_text()
-        # HIS at resid 15 should be renamed to HIE
-        assert "HIE" in content
-        # GLU at resid 35 should be renamed to GLH
-        assert "GLH" in content
-        # ALA at resid 16 should be unchanged
-        assert "ALA" in content
-
-    def test_apply_protonation_states_translates_charmm_histidine_alias(self, tmp_path):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(_pdb_atom(1, "N", "HIS", 15, 1.0, 2.0, 3.0))
-        result = _apply_protonation_states(pdb, {"HIS15": "HIE"}, tmp_path, forcefield="charmm36m")
-        assert "HSE" in result.read_text()
-
-    def test_apply_protonation_states_rejects_four_character_names(self, tmp_path):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(_pdb_atom(1, "N", "GLU", 35, 1.0, 2.0, 3.0))
-        with pytest.raises(ValueError, match="cannot be written to a PDB"):
-            _apply_protonation_states(pdb, {"GLU35": "GLUP"}, tmp_path)
-
-    def test_apply_protonation_states_rejects_charmm_acid_protonation(self, tmp_path):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(_pdb_atom(1, "N", "GLU", 35, 1.0, 2.0, 3.0))
-        # GLH aliases to CHARMM GLUP (4 chars), which cannot fit a PDB column.
-        with pytest.raises(ValueError, match="cannot be written to a PDB"):
-            _apply_protonation_states(pdb, {"GLU35": "GLH"}, tmp_path, forcefield="charmm36m")
-
-    def test_apply_protonation_states_matches_existing_histidine_tautomer(self, tmp_path):
-        # Residue 15 is already an HID tautomer; a "HIS15" key must still match it
-        # instead of silently doing nothing.
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(_pdb_atom(1, "N", "HID", 15, 1.0, 2.0, 3.0))
-        result = _apply_protonation_states(pdb, {"HIS15": "HIE"}, tmp_path, forcefield="charmm36m")
-        content = result.read_text()
-        assert "HSE" in content
-        assert "HID" not in content
-
-    def test_apply_protonation_states_raises_on_unmatched_override(self, tmp_path):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(_pdb_atom(1, "N", "HIS", 15, 1.0, 2.0, 3.0))
-        with pytest.raises(ValueError, match="matched no residue"):
-            _apply_protonation_states(pdb, {"HIS99": "HIE"}, tmp_path)
-
-    def test_apply_protonation_states_rejects_ambiguous_unqualified_key(self, tmp_path):
-        # HIS15 exists in both chain A and chain B; an unqualified key cannot say which.
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(
-            "".join(
-                [
-                    _pdb_atom(1, "N", "HIS", 15, 1.0, 2.0, 3.0, chain="A"),
-                    _pdb_atom(2, "N", "HIS", 15, 4.0, 5.0, 6.0, chain="B"),
-                ]
-            )
-        )
-        with pytest.raises(ValueError, match="ambiguous across chains"):
-            _apply_protonation_states(pdb, {"HIS15": "HIE"}, tmp_path)
-
-    def test_apply_protonation_states_chain_qualified_key_targets_one_chain(self, tmp_path):
-        # A chain-qualified key renames only the residue in that chain.
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(
-            "".join(
-                [
-                    _pdb_atom(1, "N", "HIS", 15, 1.0, 2.0, 3.0, chain="A"),
-                    _pdb_atom(2, "N", "HIS", 15, 4.0, 5.0, 6.0, chain="B"),
-                ]
-            )
-        )
-        result = _apply_protonation_states(pdb, {"A:HIS15": "HIE"}, tmp_path)
+    @pytest.mark.parametrize(
+        ("atoms", "states", "forcefield", "expected"),
+        [
+            # Plain renames; untouched residues keep their name.
+            (
+                [("HIS", 15), ("HIS", 15), ("ALA", 16), ("GLU", 35)],
+                {"HIS15": "HIE", "GLU35": "GLH"},
+                None,
+                ["HIE", "HIE", "ALA", "GLH"],
+            ),
+            # CHARMM histidine aliases.
+            ([("HIS", 15)], {"HIS15": "HIE"}, "charmm36m", ["HSE"]),
+            # An existing tautomer (HID) still matches an unqualified HIS key.
+            ([("HID", 15)], {"HIS15": "HIE"}, "charmm36m", ["HSE"]),
+            # A chain-qualified key renames only the residue in that chain.
+            ([("HIS", 15, "A"), ("HIS", 15, "B")], {"A:HIS15": "HIE"}, None, ["HIE", "HIS"]),
+            # Insertion codes distinguish otherwise identical residue numbers.
+            (
+                [("HIS", 100, "H"), ("HIS", 100, "H", 0.0, "A")],
+                {"H:HIS100A": "HIE"},
+                None,
+                ["HIS", "HIE"],
+            ),
+            (
+                [("HIS", 100, "H"), ("HIS", 100, "H", 0.0, "A")],
+                {"H:HIS100": "HID"},
+                None,
+                ["HID", "HIS"],
+            ),
+        ],
+    )
+    def test_apply_protonation_states(self, tmp_path, atoms, states, forcefield, expected):
+        pdb = _write_pdb(tmp_path, *atoms)
+        kwargs = {"forcefield": forcefield} if forcefield else {}
+        result = _apply_protonation_states(pdb, states, tmp_path, **kwargs)
         lines = [ln for ln in result.read_text().splitlines() if ln.startswith("ATOM")]
-        by_chain = {ln[21]: ln[17:20].strip() for ln in lines}
-        assert by_chain["A"] == "HIE"
-        assert by_chain["B"] == "HIS"
+        assert [ln[17:20].strip() for ln in lines] == expected
 
-    def test_apply_protonation_states_resolves_insertion_code(self, tmp_path):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(
-            "".join(
+    @pytest.mark.parametrize(
+        ("atoms", "states", "forcefield", "match"),
+        [
+            ([("GLU", 35)], {"GLU35": "GLUP"}, None, "cannot be written to a PDB"),
+            # GLH aliases to CHARMM GLUP (4 chars), which cannot fit a PDB column.
+            ([("GLU", 35)], {"GLU35": "GLH"}, "charmm36m", "cannot be written to a PDB"),
+            ([("HIS", 15)], {"HIS99": "HIE"}, None, "matched no residue"),
+            # HIS15 exists in both chains; an unqualified key cannot say which.
+            ([("HIS", 15, "A"), ("HIS", 15, "B")], {"HIS15": "HIE"}, None, "ambiguous across"),
+        ],
+    )
+    def test_apply_protonation_states_rejects(self, tmp_path, atoms, states, forcefield, match):
+        pdb = _write_pdb(tmp_path, *atoms)
+        kwargs = {"forcefield": forcefield} if forcefield else {}
+        with pytest.raises(ValueError, match=match):
+            _apply_protonation_states(pdb, states, tmp_path, **kwargs)
+
+    @pytest.mark.parametrize(
+        ("atoms", "bonds", "expected"),
+        [
+            # Answers follow the order pdb2gmx lists close SG pairs, not residue numbers.
+            (
                 [
-                    _pdb_atom(1, "N", "HIS", 100, 1.0, 2.0, 3.0, chain="H"),
-                    _pdb_atom(
-                        2,
-                        "N",
-                        "HIS",
-                        100,
-                        4.0,
-                        5.0,
-                        6.0,
-                        chain="H",
-                        insertion_code="A",
-                    ),
-                ]
-            )
-        )
-        result = _apply_protonation_states(pdb, {"H:HIS100A": "HIE"}, tmp_path)
-        lines = [ln for ln in result.read_text().splitlines() if ln.startswith("ATOM")]
-        by_insertion_code = {ln[26]: ln[17:20].strip() for ln in lines}
-        assert by_insertion_code[" "] == "HIS"
-        assert by_insertion_code["A"] == "HIE"
-
-        result = _apply_protonation_states(pdb, {"H:HIS100": "HID"}, tmp_path)
-        lines = [ln for ln in result.read_text().splitlines() if ln.startswith("ATOM")]
-        by_insertion_code = {ln[26]: ln[17:20].strip() for ln in lines}
-        assert by_insertion_code[" "] == "HID"
-        assert by_insertion_code["A"] == "HIS"
-
-    def test_build_disulfide_prompt_input_answers_exact_requested_pairs(self, tmp_path):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(
-            "".join(
+                    ("CYS", 1, "A", 0.0),
+                    ("CYS", 4, "A", 2.0),
+                    ("CYS", 2, "A", 10.0),
+                    ("CYS", 3, "A", 12.0),
+                ],
+                [("CYS2", "CYS3")],
+                "n\ny\n",
+            ),
+            # Inter-chain disulfide (e.g. insulin A7-B7) via chain-qualified references.
+            (
+                [("CYS", 7, "A", 0.0), ("CYS", 7, "B", 2.0), ("CYS", 20, "A", 20.0)],
+                [("A:CYS7", "B:CYS7")],
+                "y\n",
+            ),
+            # PDB chain order, not alphabetical, determines the prompt order.
+            (
                 [
-                    _pdb_atom(1, "SG", "CYS", 1, 0.0, 0.0, 0.0),
-                    _pdb_atom(2, "SG", "CYS", 4, 2.0, 0.0, 0.0),
-                    _pdb_atom(3, "SG", "CYS", 2, 10.0, 0.0, 0.0),
-                    _pdb_atom(4, "SG", "CYS", 3, 12.0, 0.0, 0.0),
-                ]
-            )
-        )
-        assert _build_disulfide_prompt_input(pdb, [("CYS2", "CYS3")]) == "n\ny\n"
+                    ("CYS", 6, "B", 0.0),
+                    ("CYS", 127, "B", 2.0),
+                    ("CYS", 6, "A", 10.0),
+                    ("CYS", 127, "A", 12.0),
+                ],
+                [("B:CYS6", "B:CYS127")],
+                "y\nn\n",
+            ),
+            (
+                [("CYS", 100, "H", 0.0), ("CYS", 100, "H", 2.0, "A")],
+                [("H:CYS100A", "H:CYS100")],
+                "y\n",
+            ),
+        ],
+    )
+    def test_disulfide_prompt_input(self, tmp_path, atoms, bonds, expected):
+        pdb = _write_pdb(tmp_path, *atoms, atom_name="SG")
+        assert _build_disulfide_prompt_input(pdb, bonds) == expected
 
-    def test_build_disulfide_prompt_input_rejects_missing_pair(self, tmp_path):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(
-            "".join(
-                [
-                    _pdb_atom(1, "SG", "CYS", 6, 0.0, 0.0, 0.0),
-                    _pdb_atom(2, "SG", "CYS", 127, 8.0, 0.0, 0.0),
-                ]
-            )
-        )
-        with pytest.raises(ValueError, match="not detected as close CYS SG pairs"):
-            _build_disulfide_prompt_input(pdb, [("CYS6", "CYS127")])
-
-    def test_build_disulfide_prompt_input_rejects_ambiguous_reference(self, tmp_path):
-        # CYS7 exists in both chains; an unqualified reference is ambiguous.
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(
-            "".join(
-                [
-                    _pdb_atom(1, "SG", "CYS", 7, 0.0, 0.0, 0.0, chain="A"),
-                    _pdb_atom(2, "SG", "CYS", 7, 2.0, 0.0, 0.0, chain="B"),
-                ]
-            )
-        )
-        with pytest.raises(ValueError, match="ambiguous across chains"):
-            _build_disulfide_prompt_input(pdb, [("CYS7", "CYS7")])
-
-    def test_build_disulfide_prompt_input_chain_qualified_inter_chain_bond(self, tmp_path):
-        # An inter-chain disulfide (e.g. insulin A7-B7) is expressed with chain-qualified
-        # references and matched as a close SG pair across chains.
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(
-            "".join(
-                [
-                    _pdb_atom(1, "SG", "CYS", 7, 0.0, 0.0, 0.0, chain="A"),
-                    _pdb_atom(2, "SG", "CYS", 7, 2.0, 0.0, 0.0, chain="B"),
-                    _pdb_atom(3, "SG", "CYS", 20, 20.0, 0.0, 0.0, chain="A"),
-                ]
-            )
-        )
-        assert _build_disulfide_prompt_input(pdb, [("A:CYS7", "B:CYS7")]) == "y\n"
-
-    def test_build_disulfide_prompt_input_preserves_pdb_chain_order(self, tmp_path):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(
-            "".join(
-                [
-                    _pdb_atom(1, "SG", "CYS", 6, 0.0, 0.0, 0.0, chain="B"),
-                    _pdb_atom(2, "SG", "CYS", 127, 2.0, 0.0, 0.0, chain="B"),
-                    _pdb_atom(3, "SG", "CYS", 6, 10.0, 0.0, 0.0, chain="A"),
-                    _pdb_atom(4, "SG", "CYS", 127, 12.0, 0.0, 0.0, chain="A"),
-                ]
-            )
-        )
-        assert _build_disulfide_prompt_input(pdb, [("B:CYS6", "B:CYS127")]) == "y\nn\n"
-
-    def test_build_disulfide_prompt_input_resolves_insertion_code(self, tmp_path):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(
-            "".join(
-                [
-                    _pdb_atom(1, "SG", "CYS", 100, 0.0, 0.0, 0.0, chain="H"),
-                    _pdb_atom(
-                        2,
-                        "SG",
-                        "CYS",
-                        100,
-                        2.0,
-                        0.0,
-                        0.0,
-                        chain="H",
-                        insertion_code="A",
-                    ),
-                ]
-            )
-        )
-        assert _build_disulfide_prompt_input(pdb, [("H:CYS100A", "H:CYS100")]) == "y\n"
+    @pytest.mark.parametrize(
+        ("atoms", "bonds", "match"),
+        [
+            (
+                [("CYS", 6, "A", 0.0), ("CYS", 127, "A", 8.0)],
+                [("CYS6", "CYS127")],
+                "not detected as close CYS SG pairs",
+            ),
+            # CYS7 exists in both chains; an unqualified reference is ambiguous.
+            (
+                [("CYS", 7, "A", 0.0), ("CYS", 7, "B", 2.0)],
+                [("CYS7", "CYS7")],
+                "ambiguous across chains",
+            ),
+        ],
+    )
+    def test_disulfide_prompt_input_rejects(self, tmp_path, atoms, bonds, match):
+        pdb = _write_pdb(tmp_path, *atoms, atom_name="SG")
+        with pytest.raises(ValueError, match=match):
+            _build_disulfide_prompt_input(pdb, bonds)
 
     def test_run_pdb2gmx_passes_disulfide_answers_to_subprocess(self, tmp_path, monkeypatch):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(
-            "".join(
-                [
-                    _pdb_atom(1, "SG", "CYS", 1, 0.0, 0.0, 0.0),
-                    _pdb_atom(2, "SG", "CYS", 4, 2.0, 0.0, 0.0),
-                    _pdb_atom(3, "SG", "CYS", 2, 10.0, 0.0, 0.0),
-                    _pdb_atom(4, "SG", "CYS", 3, 12.0, 0.0, 0.0),
-                ]
-            )
+        pdb = _write_pdb(
+            tmp_path,
+            ("CYS", 1, "A", 0.0),
+            ("CYS", 4, "A", 2.0),
+            ("CYS", 2, "A", 10.0),
+            ("CYS", 3, "A", 12.0),
+            atom_name="SG",
         )
         calls = {}
+        _patch_pdb2gmx(monkeypatch, ["Protein_chain_A"], ["posre.itp"], calls)
 
-        def fake_run(cmd, cwd, text, input, capture_output, timeout, env=None, check=None):
-            calls["cmd"] = cmd
-            calls["cwd"] = cwd
-            calls["input"] = input
-            calls["env"] = env
-            calls["check"] = check
-            output_dir = Path(cwd)
-            (output_dir / "processed.gro").write_text("mock gro\n")
-            (output_dir / "topol.top").write_text(
-                "[ moleculetype ]\nProtein_chain_A 3\n[ atoms ]\n[ molecules ]\nProtein_chain_A 1\n"
-            )
-            (output_dir / "posre.itp").write_text("mock posre\n")
-
-            class Result:
-                returncode = 0
-                stdout = ""
-                stderr = ""
-
-            return Result()
-
-        monkeypatch.setattr("mdfactory.setup.protein.subprocess.run", fake_run)
-        _patch_pdb2gmx_env(monkeypatch)
-
-        run_pdb2gmx(
-            pdb_path=pdb,
-            config=Pdb2gmxConfig(forcefield="charmm36m", water_model="tip3p"),
-            disulfide_bonds=[("CYS2", "CYS3")],
-            protonation_states={},
-            output_dir=tmp_path / "pdb2gmx_output",
-        )
+        _run(tmp_path, pdb, disulfide_bonds=[("CYS2", "CYS3")])
 
         assert "-ss" in calls["cmd"]
         assert calls["cmd"][:2] == ["/mock/gmx", "pdb2gmx"]
         assert calls["input"] == "n\ny\n"
-        assert calls["cwd"] == str((tmp_path / "pdb2gmx_output").resolve())
+        assert calls["cwd"] == str((tmp_path / "out").resolve())
         assert calls["env"] == {"GMXLIB": "/mock/forcefields"}
         assert calls["check"] is False
 
     def test_run_pdb2gmx_multichain_collects_chain_includes(self, tmp_path, monkeypatch):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(_pdb_atom(1, "N", "ALA", 1, 0.0, 0.0, 0.0))
+        pdb = _write_pdb(tmp_path, ("ALA", 1))
         chains = ["H", "L", "Y"]
         extra = [f"topol_Protein_chain_{c}.itp" for c in chains] + [
             f"posre_Protein_chain_{c}.itp" for c in chains
         ]
-        monkeypatch.setattr(
-            "mdfactory.setup.protein.subprocess.run",
-            _make_pdb2gmx_run([f"Protein_chain_{c}" for c in chains], extra_files=extra),
-        )
-        _patch_pdb2gmx_env(monkeypatch)
+        _patch_pdb2gmx(monkeypatch, [f"Protein_chain_{c}" for c in chains], extra)
 
-        params = run_pdb2gmx(
-            pdb_path=pdb,
-            config=Pdb2gmxConfig(forcefield="charmm36m", water_model="tip3p"),
-            disulfide_bonds=[],
-            protonation_states={},
-            output_dir=tmp_path / "out",
-            chains=chains,
-        )
+        params = _run(tmp_path, pdb, chains=chains)
 
         assert params.chains == chains
         assert sorted(p.name for p in params.topology_include_files) == sorted(extra)
 
-    def test_run_pdb2gmx_multichain_without_declaration_raises(self, tmp_path, monkeypatch):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(_pdb_atom(1, "N", "ALA", 1, 0.0, 0.0, 0.0))
-        monkeypatch.setattr(
-            "mdfactory.setup.protein.subprocess.run",
-            _make_pdb2gmx_run(["Protein_chain_H", "Protein_chain_L"]),
-        )
-        _patch_pdb2gmx_env(monkeypatch)
-
-        with pytest.raises(ValueError, match="none were declared"):
-            run_pdb2gmx(
-                pdb_path=pdb,
-                config=Pdb2gmxConfig(forcefield="charmm36m", water_model="tip3p"),
-                disulfide_bonds=[],
-                protonation_states={},
-                output_dir=tmp_path / "out",
-            )
-
-    def test_run_pdb2gmx_chain_mismatch_raises(self, tmp_path, monkeypatch):
-        pdb = tmp_path / "input.pdb"
-        pdb.write_text(_pdb_atom(1, "N", "ALA", 1, 0.0, 0.0, 0.0))
-        monkeypatch.setattr(
-            "mdfactory.setup.protein.subprocess.run",
-            _make_pdb2gmx_run(["Protein_chain_H", "Protein_chain_L", "Protein_chain_Y"]),
-        )
-        _patch_pdb2gmx_env(monkeypatch)
-
-        with pytest.raises(ValueError, match="do not match"):
-            run_pdb2gmx(
-                pdb_path=pdb,
-                config=Pdb2gmxConfig(forcefield="charmm36m", water_model="tip3p"),
-                disulfide_bonds=[],
-                protonation_states={},
-                output_dir=tmp_path / "out",
-                chains=["H", "L"],
-            )
+    @pytest.mark.parametrize(
+        ("produced", "declared", "match"),
+        [
+            (["H", "L"], None, "none were declared"),
+            (["H", "L", "Y"], ["H", "L"], "do not match"),
+        ],
+    )
+    def test_run_pdb2gmx_chain_declaration_mismatch_raises(
+        self, tmp_path, monkeypatch, produced, declared, match
+    ):
+        pdb = _write_pdb(tmp_path, ("ALA", 1))
+        _patch_pdb2gmx(monkeypatch, [f"Protein_chain_{c}" for c in produced])
+        with pytest.raises(ValueError, match=match):
+            _run(tmp_path, pdb, chains=declared)
 
 
 class TestBundleForcefield:
-    def test_copies_ff_dir_and_rewrites_absolute_includes(self, tmp_path):
+    def test_copies_ff_dir_once_and_rewrites_absolute_includes(self, tmp_path, monkeypatch):
         ff_source = tmp_path / "ffsource" / "charmm36-feb2026_cgenff-5.0.ff"
         ff_source.mkdir(parents=True)
         (ff_source / "forcefield.itp").write_text("; forcefield\n")
@@ -765,12 +552,22 @@ class TestBundleForcefield:
             #include "posre.itp"
             """)
         )
+        copies = []
+        real_copytree = protein.shutil.copytree
+
+        def counting_copytree(src, dst, *args, **kwargs):
+            copies.append(src)
+            return real_copytree(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(protein.shutil, "copytree", counting_copytree)
 
         ff_name = bundle_forcefield_into_topology(top)
 
         assert ff_name == "charmm36-feb2026_cgenff-5.0.ff"
         assert (build_dir / ff_name / "forcefield.itp").is_file()
         assert (build_dir / ff_name / "tip3p.itp").is_file()
+        # Two includes into the same .ff directory, copied exactly once.
+        assert len(copies) == 1
 
         content = top.read_text()
         assert '#include "charmm36-feb2026_cgenff-5.0.ff/forcefield.itp"' in content
@@ -781,39 +578,6 @@ class TestBundleForcefield:
         # No absolute paths remain.
         assert str(ff_source) not in content
 
-    def test_copies_ff_dir_once_for_multiple_includes(self, tmp_path, monkeypatch):
-        ff_source = tmp_path / "ffsource" / "charmm36-feb2026_cgenff-5.0.ff"
-        ff_source.mkdir(parents=True)
-        for name in ("forcefield.itp", "tip3p.itp", "ions.itp"):
-            (ff_source / name).write_text(f"; {name}\n")
-
-        build_dir = tmp_path / "build"
-        build_dir.mkdir()
-        top = build_dir / "topology.top"
-        top.write_text(
-            textwrap.dedent(f"""\
-            #include "{ff_source / "forcefield.itp"}"
-            #include "{ff_source / "tip3p.itp"}"
-            #include "{ff_source / "ions.itp"}"
-            """)
-        )
-
-        calls = []
-        real_copytree = protein.shutil.copytree
-
-        def counting_copytree(src, dst, *args, **kwargs):
-            calls.append((src, dst))
-            return real_copytree(src, dst, *args, **kwargs)
-
-        monkeypatch.setattr(protein.shutil, "copytree", counting_copytree)
-
-        bundle_forcefield_into_topology(top)
-
-        # Three includes into the same .ff directory, copied exactly once.
-        assert len(calls) == 1
-        content = top.read_text()
-        assert '#include "charmm36-feb2026_cgenff-5.0.ff/ions.itp"' in content
-
     def test_no_absolute_ff_include_returns_none(self, tmp_path):
         top = tmp_path / "topology.top"
         top.write_text('#include "protein.itp"\n#include "posre.itp"\n')
@@ -822,16 +586,13 @@ class TestBundleForcefield:
         assert bundle_forcefield_into_topology(top) is None
         assert top.read_text() == original
 
-    def test_bundles_relative_ff_include(self, tmp_path, monkeypatch):
+    def test_bundles_relative_ff_include(self, tmp_path, gmx_search_paths):
         # Built-in force fields emit relative includes like charmm27.ff/forcefield.itp;
         # the directory must be resolved from a search path and copied next to the topology.
         ff_source = tmp_path / "gmxtop" / "charmm27.ff"
         ff_source.mkdir(parents=True)
         (ff_source / "forcefield.itp").write_text("; forcefield\n")
-        monkeypatch.setattr(
-            "mdfactory.setup.protein._get_gmx_search_paths",
-            lambda: [tmp_path / "gmxtop"],
-        )
+        gmx_search_paths.append(tmp_path / "gmxtop")
 
         build_dir = tmp_path / "build"
         build_dir.mkdir()
@@ -846,11 +607,8 @@ class TestBundleForcefield:
         # force field sits alongside it, so the line is left untouched.
         assert '#include "charmm27.ff/forcefield.itp"' in top.read_text()
 
-    def test_relative_ff_include_not_found_raises(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "mdfactory.setup.protein._get_gmx_search_paths",
-            lambda: [tmp_path / "empty"],
-        )
+    def test_relative_ff_include_not_found_raises(self, tmp_path, gmx_search_paths):
+        gmx_search_paths.append(tmp_path / "empty")
         top = tmp_path / "topology.top"
         top.write_text('#include "charmm27.ff/forcefield.itp"\n')
         with pytest.raises(RuntimeError, match="not found in any GROMACS search path"):
@@ -879,133 +637,82 @@ class TestCleanPdb:
         assert all(ln[26] == "A" for ln in atom_lines)
 
 
-class TestMetadata:
-    def test_proteinbox_metadata(self, tmp_path):
-        pdb = tmp_path / "test.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        data = {
-            "simulation_type": "proteinbox",
-            "parametrization": "pdb2gmx",
-            "system": {
-                "protein": {"resname": "LYZ", "count": 1, "pdb_path": str(pdb)},
-                "padding": 12.0,
-            },
-        }
-        inp = BuildInput(**data)
-        meta = inp.metadata
-        assert meta["simulation_type"] == "proteinbox"
-        assert meta["total_count"] == 1
-        assert "padding" in meta["system_specific"]
-        assert meta["system_specific"]["padding"] == 12.0
-
-
+@pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
 class TestPdbPathResolution:
-    def test_relative_pdb_path_resolved_against_yaml_dir(self, tmp_path):
+    def test_relative_pdb_path_resolved_against_yaml_dir(self, tmp_path, sim_type):
         base = tmp_path / "specs"
         base.mkdir()
-        dct = {
-            "simulation_type": "proteinbox",
-            "system": {"protein": {"pdb_path": "1aki.pdb"}},
-        }
-        _resolve_proteinbox_pdb_path(dct, base)
+        dct = {"simulation_type": sim_type, "system": {"protein": {"pdb_path": "1aki.pdb"}}}
+        resolve_protein_pdb_path(dct, base)
         assert dct["system"]["protein"]["pdb_path"] == str((base / "1aki.pdb").resolve())
 
-    def test_absolute_pdb_path_unchanged(self, tmp_path):
+    def test_absolute_pdb_path_unchanged(self, tmp_path, sim_type):
         abs_path = str((tmp_path / "abs.pdb").resolve())
-        dct = {
-            "simulation_type": "proteinbox",
-            "system": {"protein": {"pdb_path": abs_path}},
-        }
-        _resolve_proteinbox_pdb_path(dct, tmp_path / "other")
+        dct = {"simulation_type": sim_type, "system": {"protein": {"pdb_path": abs_path}}}
+        resolve_protein_pdb_path(dct, tmp_path / "other")
         assert dct["system"]["protein"]["pdb_path"] == abs_path
 
-    def test_non_proteinbox_untouched(self, tmp_path):
-        dct = {"simulation_type": "mixedbox", "system": {"foo": "bar"}}
-        _resolve_proteinbox_pdb_path(dct, tmp_path)
-        assert dct == {"simulation_type": "mixedbox", "system": {"foo": "bar"}}
 
-    def test_run_build_from_file_resolves_relative_path(self, tmp_path, monkeypatch):
-        pdb = tmp_path / "1aki.pdb"
-        pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
-        yaml_file = tmp_path / "build.yaml"
-        yaml_file.write_text(
-            textwrap.dedent("""\
-            simulation_type: proteinbox
-            parametrization: pdb2gmx
-            system:
-              protein:
-                resname: LYZ
-                count: 1
-                pdb_path: 1aki.pdb
-              padding: 12.0
-            """)
-        )
-        captured = {}
-        monkeypatch.setattr(workflows, "run_build_from_dict", captured.update)
-        workflows.run_build_from_file(yaml_file)
-        assert captured["system"]["protein"]["pdb_path"] == str(pdb.resolve())
+def test_non_protein_simulation_type_untouched(tmp_path):
+    dct = {"simulation_type": "mixedbox", "system": {"foo": "bar"}}
+    resolve_protein_pdb_path(dct, tmp_path)
+    assert dct == {"simulation_type": "mixedbox", "system": {"foo": "bar"}}
 
 
-_VALID_PROTEINBOX_YAML = textwrap.dedent("""\
-    simulation_type: proteinbox
-    engine: gromacs
-    parametrization: pdb2gmx
-    parametrization_config:
-      type: pdb2gmx
-      forcefield: charmm36m
-      water_model: tip3p
-    system:
-      protein:
-        resname: LYZ
-        pdb_path: prot.pdb
-        chains: [A]
-      padding: 12.0
-    """)
-
-
-def _write_spec_dir(tmp_path):
-    """Create a spec dir with a PDB, plus an unrelated cwd to run from."""
+def _write_spec_dir(tmp_path, protein_pdb, sim_type="proteinbox"):
+    """Create a spec dir with a PDB and YAML using a relative pdb_path, plus an unrelated cwd."""
     spec_dir = tmp_path / "specs"
     spec_dir.mkdir()
     pdb = spec_dir / "prot.pdb"
-    pdb.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+    shutil.copy(protein_pdb, pdb)
+    yaml_file = spec_dir / "spec.yaml"
+    yaml_file.write_text(yaml.safe_dump(protein_input_data(sim_type, "prot.pdb")))
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    return spec_dir, pdb, elsewhere
+    return spec_dir, pdb, yaml_file, elsewhere
 
 
 class TestRelativePdbPathAcrossEntryPoints:
     """Every entry point must resolve a relative pdb_path the same way (same hash)."""
 
-    def test_csv_push_and_prepare_compute_identical_hashes(self, tmp_path, monkeypatch):
-        from mdfactory.cli import df_models_from_input_csv
+    def test_csv_push_and_prepare_compute_identical_hashes(
+        self, tmp_path, protein_pdb, monkeypatch
+    ):
+        from mdfactory.prepare import load_build_input_csv
         from mdfactory.utils.push import load_models_from_csv
 
-        spec_dir, pdb, elsewhere = _write_spec_dir(tmp_path)
+        spec_dir, pdb, _, elsewhere = _write_spec_dir(tmp_path, protein_pdb)
         csv_path = spec_dir / "proteins.csv"
         csv_path.write_text(
-            "simulation_type,engine,parametrization,parametrization_config.type,"
-            "parametrization_config.forcefield,parametrization_config.water_model,"
-            "system.protein.resname,system.protein.pdb_path,system.protein.chains,system.padding\n"
-            "proteinbox,gromacs,pdb2gmx,pdb2gmx,charmm36m,tip3p,LYZ,prot.pdb,A,12.0\n"
+            "simulation_type,parametrization,system.protein.resname,"
+            "system.protein.pdb_path,system.padding\n"
+            "proteinbox,pdb2gmx,LYZ,prot.pdb,12.0\n"
         )
         # Run from an unrelated directory so cwd-relative resolution would differ.
         monkeypatch.chdir(elsewhere)
 
-        _, prepared, prep_errors = df_models_from_input_csv(csv_path)
+        _, prepared, prep_errors = load_build_input_csv(csv_path)
         pushed, push_errors = load_models_from_csv(csv_path)
 
         assert prep_errors == {} and push_errors == {}
         assert prepared[0].system.protein.pdb_path == pdb.resolve()
         assert [m.hash for m in pushed] == [m.hash for m in prepared]
 
-    def test_yaml_with_config_or_dry_run_resolves_before_dispatch(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
+    def test_run_from_file_resolves_relative_path(
+        self, tmp_path, protein_pdb, monkeypatch, sim_type
+    ):
+        _, pdb, yaml_file, _ = _write_spec_dir(tmp_path, protein_pdb, sim_type)
+        captured = {}
+        monkeypatch.setattr(workflows, "run_build_from_dict", captured.update)
+        workflows.run_build_from_file(yaml_file)
+        assert captured["system"]["protein"]["pdb_path"] == str(pdb.resolve())
+
+    def test_yaml_dry_run_resolves_before_dispatch(self, tmp_path, protein_pdb, monkeypatch):
         import mdfactory.orchestration
         from mdfactory.cli import _build_from_yaml
 
-        spec_dir, pdb, elsewhere = _write_spec_dir(tmp_path)
-        yaml_file = spec_dir / "build.yaml"
-        yaml_file.write_text(_VALID_PROTEINBOX_YAML)
+        _, pdb, yaml_file, elsewhere = _write_spec_dir(tmp_path, protein_pdb)
         monkeypatch.chdir(elsewhere)
 
         captured = []
@@ -1019,12 +726,10 @@ class TestRelativePdbPathAcrossEntryPoints:
         assert len(captured) == 1
         assert captured[0].system.protein.pdb_path == pdb.resolve()
 
-    def test_yaml_sequential_build_dir_matches_built_model_hash(self, tmp_path, monkeypatch):
+    def test_yaml_sequential_run_dir_matches_model_hash(self, tmp_path, protein_pdb, monkeypatch):
         from mdfactory import cli
 
-        spec_dir, _, elsewhere = _write_spec_dir(tmp_path)
-        yaml_file = spec_dir / "build.yaml"
-        yaml_file.write_text(_VALID_PROTEINBOX_YAML)
+        _, _, yaml_file, elsewhere = _write_spec_dir(tmp_path, protein_pdb)
         monkeypatch.chdir(elsewhere)
 
         built = {}
@@ -1071,20 +776,19 @@ class TestCenterInCubicBox:
 class TestIonCounts:
     """ionize_solvated_system returns only the ions it added; counts map by resname."""
 
-    @staticmethod
-    def _ion(smiles, resname, count):
-        return SingleMoleculeSpecies(count=count, smiles=smiles, resname=resname)
-
-    def test_both_ions(self):
-        species = [self._ion("[Na+]", "NA", 7), self._ion("[Cl-]", "CL", 9)]
-        assert _ion_counts(species) == (7, 9)
-
-    def test_chloride_only_is_not_reported_as_sodium(self):
-        # Positive protein with no salt: only Cl- is added.
-        assert _ion_counts([self._ion("[Cl-]", "CL", 3)]) == (0, 3)
-
-    def test_sodium_only(self):
-        assert _ion_counts([self._ion("[Na+]", "NA", 4)]) == (4, 0)
-
-    def test_no_ions(self):
-        assert _ion_counts([]) == (0, 0)
+    @pytest.mark.parametrize(
+        ("ions", "expected"),
+        [
+            ([("[Na+]", "NA", 7), ("[Cl-]", "CL", 9)], (7, 9)),
+            # Positive protein with no salt: only Cl- is added, not reported as sodium.
+            ([("[Cl-]", "CL", 3)], (0, 3)),
+            ([("[Na+]", "NA", 4)], (4, 0)),
+            ([], (0, 0)),
+        ],
+    )
+    def test_ion_counts(self, ions, expected):
+        species = [
+            SingleMoleculeSpecies(smiles=smiles, resname=resname, count=count)
+            for smiles, resname, count in ions
+        ]
+        assert _ion_counts(species) == expected

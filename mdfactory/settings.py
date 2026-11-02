@@ -203,9 +203,6 @@ class Settings:
         """Return an environment with configured GROMACS force fields on GMXLIB."""
         env = dict(os.environ if base_env is None else base_env)
         forcefield_dir = str(self.gromacs_forcefield_dir)
-        if not forcefield_dir:
-            return env
-
         paths = [p for p in env.get("GMXLIB", "").split(":") if p]
         if forcefield_dir not in paths:
             paths.insert(0, forcefield_dir)
