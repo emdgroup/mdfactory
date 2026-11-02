@@ -29,7 +29,7 @@ from .analysis.submit import (
     submit_artifacts_slurm,
 )
 from .analysis.utils import get_chemistry_extractor
-from .prepare import df_to_build_input_models
+from .prepare import load_build_input_csv, resolve_protein_pdb_path
 from .utils.data_manager import check_run_exists
 from .utils.push import push_systems
 from .utils.utilities import working_directory
@@ -89,21 +89,10 @@ def prepare_build(input: Path, output: Path = Path(".")):
 
 
 def df_models_from_input_csv(input):
-    df = pd.read_csv(input)
-    # remove 'unnamed' CSV columns
-    df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
-    # Resolve relative protein PDB paths against the CSV's own directory so the
-    # emitted per-system YAMLs carry absolute paths regardless of where the build
-    # later runs.
-    pdb_col = "system.protein.pdb_path"
-    if pdb_col in df.columns:
-        df[pdb_col] = df[pdb_col].apply(
-            lambda p: p
-            if pd.isna(p) or Path(p).is_absolute()
-            else str((input.parent / p).resolve())
-        )
-    models, errors = df_to_build_input_models(df)
-    return df, models, errors
+    # Shared with push/discovery: relative protein PDB paths are resolved against
+    # the CSV's own directory, so the emitted per-system YAMLs carry absolute paths
+    # and every CSV consumer computes the same hashes.
+    return load_build_input_csv(input)
 
 
 def _prepare_system_directories(
@@ -353,6 +342,10 @@ def _build_from_yaml(
         # Single build YAML
         from mdfactory.models.input import BuildInput
 
+        # Resolve a relative protein pdb_path against the YAML's directory before
+        # hashing, so the Parsl worker (which runs inside output/<hash>/) finds the
+        # PDB and the build directory is named after the model that is built.
+        resolve_protein_pdb_path(data, Path(input).parent)
         model = BuildInput(**data)
 
         if config is not None or dry_run:
