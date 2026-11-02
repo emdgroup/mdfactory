@@ -32,6 +32,152 @@ def _add_protein_rmsd_restraint(system, positions, protein_indices, restraint_k)
     return restraint
 
 
+def rescale_to_volume(context, target_volume_nm3, rigid_indices=None):
+    """Isotropically expand a rectangular box and its molecule centers to a target volume.
+
+    Each molecule moves rigidly with its center of mass, so internal geometry is
+    unchanged and intermolecular distances only grow. Atoms in *rigid_indices*
+    (e.g. a multi-chain protein) are treated as a single rigid unit even when
+    they span several molecules, so the unit is not pulled apart.
+
+    Parameters
+    ----------
+    context : openmm.Context
+        Context whose positions and box vectors are updated in place.
+    target_volume_nm3 : float
+        Target box volume in nm^3. Must not be smaller than the current volume.
+    rigid_indices : iterable of int or None, optional
+        Particle indices to move together as one unit. Default is None.
+
+    Returns
+    -------
+    float
+        Linear scale factor applied to the box edges.
+
+    Raises
+    ------
+    ValueError
+        If the target volume is smaller than the current volume (shrinking by
+        scaling would create overlaps).
+
+    """
+    state = context.getState(getPositions=True)
+    positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+    a, b, c = (v.value_in_unit(unit.nanometer) for v in state.getPeriodicBoxVectors())
+    volume = a[0] * b[1] * c[2]
+    if target_volume_nm3 < volume:
+        raise ValueError(
+            f"Target volume {target_volume_nm3:.3f} nm³ is smaller than the current "
+            f"volume {volume:.3f} nm³; rescaling can only expand the box."
+        )
+    scale = (target_volume_nm3 / volume) ** (1.0 / 3.0)
+
+    system = context.getSystem()
+    masses = np.array(
+        [system.getParticleMass(i).value_in_unit(unit.dalton) for i in range(len(positions))]
+    )
+
+    rigid = set(rigid_indices) if rigid_indices is not None else set()
+    groups = []
+    rigid_group = []
+    for molecule in context.getMolecules():
+        if rigid and rigid.intersection(molecule):
+            rigid_group.extend(molecule)
+        else:
+            groups.append(list(molecule))
+    if rigid_group:
+        groups.append(rigid_group)
+
+    new_positions = positions.copy()
+    for group in groups:
+        group_masses = masses[group]
+        weights = group_masses if group_masses.sum() > 0 else np.ones(len(group))
+        center = (positions[group] * weights[:, None]).sum(axis=0) / weights.sum()
+        new_positions[group] += (scale - 1.0) * center
+
+    context.setPeriodicBoxVectors(
+        mm.Vec3(*(np.asarray(a) * scale)) * unit.nanometer,
+        mm.Vec3(*(np.asarray(b) * scale)) * unit.nanometer,
+        mm.Vec3(*(np.asarray(c) * scale)) * unit.nanometer,
+    )
+    context.setPositions(new_positions * unit.nanometer)
+    return scale
+
+
+def finish_compression(
+    context,
+    target_volume_nm3,
+    *,
+    density_target,
+    converged,
+    require_convergence,
+    tolerance,
+    rigid_indices=None,
+    not_reached_message="Box compression did not reach its target.",
+):
+    """Settle a compressed box exactly on its target volume.
+
+    Parameters
+    ----------
+    context : openmm.Context
+        Context after the compression run; updated in place when rescaled.
+    target_volume_nm3 : float
+        Target box volume in nm^3 (for a density target, total mass / density).
+    density_target : bool
+        Whether the target was a density. The overshoot is then reported as a
+        relative density excess, otherwise as a relative volume deficit.
+    converged : bool
+        Whether the compression loop reached the target.
+    require_convergence : bool
+        Raise when not converged; otherwise warn and keep the box as is.
+    tolerance : float
+        Largest relative overshoot that is corrected by rescaling.
+    rigid_indices : iterable of int or None, optional
+        Particles moved as one rigid unit during rescaling.
+    not_reached_message : str, optional
+        Message used when the target was not reached.
+
+    Returns
+    -------
+    float or None
+        Relative overshoot that was corrected, or None when the target was not
+        reached.
+
+    Raises
+    ------
+    RuntimeError
+        If the target was not reached and *require_convergence* is True, or the
+        overshoot exceeds *tolerance*.
+
+    """
+    if not converged:
+        if require_convergence:
+            raise RuntimeError(not_reached_message)
+        print(f"WARNING: {not_reached_message} Continuing with the box as compressed.")
+        return None
+
+    box = context.getState().getPeriodicBoxVectors()
+    volume_nm3 = (box[0][0] * box[1][1] * box[2][2]).value_in_unit(unit.nanometer**3)
+    if density_target:
+        overshoot = target_volume_nm3 / volume_nm3 - 1.0
+        kind = "density"
+    else:
+        overshoot = (target_volume_nm3 - volume_nm3) / target_volume_nm3
+        kind = "volume"
+    if overshoot > tolerance:
+        raise RuntimeError(
+            f"Box compression overshot the target {kind} by {overshoot:.1%}, exceeding "
+            f"the {tolerance:.1%} that can be corrected by rescaling."
+        )
+    if volume_nm3 < target_volume_nm3:
+        scale = rescale_to_volume(context, target_volume_nm3, rigid_indices=rigid_indices)
+        print(
+            f"Compression overshot the target {kind} by {overshoot:.2%}; expanded the box "
+            f"from {volume_nm3:.3f} to {target_volume_nm3:.3f} nm³ (edge x{scale:.4f})."
+        )
+    return max(overshoot, 0.0)
+
+
 def monitor_volume_convergence(volumes, window_size=10, tolerance=0.02):
     """Check if box volume has converged by comparing running averages.
 
@@ -376,8 +522,9 @@ def compress_box(
     target_volume=None,
     protein_indices=None,
     restraint_k=1000.0,
-    target_volume_tolerance=0.02,
-    target_density_tolerance=0.02,
+    target_volume_tolerance=0.15,
+    target_density_tolerance=0.15,
+    require_convergence=True,
 ):
     """Compress a periodic box to a target density using high-pressure NPT.
 
@@ -387,6 +534,12 @@ def compress_box(
     *protein_indices* is given, their best-fit RMSD from the starting structure
     is restrained through minimization and compression. This protects the
     protein shape without opposing rigid translations caused by box scaling.
+
+    At high pressure the box can sweep past the target between two checks
+    (water at 1000 bar equilibrates several percent denser than at 1 bar). Any
+    such overshoot is undone by expanding the box and molecule centers to the
+    exact target volume (see :func:`rescale_to_volume`), so the returned box
+    always matches the requested volume or density.
 
     Parameters
     ----------
@@ -414,11 +567,15 @@ def compress_box(
     restraint_k : float, optional
         Restraint force constant in kJ/mol/nm^2. Default is 1000.0.
     target_volume_tolerance : float, optional
-        Maximum relative undershoot accepted for a fixed-volume target. Default
-        is 0.02 (2%).
+        Largest relative volume undershoot of a fixed-volume target that is
+        corrected by rescaling. Larger undershoots raise. Default is 0.15 (15%).
     target_density_tolerance : float, optional
-        Maximum relative overshoot accepted for a density target. Default is
-        0.02 (2%).
+        Largest relative density overshoot of a density target that is
+        corrected by rescaling. Larger overshoots raise. Default is 0.15 (15%).
+    require_convergence : bool, optional
+        Raise when the target is not reached within *steps_compression*. When
+        False, only warn and return the box as compressed so far (the behavior
+        LNP core compression relies on). Default is True.
 
     Returns
     -------
@@ -430,8 +587,9 @@ def compress_box(
     Raises
     ------
     RuntimeError
-        If the requested density or volume is not reached, or compression
-        overshoots its target beyond the corresponding tolerance.
+        If the requested density or volume is not reached (and
+        *require_convergence* is True), or compression overshoots its target
+        beyond the corresponding tolerance.
 
     """
     # TODO: use proper logging
@@ -498,42 +656,37 @@ def compress_box(
 
     if target_volume is not None:
         # target_volume is in Å^3; OpenMM box volumes are in nm^3 (1 nm^3 = 1000 Å^3).
-        values, completed_steps, converged = simulate_compression_until_volume_reached(
-            simulation, target_volume_nm3=target_volume / 1000.0, steps=steps_compression
-        )
         target_volume_nm3 = target_volume / 1000.0
-        if not converged:
-            final_volume = values[-1] if values else float("nan")
-            raise RuntimeError(
-                f"Box compression did not reach {target_volume_nm3:.3f} nm³ in "
-                f"{completed_steps} steps; final volume was {final_volume:.3f} nm³."
-            )
-        final_volume = values[-1]
-        relative_undershoot = (target_volume_nm3 - final_volume) / target_volume_nm3
-        if relative_undershoot > target_volume_tolerance:
-            raise RuntimeError(
-                f"Box compression overshot the target volume by "
-                f"{relative_undershoot:.1%}, exceeding the allowed "
-                f"{target_volume_tolerance:.1%}."
-            )
+        values, completed_steps, converged = simulate_compression_until_volume_reached(
+            simulation, target_volume_nm3=target_volume_nm3, steps=steps_compression
+        )
+        target_label = f"{target_volume_nm3:.3f} nm³"
+        final_label = f"{values[-1]:.3f} nm³" if values else "nan"
+        tolerance = target_volume_tolerance
     else:
         values, completed_steps, converged = simulate_compression_until_density_reached(
             simulation, mass=totalMass, steps=steps_compression, target_density=target_density
         )
-        if not converged:
-            final_density = values[-1] if values else float("nan")
-            raise RuntimeError(
-                f"Box compression did not reach {target_density:.3f} g/mL in "
-                f"{completed_steps} steps; final density was {final_density:.3f} g/mL."
-            )
-        final_density = values[-1]
-        relative_overshoot = (final_density - target_density) / target_density
-        if relative_overshoot > target_density_tolerance:
-            raise RuntimeError(
-                f"Box compression overshot the target density by "
-                f"{relative_overshoot:.1%}, exceeding the allowed "
-                f"{target_density_tolerance:.1%}."
-            )
+        target_volume_nm3 = (
+            totalMass / (target_density * unit.gram / unit.item / unit.milliliter)
+        ).value_in_unit(unit.nanometer**3)
+        target_label = f"{target_density:.3f} g/mL"
+        final_label = f"{values[-1]:.3f} g/mL" if values else "nan"
+        tolerance = target_density_tolerance
+
+    finish_compression(
+        simulation.context,
+        target_volume_nm3=target_volume_nm3,
+        density_target=target_volume is None,
+        converged=converged,
+        require_convergence=require_convergence,
+        tolerance=tolerance,
+        rigid_indices=protein_indices,
+        not_reached_message=(
+            f"Box compression did not reach {target_label} in {completed_steps} steps; "
+            f"final value was {final_label}."
+        ),
+    )
 
     state = simulation.context.getState()
     positions = simulation.context.getState(getPositions=True).getPositions()

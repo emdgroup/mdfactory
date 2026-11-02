@@ -118,8 +118,18 @@ def build_mixedbox(inp: BuildInput):
 
 
 @validate_call
-def create_mixedbox_by_compression(inp: BuildInput):
+def create_mixedbox_by_compression(inp: BuildInput, require_target_density: bool = True):
     """Create a mixed-box universe by packing at low density then compressing with OpenMM.
+
+    Parameters
+    ----------
+    inp : BuildInput
+        Mixed-box build input.
+    require_target_density : bool, optional
+        Raise when compression does not reach ``inp.system.target_density``.
+        When False, warn and continue with the box as compressed (LNP cores,
+        whose lipid packing often cannot reach the nominal density within the
+        compression budget). Default is True.
 
     Returns
     -------
@@ -161,7 +171,11 @@ def create_mixedbox_by_compression(inp: BuildInput):
         # 4. get the coordinates of the equilibrated (in-vacuo) mixedbox and set it
         # on the existing universe
         u_equil = compress_box(
-            u, wd / "mixedbox.pdb", wd / "topology.top", target_density=inp.system.target_density
+            u,
+            wd / "mixedbox.pdb",
+            wd / "topology.top",
+            target_density=inp.system.target_density,
+            require_convergence=require_target_density,
         )
         u = u_equil
 
@@ -413,11 +427,13 @@ def create_lnp_core(inp: BuildInput):
         engine=inp.engine,
     )
 
-    # Use the existing mixedbox compression workflow for the unit cell
+    # Use the existing mixedbox compression workflow for the unit cell. The lipid
+    # core often cannot reach the nominal density within the compression budget;
+    # keep the pre-existing behavior of continuing with a warning instead of failing.
     u_unit, parameters, parametrize_function, topology_function = create_mixedbox_by_compression(
-        core_inp
+        core_inp, require_target_density=False
     )
-    logger.info("Core unit cell compressed to target density.")
+    logger.info("Core unit cell compressed.")
 
     # Replicate the unit cell n×n×n times
     n = inp.system.core.replication_factor
@@ -880,7 +896,13 @@ def build_proteinbox(inp: BuildInput):
 
     em_mdp = Path("em.mdp")
     if em_mdp.is_file():
-        validate_with_grompp(topology_dest, Path("system.pdb"), em_mdp, Path.cwd())
+        validate_with_grompp(
+            topology_dest,
+            Path("system.pdb"),
+            em_mdp,
+            Path.cwd(),
+            allow_net_charge=not inp.system.ionization.neutralize,
+        )
 
     # Remove the pdb2gmx-specific loose intermediates, which have no counterpart in
     # the small-molecule builds. solvated.pdb and the relaxation/ working dir are
@@ -1032,11 +1054,11 @@ def build_protein_mixedbox(inp: BuildInput):
     from .simulation.openmm_utils import compress_box, relax_with_protein_restraints
     from .utils.setup_utilities import (
         PROTEIN_MIXEDBOX_DILUTION_FACTOR,
-        charmm_native_atom_names,
         create_protein_mixedbox_universe,
         cubic_box_edge_for_density,
         protein_displaced_volume_a3,
         resolve_solution_counts,
+        topology_atom_names,
     )
 
     if not isinstance(inp.system, ProteinMixedBoxComposition):
@@ -1158,7 +1180,10 @@ def build_protein_mixedbox(inp: BuildInput):
             [spec.resname for spec in packed_species],
             dilute_edge,
             wd / "packmol",
-            native_atom_names=[charmm_native_atom_names(spec.smiles) for spec in packed_species],
+            native_atom_names=[
+                topology_atom_names(spec, par)
+                for spec, par in zip(packed_species, packed_parameters)
+            ],
         )
         logger.info(
             f"Packed {sum(packed_counts)} solution molecules around the protein "
@@ -1391,7 +1416,13 @@ def build_protein_mixedbox(inp: BuildInput):
 
     em_mdp = Path("em.mdp")
     if em_mdp.is_file():
-        validate_with_grompp(topology_dest, Path("system.pdb"), em_mdp, Path.cwd())
+        validate_with_grompp(
+            topology_dest,
+            Path("system.pdb"),
+            em_mdp,
+            Path.cwd(),
+            allow_net_charge=not inp.system.ionization.neutralize,
+        )
 
     # Remove the pdb2gmx-specific loose intermediates, matching build_proteinbox.
     # Only runs on success; a failure earlier keeps the intermediates for debugging.

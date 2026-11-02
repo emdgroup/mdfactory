@@ -534,6 +534,46 @@ def collect_forcefield_atomtype_definitions(
     return definitions
 
 
+def read_itp_atoms(itp_path: Path) -> list[tuple[str, float]]:
+    """Return ``(atom name, mass)`` for each atom of the first moleculetype in an ITP.
+
+    Parameters
+    ----------
+    itp_path : Path
+        GROMACS ``.itp`` file containing a single-molecule ``[ atoms ]`` section.
+
+    Returns
+    -------
+    list of tuple of (str, float)
+        Atom names and masses in topology order.
+
+    Raises
+    ------
+    ValueError
+        If the file has no ``[ atoms ]`` section or an atom line lacks a mass.
+
+    """
+    atoms: list[tuple[str, float]] = []
+    in_atoms = False
+    for raw in Path(itp_path).read_text().splitlines():
+        line = raw.split(";", 1)[0].strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            if in_atoms:
+                break
+            in_atoms = line[1:-1].strip().lower() == "atoms"
+            continue
+        if in_atoms:
+            fields = line.split()
+            if len(fields) < 8:
+                raise ValueError(f"Atom line without a mass in {itp_path}: {raw!r}")
+            atoms.append((fields[4], float(fields[7])))
+    if not atoms:
+        raise ValueError(f"No [ atoms ] section found in {itp_path}.")
+    return atoms
+
+
 def collect_forcefield_atomtypes(ff_dir: str | Path) -> set[str]:
     """Return the atom type names defined by a bundled GROMACS force-field directory.
 

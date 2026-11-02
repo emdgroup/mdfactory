@@ -856,9 +856,10 @@ def create_protein_mixedbox_universe(
     tolerance_a : float, optional
         Packmol non-overlap tolerance in Å. Default 2.0 (matches pack_box).
     native_atom_names : list[list[str] | None] or None, optional
-        CHARMM atom names for each species, aligned with ``molecules``. Use
-        ``None`` for CGenFF species. These names replace the generic OpenFF PDB
-        names for native water and ions.
+        Topology atom names for each species, aligned with ``molecules`` (see
+        :func:`topology_atom_names`). They replace the generic OpenFF PDB names,
+        e.g. CHARMM names for native water and ions and the ITP names for CGenFF
+        solutes. Use ``None`` to keep the packed names.
 
     Returns
     -------
@@ -982,3 +983,55 @@ def charmm_native_atom_names(smiles: str) -> list[str] | None:
         "[Na+]": ["NA"],
         "[Cl-]": ["CL"],
     }.get(smiles)
+
+
+def topology_atom_names(species, parameter_set) -> list[str] | None:
+    """Return the atom names the topology expects for a packed solution species.
+
+    Native water and ions use the canonical CHARMM36m names. Small molecules
+    with their own ``.itp`` (CGenFF solutes) use that file's ``[ atoms ]`` names,
+    so the coordinates match the topology instead of keeping the generic
+    element-indexed names from packing.
+
+    Parameters
+    ----------
+    species : SingleMoleculeSpecies
+        Packed solution species; its RDKit molecule defines the packing atom order.
+    parameter_set : GromacsSingleMoleculeParameterSet
+        Parameters for *species*.
+
+    Returns
+    -------
+    list of str or None
+        Atom names in packing order, or None to keep the packed names.
+
+    Raises
+    ------
+    ValueError
+        If the ITP atoms do not match the species atom by atom (count or mass),
+        which would mean the topology and coordinate orders differ.
+
+    """
+    native = charmm_native_atom_names(species.smiles)
+    if native is not None:
+        return native
+    if parameter_set.parameter_itp is None:
+        return None
+
+    from .topology_utilities import read_itp_atoms  # noqa: PLC0415
+
+    itp_atoms = read_itp_atoms(parameter_set.itp)
+    mol_atoms = list(species.rdkit_molecule.GetAtoms())
+    if len(itp_atoms) != len(mol_atoms):
+        raise ValueError(
+            f"{parameter_set.itp} defines {len(itp_atoms)} atoms but species "
+            f"{species.resname} ({species.smiles}) has {len(mol_atoms)}."
+        )
+    for index, ((name, itp_mass), atom) in enumerate(zip(itp_atoms, mol_atoms)):
+        if abs(itp_mass - atom.GetMass()) > 0.1:
+            raise ValueError(
+                f"Atom {index + 1} of {species.resname} is {atom.GetSymbol()} in the "
+                f"packed molecule but {name} (mass {itp_mass}) in {parameter_set.itp}; "
+                "topology and coordinate atom orders differ."
+            )
+    return [name for name, _ in itp_atoms]

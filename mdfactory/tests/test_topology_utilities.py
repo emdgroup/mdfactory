@@ -81,9 +81,7 @@ def test_collect_atomtypes_rejects_genuine_redefinition(tmp_path):
     ff_dir = tmp_path / "charmm36.ff"
     ff_dir.mkdir()
     (ff_dir / "ffnonbonded.itp").write_text(
-        "[ atomtypes ]\n"
-        "HT 1 1.008 0.417 A 0.04000 0.19246\n"
-        "HT 1 4.032 0.417 A 0.04000 0.19246\n"
+        "[ atomtypes ]\nHT 1 1.008 0.417 A 0.04000 0.19246\nHT 1 4.032 0.417 A 0.04000 0.19246\n"
     )
 
     with pytest.raises(ValueError, match="inconsistently"):
