@@ -1045,7 +1045,18 @@ def bundle_forcefield_into_topology(top_path: Path) -> str | None:
     return ff_dir_name
 
 
-def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) -> None:
+_NET_CHARGE_WARNING = "system with net charge"
+
+
+def _grompp_warnings(output: str) -> list[str]:
+    """Return the text of each ``WARNING <n> [...]`` block in grompp output."""
+    blocks = re.split(r"^WARNING \d+ \[", output, flags=re.MULTILINE)[1:]
+    return [block.split("\n\n", 1)[0] for block in blocks]
+
+
+def validate_with_grompp(
+    topology: Path, structure: Path, mdp: Path, cwd: Path, allow_net_charge: bool = False
+) -> None:
     """Run gmx grompp as a validation check for topology/coordinate consistency.
 
     Parameters
@@ -1058,6 +1069,10 @@ def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) 
         Path to MDP file (e.g., em.mdp).
     cwd : Path
         Working directory for the command.
+    allow_net_charge : bool, optional
+        Accept grompp's warning about Ewald electrostatics in a system with net
+        charge, for builds that deliberately skip neutralization. Any other
+        warning still fails validation. Default is False.
 
     Raises
     ------
@@ -1067,31 +1082,36 @@ def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) 
     """
     gmx_bin = str(check_gmx_available())
     tpr_out = cwd / "check.tpr"
-    cmd = [
-        gmx_bin,
-        "grompp",
-        "-f",
-        str(mdp),
-        "-c",
-        str(structure),
-        "-p",
-        str(topology),
-        "-o",
-        str(tpr_out),
-        "-maxwarn",
-        "0",
-    ]
 
-    result = subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        text=True,
-        input="",
-        capture_output=True,
-        timeout=60,
-        env=get_gromacs_env(),
-        check=False,
-    )
+    def run_grompp(maxwarn: int) -> subprocess.CompletedProcess:
+        cmd = [
+            gmx_bin,
+            "grompp",
+            "-f",
+            str(mdp),
+            "-c",
+            str(structure),
+            "-p",
+            str(topology),
+            "-o",
+            str(tpr_out),
+            "-maxwarn",
+            str(maxwarn),
+        ]
+        return subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            text=True,
+            input="",
+            capture_output=True,
+            timeout=60,
+            env=get_gromacs_env(),
+            check=False,
+        )
+
+    # A single grompp call: gmx_mpi aborts through MPI on failure, which can take
+    # down an enclosing srun step, so never rely on a failing first attempt.
+    result = run_grompp(1 if allow_net_charge else 0)
 
     # Clean up grompp artifacts
     if tpr_out.is_file():
@@ -1106,5 +1126,19 @@ def validate_with_grompp(topology: Path, structure: Path, mdp: Path, cwd: Path) 
             f"stdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}"
         )
+
+    if allow_net_charge:
+        grompp_warnings = _grompp_warnings(result.stdout + result.stderr)
+        unexpected = [w for w in grompp_warnings if _NET_CHARGE_WARNING not in " ".join(w.split())]
+        if unexpected:
+            raise RuntimeError(
+                "gmx grompp validation reported warnings other than the accepted "
+                "net-charge warning:\n" + "\n".join(unexpected)
+            )
+        if grompp_warnings:
+            logger.warning(
+                "System has a net charge (neutralization disabled); accepted grompp's "
+                "net-charge warning."
+            )
 
     logger.info("grompp validation passed.")
