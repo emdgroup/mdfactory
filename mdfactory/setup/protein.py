@@ -498,8 +498,59 @@ def check_forcefield_available(forcefield: str) -> None:
     )
 
 
+def _restrict_missing_residues_to_internal_gaps(fixer) -> None:
+    """Drop missing terminal residues from ``fixer.missingResidues``; warn about all gaps.
+
+    ``PDBFixer.findMissingResidues`` compares the coordinates with the SEQRES
+    records and lists every unresolved residue, and ``addMissingAtoms`` then
+    builds all of them. Unresolved terminal tails (tags, disordered termini)
+    are not part of the deposited structure and would be built as extended
+    stubs pointing into the solvent, so they are dropped. Internal gaps are
+    kept and modeled: leaving them open would make pdb2gmx bond the residues
+    on either side of the gap across the missing segment.
+
+    Parameters
+    ----------
+    fixer : pdbfixer.PDBFixer
+        Fixer on which ``findMissingResidues`` has been called. Modified in place.
+
+    """
+    chains = list(fixer.topology.chains())
+    internal = {}
+    for (chain_index, position), names in sorted(fixer.missingResidues.items()):
+        chain = chains[chain_index]
+        residues = list(chain.residues())
+        seq = "-".join(names)
+        if position == 0:
+            first = residues[0]
+            logger.warning(
+                f"Chain {chain.id}: {len(names)} unresolved N-terminal residue(s) {seq} "
+                f"before {first.name}{first.id} are listed in SEQRES but not modeled."
+            )
+        elif position == len(residues):
+            last = residues[-1]
+            logger.warning(
+                f"Chain {chain.id}: {len(names)} unresolved C-terminal residue(s) {seq} "
+                f"after {last.name}{last.id} are listed in SEQRES but not modeled."
+            )
+        else:
+            before, after = residues[position - 1], residues[position]
+            logger.warning(
+                f"Chain {chain.id}: modeling {len(names)} missing internal residue(s) {seq} "
+                f"between {before.name}{before.id} and {after.name}{after.id} "
+                "with PDBFixer; check the loop geometry."
+            )
+            internal[(chain_index, position)] = names
+    fixer.missingResidues = internal
+
+
 def clean_pdb(pdb_path: Path, output_path: Path) -> Path:
-    """Clean a PDB file using PDBFixer: remove heterogens, add missing heavy atoms.
+    """Clean a PDB file using PDBFixer.
+
+    Removes all heterogens (ligands, cofactors, metals, crystal waters), models
+    residues missing from internal gaps of a chain (per the SEQRES records),
+    and adds missing heavy atoms. Unresolved terminal residues are not
+    modeled. Every missing segment is reported as a warning.
 
     Parameters
     ----------
@@ -519,6 +570,7 @@ def clean_pdb(pdb_path: Path, output_path: Path) -> Path:
     fixer = PDBFixer(filename=str(pdb_path))
     fixer.removeHeterogens(keepWater=False)
     fixer.findMissingResidues()
+    _restrict_missing_residues_to_internal_gaps(fixer)
     fixer.findMissingAtoms()
     fixer.addMissingAtoms()
 
