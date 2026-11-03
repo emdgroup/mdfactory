@@ -636,6 +636,49 @@ class TestCleanPdb:
         assert all(ln[22:26].strip() == "15" for ln in atom_lines)
         assert all(ln[26] == "A" for ln in atom_lines)
 
+    def test_models_internal_gaps_but_not_terminal_tails(self, tmp_path):
+        # SEQRES lists 9 residues; only ALA 3-5 and ALA 7 have coordinates.
+        # The internal gap (GLY 6) is modeled, the unresolved tails
+        # (GLY 1-2, SER 8-9) are not, and every segment is reported.
+        from loguru import logger
+
+        seqres = "GLY GLY ALA ALA ALA GLY ALA SER SER".split()
+        lines = [f"SEQRES   1 A    9  {' '.join(seqres)}"]
+        serial = 1
+        for resid in (3, 4, 5, 7):
+            x0 = 3.8 * (resid - 1)
+            for name, dx, dy, element in (
+                ("N", -1.2, 0.3, "N"),
+                ("CA", 0.0, 0.0, "C"),
+                ("C", 1.2, 0.3, "C"),
+                ("O", 1.4, 1.5, "O"),
+            ):
+                lines.append(
+                    f"ATOM  {serial:5d}  {name:<3s} ALA A{resid:4d}    "
+                    f"{x0 + dx:8.3f}{dy:8.3f}{0.0:8.3f}  1.00  0.00          {element:>2s}"
+                )
+                serial += 1
+        lines += ["TER", "END"]
+        pdb = tmp_path / "gapped.pdb"
+        pdb.write_text("\n".join(lines) + "\n")
+
+        messages = []
+        handler_id = logger.add(
+            lambda m: messages.append(str(m)), level="WARNING", format="{message}"
+        )
+        try:
+            out = clean_pdb(pdb, tmp_path / "clean.pdb")
+        finally:
+            logger.remove(handler_id)
+
+        u = mda.Universe(str(out))
+        assert list(u.residues.resids) == [3, 4, 5, 6, 7]
+        assert list(u.residues.resnames) == ["ALA", "ALA", "ALA", "GLY", "ALA"]
+        text = "\n".join(messages)
+        assert "N-terminal" in text and "GLY-GLY" in text
+        assert "C-terminal" in text and "SER-SER" in text
+        assert "internal" in text
+
 
 @pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
 class TestPdbPathResolution:
