@@ -29,7 +29,7 @@ from .analysis.submit import (
     submit_artifacts_slurm,
 )
 from .analysis.utils import get_chemistry_extractor
-from .prepare import df_to_build_input_models
+from .prepare import load_build_input_csv, resolve_protein_pdb_path
 from .utils.data_manager import check_run_exists
 from .utils.push import push_systems
 from .utils.utilities import working_directory
@@ -69,7 +69,7 @@ def prepare_build(input: Path, output: Path = Path(".")):
         )
         shutil.copy(yml_build_path, yml_bak)
 
-    df, models, errors = df_models_from_input_csv(input)
+    df, models, errors = load_build_input_csv(input)
     for m in models:
         if check_run_exists(m):
             raise ValueError("This system has already been built and is in the database:")
@@ -86,14 +86,6 @@ def prepare_build(input: Path, output: Path = Path(".")):
     logger.info("Created DataFrame for systems:\n{}", df)
 
     _prepare_system_directories(models, input, output, exist_ok=False)
-
-
-def df_models_from_input_csv(input):
-    df = pd.read_csv(input)
-    # remove 'unnamed' CSV columns
-    df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
-    models, errors = df_to_build_input_models(df)
-    return df, models, errors
 
 
 def _prepare_system_directories(
@@ -129,7 +121,9 @@ def _prepare_system_directories(
         yml_path = build_dir / f"{model.hash}.yaml"
         if not yml_path.exists():
             with open(yml_path, "w") as f:
-                yaml.safe_dump(model.model_dump(), f)
+                # mode="json" so Path and tuple fields (e.g. proteinbox pdb_path and
+                # disulfide_bonds) serialize to plain str/list that yaml.safe_dump can write.
+                yaml.safe_dump(model.model_dump(mode="json"), f)
         dirs.append(str(build_dir.resolve()))
 
     summary_path = output / f"{input_path.stem}.yaml"
@@ -284,7 +278,7 @@ def _build_from_csv(
     dry_run: bool = False,
 ):
     """Handle CSV input for the build command."""
-    df, models, errors = df_models_from_input_csv(input)
+    df, models, errors = load_build_input_csv(input)
     if errors:
         logger.error("Errors building models from CSV:")
         for k, v in errors.items():
@@ -341,6 +335,10 @@ def _build_from_yaml(
         # Single build YAML
         from mdfactory.models.input import BuildInput
 
+        # Resolve a relative protein pdb_path against the YAML's directory before
+        # hashing, so the Parsl worker (which runs inside output/<hash>/) finds the
+        # PDB and the build directory is named after the model that is built.
+        resolve_protein_pdb_path(data, Path(input).parent)
         model = BuildInput(**data)
 
         if config is not None or dry_run:
@@ -743,7 +741,7 @@ def check_csv(input: Path):
 
     """
     input = input.resolve()
-    _, models, errors = df_models_from_input_csv(input)
+    _, models, errors = load_build_input_csv(input)
     if errors:
         logger.error("Error occured in building models from CSV data.")
         for k, v in errors.items():

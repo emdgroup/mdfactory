@@ -21,7 +21,15 @@ from scipy.spatial.distance import cdist
 from mdfactory.models.composition import BilayerComposition
 from mdfactory.models.input import MixedBoxComposition
 from mdfactory.models.species import LipidSpecies
-from mdfactory.utils.utilities import temporary_working_directory
+from mdfactory.utils.utilities import temporary_working_directory, working_directory
+
+# Avogadro's number, matching the g<->Dalton conventions used in composition.py.
+N_AVOGADRO = 6.022e23
+
+# A protein_mixedbox is packed at 0.1x the final density so water and solutes have
+# room to be placed around the fixed protein before compression squeezes the box
+# down to its requested size (mirrors the mixedbox 0.1x loose-packing idiom).
+PROTEIN_MIXEDBOX_DILUTION_FACTOR = 0.1
 
 
 def generate_lipid_structure_legacy(
@@ -725,3 +733,300 @@ def _pack_molecules_into_box(molecules, number_of_copies, working_dir, target_de
         box_shape=UNIT_CUBE,
         working_directory=working_dir,
     )
+
+
+def protein_displaced_volume_a3(
+    protein_mass_dalton: float, partial_specific_volume: float
+) -> float:
+    """Return a protein's displaced volume in Å³ from its mass and partial specific volume.
+
+    ``partial_specific_volume`` is in mL/g. The mass converts to grams via
+    Avogadro's number, multiplies by the specific volume to give cm³, and cm³
+    converts to Å³ (1 cm³ = 1e24 Å³).
+    """
+    mass_g = protein_mass_dalton / N_AVOGADRO
+    volume_cm3 = mass_g * partial_specific_volume
+    return volume_cm3 * 1e24
+
+
+def cubic_box_edge_for_density(total_mass_dalton: float, target_density: float) -> float:
+    """Return box edge (Å) holding ``total_mass_dalton`` at the density."""
+    mass_g = total_mass_dalton / N_AVOGADRO
+    volume_cm3 = mass_g / target_density
+    volume_a3 = volume_cm3 * 1e24
+    return float(volume_a3 ** (1.0 / 3.0))
+
+
+def concentration_reference_volume_a3(
+    box_volume_a3: float, protein_mass_dalton: float, partial_specific_volume: float, basis: str
+) -> float:
+    """Return the volume (Å³) that molar concentrations refer to.
+
+    This is ``box_volume_a3`` for ``basis="box"`` and the box minus the protein's
+    displaced volume for ``basis="protein_excluded"``. Raises ``ValueError`` if
+    the result is not positive.
+    """
+    volume_a3 = box_volume_a3
+    if basis == "protein_excluded":
+        volume_a3 -= protein_displaced_volume_a3(protein_mass_dalton, partial_specific_volume)
+    if volume_a3 <= 0:
+        raise ValueError(
+            f"Concentration reference volume is non-positive ({volume_a3:.1f} Å³): the "
+            "protein does not fit in the box. A larger box is required."
+        )
+    return volume_a3
+
+
+def resolve_solution_counts(
+    species,
+    box_volume_a3: float,
+    protein_mass_dalton: float,
+    partial_specific_volume: float,
+    basis: str,
+) -> list[int]:
+    """Resolve each solution species to an integer molecule count.
+
+    A species with an explicit ``count`` keeps it. A species with a molar
+    ``concentration`` resolves to ``round(concentration * V_basis * N_A)`` where
+    ``V_basis`` is the full box volume (``basis="box"``) or the box minus the
+    protein's displaced volume (``basis="protein_excluded"``). A positive
+    concentration that rounds to zero molecules is rejected: a larger box is
+    required to represent it.
+
+    Parameters
+    ----------
+    species : list
+        Solution species; each has ``count`` or ``concentration`` set.
+    box_volume_a3 : float
+        Final box volume in Å³.
+    protein_mass_dalton : float
+        Protein mass in Daltons, for the excluded-volume basis.
+    partial_specific_volume : float
+        Protein partial specific volume in mL/g.
+    basis : str
+        ``"box"`` or ``"protein_excluded"``.
+
+    Returns
+    -------
+    list[int]
+        Counts aligned with ``species``.
+
+    """
+    v_basis_a3 = concentration_reference_volume_a3(
+        box_volume_a3, protein_mass_dalton, partial_specific_volume, basis
+    )
+    # 1 Å³ = 1e-27 L, so count = concentration[mol/L] * V[L] * N_A.
+    v_basis_liters = v_basis_a3 * 1e-27
+    counts = []
+    for spec in species:
+        if spec.count is not None:
+            counts.append(int(spec.count))
+            continue
+        count = int(round(spec.concentration * v_basis_liters * N_AVOGADRO))
+        if spec.concentration > 0 and count == 0:
+            raise ValueError(
+                f"Species '{spec.resname}' at {spec.concentration} M resolves to zero "
+                f"molecules in a {v_basis_a3:.1f} Å³ reference volume. A larger box is required."
+            )
+        counts.append(count)
+    return counts
+
+
+def create_protein_mixedbox_universe(
+    u_protein: mda.Universe,
+    molecules,
+    number_of_copies,
+    resnames,
+    box_edge: float,
+    working_dir,
+    native_atom_names,
+) -> mda.Universe:
+    """Pack solution molecules around a fixed protein with packmol.
+
+    The protein is centered in a cubic box of edge ``box_edge`` and handed to
+    packmol as a fixed solute, so its pdb2gmx atom order is preserved. This drives
+    packmol's lower-level primitives directly because ``pack_box(solute=...)``
+    would route the protein through an OpenFF Topology and reorder its atoms.
+
+    Parameters
+    ----------
+    u_protein : mda.Universe
+        The processed protein (pdb2gmx atom order); centered in place by this call.
+    molecules : list
+        OpenFF molecules for each solution species, in packing order.
+    number_of_copies : list[int]
+        Copies to pack for each molecule.
+    resnames : list[str]
+        Residue name for each molecule.
+    box_edge : float
+        Cubic box edge length in Å (the dilute packing box).
+    working_dir : str or Path
+        Directory the packmol working files are written into.
+    native_atom_names : list[list[str] | None]
+        Topology atom names for each species (see :func:`topology_atom_names`),
+        replacing the generic OpenFF PDB names; ``None`` keeps the packed names.
+
+    Returns
+    -------
+    mda.Universe
+        Protein atoms first, followed by the packed solution molecules with one
+        residue each, in a cubic box of ``box_edge``.
+
+    """
+    import subprocess  # noqa: PLC0415
+
+    from openff.interchange.components._packmol import (  # noqa: PLC0415
+        _build_input_file,
+        _create_molecule_pdbs,
+        _find_packmol,
+    )
+    from openff.units import Quantity  # noqa: PLC0415
+
+    packmol_path = _find_packmol()
+    if packmol_path is None:
+        raise OSError("Packmol not found, cannot pack protein_mixedbox.")
+
+    # Center the protein so packmol's fixed (zero-translation) placement keeps it
+    # in the middle of the box.
+    bbox_min = u_protein.atoms.positions.min(axis=0)
+    bbox_max = u_protein.atoms.positions.max(axis=0)
+    box_center = np.array([box_edge, box_edge, box_edge]) / 2.0
+    u_protein.atoms.translate(box_center - (bbox_min + bbox_max) / 2.0)
+    n_protein_atoms = u_protein.atoms.n_atoms
+
+    with working_directory(working_dir, create=True) as wd:
+        protein_pdb = wd / "protein_centered.pdb"
+        u_protein.atoms.write(str(protein_pdb))
+
+        pdb_file_names = _create_molecule_pdbs(molecules)
+        box_size = Quantity(np.array([box_edge, box_edge, box_edge]), "angstrom")
+        input_file_path, output_file_path = _build_input_file(
+            pdb_file_names,
+            number_of_copies,
+            str(protein_pdb),
+            box_size,
+            Quantity(2.0, "angstrom"),  # matches pack_box
+            rectangular=True,
+        )
+
+        with open(input_file_path) as file_handle:
+            result = subprocess.check_output(
+                packmol_path, stdin=file_handle, stderr=subprocess.STDOUT
+            )
+        if result.decode("utf-8").find("Success!") <= 0:
+            raise RuntimeError("Packmol did not report success while packing protein_mixedbox.")
+
+        # The fixed solute is written first, so its atoms/positions are unchanged;
+        # take those from the authoritative protein universe and only the packed
+        # solution atoms from packmol's output.
+        u_packed = mda.Universe(str(wd / output_file_path))
+
+    solution_residue_data = []
+    for molecule, resname, count, atom_names in zip(
+        molecules, resnames, number_of_copies, native_atom_names
+    ):
+        solution_residue_data.extend([(resname.upper(), molecule.n_atoms, atom_names)] * count)
+
+    expected_atoms = n_protein_atoms + sum(n_atoms for _, n_atoms, _ in solution_residue_data)
+    if u_packed.atoms.n_atoms != expected_atoms:
+        raise ValueError(
+            f"Packmol output has {u_packed.atoms.n_atoms} atoms, expected "
+            f"{expected_atoms}. Cannot reconstruct packed molecules."
+        )
+
+    # Packmol preserves structure/copy order, but its repeated residue IDs and
+    # chain labels are not reliable molecule boundaries. Rebuild the solution in
+    # one allocation, assigning one residue per known molecule. Avoid a Merge per
+    # molecule here: realistic systems contain tens of thousands of waters.
+    atom_offset = n_protein_atoms
+    solution_names: list[str] = []
+    solution_resnames: list[str] = []
+    atom_resindex: list[int] = []
+    for residue_index, (resname, n_atoms, atom_names) in enumerate(solution_residue_data):
+        solution_names.extend(
+            u_packed.atoms.names[atom_offset : atom_offset + n_atoms]
+            if atom_names is None
+            else atom_names
+        )
+        solution_resnames.append(resname)
+        atom_resindex.extend([residue_index] * n_atoms)
+        atom_offset += n_atoms
+
+    n_solution_atoms = expected_atoms - n_protein_atoms
+    solution = mda.Universe.empty(
+        n_solution_atoms,
+        n_residues=len(solution_residue_data),
+        atom_resindex=np.asarray(atom_resindex),
+        trajectory=True,
+    )
+    solution.add_TopologyAttr("names", solution_names)
+    solution.add_TopologyAttr("types", list(u_packed.atoms.types[n_protein_atoms:expected_atoms]))
+    solution.add_TopologyAttr("resnames", solution_resnames)
+    solution.add_TopologyAttr("resids", np.arange(1, len(solution_residue_data) + 1))
+    solution.add_TopologyAttr("chainIDs", ["S"] * n_solution_atoms)
+    solution.atoms.positions = u_packed.atoms.positions[n_protein_atoms:expected_atoms]
+
+    merged = mda.Merge(u_protein.atoms, solution.atoms)
+    merged.dimensions = [box_edge, box_edge, box_edge, 90, 90, 90]
+    return merged
+
+
+def charmm_native_atom_names(smiles: str) -> list[str] | None:
+    """Return canonical CHARMM36m atom names for supported native species."""
+    return {
+        "O": ["OW", "HW1", "HW2"],
+        "[Na+]": ["NA"],
+        "[Cl-]": ["CL"],
+    }.get(smiles)
+
+
+def topology_atom_names(species, parameter_set) -> list[str] | None:
+    """Return the atom names the topology expects for a packed solution species.
+
+    Native water and ions use the canonical CHARMM36m names. Small molecules
+    with their own ``.itp`` (CGenFF solutes) use that file's ``[ atoms ]`` names,
+    so the coordinates match the topology instead of keeping the generic
+    element-indexed names from packing.
+
+    Parameters
+    ----------
+    species : SingleMoleculeSpecies
+        Packed solution species; its RDKit molecule defines the packing atom order.
+    parameter_set : GromacsSingleMoleculeParameterSet
+        Parameters for *species*.
+
+    Returns
+    -------
+    list of str or None
+        Atom names in packing order, or None to keep the packed names.
+
+    Raises
+    ------
+    ValueError
+        If the ITP atoms do not match the species atom by atom (count or mass),
+        which would mean the topology and coordinate orders differ.
+
+    """
+    native = charmm_native_atom_names(species.smiles)
+    if native is not None:
+        return native
+    if parameter_set.parameter_itp is None:
+        return None
+
+    from .topology_utilities import read_itp_atoms  # noqa: PLC0415
+
+    itp_atoms = read_itp_atoms(parameter_set.itp)
+    mol_atoms = list(species.rdkit_molecule.GetAtoms())
+    if len(itp_atoms) != len(mol_atoms):
+        raise ValueError(
+            f"{parameter_set.itp} defines {len(itp_atoms)} atoms but species "
+            f"{species.resname} ({species.smiles}) has {len(mol_atoms)}."
+        )
+    for index, ((name, itp_mass), atom) in enumerate(zip(itp_atoms, mol_atoms)):
+        if abs(itp_mass - atom.GetMass()) > 0.1:
+            raise ValueError(
+                f"Atom {index + 1} of {species.resname} is {atom.GetSymbol()} in the "
+                f"packed molecule but {name} (mass {itp_mass}) in {parameter_set.itp}; "
+                "topology and coordinate atom orders differ."
+            )
+    return [name for name, _ in itp_atoms]

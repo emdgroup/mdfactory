@@ -1,12 +1,13 @@
-# ABOUTME: Pydantic models for molecular species (small molecules and lipids)
+# ABOUTME: Pydantic models for molecular species (small molecules, lipids, proteins)
 # ABOUTME: Provides SMILES-based identity, charge, and molecular object properties
-"""Pydantic models for molecular species (small molecules and lipids)."""
+"""Pydantic models for molecular species (small molecules, lipids, proteins)."""
 
 import hashlib
 import io
 import warnings
 from functools import cached_property
-from typing import Optional
+from pathlib import Path
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 from rdkit import Chem
@@ -151,6 +152,44 @@ class SingleMoleculeSpecies(Species):
         return Descriptors.MolWt(ml)
 
 
+class SolutionSpecies(SingleMoleculeSpecies):
+    """Represent a solution molecule specified by an exact count or a molar concentration.
+
+    Used for the molecules packed around a protein in a protein_mixedbox: water
+    (expressed as ``smiles: O``), ions, and arbitrary SMILES solutes. Exactly one
+    of ``count`` or ``concentration`` must be given; fractions are not supported,
+    because the box packs an explicit number of each molecule or resolves a molar
+    concentration to a count against a chosen volume basis.
+    """
+
+    count: Optional[int] = Field(None, description="Exact number of molecules to pack.", ge=0)
+    concentration: Optional[float] = Field(
+        None, description="Target molar concentration in mol/L (M).", ge=0.0
+    )
+
+    @model_validator(mode="after")
+    def check_fraction_or_count(self) -> "SolutionSpecies":
+        """Require exactly one of count or concentration and reject fractions.
+
+        Shadows the base ``Species`` validator (same method name) so a species
+        carrying only a concentration is not rejected for lacking a count.
+        """
+        if self.fraction is not None:
+            raise ValueError(
+                "SolutionSpecies does not support 'fraction'; provide 'count' or 'concentration'."
+            )
+        if (self.count is None) == (self.concentration is None):
+            raise ValueError("SolutionSpecies requires exactly one of 'count' or 'concentration'.")
+        native_resnames = {"O": "SOL", "[Na+]": "NA", "[Cl-]": "CL"}
+        expected_resname = native_resnames.get(self.smiles)
+        if expected_resname is not None and self.resname.upper() != expected_resname:
+            raise ValueError(
+                f"Native CHARMM species {self.smiles!r} must use resname "
+                f"'{expected_resname}', not '{self.resname}'."
+            )
+        return self
+
+
 class LipidSpecies(SingleMoleculeSpecies):
     """Represent a lipid species with head, tail, and branch atom annotations."""
 
@@ -196,3 +235,46 @@ class LipidSpecies(SingleMoleculeSpecies):
     #         u, tail_atom_ids=self.tail_atoms, head_atom_ids=self.head_atoms, z_axis=[1, 0, 0]
     #     )
     #     return u
+
+
+class ProteinSpecies(Species):
+    """Represent a protein species identified by a PDB structure file."""
+
+    # A protein species is exactly one copy: the builder produces a single structure
+    # and metadata reports a total count of 1.
+    count: Literal[1] = Field(1, description="Number of protein copies (always 1).")
+    fraction: Literal[1.0] = Field(1.0, description="Fraction (always 1.0 for protein).")
+    pdb_path: Path = Field(..., description="Path to the input PDB file.")
+    chains: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Chain identifiers to build, e.g. ['A'] or ['H', 'L', 'Y']. Required for "
+            "multi-chain structures and validated against the chains pdb2gmx produces; "
+            "optional for a single-chain structure."
+        ),
+    )
+    disulfide_bonds: list[tuple[str, str]] = Field(
+        default_factory=list,
+        description=(
+            "Pairs of cysteine residues forming disulfide bonds, "
+            "e.g. [('CYS6', 'CYS127'), ('CYS30', 'CYS115')]. Each residue may be "
+            "chain-qualified and may include a PDB insertion code (e.g. 'A:CYS6' or "
+            "'H:CYS100A'); a partially qualified reference matching multiple residues is "
+            "rejected as ambiguous."
+        ),
+    )
+    protonation_states: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Residue-specific protonation states, e.g. {'HIS15': 'HIE'}. Keys may be "
+            "chain-qualified and may include a PDB insertion code (e.g. "
+            "{'A:HIS15': 'HIE'} or {'H:HIS100A': 'HIE'}); a partially qualified key "
+            "matching multiple residues is rejected as ambiguous. For CHARMM only "
+            "3-character states are expressible (histidine tautomers, neutral lysine)."
+        ),
+    )
+
+    @property
+    def charge(self) -> int | None:
+        """Return None; protein charge comes from the pdb2gmx topology, not the species."""
+        return None

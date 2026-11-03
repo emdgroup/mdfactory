@@ -81,10 +81,12 @@ class RunScheduleManager:
         """Get paths to all run files for a specific configuration."""
         config = self._get_config(engine, system_type, version)
         run_files = config.get("run_files", [])
+        # ``template_dir`` lets a system type reuse another type's run files.
+        template_dir = self.config_dir / engine / config.get("template_dir", system_type)
 
         file_paths = {}
         for filename in run_files:
-            file_path = self.config_dir / engine / system_type / filename
+            file_path = template_dir / filename
             if file_path.exists():
                 file_paths[filename] = file_path
             else:

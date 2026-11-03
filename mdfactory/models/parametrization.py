@@ -6,7 +6,20 @@ import json
 from pathlib import Path
 from typing import Annotated, Literal, Optional
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Discriminator, Field, FilePath, Tag
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    FilePath,
+    Tag,
+    model_validator,
+)
+
+# The proteinbox pipeline solvates with 3-site spc216 coordinates and uses
+# CHARMM Force-switch LJ in every mdp, so only these combinations are supported.
+SUPPORTED_WATER_MODELS = frozenset({"tip3p", "spc", "spce"})
 
 
 def validate_absolute_path(path: Path):
@@ -50,8 +63,87 @@ class CgenffConfig(BaseModel):
     # CGenFF uses SILCSBIODIR from config.ini, no additional settings needed
 
 
+class _CharmmFamilyConfig(BaseModel):
+    """Shared fields and CHARMM force-field/water validation for protein configs.
+
+    The run schedules use CHARMM Force-switch LJ (cutoff, not LJ-PME) and solvate
+    with 3-site spc216 coordinates, so a non-CHARMM force field, an LJ-PME variant,
+    or a non-3-site water model would silently mismatch the mdp settings.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: str  # narrowed to a Literal discriminator by subclasses (kept first in field order)
+    forcefield: str = Field(
+        "charmm36m", description="Force field name as recognized by gmx pdb2gmx."
+    )
+    water_model: str = Field("tip3p", description="Water model name as recognized by gmx pdb2gmx.")
+    ignore_hydrogens: bool = Field(
+        True, description="Ignore hydrogens in input PDB (regenerate with pdb2gmx)."
+    )
+    merge_all: bool = Field(False, description="Merge all chains into a single moleculetype.")
+
+    @model_validator(mode="after")
+    def _check_charmm_forcefield_and_water(self):
+        """Reject force fields and water models the CHARMM run schedules cannot honor."""
+        if not self.forcefield.lower().startswith("charmm"):
+            raise ValueError(
+                f"Force field '{self.forcefield}' is not supported. The run schedule uses "
+                "CHARMM Force-switch LJ settings, so only CHARMM force fields (e.g. "
+                "charmm36m, charmm36, charmm27) are supported."
+            )
+        if "ljpme" in self.forcefield.lower():
+            raise ValueError(
+                f"Force field '{self.forcefield}' is not supported. The run schedule uses "
+                "cutoff/Force-switch LJ, which is incompatible with an LJ-PME force "
+                "field. Use the standard CHARMM variant (e.g. charmm36m)."
+            )
+        if self.water_model.lower() not in SUPPORTED_WATER_MODELS:
+            raise ValueError(
+                f"Water model '{self.water_model}' is not supported. Solvation uses 3-site "
+                "spc216 coordinates, so only 3-site water models are supported: "
+                f"{sorted(SUPPORTED_WATER_MODELS)}."
+            )
+        return self
+
+
+class Pdb2gmxConfig(_CharmmFamilyConfig):
+    """Configuration for pdb2gmx protein parametrization."""
+
+    type: Literal["pdb2gmx"] = Field("pdb2gmx", description="Config type discriminator.")
+
+
+class CharmmConfig(_CharmmFamilyConfig):
+    """Configuration for CHARMM parametrization of a protein packed with small molecules.
+
+    Protein atoms are built with gmx pdb2gmx and ordinary SMILES solutes with
+    CGenFF under one compatible CHARMM/CGenFF force-field family; native water and
+    supported CHARMM ions skip CGenFF.
+    """
+
+    type: Literal["charmm"] = Field("charmm", description="Config type discriminator.")
+
+    @model_validator(mode="after")
+    def _check_protein_mixedbox_bundle(self) -> "CharmmConfig":
+        """Reject force fields and water models the protein_mixedbox pipeline cannot honor."""
+        if self.forcefield != "charmm36m":
+            raise ValueError(
+                "protein_mixedbox currently supports only the registered 'charmm36m' "
+                "bundle, which pins a compatible CHARMM36m + CGenFF parameter family."
+            )
+        if self.water_model != "tip3p":
+            raise ValueError(
+                "protein_mixedbox currently supports only 'tip3p', whose native atom "
+                "and residue names are normalized during packing."
+            )
+        return self
+
+
 ParametrizationConfig = Annotated[
-    Annotated[SmirnoffConfig, Tag("smirnoff")] | Annotated[CgenffConfig, Tag("cgenff")],
+    Annotated[SmirnoffConfig, Tag("smirnoff")]
+    | Annotated[CgenffConfig, Tag("cgenff")]
+    | Annotated[Pdb2gmxConfig, Tag("pdb2gmx")]
+    | Annotated[CharmmConfig, Tag("charmm")],
     Discriminator("type"),
 ]
 
@@ -91,3 +183,17 @@ class GromacsSingleMoleculeParameterSet(BaseModel):
             raise ValueError("Invalid parameter_data_type for GromacsSingleMoleculeParameterSet.")
         data = json.loads(data_row["parameter_data"])
         return cls(**data)
+
+
+class GromacsProteinParameterSet(BaseModel):
+    """Store GROMACS topology output from pdb2gmx for a protein system."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    topology_file: Path
+    structure_file: Path
+    topology_include_files: list[Path]
+    chains: list[str]
+    forcefield: str
+    water_model: str
+    total_charge: int
