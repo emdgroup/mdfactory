@@ -63,3 +63,35 @@
     num_gpus: 1
     num_cores: 8
     walltime: 24:00:00
+
+# Amber ff14SB + OpenFF Sage builds use Sage-style nonbonded settings. Entries with
+# a `parametrization` key are preferred for builds with that parametrization.
+- engine: gromacs
+  system_type: proteinbox
+  parametrization: amber
+  version: 1.0
+  template_dir: proteinbox_amber
+  run_files:
+    - em.mdp
+    - nvt.mdp
+    - npt.mdp
+    - md.mdp
+  settings:
+    num_gpus: 1
+    num_cores: 8
+    walltime: 24:00:00
+
+- engine: gromacs
+  system_type: protein_mixedbox
+  parametrization: amber
+  version: 1.0
+  template_dir: proteinbox_amber
+  run_files:
+    - em.mdp
+    - nvt.mdp
+    - npt.mdp
+    - md.mdp
+  settings:
+    num_gpus: 1
+    num_cores: 8
+    walltime: 24:00:00

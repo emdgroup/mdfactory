@@ -188,6 +188,19 @@ def _extract_resource_hints(stage_config: Any) -> ResourceHints:
     return ResourceHints(ntasks=ntasks, disable_gpu=disable_gpu, gmx_binary=gmx_binary)
 
 
+def min_gmx_version_for_sim_dir(sim_dir: Path) -> str:
+    """Return the minimum GROMACS version a simulation directory's topology needs.
+
+    Derived from the force field ``topology.top`` includes (e.g.
+    ``amber14sb.ff/forcefield.itp`` needs 2026). Returns ``""`` when there is no
+    requirement (CHARMM and small-molecule builds) or no topology.
+    """
+    from ..setup.protein import format_gmx_version, min_gmx_version_for_topology
+
+    required = min_gmx_version_for_topology(Path(sim_dir) / "topology.top")
+    return format_gmx_version(required) if required is not None else ""
+
+
 def run_stage(
     spec: StageSpec,
     sim_dir: Path,
@@ -272,6 +285,11 @@ def run_stage(
         grompp_kwargs["ref_file"] = spec.ref_file
     if spec.prereq_cpt:
         grompp_kwargs["cpt_file"] = spec.prereq_cpt
+    # Force fields that need a newer GROMACS (amber14sb) make grompp check the
+    # node's binary first; other topologies keep the unchanged script.
+    min_gmx_version = min_gmx_version_for_sim_dir(sim_dir)
+    if min_gmx_version:
+        grompp_kwargs["min_gmx_version"] = min_gmx_version
 
     grompp_fut = grompp_app(**grompp_kwargs)
 

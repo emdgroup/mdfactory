@@ -971,8 +971,23 @@ def create_protein_mixedbox_universe(
     return merged
 
 
-def charmm_native_atom_names(smiles: str) -> list[str] | None:
-    """Return canonical CHARMM36m atom names for supported native species."""
+def native_atom_names(smiles: str) -> list[str] | None:
+    """Return the force-field atom names of a supported native water or ion species.
+
+    The bundled CHARMM36m and GROMACS ``amber14sb.ff`` TIP3P water and ion
+    topologies use the same names (``OW``/``HW1``/``HW2``, ``NA``, ``CL``).
+
+    Parameters
+    ----------
+    smiles : str
+        Species SMILES.
+
+    Returns
+    -------
+    list of str or None
+        Atom names in packing order, or None if the species is not native.
+
+    """
     return {
         "O": ["OW", "HW1", "HW2"],
         "[Na+]": ["NA"],
@@ -980,13 +995,20 @@ def charmm_native_atom_names(smiles: str) -> list[str] | None:
     }.get(smiles)
 
 
+# Kept for existing imports; the native names are not CHARMM-specific.
+charmm_native_atom_names = native_atom_names
+
+
 def topology_atom_names(species, parameter_set) -> list[str] | None:
     """Return the atom names the topology expects for a packed solution species.
 
-    Native water and ions use the canonical CHARMM36m names. Small molecules
-    with their own ``.itp`` (CGenFF solutes) use that file's ``[ atoms ]`` names,
-    so the coordinates match the topology instead of keeping the generic
-    element-indexed names from packing.
+    Native water and ions use the force-field names from :func:`native_atom_names`.
+    Small molecules with their own ``.itp`` (CGenFF or SMIRNOFF solutes) use that
+    file's ``[ atoms ]`` names, so the coordinates match the topology instead of
+    keeping the generic element-indexed names from packing. Repeated names
+    (SMIRNOFF names atoms by element only) are numbered with
+    :func:`~mdfactory.utils.topology_utilities.unique_atom_names`, matching the
+    ITP copy that ``generate_gromacs_topology_with_protein`` writes.
 
     Parameters
     ----------
@@ -1007,13 +1029,13 @@ def topology_atom_names(species, parameter_set) -> list[str] | None:
         which would mean the topology and coordinate orders differ.
 
     """
-    native = charmm_native_atom_names(species.smiles)
+    native = native_atom_names(species.smiles)
     if native is not None:
         return native
     if parameter_set.parameter_itp is None:
         return None
 
-    from .topology_utilities import read_itp_atoms  # noqa: PLC0415
+    from .topology_utilities import read_itp_atoms, unique_atom_names  # noqa: PLC0415
 
     itp_atoms = read_itp_atoms(parameter_set.itp)
     mol_atoms = list(species.rdkit_molecule.GetAtoms())
@@ -1029,4 +1051,4 @@ def topology_atom_names(species, parameter_set) -> list[str] | None:
                 f"packed molecule but {name} (mass {itp_mass}) in {parameter_set.itp}; "
                 "topology and coordinate atom orders differ."
             )
-    return [name for name, _ in itp_atoms]
+    return unique_atom_names([name for name, _ in itp_atoms])

@@ -16,6 +16,7 @@ from .composition import (
     ProteinMixedBoxComposition,
 )
 from .parametrization import (
+    AmberConfig,
     CgenffConfig,
     CharmmConfig,
     ParametrizationConfig,
@@ -35,13 +36,14 @@ type_mapping = {
 
 # Parametrizations each simulation type accepts. Proteins are parametrized with
 # gmx pdb2gmx; small-molecule systems use CGenFF or SMIRNOFF. A protein packed
-# with small molecules uses the combined CHARMM/CGenFF parametrization.
+# with small molecules uses the combined CHARMM/CGenFF parametrization. Both
+# protein types also accept the open-source Amber ff14SB + OpenFF Sage route.
 allowed_parametrizations = {
     "mixedbox": {"cgenff", "smirnoff"},
     "bilayer": {"cgenff", "smirnoff"},
     "lnp": {"cgenff", "smirnoff"},
-    "proteinbox": {"pdb2gmx"},
-    "protein_mixedbox": {"charmm"},
+    "proteinbox": {"pdb2gmx", "amber"},
+    "protein_mixedbox": {"charmm", "amber"},
 }
 
 
@@ -56,7 +58,7 @@ class BuildInput(BaseModel):
         | ProteinBoxComposition
         | ProteinMixedBoxComposition
     )
-    parametrization: Literal["cgenff", "smirnoff", "pdb2gmx", "charmm"] = Field(
+    parametrization: Literal["cgenff", "smirnoff", "pdb2gmx", "charmm", "amber"] = Field(
         "cgenff", description="Parametrization to use."
     )
     parametrization_config: ParametrizationConfig | None = Field(
@@ -223,6 +225,7 @@ class BuildInput(BaseModel):
                 "cgenff": CgenffConfig,
                 "pdb2gmx": Pdb2gmxConfig,
                 "charmm": CharmmConfig,
+                "amber": AmberConfig,
             }[self.parametrization]
             object.__setattr__(self, "parametrization_config", config_class())
         return self

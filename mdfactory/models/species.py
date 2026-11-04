@@ -184,7 +184,7 @@ class SolutionSpecies(SingleMoleculeSpecies):
         expected_resname = native_resnames.get(self.smiles)
         if expected_resname is not None and self.resname.upper() != expected_resname:
             raise ValueError(
-                f"Native CHARMM species {self.smiles!r} must use resname "
+                f"Native water/ion species {self.smiles!r} must use resname "
                 f"'{expected_resname}', not '{self.resname}'."
             )
         return self

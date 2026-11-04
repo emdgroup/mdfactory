@@ -119,10 +119,28 @@ docs-dev = { cmd = "bun run dev", cwd = "docs", depends-on = ["docs-fumapy"] }
 docs-build = { cmd = "bun run build", cwd = "docs", depends-on = ["docs-fumapy"] }
 docs-generate = { cmd = "bun run docs:generate", cwd = "docs", depends-on = ["docs-fumapy"] }
 
+# GROMACS >= 2026 (ships amber14sb.ff) for the open-source `amber` parametrization.
+# Kept out of the default solve group so CI and existing environments are not
+# re-solved. Packmol is listed explicitly because newer openff-interchange
+# releases no longer pull in the binary.
+[tool.pixi.feature.gmx.dependencies]
+gromacs = { version = ">=2026", build = "nompi_h*" }
+packmol = "*"
+
+[tool.pixi.feature.gmx-cuda]
+platforms = ["linux-64"]
+system-requirements = { cuda = "12" }
+
+[tool.pixi.feature.gmx-cuda.dependencies]
+gromacs = { version = ">=2026", build = "nompi_cuda_h*" }
+packmol = "*"
+
 [tool.pixi.environments]
 default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 docs = { features = ["docs"], solve-group = "default" }
+gmx = { features = ["gmx"] }
+gmx-cuda = { features = ["gmx-cuda"] }
 
 # --- Ruff linter/formatter ---------------------------------------------------
 

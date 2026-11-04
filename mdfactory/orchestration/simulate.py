@@ -345,7 +345,7 @@ def clean_simulation_outputs(
 def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[dict]:
     """Log the dry-run work plan with resolved gmx commands per stage."""
     from .apps import _build_grompp_script, _build_mdrun_script
-    from .stages import _extract_resource_hints
+    from .stages import _extract_resource_hints, min_gmx_version_for_sim_dir
 
     logger.info("=" * 60)
     logger.info("DRY RUN - No jobs will be submitted")
@@ -366,6 +366,9 @@ def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[d
             work_dir = str(Path(item["sim_dir"]).resolve())
             stage_config = get_stage_config_or_none(config, item["stages"][0])
             hints = _extract_resource_hints(stage_config)
+            min_gmx_version = min_gmx_version_for_sim_dir(item["sim_dir"])
+            if min_gmx_version:
+                logger.info(f"  Requires GROMACS >= {min_gmx_version} (checked before grompp)")
 
             for stage_name in item["stages"]:
                 spec = STAGE_BY_NAME[stage_name]
@@ -386,6 +389,7 @@ def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[d
                         ref_file=spec.ref_file or "",
                         cpt_file=spec.prereq_cpt or "",
                         maxwarn=spec.maxwarn,
+                        min_gmx_version=min_gmx_version,
                     )
                     _log_resolved_script(grompp_script, label="grompp")
 
