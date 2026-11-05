@@ -1,5 +1,5 @@
 # ABOUTME: Tests for proteinbox models, topology parsing, and YAML validation
-# ABOUTME: Covers ProteinSpecies, ProteinBoxComposition, Pdb2gmxConfig, and BuildInput
+# ABOUTME: Covers ProteinSpecies, ProteinBoxComposition, protein family specs, and BuildInput
 """Tests for proteinbox models, topology parsing, and YAML validation."""
 
 import hashlib
@@ -20,10 +20,9 @@ from mdfactory.build import _center_in_cubic_box, _ion_counts, _prepare_protein
 from mdfactory.models.composition import ProteinBoxComposition, ProteinMixedBoxComposition
 from mdfactory.models.input import BuildInput
 from mdfactory.models.parametrization import (
-    AmberConfig,
-    CharmmConfig,
-    Pdb2gmxConfig,
-    SmirnoffConfig,
+    AmberParametrization,
+    CharmmParametrization,
+    OpenFFSmallMolecules,
 )
 from mdfactory.models.species import ProteinSpecies, SingleMoleculeSpecies
 from mdfactory.prepare import resolve_protein_pdb_path
@@ -44,7 +43,6 @@ from mdfactory.setup.protein import (
 from .conftest import protein_input_data
 
 PROTEIN_SIM_TYPES = ["proteinbox", "protein_mixedbox"]
-CONFIG_CLASSES = {"proteinbox": Pdb2gmxConfig, "protein_mixedbox": CharmmConfig}
 COMPOSITION_CLASSES = {
     "proteinbox": ProteinBoxComposition,
     "protein_mixedbox": ProteinMixedBoxComposition,
@@ -94,7 +92,10 @@ def _patch_pdb2gmx(monkeypatch, molecule_names, extra_files=(), calls=None):
 
 def _run(tmp_path, pdb, **kwargs):
     """Call run_pdb2gmx with default (empty) disulfide/protonation arguments."""
-    kwargs.setdefault("config", Pdb2gmxConfig(forcefield="charmm36m", water_model="tip3p"))
+    kwargs.setdefault("forcefield", "charmm36m")
+    kwargs.setdefault("water_model", "tip3p")
+    kwargs.setdefault("ignore_hydrogens", True)
+    kwargs.setdefault("merge_all", False)
     kwargs.setdefault("disulfide_bonds", [])
     kwargs.setdefault("protonation_states", {})
     kwargs.setdefault("output_dir", tmp_path / "out")
@@ -171,25 +172,29 @@ class TestProteinBoxComposition:
         assert comp.ionization.concentration == 0.10
 
 
-@pytest.mark.parametrize("config_cls", [Pdb2gmxConfig, CharmmConfig])
-class TestForcefieldConfigs:
-    """Constraints shared by the pdb2gmx and CHARMM parametrization configs."""
+@pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
+class TestCharmmProteinSpec:
+    """CHARMM protein force-field and water constraints for both protein types."""
 
-    def test_frozen(self, config_cls):
+    def test_frozen(self, sim_type, protein_pdb):
+        inp = BuildInput(**protein_input_data(sim_type, protein_pdb))
         with pytest.raises(Exception):
-            config_cls().forcefield = "other"
+            inp.parametrization.protein = "other"
 
     @pytest.mark.parametrize(
         ("overrides", "match"),
         [
-            ({"forcefield": "amber99sb-ildn"}, "CHARMM"),
+            ({"protein": "amber99sb-ildn"}, "CHARMM"),
             ({"water_model": "tip4p"}, "3-site"),
-            ({"forcefield": "charmm36m-ljpme"}, "LJ-PME"),
+            ({"protein": "charmm36m-ljpme"}, "LJ-PME"),
         ],
     )
-    def test_rejects_unsupported_choices(self, config_cls, overrides, match):
+    def test_rejects_unsupported_choices(self, sim_type, protein_pdb, overrides, match):
+        data = protein_input_data(
+            sim_type, protein_pdb, parametrization={"family": "charmm", **overrides}
+        )
         with pytest.raises(ValueError, match=match):
-            config_cls(**overrides)
+            BuildInput(**data)
 
 
 class TestForceFieldCheck:
@@ -257,21 +262,24 @@ class TestForceFieldDownload:
 class TestProteinInput:
     """BuildInput validation shared by proteinbox and protein_mixedbox."""
 
-    def test_default_parametrization_config(self, sim_type, protein_pdb):
+    def test_charmm_family_defaults(self, sim_type, protein_pdb):
         inp = BuildInput(**protein_input_data(sim_type, protein_pdb))
         assert isinstance(inp.system, COMPOSITION_CLASSES[sim_type])
-        assert isinstance(inp.parametrization_config, CONFIG_CLASSES[sim_type])
+        assert isinstance(inp.parametrization, CharmmParametrization)
+        assert (inp.parametrization.protein, inp.parametrization.water_model) == (
+            "charmm36m",
+            "tip3p",
+        )
+        assert inp.system.protein.ignore_hydrogens is True
+        assert inp.system.protein.merge_all is False
 
     @pytest.mark.parametrize(
         ("overrides", "match"),
         [
-            ({"parametrization": "cgenff"}, "not valid for simulation type"),
-            ({"config": {"type": "cgenff"}}, "does not match"),
+            ({"parametrization": "openff"}, "not valid for simulation type"),
+            ({"parametrization": "cgenff"}, "does not match any of the expected tags"),
             (
-                {
-                    "config": {"merge_all": True},
-                    "protein": {"resname": "INS", "chains": ["A", "B"]},
-                },
+                {"protein": {"resname": "INS", "chains": ["A", "B"], "merge_all": True}},
                 "merge_all",
             ),
         ],
@@ -282,10 +290,10 @@ class TestProteinInput:
 
     def test_merge_all_without_declared_chains_allowed(self, sim_type, protein_pdb):
         data = protein_input_data(
-            sim_type, protein_pdb, config={"merge_all": True}, protein={"resname": "INS"}
+            sim_type, protein_pdb, protein={"resname": "INS", "merge_all": True}
         )
         inp = BuildInput(**data)
-        assert inp.parametrization_config.merge_all is True
+        assert inp.system.protein.merge_all is True
         assert inp.system.protein.chains == []
 
 
@@ -294,16 +302,15 @@ class TestProteinboxInput:
         yaml_str = f"""
 simulation_type: proteinbox
 engine: gromacs
-parametrization: pdb2gmx
-parametrization_config:
-  type: pdb2gmx
-  forcefield: charmm36m
-  water_model: tip3p
-  ignore_hydrogens: true
+parametrization:
+  family: charmm
+  protein: charmm36m
+  water_model: spce
 system:
   protein:
     resname: LYZ
     pdb_path: {protein_pdb}
+    ignore_hydrogens: false
     disulfide_bonds:
       - [CYS6, CYS127]
       - [CYS30, CYS115]
@@ -316,7 +323,10 @@ system:
 """
         inp = BuildInput(**yaml.safe_load(yaml_str))
         assert isinstance(inp.system, ProteinBoxComposition)
-        assert isinstance(inp.parametrization_config, Pdb2gmxConfig)
+        assert isinstance(inp.parametrization, CharmmParametrization)
+        assert inp.parametrization.water_model == "spce"
+        assert inp.parametrization.small_molecules is None
+        assert inp.system.protein.ignore_hydrogens is False
         assert inp.system.protein.disulfide_bonds == [("CYS6", "CYS127"), ("CYS30", "CYS115")]
         assert inp.system.protein.protonation_states == {"HIS15": "HIE"}
 
@@ -735,7 +745,7 @@ class TestRelativePdbPathAcrossEntryPoints:
         csv_path.write_text(
             "simulation_type,parametrization,system.protein.resname,"
             "system.protein.pdb_path,system.padding\n"
-            "proteinbox,pdb2gmx,LYZ,prot.pdb,12.0\n"
+            "proteinbox,charmm,LYZ,prot.pdb,12.0\n"
         )
         # Run from an unrelated directory so cwd-relative resolution would differ.
         monkeypatch.chdir(elsewhere)
@@ -846,59 +856,69 @@ class TestIonCounts:
 EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples" / "proteinbox"
 
 
-class TestAmberConfig:
-    def test_defaults_and_sage_settings(self):
-        config = AmberConfig()
-        assert (config.forcefield, config.water_model) == ("amber14sb", "tip3p")
-        assert config.ignore_hydrogens is True and config.merge_all is False
-        smirnoff = config.smirnoff_config()
-        assert isinstance(smirnoff, SmirnoffConfig)
-        assert smirnoff.forcefield == SmirnoffConfig().forcefield == config.sage_forcefield
-        assert smirnoff.charge_method == config.charge_method
+class TestAmberSpec:
+    @pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
+    def test_family_defaults(self, sim_type, protein_pdb):
+        inp = BuildInput(**protein_input_data(sim_type, protein_pdb, parametrization="amber"))
+        spec = inp.parametrization
+        assert isinstance(spec, AmberParametrization)
+        assert (spec.protein, spec.water_model) == ("amber14sb", "tip3p")
+        assert spec.nonbonded_scheme == "sage"
+        if sim_type == "protein_mixedbox":
+            assert spec.small_molecules == OpenFFSmallMolecules()
+        else:
+            # A proteinbox has no small molecules, so the component is not shown.
+            assert spec.small_molecules is None
 
-    def test_smirnoff_config_follows_sage_fields(self):
-        config = AmberConfig(sage_forcefield="openff-2.1.0.offxml", charge_method="am1bcc")
-        smirnoff = config.smirnoff_config()
-        assert (smirnoff.forcefield, smirnoff.charge_method) == ("openff-2.1.0.offxml", "am1bcc")
-
-    def test_frozen(self):
+    def test_frozen(self, protein_pdb):
+        inp = BuildInput(**protein_input_data("proteinbox", protein_pdb, parametrization="amber"))
         with pytest.raises(Exception):
-            AmberConfig().forcefield = "amber19sb"
+            inp.parametrization.protein = "amber19sb"
 
     @pytest.mark.parametrize(
         ("overrides", "match"),
         [
-            ({"forcefield": "amber19sb"}, "Only 'amber14sb'"),
-            ({"forcefield": "charmm36m"}, "Only 'amber14sb'"),
+            ({"protein": "amber19sb"}, "Only 'amber14sb'"),
+            ({"protein": "charmm36m"}, "Only 'amber14sb'"),
             ({"water_model": "opc"}, "Only 'tip3p'"),
             ({"water_model": "spce"}, "Only 'tip3p'"),
         ],
     )
-    def test_rejects_unsupported_choices(self, overrides, match):
+    @pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
+    def test_rejects_unsupported_choices(self, sim_type, protein_pdb, overrides, match):
+        data = protein_input_data(
+            sim_type, protein_pdb, parametrization={"family": "amber", **overrides}
+        )
         with pytest.raises(ValueError, match=match):
-            AmberConfig(**overrides)
+            BuildInput(**data)
 
 
 class TestAmberInput:
-    @pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
-    @pytest.mark.parametrize("explicit", [False, True])
-    def test_accepts_amber_for_protein_types(self, sim_type, protein_pdb, explicit):
-        data = protein_input_data(sim_type, protein_pdb, parametrization="amber")
-        if explicit:
-            data["parametrization_config"] = {"type": "amber", "sage_forcefield": "x.offxml"}
-        inp = BuildInput(**data)
-        assert inp.parametrization == "amber"
-        assert isinstance(inp.parametrization_config, AmberConfig)
-        if explicit:
-            assert inp.parametrization_config.sage_forcefield == "x.offxml"
+    def test_small_molecule_override_for_protein_mixedbox(self, protein_pdb):
+        small_molecules = {"forcefield": "openff-2.1.0.offxml", "charge_method": "am1bcc"}
+        data = protein_input_data(
+            "protein_mixedbox",
+            protein_pdb,
+            parametrization={"family": "amber", "small_molecules": small_molecules},
+        )
+        spec = BuildInput(**data).parametrization
+        assert spec.small_molecules == OpenFFSmallMolecules(**small_molecules)
+
+    def test_small_molecules_rejected_for_proteinbox(self, protein_pdb):
+        data = protein_input_data(
+            "proteinbox",
+            protein_pdb,
+            parametrization={"family": "amber", "small_molecules": {"charge_method": "am1bcc"}},
+        )
+        with pytest.raises(ValueError, match="small_molecules does not apply"):
+            BuildInput(**data)
 
     def test_yaml_round_trip(self, protein_pdb):
         yaml_str = f"""
 simulation_type: proteinbox
-parametrization: amber
-parametrization_config:
-  type: amber
-  forcefield: amber14sb
+parametrization:
+  family: amber
+  protein: amber14sb
   water_model: tip3p
 system:
   protein:
@@ -908,26 +928,22 @@ system:
 """
         inp = BuildInput(**yaml.safe_load(yaml_str))
         assert BuildInput.from_data_row(inp.to_data_row()).hash == inp.hash
+        shorthand = protein_input_data("proteinbox", protein_pdb, parametrization="amber")
+        assert BuildInput(**shorthand).hash == inp.hash
 
     def test_rejected_for_mixedbox(self):
+        # The other small-molecule types are covered in test_parametrization_schema.
         system = {"species": [{"smiles": "O", "resname": "SOL", "count": 10}]}
         with pytest.raises(ValueError, match="not valid for simulation type"):
             BuildInput(simulation_type="mixedbox", parametrization="amber", system=system)
-
-    @pytest.mark.parametrize("simulation_type", ["mixedbox", "bilayer", "lnp"])
-    def test_not_allowed_for_small_molecule_types(self, simulation_type):
-        from mdfactory.models.input import allowed_parametrizations
-
-        assert "amber" not in allowed_parametrizations[simulation_type]
 
     def test_amber_merge_all_conflicts_with_chains(self, protein_pdb):
         data = protein_input_data(
             "proteinbox",
             protein_pdb,
             parametrization="amber",
-            protein={"resname": "INS", "chains": ["A", "B"]},
+            protein={"resname": "INS", "chains": ["A", "B"], "merge_all": True},
         )
-        data["parametrization_config"] = {"type": "amber", "merge_all": True}
         with pytest.raises(ValueError, match="merge_all"):
             BuildInput(**data)
 
@@ -937,11 +953,12 @@ system:
         from mdfactory.prepare import df_to_build_input_models
 
         inp = BuildInput(**yaml.safe_load((EXAMPLES_DIR / "lysozyme_amber14sb.yaml").read_text()))
-        assert isinstance(inp.parametrization_config, AmberConfig)
+        assert isinstance(inp.parametrization, AmberParametrization)
         models, errors = df_to_build_input_models(pd.read_csv(EXAMPLES_DIR / "proteins_amber.csv"))
         assert errors == {}
-        assert [m.parametrization for m in models] == ["amber"]
-        assert isinstance(models[0].parametrization_config, AmberConfig)
+        assert [m.parametrization.family for m in models] == ["amber"]
+        assert models[0].parametrization == inp.parametrization
+        assert models[0].system.protein.ignore_hydrogens is True
         assert models[0].system.protein.protonation_states == {"HIS15": "HIE"}
 
 
@@ -1004,28 +1021,55 @@ def _patch_prepare_protein(monkeypatch, tmp_path, version_output):
     return calls
 
 
+AMBER_PROTEIN = AmberParametrization().resolve("proteinbox")
+
+
 class TestPrepareProteinVersionGate:
     def test_new_gromacs_passes(self, tmp_path, monkeypatch, protein_pdb):
         calls = _patch_prepare_protein(
             monkeypatch, tmp_path, "GROMACS version:    2026.3-conda_forge\n"
         )
-        _prepare_protein(ProteinSpecies(resname="LYZ", pdb_path=protein_pdb), AmberConfig())
+        _prepare_protein(ProteinSpecies(resname="LYZ", pdb_path=protein_pdb), AMBER_PROTEIN)
         assert calls == ["version", "clean_pdb", "pdb2gmx"]
 
     def test_old_gromacs_fails_before_pdb2gmx(self, tmp_path, monkeypatch, protein_pdb):
         calls = _patch_prepare_protein(monkeypatch, tmp_path, "GROMACS version:    2024.3\n")
         with pytest.raises(RuntimeError) as exc_info:
-            _prepare_protein(ProteinSpecies(resname="LYZ", pdb_path=protein_pdb), AmberConfig())
+            _prepare_protein(ProteinSpecies(resname="LYZ", pdb_path=protein_pdb), AMBER_PROTEIN)
         message = str(exc_info.value)
         assert "/mock/gmx" in message and "2024.3" in message and ">= 2026" in message
         assert calls == ["version"]
 
-    @pytest.mark.parametrize("config", [Pdb2gmxConfig(), CharmmConfig()])
-    def test_charmm_configs_skip_gate(self, tmp_path, monkeypatch, protein_pdb, config):
+    def test_charmm_family_skips_gate(self, tmp_path, monkeypatch, protein_pdb):
         calls = _patch_prepare_protein(monkeypatch, tmp_path, "GROMACS version:    2024.3\n")
-        _prepare_protein(ProteinSpecies(resname="LYZ", pdb_path=protein_pdb), config)
+        spec = CharmmParametrization().resolve("proteinbox")
+        _prepare_protein(ProteinSpecies(resname="LYZ", pdb_path=protein_pdb), spec)
         assert "version" not in calls
         assert calls[-1] == "pdb2gmx"
+
+
+def test_prepare_protein_takes_forcefield_from_spec_and_options_from_protein(
+    tmp_path, monkeypatch, protein_pdb
+):
+    calls = {}
+    _patch_pdb2gmx(monkeypatch, ["Protein"], ["posre.itp"], calls)
+    monkeypatch.setattr(
+        "mdfactory.setup.protein.clean_pdb", lambda pdb_path, out: shutil.copy(pdb_path, out)
+    )
+    monkeypatch.chdir(tmp_path)
+    spec = CharmmParametrization(protein="charmm27", water_model="spce").resolve("proteinbox")
+    species = ProteinSpecies(
+        resname="LYZ", pdb_path=protein_pdb, ignore_hydrogens=False, merge_all=True
+    )
+
+    params = _prepare_protein(species, spec)
+
+    cmd = calls["cmd"]
+    assert cmd[cmd.index("-ff") + 1] == "charmm27"
+    assert cmd[cmd.index("-water") + 1] == "spce"
+    assert "-ignh" not in cmd
+    assert cmd[cmd.index("-merge") + 1] == "all"
+    assert (params.forcefield, params.water_model) == ("charmm27", "spce")
 
 
 def test_run_pdb2gmx_amber_passes_forcefield_and_amber_protonation(tmp_path, monkeypatch):
@@ -1033,7 +1077,13 @@ def test_run_pdb2gmx_amber_passes_forcefield_and_amber_protonation(tmp_path, mon
     calls = {}
     _patch_pdb2gmx(monkeypatch, ["Protein_chain_A"], ["posre.itp"], calls)
 
-    params = _run(tmp_path, pdb, config=AmberConfig(), protonation_states={"HIS15": "HIE"})
+    params = _run(
+        tmp_path,
+        pdb,
+        forcefield="amber14sb",
+        water_model="tip3p",
+        protonation_states={"HIS15": "HIE"},
+    )
 
     cmd = calls["cmd"]
     assert cmd[cmd.index("-ff") + 1] == "amber14sb"

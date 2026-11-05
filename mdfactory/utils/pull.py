@@ -28,7 +28,7 @@ def pull_systems(
     simulation_type : str, optional
         Filter by simulation type ("mixedbox", "bilayer")
     parametrization : str, optional
-        Filter by parametrization ("cgenff", "smirnoff")
+        Filter by force-field family ("charmm", "amber", "openff")
     engine : str, optional
         Filter by engine ("gromacs")
     db_type : str, optional

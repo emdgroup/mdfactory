@@ -15,7 +15,7 @@ def sample_csv(tmp_path):
     """Create a minimal CSV input file for testing."""
     csv_content = (
         "simulation_type,system.species.SOL.smiles,system.species.SOL.count,parametrization\n"
-        "mixedbox,O,100,cgenff\n"
+        "mixedbox,O,100,charmm\n"
     )
     csv_path = tmp_path / "input.csv"
     csv_path.write_text(csv_content)
@@ -28,7 +28,7 @@ def sample_yaml(tmp_path):
     data = {
         "simulation_type": "mixedbox",
         "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "engine": "gromacs",
     }
     yaml_path = tmp_path / "build.yaml"
@@ -188,7 +188,7 @@ class TestBuildCommandSummaryYAML:
         build_dir.mkdir()
         yaml_data = {
             "simulation_type": "mixedbox",
-            "parametrization": "cgenff",
+            "parametrization": "charmm",
             "engine": "gromacs",
             "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
         }
@@ -211,7 +211,7 @@ class TestBuildCommandSummaryYAML:
         build_dir.mkdir()
         yaml_data = {
             "simulation_type": "mixedbox",
-            "parametrization": "cgenff",
+            "parametrization": "charmm",
             "engine": "gromacs",
             "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
         }
@@ -232,7 +232,7 @@ class TestBuildCommandSummaryYAML:
         build_dir.mkdir()
         yaml_data = {
             "simulation_type": "mixedbox",
-            "parametrization": "cgenff",
+            "parametrization": "charmm",
             "engine": "gromacs",
             "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
         }

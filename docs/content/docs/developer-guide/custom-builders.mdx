@@ -65,7 +65,7 @@ def build_mysystem(inp: BuildInput):
     inp : BuildInput
         The validated build input with simulation_type="mysystem".
     """
-    parametrize_fn = _get_parametrize_function(inp)
+    parametrize_fn = resolve_parametrizer(inp.parametrization, inp.engine)
 
     # Parametrize each species
     parameters = []
@@ -115,7 +115,7 @@ Users would specify the new system type like this:
 ```yaml
 engine: gromacs
 simulation_type: mysystem
-parametrization: smirnoff
+parametrization: openff
 
 system:
   species:

@@ -17,6 +17,7 @@ from mdfactory.analysis.utils import (
     flatten_species_composition,
     flatten_system_parameters,
 )
+from mdfactory.models.parametrization import OpenFFParametrization
 from mdfactory.models.species import SolutionSpecies
 
 
@@ -210,7 +211,7 @@ def test_flatten_system_parameters() -> None:
     build_input = SimpleNamespace(
         simulation_type="mixedbox",
         engine="gromacs",
-        parametrization="cgenff",
+        parametrization=OpenFFParametrization().resolve("mixedbox"),
         metadata={"system_specific": {"z_padding": 10.0, "target_density": 1.0}},
     )
 
@@ -218,7 +219,7 @@ def test_flatten_system_parameters() -> None:
 
     assert result["simulation_type"] == "mixedbox"
     assert result["engine"] == "gromacs"
-    assert result["parametrization"] == "cgenff"
+    assert result["parametrization"] == "openff"
     assert result["z_padding"] == 10.0
     assert result["target_density"] == 1.0
 

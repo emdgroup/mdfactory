@@ -12,10 +12,11 @@ mdfactory/
   workflows.py         # run_build_from_file() — dispatches to build.py
   prepare.py           # df_to_build_input_models() — CSV row -> BuildInput
   check.py             # check_bilayer_buildable()
-  parametrize.py       # Parametrization dispatch (cgenff/smirnoff)
+  parametrize.py       # Parametrization dispatch (cgenff/openff), OpenFF cache, resolve_parametrizer
   models/
     input.py           # BuildInput (central model, has .hash, .metadata)
     species.py         # Species, SingleMoleculeSpecies, LipidSpecies
+    parametrization.py # charmm/amber/openff family specs, parameter sets
     composition.py     # MixedBoxComposition, BilayerComposition, IonizationConfig
   analysis/
     simulation.py      # Simulation class, ANALYSIS_REGISTRY
@@ -156,7 +157,7 @@ from mdfactory.models.input import BuildInput
 from mdfactory.models.species import SingleMoleculeSpecies, LipidSpecies
 from mdfactory.models.composition import MixedBoxComposition, BilayerComposition
 
-bi = BuildInput(simulation_type="bilayer", system=composition, parametrization="cgenff", engine="gromacs")
+bi = BuildInput(simulation_type="bilayer", system=composition, parametrization="charmm", engine="gromacs")
 bi.hash          # deterministic content hash
 bi.metadata      # dict summary
 bi.to_data_row() # serialize for database
@@ -222,7 +223,7 @@ _(none registered yet)_
 ## Database Schema
 
 ### RUN_DATABASE
-`hash` (PK), `engine`, `parametrization`, `simulation_type`, `input_data` (JSON), `input_data_type`, `directory`, `status`, `timestamp_utc`
+`hash` (PK), `engine`, `parametrization` (family name: charmm/amber/openff), `simulation_type`, `input_data` (JSON), `input_data_type`, `directory`, `status`, `timestamp_utc`
 
 ### ANALYSIS tables (one per analysis type)
 Per-analysis columns auto-inferred from parquet. All include `hash` as foreign key.
@@ -246,11 +247,11 @@ Key sections: `[cgenff]` (SILCSBIODIR), `[storage]` (parameter store path), `[da
 
 Build: `DISPATCH_BUILD = {"mixedbox": build_mixedbox, "bilayer": build_bilayer}`
 
-Parametrize: `DISPATCH_ENGINE_PARAMETRIZE = {"gromacs": {"cgenff": ..., "smirnoff": ...}}`
+Parametrize: `DISPATCH_ENGINE_PARAMETRIZE = {"gromacs": {"cgenff": ..., "openff": ...}}`
 
 ## Testing
 
 ```
 pytest mdfactory/tests/
 ```
-Key test files: `test_build.py`, `test_push.py`, `test_push_analysis.py`, `test_push_artifacts.py`, `test_simulation.py`, `test_simulation_store.py`, `test_db_operations.py`, `test_sql.py`, `test_models.py`, `test_parametrization.py`
+Key test files: `test_build.py`, `test_push.py`, `test_push_analysis.py`, `test_push_artifacts.py`, `test_simulation.py`, `test_simulation_store.py`, `test_db_operations.py`, `test_sql.py`, `test_models.py`, `test_parametrization.py`, `test_parametrization_schema.py`

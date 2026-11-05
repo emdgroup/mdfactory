@@ -1,115 +1,106 @@
 ---
 title: Parametrization
-description: Force field parametrization methods in MDFactory
+description: Force-field families and per-component parametrization in MDFactory
 ---
 
-MDFactory supports two force field parametrization methods for generating molecular mechanics parameters from SMILES strings, SMIRNOFF and CGenFF. Both generate GROMACS-compatible ITP files. Protein systems additionally support an open-source Amber ff14SB + OpenFF Sage route.
+Every build names one **force-field family** in its `parametrization` field. A family is a
+coherent combination of force fields, one per system component:
 
-## Available parametrization methods
+- **protein**: the protein force field passed to `gmx pdb2gmx` (protein systems only)
+- **small molecules**: how SMILES species are parametrized
+- **water**: the water model
+- **ions**: Na⁺/Cl⁻ parameters, which follow from the family (they are not chosen separately)
 
-### SMIRNOFF (OpenFF)
+Each component has a family default and can be overridden. `parametrization` is **required** for
+every simulation type; there is no global default.
 
-The **SMIRNOFF** parametrization uses the [Open Force Field](https://openforcefield.org/) ecosystem to generate parameters. This is the recommended method for most applications.
+## Families
 
-**Advantages:**
-- Modern, well-maintained force field (OpenFF 2.x "Sage")
-- Automatic atom typing from SMILES
-- Fast neural network-based partial charge assignment (NAGL)
-- No external license required
-- Parameters embedded directly in ITP files
+| Family | Protein | Small molecules | Water | Ions | Nonbonded scheme | Simulation types |
+|--------|---------|-----------------|-------|------|------------------|------------------|
+| `charmm` | `charmm36m` | CGenFF | `tip3p` | CHARMM (`ions.itp`) | `charmm` (Force-switch) | all five |
+| `amber` | `amber14sb` | OpenFF Sage | `tip3p` | Joung–Cheatham (`ions_tip3p.itp`) | `sage` (Potential-switch, `DispCorr EnerPres`) | `proteinbox`, `protein_mixedbox` |
+| `openff` | n/a | OpenFF Sage | `opc3` | from the Sage `.offxml` | `sage` | `mixedbox`, `bilayer`, `lnp` |
 
-**Configuration:**
+The **nonbonded scheme** selects the run schedule: `amber` builds of protein systems get
+Sage-style mdp settings (`rcoulomb = rvdw = 0.9`, PME, `vdw-modifier = Potential-switch`,
+`rvdw-switch = 0.8`, `DispCorr = EnerPres`). All other builds use the generic run schedule of
+their simulation type.
 
-```yaml
-engine: gromacs
-parametrization: smirnoff
-parametrization_config:
-  forcefield: openff-2.2.0.offxml
-  water_model: opc3.offxml
-  charge_method: openff-gnn-am1bcc-0.1.0-rc.3.pt
-```
+<Callout type="info" title="openff mixedbox/bilayer/lnp run schedules">
+`openff` builds of `mixedbox`, `bilayer` and `lnp` still get the generic (CHARMM-style) mdp
+files. Force-field-dependent run schedules for these types are planned.
+</Callout>
 
-#### Configuration options
+## Syntax
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `forcefield` | `openff-2.2.0.offxml` | OpenFF force field file. Options include `openff-2.2.0.offxml`, `openff_unconstrained-2.2.0.offxml` |
-| `water_model` | `opc3.offxml` | Water model. Options: `opc3.offxml`, `tip3p_fb.offxml`, `tip4p_fb.offxml` |
-| `charge_method` | `openff-gnn-am1bcc-0.1.0-rc.3.pt` | Partial charge method. NAGL models are fast; `am1bcc` or `am1bccelf10` are slower but standard. `nagl` is an alias for the default NAGL model. |
-
-#### Charge methods
-
-<Tabs items={['NAGL (Fast)', 'AM1-BCC (Standard)']}>
-<Tab value="NAGL (Fast)">
-
-NAGL uses a graph neural network trained on AM1-BCC charges. It's significantly faster than quantum-mechanical methods.
+The shorthand takes every component's family default:
 
 ```yaml
-parametrization_config:
-  charge_method: openff-gnn-am1bcc-0.1.0-rc.3.pt
+parametrization: amber
 ```
 
-Or use the shorthand alias:
+The explicit form overrides individual components. Components that are omitted keep their family
+default:
 
 ```yaml
-parametrization_config:
-  charge_method: nagl
+parametrization:
+  family: amber              # charmm | amber | openff (required)
+  protein: amber14sb         # protein types only
+  small_molecules:           # not allowed for proteinbox
+    forcefield: openff-2.2.0.offxml
+    charge_method: openff-gnn-am1bcc-0.1.0-rc.3.pt
+  water_model: tip3p
 ```
 
-Typical performance: ~0.1 seconds per molecule.
+The shorthand and the fully spelled-out defaults describe the same build and have the same hash.
+After validation, components that do not apply to the simulation type are stored as `null`
+(for example `protein` in a `mixedbox`, or `small_molecules` in a `proteinbox`). Setting such a
+component is an error.
 
-</Tab>
-<Tab value="AM1-BCC (Standard)">
+`water_model` is always a **water model name** (`tip3p`, `opc3`, `spce`, ...). Depending on the
+family it selects the `pdb2gmx -water` model, the native `<name>.itp` of the force field, or the
+OpenFF `<name>.offxml` file. A value ending in `.offxml` is rejected.
 
-Standard AM1-BCC uses semi-empirical quantum mechanics for charge assignment.
+The protein-preparation options `ignore_hydrogens` and `merge_all` are not part of the
+parametrization. They live on `system.protein`; see [System Types](/docs/user-guide/system-types).
 
-```yaml
-parametrization_config:
-  charge_method: am1bcc
-```
+### Component options
 
-For better conformer handling:
+| Component | Families | Default | Allowed values |
+|-----------|----------|---------|----------------|
+| `protein` | `charmm` | `charmm36m` | CHARMM force fields without LJ-PME (e.g. `charmm36m`, `charmm27`) for `proteinbox`; only `charmm36m` for `protein_mixedbox` |
+| `protein` | `amber` | `amber14sb` | only `amber14sb` |
+| `small_molecules.forcefield` | `charmm` | `cgenff` | only `cgenff` |
+| `small_molecules.forcefield` | `amber`, `openff` | `openff-2.2.0.offxml` | any OpenFF `.offxml`, e.g. `openff_unconstrained-2.2.0.offxml` |
+| `small_molecules.charge_method` | `amber`, `openff` | `openff-gnn-am1bcc-0.1.0-rc.3.pt` | a NAGL model file, `nagl` (alias of the default model), `am1bcc`, `am1bccelf10` |
+| `water_model` | `charmm` | `tip3p` | `tip3p`, `spc`, `spce` for `proteinbox`; only `tip3p` otherwise |
+| `water_model` | `amber` | `tip3p` | only `tip3p` |
+| `water_model` | `openff` | `opc3` | any OpenFF water model name, e.g. `tip3p`, `tip3p_fb`, `tip4p_fb`, `spce` |
 
-```yaml
-parametrization_config:
-  charge_method: am1bccelf10
-```
+## The `charmm` family
 
-Typical performance: 1-30 seconds per molecule depending on size.
-
-</Tab>
-</Tabs>
-
-### CGenFF
-
-The **CGenFF** (CHARMM General Force Field) parametrization uses the CGenFF program to generate CHARMM36-compatible parameters.
+CHARMM36m for proteins, CGenFF for small molecules, and the CHARMM TIP3P water and ions.
 
 <Callout type="warn" title="Third-party software">
 CGenFF is third-party software developed by SilcsBio / University of Maryland and is **not included** with MDFactory.
-A separate [CGenFF license](https://cgenff.silcsbio.com/) is required.
+A separate [CGenFF license](https://cgenff.silcsbio.com/) is required for small molecules
+(`proteinbox` builds need no CGenFF).
 </Callout>
 
-**Advantages:**
-- Well-validated for drug-like molecules
-- Compatible with CHARMM36 lipid and protein force fields
-- Extensive validation data available
-
-**Requirements:**
-- CGenFF license and installation (configure `SILCSBIODIR` in `config.ini`)
-
-**Configuration:**
+- Small molecules need a CGenFF installation (`SILCSBIODIR` in `config.ini`).
+- In `mixedbox`, `bilayer` and `lnp`, water and ions come from the `charmm36.ff` of the CGenFF
+  installation. In protein systems they come from the bundled protein force field.
+- Well validated for drug-like molecules and compatible with the CHARMM36 lipid and protein force fields.
 
 ```yaml
-engine: gromacs
-parametrization: cgenff
+parametrization: charmm
 ```
 
-CGenFF does not require additional configuration options as it uses the global installation settings.
+## The `amber` family (protein systems)
 
-### Amber ff14SB + OpenFF Sage (protein systems)
-
-The **amber** parametrization is a fully open-source route for the `proteinbox` and
-`protein_mixedbox` system types. It needs no CGenFF or SILCSBIO license:
+A fully open-source route for `proteinbox` and `protein_mixedbox` that needs no CGenFF or SILCSBIO
+license:
 
 - **Protein:** Amber ff14SB, using the `amber14sb.ff` force field that ships with GROMACS, through `gmx pdb2gmx`.
 - **Small-molecule solutes** (`protein_mixedbox`): OpenFF Sage through SMIRNOFF.
@@ -123,106 +114,156 @@ Use the pixi `gmx` environment (`pixi run -e gmx ...`, or `gmx-cuda` for the CUD
 `[gromacs] GMX_PATH` at a GROMACS 2026 binary.
 </Callout>
 
-**Configuration:**
-
 ```yaml
-engine: gromacs
-parametrization: amber
-parametrization_config:
-  type: amber
-  forcefield: amber14sb        # only amber14sb is supported
-  water_model: tip3p           # only tip3p is supported
-  ignore_hydrogens: true
-  merge_all: false
-  sage_forcefield: openff-2.2.0.offxml
-  charge_method: openff-gnn-am1bcc-0.1.0-rc.3.pt
+parametrization:
+  family: amber
+  small_molecules:
+    charge_method: nagl
 ```
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `forcefield` | `amber14sb` | Protein force field passed to `pdb2gmx`. Only `amber14sb` is supported. |
-| `water_model` | `tip3p` | Water model passed to `pdb2gmx`. Only `tip3p` is supported. |
-| `ignore_hydrogens` | `true` | Drop input hydrogens and let `pdb2gmx` rebuild them. |
-| `merge_all` | `false` | Merge all chains into one moleculetype. |
-| `sage_forcefield` | `openff-2.2.0.offxml` | OpenFF force field for small-molecule solutes. Ignored for `proteinbox`. |
-| `charge_method` | `openff-gnn-am1bcc-0.1.0-rc.3.pt` | Partial charge method for solutes (see [Charge methods](#charge-methods)). Ignored for `proteinbox`. |
+Protonation states use Amber residue names directly (e.g. `HIE`, `HID`, `HIP`).
 
-Amber builds install their own run schedule with Sage-style nonbonded settings
-(`rcoulomb = rvdw = 0.9`, PME, `vdw-modifier = Potential-switch`, `rvdw-switch = 0.8`,
-`DispCorr = EnerPres`). Protonation states use Amber residue names directly (e.g. `HIE`, `HID`, `HIP`).
+## The `openff` family
 
-Sage solute parameters share the regular SMIRNOFF parameter cache (see below). The cache is keyed
-by the OpenFF force field only, so a solute parametrized earlier with a different `charge_method`
-is reused as-is.
+OpenFF Sage for every small molecule, with OpenFF water and ions, for `mixedbox`, `bilayer` and `lnp`.
 
-## Choosing a parametrization method
+- Modern, well-maintained force field (OpenFF 2.x "Sage") with automatic atom typing from SMILES
+- Fast neural-network partial charges (NAGL)
+- No external license required
 
-| Use Case | Recommended Method |
-|----------|-------------------|
-| General small molecules | SMIRNOFF |
-| Drug discovery workflows | SMIRNOFF or CGenFF |
-| Lipid bilayer simulations | CGenFF (CHARMM36 compatible) |
-| Quick prototyping | SMIRNOFF (faster, no license) |
-| Compatibility with existing CHARMM systems | CGenFF |
-| Protein systems without a CGenFF license | Amber (ff14SB + Sage, GROMACS ≥ 2026) |
+```yaml
+parametrization:
+  family: openff
+  water_model: tip3p
+```
+
+### Charge methods
+
+<Tabs items={['NAGL (Fast)', 'AM1-BCC (Standard)']}>
+<Tab value="NAGL (Fast)">
+
+NAGL uses a graph neural network trained on AM1-BCC charges. It is much faster than
+quantum-mechanical methods (typically ~0.1 s per molecule).
+
+```yaml
+parametrization:
+  family: openff
+  small_molecules:
+    charge_method: nagl   # alias of openff-gnn-am1bcc-0.1.0-rc.3.pt
+```
+
+</Tab>
+<Tab value="AM1-BCC (Standard)">
+
+Standard AM1-BCC uses semi-empirical quantum mechanics (typically 1–30 s per molecule).
+Use `am1bccelf10` for better conformer handling.
+
+```yaml
+parametrization:
+  family: openff
+  small_molecules:
+    charge_method: am1bcc
+```
+
+</Tab>
+</Tabs>
+
+## Choosing a family
+
+| Use case | Family |
+|----------|--------|
+| General small molecules, quick prototyping, no license | `openff` |
+| Lipid bilayers compatible with CHARMM36 | `charmm` |
+| Compatibility with existing CHARMM systems | `charmm` |
+| Protein systems with CHARMM36m | `charmm` |
+| Protein systems without a CGenFF license | `amber` (GROMACS ≥ 2026) |
 
 ## Parameter caching
 
-MDFactory automatically caches generated parameters to avoid redundant calculations:
+Generated small-molecule, water and ion parameters are cached in the parameter store
+(`[storage] PARAMETERS` in `config.ini`):
 
 ```
-~/.mdfactory/parameters/
+<parameter store>/
 └── gromacs/
     ├── cgenff/
     │   └── {molecule_hash}/
-    │       ├── {hash}.itp
-    │       └── {hash}_extra_params.itp
-    └── smirnoff/
-        └── {ff_config_hash}/
-            └── {molecule_hash}/
-                └── {hash}.itp
+    │       ├── {molecule_hash}.itp
+    │       └── {molecule_hash}_extra_params.itp
+    └── openff/
+        ├── small_molecules/
+        │   └── {forcefield}_{key_digest}/
+        │       └── {molecule_hash}/
+        ├── water/
+        │   └── {water_model}_{key_digest}/
+        └── ions/
+            └── {forcefield}_{key_digest}/
+                ├── NA/
+                └── CL/
 ```
 
-Parameters are cached by:
-- MD engine (`gromacs`)
-- Parametrization method (`cgenff` or `smirnoff`)
-- Force field configuration hash (for SMIRNOFF — includes forcefield, water model, and charge method)
-- Molecule hash (derived from canonical SMILES)
+- **OpenFF small molecules** are keyed on the force field, the resolved charge method (`nagl` and
+  the default NAGL model file share an entry) and an internal cache-format version. Changing the
+  force field or the charge method never reuses an entry made with other settings.
+- **OpenFF water** is keyed on the water model, **OpenFF ions** on the force field.
+- Each OpenFF entry holds the moleculetype `.itp`, the atom types, the merged `_params.itp` and a
+  `provenance.json` with the key inputs and the installed `openff-toolkit` and
+  `openff-interchange` versions (recorded for reference, not part of the key).
+- An entry is reused only if all files exist and its completion marker (`.complete`, written
+  last) is present. An interrupted or failed entry is removed and regenerated.
+- Each entry directory is locked while it is checked and written, so concurrent builds do not
+  parametrize the same molecule twice.
+- Native water and ions (from a CHARMM or Amber force-field directory) are never cached.
+
+### OpenFF atom-type names
+
+OpenFF atom types are private to each molecule. MDFactory renames them to
+`<prefix>_<index>`, where the prefix (`T` plus nine hex digits) is derived from the molecule and
+its cache key. Two different molecules therefore never share atom-type names, even when they
+were parametrized with the same residue name. Atom names are not changed.
 
 ## Parameter set structure
 
-Each parametrized molecule produces a `GromacsSingleMoleculeParameterSet` containing:
+Each parametrized species produces a `GromacsSingleMoleculeParameterSet`:
 
 | Field | Description |
 |-------|-------------|
-| `moleculetype` | GROMACS molecule type name (hash or standard name for water/ions) |
+| `moleculetype` | GROMACS moleculetype name (molecule hash, or `SOL`/`NA`/`CL`) |
 | `smiles` | Canonical SMILES string |
-| `parametrization` | Method used (`cgenff` or `smirnoff`) |
-| `parametrization_config` | Full configuration used for parametrization |
+| `component` | `small_molecule`, `water` or `ion` |
+| `forcefield` | Force field that produced the set (e.g. `cgenff`, `openff-2.2.0.offxml`, `opc3.offxml`, `amber14sb`) |
+| `charge_method` | Resolved charge method (OpenFF small molecules only) |
+| `water_model` | Water model of water sets and of water-specific ions (Amber `ions_tip3p.itp`) |
+| `topology_merge` | How the set is combined into a topology: `cgenff`, `smirnoff` or `native` |
 | `itp` | Path to the molecule's ITP file |
-| `parameter_itp` | Path to extra parameters ITP (generated by both CGenFF and SMIRNOFF) |
-| `forcefield_itp` | Path to force field ITP (CGenFF only) |
+| `parameter_itp` | Path to the extra parameters ITP (`None` for native water/ions) |
+| `forcefield_itp` | Path to the force field's `forcefield.itp` (CGenFF and native sets) |
 
-## Special molecules
+## Migrating from the old keys
 
-### Water
+The flat `parametrization: cgenff | smirnoff | pdb2gmx` values and the `parametrization_config`
+block were removed. They are rejected with a validation error:
 
-Water is handled specially by both parametrization methods:
+| Old | New |
+|-----|-----|
+| `parametrization: cgenff` | `parametrization: charmm` |
+| `parametrization: smirnoff` | `parametrization: openff` |
+| `parametrization: pdb2gmx` | `parametrization: charmm` |
+| `parametrization_config.forcefield` (protein) | `parametrization.protein` |
+| `parametrization_config.water_model: opc3.offxml` | `parametrization.water_model: opc3` |
+| `parametrization_config.forcefield` / `sage_forcefield` (OpenFF) | `parametrization.small_molecules.forcefield` |
+| `parametrization_config.charge_method` | `parametrization.small_molecules.charge_method` |
+| `parametrization_config.ignore_hydrogens` / `merge_all` | `system.protein.ignore_hydrogens` / `system.protein.merge_all` |
 
-- **SMIRNOFF**: Uses the configured water model (default: OPC3)
-- **CGenFF**: Uses TIP3P from CHARMM36
-
-### Ions
-
-Currently supported ions:
-- Sodium: `[Na+]`
-- Chloride: `[Cl-]`
-
-Ions use formal charges and standard ion parameters from the respective force fields.
+This is a clean break: build hashes change, and old build directories, run-database rows
+(`input_data`) and pushed data cannot be parsed into the new `BuildInput`. Old OpenFF cache
+entries under `parameter_store/gromacs/smirnoff/` are not reused; OpenFF parameters (including
+NAGL/AM1-BCC charges) are regenerated once under `gromacs/openff/`. The CGenFF cache under
+`gromacs/cgenff/` is unchanged and still valid.
 
 ## Troubleshooting
 
-### SMIRNOFF issues
+### OpenFF issues
 
 **"No conformer available"**
 

@@ -13,15 +13,14 @@ import numpy as np
 from pydantic import validate_call
 
 from mdfactory.parametrize import (
-    DISPATCH_ENGINE_PARAMETRIZE,
     DISPATCH_TOPOLOGY_BUILD,
-    retrieve_or_deposit_parameters,
+    NativeForceField,
+    resolve_parametrizer,
 )
 
 from .check import check_bilayer_buildable
 from .models.composition import BilayerComposition, LNPComposition, MixedBoxComposition
 from .models.input import BuildInput
-from .models.parametrization import SmirnoffConfig
 from .models.species import SingleMoleculeSpecies
 from .run_schedules import RunScheduleManager
 from .setup.solvation import ionize, solvate
@@ -67,25 +66,6 @@ def _compute_charge_from_universe(u: mda.Universe, species: list) -> int:
     return total_charge
 
 
-def _get_parametrize_function(inp: BuildInput):
-    """Get the parametrization function, optionally wrapping with config for SMIRNOFF."""
-    parametrize_function = DISPATCH_ENGINE_PARAMETRIZE.get(inp.engine, {}).get(
-        inp.parametrization, None
-    )
-    if parametrize_function is None:
-        raise NotImplementedError(
-            f"Cannot parametrize with {inp.parametrization} for engine {inp.engine}"
-        )
-
-    # Wrap to include config for smirnoff
-    if inp.parametrization == "smirnoff" and isinstance(inp.parametrization_config, SmirnoffConfig):
-        parametrize_function = partial(
-            parametrize_function, smirnoff_config=inp.parametrization_config
-        )
-
-    return parametrize_function
-
-
 @validate_call
 def build_mixedbox(inp: BuildInput):
     """Build a mixed-box system: compress, ionize, write topology and run files."""
@@ -113,7 +93,11 @@ def build_mixedbox(inp: BuildInput):
     # copy run files from template directory (run_schedules.yaml)
     manager = RunScheduleManager()
     manager.copy_run_files_with_check(
-        engine=inp.engine, system_type="mixedbox", target_folder=os.getcwd(), force_copy=True
+        engine=inp.engine,
+        system_type="mixedbox",
+        target_folder=os.getcwd(),
+        force_copy=True,
+        nonbonded_scheme=inp.parametrization.nonbonded_scheme,
     )
     logger.info("Run schedule files copied.")
 
@@ -147,14 +131,12 @@ def create_mixedbox_by_compression(inp: BuildInput, require_target_density: bool
     logger.info("Successfully created universe for mixed box system.")
 
     # parametrize all species in the box for the FF/engine combination
-    parametrize_function = _get_parametrize_function(inp)
+    parametrize_function = resolve_parametrizer(inp.parametrization, inp.engine)
     topology_function = DISPATCH_TOPOLOGY_BUILD.get(inp.engine, None)
     if topology_function is None:
         raise NotImplementedError(f"Cannot build topology for engine {inp.engine}.")
 
-    dec = retrieve_or_deposit_parameters(engine=inp.engine, parametrization=inp.parametrization)
-    parametrize_with_db = dec(parametrize_function)
-    parameters = [parametrize_with_db(spec) for spec in inp.system.species]
+    parameters = [parametrize_function(spec) for spec in inp.system.species]
     logger.info("Parametrization done.")
 
     # compress box to target density
@@ -225,7 +207,11 @@ def build_bilayer(inp: BuildInput):
     # 8. copy run schedule files
     manager = RunScheduleManager()
     manager.copy_run_files_with_check(
-        engine=inp.engine, system_type="bilayer", target_folder=os.getcwd(), force_copy=True
+        engine=inp.engine,
+        system_type="bilayer",
+        target_folder=os.getcwd(),
+        force_copy=True,
+        nonbonded_scheme=inp.parametrization.nonbonded_scheme,
     )
     logger.info("Run schedule files copied.")
 
@@ -253,12 +239,10 @@ def create_bilayer_by_compression(inp):
 
     # 1. parametrize lipid species
     # parametrize all species in the box for the FF/engine combination
-    parametrize_function = _get_parametrize_function(inp)
+    parametrize_function = resolve_parametrizer(inp.parametrization, inp.engine)
 
     # preliminary parameters (only lipids)
-    dec = retrieve_or_deposit_parameters(engine=inp.engine, parametrization=inp.parametrization)
-    parametrize_with_db = dec(parametrize_function)
-    parameters = [parametrize_with_db(spec) for spec in inp.system.species]
+    parameters = [parametrize_function(spec) for spec in inp.system.species]
 
     logger.info("Parametrization done.")
     # 2. write temporary toplogy file
@@ -391,7 +375,11 @@ def build_lnp(inp: BuildInput):
     # Step 7: Copy run schedule files
     manager = RunScheduleManager()
     manager.copy_run_files_with_check(
-        engine=inp.engine, system_type="lnp", target_folder=os.getcwd(), force_copy=True
+        engine=inp.engine,
+        system_type="lnp",
+        target_folder=os.getcwd(),
+        force_copy=True,
+        nonbonded_scheme=inp.parametrization.nonbonded_scheme,
     )
     logger.info("Run schedule files copied.")
 
@@ -424,7 +412,6 @@ def create_lnp_core(inp: BuildInput):
         simulation_type="mixedbox",
         system=core_comp,
         parametrization=inp.parametrization,
-        parametrization_config=inp.parametrization_config,
         engine=inp.engine,
     )
 
@@ -501,7 +488,6 @@ def create_lnp_shell(inp: BuildInput, parametrize_function, topology_function):
         simulation_type="bilayer",
         system=shell_comp,
         parametrization=inp.parametrization,
-        parametrization_config=inp.parametrization_config,
         engine=inp.engine,
     )
 
@@ -766,13 +752,15 @@ def _center_in_cubic_box(u: mda.Universe, padding: float) -> float:
     return box_size
 
 
-def _prepare_protein(protein, config):
+def _prepare_protein(protein, spec):
     """Check GROMACS, clean the protein PDB, and run pdb2gmx in the current directory.
 
-    ``config`` may be a ``Pdb2gmxConfig``, ``CharmmConfig`` or ``AmberConfig``;
-    ``run_pdb2gmx`` only reads the fields they share. A force field that needs a
-    minimum GROMACS version (amber14sb) is checked against the binary first, so
-    an old GROMACS fails before any protein preparation.
+    The protein force field and water model come from the resolved family
+    ``spec``; the preparation options (``ignore_hydrogens``, ``merge_all``) and
+    the chain/disulfide/protonation settings from the ``protein`` species. A
+    force field that needs a minimum GROMACS version (amber14sb) is checked
+    against the binary first, so an old GROMACS fails before any protein
+    preparation.
     """
     from loguru import logger
 
@@ -785,12 +773,15 @@ def _prepare_protein(protein, config):
 
     gmx_bin = check_gmx_available()
     logger.info(f"Using GROMACS: {gmx_bin}")
-    require_gmx_version(gmx_bin, config.forcefield)
+    require_gmx_version(gmx_bin, spec.protein)
     cleaned_pdb = Path("cleaned.pdb")
     clean_pdb(protein.pdb_path.resolve(), cleaned_pdb)
     params = run_pdb2gmx(
         pdb_path=cleaned_pdb,
-        config=config,
+        forcefield=spec.protein,
+        water_model=spec.water_model,
+        ignore_hydrogens=protein.ignore_hydrogens,
+        merge_all=protein.merge_all,
         disulfide_bonds=protein.disulfide_bonds,
         protonation_states=protein.protonation_states,
         output_dir=Path("pdb2gmx_output"),
@@ -832,8 +823,8 @@ def _relax_protein_system(u, topology, itps, ff_dir_name, protein_indices, **rel
 def _finalize_protein_build(inp, system_type, topology, extra_intermediates=()):
     """Install the run schedule, validate with grompp, and drop build intermediates.
 
-    The run schedule is selected by parametrization, so Amber builds get the
-    Sage-style nonbonded mdps. Cleanup only runs on success so a failed build
+    The run schedule is selected by the family's nonbonded scheme, so Amber
+    builds get the Sage-style nonbonded mdps. Cleanup only runs on success so a failed build
     keeps its intermediates. ``solvated.pdb`` and ``relaxation/`` are left in
     place, as in the bilayer build.
     """
@@ -846,7 +837,7 @@ def _finalize_protein_build(inp, system_type, topology, extra_intermediates=()):
         system_type=system_type,
         target_folder=os.getcwd(),
         force_copy=True,
-        parametrization=inp.parametrization,
+        nonbonded_scheme=inp.parametrization.nonbonded_scheme,
     )
     logger.info("Run schedule files copied.")
 
@@ -871,18 +862,12 @@ def build_proteinbox(inp: BuildInput):
     from loguru import logger
 
     from .models.composition import ProteinBoxComposition
-    from .models.parametrization import AmberConfig, Pdb2gmxConfig
     from .setup.protein import bundle_forcefield_into_topology, update_topology_molecules
 
     if not isinstance(inp.system, ProteinBoxComposition):
         raise TypeError("System must specify a ProteinBoxComposition.")
 
-    if not isinstance(inp.parametrization_config, (Pdb2gmxConfig, AmberConfig)):
-        raise TypeError(
-            "Parametrization config must be Pdb2gmxConfig or AmberConfig for proteinbox."
-        )
-
-    params = _prepare_protein(inp.system.protein, inp.parametrization_config)
+    params = _prepare_protein(inp.system.protein, inp.parametrization)
 
     # Center protein in a cubic box
     u = mda.Universe(str(params.structure_file))
@@ -1057,46 +1042,6 @@ def _stage_protein_topology(params, protein_ff_dir, dest_dir, species, parameter
     return topology
 
 
-def _protein_solution_parametrizer(config, protein_ff_dir: Path):
-    """Return the parameter-store scheme and parametrizer for protein_mixedbox solutes.
-
-    Native water and ions short-circuit to the bundled protein force field
-    ``protein_ff_dir`` in both cases; the parametrizer only differs for SMILES
-    solutes.
-
-    Parameters
-    ----------
-    config : CharmmConfig or AmberConfig
-        protein_mixedbox parametrization config.
-    protein_ff_dir : Path
-        Bundled force-field directory selected by pdb2gmx.
-
-    Returns
-    -------
-    tuple
-        ``(parametrization, function)``: ``"cgenff"`` with
-        ``parametrize_cgenff_gromacs`` for CHARMM, or ``"smirnoff"`` with
-        ``parametrize_smirnoff_gromacs`` (OpenFF Sage) for Amber.
-
-    """
-    from .models.parametrization import AmberConfig, CharmmConfig
-    from .parametrize import parametrize_cgenff_gromacs, parametrize_smirnoff_gromacs
-
-    if isinstance(config, CharmmConfig):
-        return "cgenff", partial(parametrize_cgenff_gromacs, native_forcefield_dir=protein_ff_dir)
-    if isinstance(config, AmberConfig):
-        return "smirnoff", partial(
-            parametrize_smirnoff_gromacs,
-            smirnoff_config=config.smirnoff_config(),
-            native_forcefield_dir=protein_ff_dir,
-            native_water_model=config.water_model,
-        )
-    raise TypeError(
-        "Parametrization config must be CharmmConfig or AmberConfig for protein_mixedbox, "
-        f"got {type(config).__name__}."
-    )
-
-
 @validate_call
 def build_protein_mixedbox(inp: BuildInput):
     """Build a protein packed with water, ions, and SMILES solutes.
@@ -1117,7 +1062,6 @@ def build_protein_mixedbox(inp: BuildInput):
         FixedBoxSizing,
         ProteinMixedBoxComposition,
     )
-    from .models.parametrization import AmberConfig, CharmmConfig
     from .setup.protein import bundle_forcefield_into_topology, extract_mass_from_topology
     from .simulation.openmm_utils import compress_box
     from .utils.setup_utilities import (
@@ -1131,15 +1075,11 @@ def build_protein_mixedbox(inp: BuildInput):
 
     if not isinstance(inp.system, ProteinMixedBoxComposition):
         raise TypeError("System must specify a ProteinMixedBoxComposition.")
-    if not isinstance(inp.parametrization_config, (CharmmConfig, AmberConfig)):
-        raise TypeError(
-            "Parametrization config must be CharmmConfig or AmberConfig for protein_mixedbox."
-        )
 
     system = inp.system
     fixed_box = isinstance(system.sizing, FixedBoxSizing)
 
-    params = _prepare_protein(system.protein, inp.parametrization_config)
+    params = _prepare_protein(system.protein, inp.parametrization)
 
     # Bundle the selected force field immediately. Native water/ion parameters
     # and small-molecule compatibility checks must use this exact directory
@@ -1186,14 +1126,15 @@ def build_protein_mixedbox(inp: BuildInput):
         system.concentration_volume_basis,
     )
 
-    # Parametrize the solution species with CGenFF or Sage (native water/ions
-    # short-circuit to the bundled force field).
-    scheme, parametrize_solute = _protein_solution_parametrizer(
-        inp.parametrization_config, protein_ff_dir
+    # Parametrize the solution species with the family's small-molecule force field
+    # (CGenFF or Sage); native water/ions short-circuit to the bundled force field.
+    native_forcefield = NativeForceField(
+        name=inp.parametrization.protein,
+        directory=protein_ff_dir,
+        water_model=inp.parametrization.water_model,
     )
-    decorate = retrieve_or_deposit_parameters(engine="gromacs", parametrization=scheme)
-    parametrize_with_db = decorate(parametrize_solute)
-    parameters = [parametrize_with_db(spec) for spec in system.species]
+    parametrize_solute = resolve_parametrizer(inp.parametrization, inp.engine, native_forcefield)
+    parameters = [parametrize_solute(spec) for spec in system.species]
     logger.info("Solution-species parametrization complete.")
 
     # Drop species that resolve to zero copies from packing and topology alike.
@@ -1293,7 +1234,7 @@ def build_protein_mixedbox(inp: BuildInput):
     final_iter = iter(final_counts)
     final_input_counts = [next(final_iter) if count > 0 else 0 for count in counts]
     final_species = [*packed_species, *ion_species]
-    final_parameters = [*packed_parameters, *(parametrize_with_db(s) for s in ion_species)]
+    final_parameters = [*packed_parameters, *(parametrize_solute(s) for s in ion_species)]
     final_counts += [spec.count for spec in ion_species]
 
     # Write the final composite topology in the build directory.

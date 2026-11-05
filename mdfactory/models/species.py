@@ -273,6 +273,12 @@ class ProteinSpecies(Species):
             "3-character states are expressible (histidine tautomers, neutral lysine)."
         ),
     )
+    ignore_hydrogens: bool = Field(
+        True, description="Ignore hydrogens in the input PDB (pdb2gmx regenerates them)."
+    )
+    merge_all: bool = Field(
+        False, description="Merge all chains into a single pdb2gmx moleculetype."
+    )
 
     @property
     def charge(self) -> int | None:

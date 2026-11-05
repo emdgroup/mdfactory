@@ -13,7 +13,6 @@ The YAML is parsed into the `BuildInput` model, which combines:
 
 - top-level run settings (`simulation_type`, `engine`, `parametrization`)
 - `system` composition (varies by simulation type)
-- optional `parametrization_config`
 
 ## Top-level schema
 
@@ -21,8 +20,7 @@ The YAML is parsed into the `BuildInput` model, which combines:
 |---|---|---|---|
 | `simulation_type` | Yes | string | One of `mixedbox`, `bilayer`, `lnp` |
 | `system` | Yes | object | Shape depends on `simulation_type` |
-| `parametrization` | No | string | `cgenff` or `smirnoff` (default: `cgenff`) |
-| `parametrization_config` | No | object | If omitted, defaults are injected based on `parametrization` |
+| `parametrization` | Yes | string or object | Force-field family: `charmm`, `amber` or `openff` (no default). See [Parametrization](/docs/user-guide/parametrization) |
 | `engine` | No | string | Currently only `gromacs` (default: `gromacs`) |
 
 ## How `system` works
@@ -60,35 +58,29 @@ Composition-level rules:
 - If fractions are used, they must sum exactly to `1.0` and `total_count` is required.
 - Zero-count species are removed after validation.
 
-## Parametrization config
+## Parametrization
 
-### Default behavior
-
-If `parametrization_config` is omitted:
-
-- `parametrization: smirnoff` -> default `SmirnoffConfig`
-- `parametrization: cgenff` -> default `CgenffConfig`
-
-### SMIRNOFF config example
+`parametrization` is required and names a force-field family (`charmm`, `amber` or `openff`).
+The shorthand takes every component's family default:
 
 ```yaml
-parametrization: smirnoff
-parametrization_config:
-  type: smirnoff
-  forcefield: openff-2.2.0.offxml
-  water_model: opc3.offxml
-  charge_method: openff-gnn-am1bcc-0.1.0-rc.3.pt
+parametrization: openff
 ```
 
-### CGenFF config example
+The explicit form overrides individual components:
 
 ```yaml
-parametrization: cgenff
-parametrization_config:
-  type: cgenff
+parametrization:
+  family: openff
+  small_molecules:
+    forcefield: openff-2.2.0.offxml
+    charge_method: openff-gnn-am1bcc-0.1.0-rc.3.pt
+  water_model: opc3
 ```
 
-CGenFF installation path is configured globally via `SILCSBIODIR` in `mdfactory config init` / config file.
+Omitted components keep their family default. Unknown top-level keys are rejected. See
+[Parametrization](/docs/user-guide/parametrization) for the families, their component options and
+the CGenFF requirements of the `charmm` family.
 
 ## Ionization block
 
@@ -130,7 +122,7 @@ These examples intentionally use compounds from the repository example inputs un
 ```yaml
 simulation_type: mixedbox
 engine: gromacs
-parametrization: smirnoff
+parametrization: openff
 system:
   species:
     - smiles: "O"
@@ -159,7 +151,7 @@ system:
 ```yaml
 simulation_type: bilayer
 engine: gromacs
-parametrization: smirnoff
+parametrization: openff
 system:
   species:
     - smiles: "CCCCCCCC/C=C\\CCCCCCCC(=O)OC[C@H](CO[P@](=O)([O-])OCC[N+](C)(C)C)OC(=O)CCCCCCC/C=C\\CCCCCCCC"
@@ -188,7 +180,7 @@ Validation note:
 ```yaml
 simulation_type: lnp
 engine: gromacs
-parametrization: smirnoff
+parametrization: openff
 system:
   radius: 120.0
   shell_thickness: 28.0
@@ -264,7 +256,7 @@ When YAML is loaded:
 
 1. `simulation_type` selects the correct system model.
 2. Validation checks species, fractions/counts, and type-specific constraints.
-3. Missing defaults are injected (engine, parametrization config, ionization defaults).
+3. Missing defaults are injected (engine, ionization defaults, and the family defaults of each parametrization component).
 4. A canonical hash is generated from the final normalized model payload.
 
 This is why small YAML changes (including defaults becoming explicit) can change the resulting hash.
@@ -284,5 +276,5 @@ This is why small YAML changes (including defaults becoming explicit) can change
 <Cards>
   <Card title="System Types" href="/docs/user-guide/system-types" description="Conceptual differences and field notes for mixedbox, bilayer, and lnp." />
   <Card title="CSV Format" href="/docs/user-guide/csv-format" description="How the CSV schema maps onto the same BuildInput model." />
-  <Card title="Parametrization" href="/docs/user-guide/parametrization" description="Detailed force-field configuration and method selection." />
+  <Card title="Parametrization" href="/docs/user-guide/parametrization" description="Force-field families and per-component options." />
 </Cards>

@@ -1,5 +1,5 @@
 simulation_type: mixedbox
-parametrization: smirnoff
+parametrization: openff
 system:
   species:
   - smiles: O

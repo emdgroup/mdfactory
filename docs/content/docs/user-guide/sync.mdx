@@ -159,7 +159,7 @@ The sync backend stores four logical record types:
 
 | Logical table | Primary key behavior | Key columns |
 |---|---|---|
-| `RUN_DATABASE` | keyed by `hash` | `hash`, `engine`, `parametrization`, `simulation_type`, `directory`, `status`, `timestamp_utc`, plus `input_data` and `input_data_type` |
+| `RUN_DATABASE` | keyed by `hash` (`parametrization` holds the force-field family name: `charmm`, `amber` or `openff`) | `hash`, `engine`, `parametrization`, `simulation_type`, `directory`, `status`, `timestamp_utc`, plus `input_data` and `input_data_type` |
 | `ANALYSIS_OVERVIEW` | keyed by `(hash, item_type, item_name)` | `hash`, `simulation_type`, `directory`, `item_type`, `item_name`, `status`, `row_count`, `file_count`, `updated_at` |
 | `ANALYSIS_<name>` | keyed by `hash` | `hash`, `directory`, `simulation_type`, `row_count`, `columns`, `data_csv`, `data_path`, `timestamp_utc` |
 | `ARTIFACT_<name>` | keyed by `hash` | `hash`, `directory`, `simulation_type`, `file_count`, `files`, `checksums`, `timestamp_utc` |
