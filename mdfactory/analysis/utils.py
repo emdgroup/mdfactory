@@ -183,7 +183,7 @@ def flatten_system_parameters(build_input: BuildInput) -> dict[str, Any]:
     flat = {
         "simulation_type": build_input.simulation_type,
         "engine": build_input.engine,
-        "parametrization": build_input.parametrization,
+        "parametrization": build_input.parametrization.family,
     }
 
     # Add system-specific parameters from metadata

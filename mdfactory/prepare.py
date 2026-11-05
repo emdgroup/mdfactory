@@ -17,13 +17,15 @@ PROTEIN_PDB_SIMULATION_TYPES = frozenset({"proteinbox", "protein_mixedbox"})
 # CSV column holding the protein PDB path (flat, dotted notation).
 PROTEIN_PDB_PATH_COLUMN = "system.protein.pdb_path"
 
-# Protein fields that are lists/dicts and therefore optional: a CSV row may leave
-# them blank. They are excluded from the strict all-columns NaN check and dropped
-# per row when empty so heterogeneous proteins can share one CSV.
+# Protein fields with defaults (lists/dicts and preparation options): a CSV row
+# may leave them blank. They are excluded from the strict all-columns NaN check
+# and dropped per row when empty so heterogeneous proteins can share one CSV.
 OPTIONAL_PROTEIN_FIELD_PREFIXES = (
     "system.protein.chains",
     "system.protein.disulfide_bonds",
     "system.protein.protonation_states",
+    "system.protein.ignore_hydrogens",
+    "system.protein.merge_all",
 )
 
 

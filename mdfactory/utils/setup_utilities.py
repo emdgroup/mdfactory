@@ -995,10 +995,6 @@ def native_atom_names(smiles: str) -> list[str] | None:
     }.get(smiles)
 
 
-# Kept for existing imports; the native names are not CHARMM-specific.
-charmm_native_atom_names = native_atom_names
-
-
 def topology_atom_names(species, parameter_set) -> list[str] | None:
     """Return the atom names the topology expects for a packed solution species.
 

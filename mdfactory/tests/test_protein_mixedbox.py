@@ -1,5 +1,5 @@
 # ABOUTME: Tests for protein_mixedbox models, helpers, topology, and YAML/CSV validation
-# ABOUTME: Covers SolutionSpecies, CharmmConfig, sizing, volume/count helpers, and re-imaging
+# ABOUTME: Covers SolutionSpecies, family specs, sizing, volume/count helpers, and re-imaging
 """Tests for protein_mixedbox models, helpers, topology, and YAML/CSV validation."""
 
 import textwrap
@@ -17,7 +17,6 @@ from mdfactory.build import (
     PROTEIN_MIXEDBOX_RMSD_TOLERANCE_A,
     _check_no_protein_clashes,
     _check_no_solution_clashes,
-    _protein_solution_parametrizer,
     _reimage_protein_centered,
     ionize_solvated_system,
 )
@@ -28,12 +27,14 @@ from mdfactory.models.composition import (
     ProteinMixedBoxComposition,
 )
 from mdfactory.models.input import BuildInput
-from mdfactory.models.parametrization import AmberConfig, CharmmConfig
+from mdfactory.models.parametrization import AmberParametrization, CharmmParametrization
 from mdfactory.models.species import ProteinSpecies, SolutionSpecies
 from mdfactory.parametrize import (
+    NativeForceField,
     generate_gromacs_topology_with_protein,
     parametrize_cgenff_gromacs,
-    parametrize_smirnoff_gromacs,
+    parametrize_openff_gromacs,
+    resolve_parametrizer,
 )
 from mdfactory.prepare import df_to_build_input_models
 from mdfactory.run_schedules import RunScheduleManager
@@ -44,7 +45,6 @@ from mdfactory.simulation.openmm_utils import (
 )
 from mdfactory.utils.setup_utilities import (
     N_AVOGADRO,
-    charmm_native_atom_names,
     create_protein_mixedbox_universe,
     cubic_box_edge_for_density,
     native_atom_names,
@@ -124,17 +124,30 @@ class TestSolutionSpecies:
             SolutionSpecies(smiles=smiles, resname=wrong_resname, count=1)
 
 
-class TestCharmmConfig:
+class TestCharmmSpec:
     @pytest.mark.parametrize(
         ("overrides", "match"),
         [
-            ({"forcefield": "charmm27"}, "only the registered 'charmm36m'"),
+            ({"protein": "charmm27"}, "only the registered 'charmm36m'"),
             ({"water_model": "spce"}, "only 'tip3p'"),
         ],
     )
-    def test_rejects_unpinned_choices(self, overrides, match):
+    def test_rejects_unpinned_choices(self, protein_pdb, overrides, match):
+        data = protein_input_data(
+            "protein_mixedbox", protein_pdb, parametrization={"family": "charmm", **overrides}
+        )
         with pytest.raises(ValueError, match=match):
-            CharmmConfig(**overrides)
+            BuildInput(**data)
+
+    def test_resolves_cgenff_small_molecules(self, protein_pdb):
+        spec = BuildInput(**protein_input_data("protein_mixedbox", protein_pdb)).parametrization
+        assert spec.small_molecules.forcefield == "cgenff"
+        assert spec.components() == {
+            "protein": "charmm36m",
+            "small_molecules": "cgenff",
+            "water": "tip3p",
+            "ions": "charmm36m",
+        }
 
 
 class TestSizingConfigs:
@@ -234,7 +247,7 @@ class TestExampleFiles:
     def test_yaml_loads(self, filename, sizing_cls, total_count):
         inp = BuildInput(**yaml.safe_load((EXAMPLES_DIR / filename).read_text()))
         assert isinstance(inp.system, ProteinMixedBoxComposition)
-        assert isinstance(inp.parametrization_config, CharmmConfig)
+        assert isinstance(inp.parametrization, CharmmParametrization)
         assert isinstance(inp.system.sizing, sizing_cls)
         assert inp.system.total_count == total_count
 
@@ -472,10 +485,10 @@ class TestReimageAndClash:
 
 class TestPackingAndRestraints:
     def test_native_charmm_atom_names(self):
-        assert charmm_native_atom_names("O") == ["OW", "HW1", "HW2"]
-        assert charmm_native_atom_names("[Na+]") == ["NA"]
-        assert charmm_native_atom_names("[Cl-]") == ["CL"]
-        assert charmm_native_atom_names("CCO") is None
+        assert native_atom_names("O") == ["OW", "HW1", "HW2"]
+        assert native_atom_names("[Na+]") == ["NA"]
+        assert native_atom_names("[Cl-]") == ["CL"]
+        assert native_atom_names("CCO") is None
 
     def test_native_parameters_come_from_selected_forcefield(self, tmp_path, monkeypatch):
         monkeypatch.setattr(settings, "parameter_store", tmp_path / "parameters")
@@ -484,13 +497,13 @@ class TestPackingAndRestraints:
         for filename in ("forcefield.itp", "tip3p.itp", "ions.itp"):
             (ff_dir / filename).touch()
 
+        native = NativeForceField(name="charmm36m", directory=ff_dir, water_model="tip3p")
+        spec = CharmmParametrization().resolve("protein_mixedbox")
         water = parametrize_cgenff_gromacs(
-            SolutionSpecies(smiles="O", resname="SOL", count=1),
-            native_forcefield_dir=ff_dir,
+            SolutionSpecies(smiles="O", resname="SOL", count=1), spec, native_forcefield=native
         )
         sodium = parametrize_cgenff_gromacs(
-            SolutionSpecies(smiles="[Na+]", resname="NA", count=1),
-            native_forcefield_dir=ff_dir,
+            SolutionSpecies(smiles="[Na+]", resname="NA", count=1), spec, native_forcefield=native
         )
         assert water.itp == ff_dir / "tip3p.itp"
         assert sodium.itp == ff_dir / "ions.itp"
@@ -514,7 +527,7 @@ class TestPackingAndRestraints:
             [spec.resname for spec in species],
             30.0,
             tmp_path / "packmol",
-            native_atom_names=[charmm_native_atom_names(spec.smiles) for spec in species],
+            native_atom_names=[native_atom_names(spec.smiles) for spec in species],
         )
         assert list(universe.residues.resnames[1:]) == ["SOL", "SOL", "NA", "CL"]
         assert list(universe.residues[1].atoms.names) == ["OW", "HW1", "HW2"]
@@ -679,7 +692,7 @@ class TestCompositeTopology:
             SolutionSpecies(smiles="[Cl-]", resname="CL", count=6),
         ]
         parameters = [
-            SimpleNamespace(moleculetype=name, parameter_itp=None)
+            SimpleNamespace(moleculetype=name, parameter_itp=None, topology_merge="native")
             for name in ("SOL", "ETH0", "SOD", "CLA")
         ]
 
@@ -733,7 +746,11 @@ class TestCompositeTopology:
         mol_itp.write_text("[ moleculetype ]\nMOL0   3\n")
 
         species = [SolutionSpecies(smiles="CCO", resname="ETH", count=5)]
-        parameters = [SimpleNamespace(moleculetype="MOL0", parameter_itp=param_itp, itp=mol_itp)]
+        parameters = [
+            SimpleNamespace(
+                moleculetype="MOL0", parameter_itp=param_itp, itp=mol_itp, topology_merge="cgenff"
+            )
+        ]
 
         text = _gen(tmp_path, species, parameters, [5], ff_dir=ff_dir)
 
@@ -756,8 +773,8 @@ class TestCompositeTopology:
             SolutionSpecies(smiles="CCO", resname="ETH", count=0),
         ]
         parameters = [
-            SimpleNamespace(moleculetype="SOL", parameter_itp=None),
-            SimpleNamespace(moleculetype="ETH0", parameter_itp=None),
+            SimpleNamespace(moleculetype="SOL", parameter_itp=None, topology_merge="native"),
+            SimpleNamespace(moleculetype="ETH0", parameter_itp=None, topology_merge="native"),
         ]
         text = _gen(tmp_path, species, parameters, [100, 0])
         molecules = text.split("[ molecules ]", 1)[1]
@@ -829,7 +846,7 @@ def _sage_parameters(tmp_path, name="ETH0", **fmt):
         "\n[ bonds ]\n     1     2     1\n"
     )
     return SimpleNamespace(
-        moleculetype=name, parameter_itp=params, itp=itp, parametrization="smirnoff"
+        moleculetype=name, parameter_itp=params, itp=itp, topology_merge="smirnoff"
     )
 
 
@@ -873,17 +890,20 @@ def _gen_amber(tmp_path, parameters, counts=None):
     return out.read_text()
 
 
+AMBER_PROTEIN_MIXEDBOX = AmberParametrization().resolve("protein_mixedbox")
+
+
 class TestAmberSolutionParametrization:
     def test_native_water_and_ions_come_from_forcefield_dir(self, tmp_path, monkeypatch):
         monkeypatch.setattr(settings, "parameter_store", tmp_path / "parameters")
         ff_dir = _amber_ff_dir(tmp_path)
-        config = AmberConfig().smirnoff_config()
+        native = NativeForceField(name="amber14sb", directory=ff_dir, water_model="tip3p")
 
         results = {
-            smiles: parametrize_smirnoff_gromacs(
+            smiles: parametrize_openff_gromacs(
                 SolutionSpecies(smiles=smiles, resname=resname, count=1),
-                smirnoff_config=config,
-                native_forcefield_dir=ff_dir,
+                spec=AMBER_PROTEIN_MIXEDBOX,
+                native_forcefield=native,
             )
             for smiles, resname in (("O", "SOL"), ("[Na+]", "NA"), ("[Cl-]", "CL"))
         }
@@ -895,30 +915,36 @@ class TestAmberSolutionParametrization:
         for result in results.values():
             assert result.parameter_itp is None
             assert result.forcefield_itp == ff_dir / "forcefield.itp"
-            assert result.parametrization == "smirnoff"
-            assert result.parametrization_config == config
-        # The native short-circuit never touches the SMIRNOFF cache.
-        assert not (tmp_path / "parameters" / "gromacs" / "smirnoff").exists()
+            assert result.topology_merge == "native"
+            # Native Amber sets report the protein force field and the water model.
+            assert (result.forcefield, result.water_model) == ("amber14sb", "tip3p")
+            assert result.charge_method is None
+        assert [r.component for r in results.values()] == ["water", "ion", "ion"]
+        # The native short-circuit never touches the OpenFF cache.
+        assert not (tmp_path / "parameters" / "gromacs" / "openff").exists()
 
     def test_parametrizer_selection(self, tmp_path):
-        scheme, function = _protein_solution_parametrizer(CharmmConfig(), tmp_path)
-        assert scheme == "cgenff"
+        native = NativeForceField(name="charmm36m", directory=tmp_path, water_model="tip3p")
+        charmm = CharmmParametrization().resolve("protein_mixedbox")
+        function = resolve_parametrizer(charmm, "gromacs", native)
         assert function.func is parametrize_cgenff_gromacs
-        assert function.keywords == {"native_forcefield_dir": tmp_path}
+        assert function.keywords == {"spec": charmm, "native_forcefield": native}
 
-        config = AmberConfig(charge_method="am1bcc")
-        scheme, function = _protein_solution_parametrizer(config, tmp_path)
-        assert scheme == "smirnoff"
-        assert function.func is parametrize_smirnoff_gromacs
-        assert function.keywords["native_forcefield_dir"] == tmp_path
-        assert function.keywords["native_water_model"] == "tip3p"
-        assert function.keywords["smirnoff_config"] == config.smirnoff_config()
+        amber = AmberParametrization(small_molecules={"charge_method": "am1bcc"}).resolve(
+            "protein_mixedbox"
+        )
+        function = resolve_parametrizer(amber, "gromacs", native)
+        assert function.func is parametrize_openff_gromacs
+        assert function.keywords == {"spec": amber, "native_forcefield": native}
 
-    def test_native_atom_names_and_alias(self):
+    def test_parametrizer_requires_small_molecule_component(self):
+        with pytest.raises(ValueError, match="no small-molecule component"):
+            resolve_parametrizer(AmberParametrization().resolve("proteinbox"))
+
+    def test_native_atom_names(self):
         assert native_atom_names("O") == ["OW", "HW1", "HW2"]
         assert native_atom_names("[Na+]") == ["NA"]
         assert native_atom_names("CCO") is None
-        assert charmm_native_atom_names is native_atom_names
 
     def test_topology_atom_names_for_sage_solute(self, tmp_path):
         species = SolutionSpecies(smiles="CO", resname="MEO", count=1)
@@ -1016,9 +1042,28 @@ class TestAmberCompositeTopology:
         merged = (tmp_path / "extra_params.itp").read_text()
         assert merged.count("ETH_0 ") == 1
 
+    def test_real_sage_sets_with_same_resname_combine(self, tmp_path, monkeypatch):
+        """Different molecules parametrized with one resname get distinct atom types."""
+        pytest.importorskip("openff.interchange")
+        monkeypatch.setattr(settings, "parameter_store", tmp_path / "parameters")
+        parameters = [
+            parametrize_openff_gromacs(
+                SolutionSpecies(smiles=smiles, resname="LIG", count=1),
+                spec=AMBER_PROTEIN_MIXEDBOX,
+            )
+            for smiles in ("CCO", "CCCO")
+        ]
+
+        _gen_amber(tmp_path, parameters)  # runs check_atomtype_collisions
+
+        merged = (tmp_path / "extra_params.itp").read_text().split("[ atomtypes ]", 1)[1]
+        names = [line.split()[0] for line in merged.splitlines() if line and line[0] != ";"]
+        assert len(names) == len(set(names)) > 0
+        assert not any(name.startswith("LIG") for name in names)
+
     def test_mixed_cgenff_and_smirnoff_raises(self, tmp_path):
         cgenff = _sage_parameters(tmp_path, name="CG0")
-        cgenff.parametrization = "cgenff"
+        cgenff.topology_merge = "cgenff"
         with pytest.raises(ValueError, match="Cannot mix small-molecule parametrizations"):
             _gen_amber(tmp_path, [_sage_parameters(tmp_path), cgenff])
 
@@ -1033,8 +1078,7 @@ class TestAmberExamplesAndSchedule:
     )
     def test_yaml_loads(self, filename, resnames):
         inp = BuildInput(**yaml.safe_load((EXAMPLES_DIR / filename).read_text()))
-        assert inp.parametrization == "amber"
-        assert isinstance(inp.parametrization_config, AmberConfig)
+        assert inp.parametrization == AMBER_PROTEIN_MIXEDBOX
         assert {s.resname for s in inp.system.species} == resnames
 
     def test_csv_loads(self):
@@ -1042,8 +1086,8 @@ class TestAmberExamplesAndSchedule:
             pd.read_csv(EXAMPLES_DIR / "protein_mixedbox_amber.csv")
         )
         assert errors == {}
-        assert [m.parametrization for m in models] == ["amber"]
-        assert isinstance(models[0].parametrization_config, AmberConfig)
+        assert [m.parametrization for m in models] == [AMBER_PROTEIN_MIXEDBOX]
+        assert models[0].system.protein.ignore_hydrogens is True
 
     @pytest.mark.parametrize("system_type", ["proteinbox", "protein_mixedbox"])
     def test_amber_schedule_has_sage_nonbonded_settings(self, system_type):
@@ -1051,7 +1095,7 @@ class TestAmberExamplesAndSchedule:
 
         manager = RunScheduleManager()
         amber = manager.get_all_run_file_paths(
-            engine="gromacs", system_type=system_type, parametrization="amber"
+            engine="gromacs", system_type=system_type, nonbonded_scheme="sage"
         )
         charmm = manager.get_all_run_file_paths(engine="gromacs", system_type=system_type)
         assert set(amber) == set(charmm) == {"em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"}
@@ -1073,10 +1117,21 @@ class TestAmberExamplesAndSchedule:
             assert path.parent.name == "proteinbox"
             assert get_mdp_value(parse_mdp(path), "vdw_modifier").lower() == "force-switch"
 
-    def test_unknown_parametrization_falls_back_to_generic(self):
+    @pytest.mark.parametrize(
+        ("system_type", "scheme"),
+        [
+            ("proteinbox", "charmm"),
+            ("protein_mixedbox", "charmm"),
+            ("proteinbox", "unknown"),
+            ("mixedbox", "sage"),
+            ("bilayer", "sage"),
+        ],
+    )
+    def test_scheme_without_entry_falls_back_to_generic(self, system_type, scheme):
         manager = RunScheduleManager()
-        charmm = manager.get_all_run_file_paths("gromacs", "proteinbox", parametrization="pdb2gmx")
-        assert {p.parent.name for p in charmm.values()} == {"proteinbox"}
+        generic = manager.get_all_run_file_paths("gromacs", system_type)
+        selected = manager.get_all_run_file_paths("gromacs", system_type, nonbonded_scheme=scheme)
+        assert selected == generic
 
     def test_finalize_installs_amber_schedule(self, tmp_path, monkeypatch):
         from mdfactory import build
@@ -1085,8 +1140,22 @@ class TestAmberExamplesAndSchedule:
         monkeypatch.setattr("mdfactory.setup.protein.validate_with_grompp", lambda *a, **k: None)
         inp = SimpleNamespace(
             engine="gromacs",
-            parametrization="amber",
+            parametrization=AMBER_PROTEIN_MIXEDBOX,
             system=SimpleNamespace(ionization=IonizationConfig()),
         )
         build._finalize_protein_build(inp, "protein_mixedbox", tmp_path / "topology.top")
         assert "Potential-switch" in (tmp_path / "md.mdp").read_text()
+
+    def test_finalize_installs_generic_schedule_for_charmm(self, tmp_path, monkeypatch):
+        from mdfactory import build
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("mdfactory.setup.protein.validate_with_grompp", lambda *a, **k: None)
+        inp = SimpleNamespace(
+            engine="gromacs",
+            parametrization=CharmmParametrization().resolve("protein_mixedbox"),
+            system=SimpleNamespace(ionization=IonizationConfig()),
+        )
+        build._finalize_protein_build(inp, "protein_mixedbox", tmp_path / "topology.top")
+        generic = RunScheduleManager().get_all_run_file_paths("gromacs", "protein_mixedbox")
+        assert (tmp_path / "md.mdp").read_bytes() == generic["md.mdp"].read_bytes()

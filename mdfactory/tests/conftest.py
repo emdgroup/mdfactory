@@ -35,7 +35,7 @@ def make_test_record(hash_value: str, status: str = "build", **overrides: Any) -
     record = {
         "hash": hash_value,
         "engine": "gromacs",
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "simulation_type": "mixedbox",
         "input_data": "{}",
         "input_data_type": "BuildInput",
@@ -58,7 +58,7 @@ def _sample_rows() -> list[dict[str, object]]:
         {
             "simulation_type": "mixedbox",
             "engine": "gromacs",
-            "parametrization": "cgenff",
+            "parametrization": "charmm",
             "system.total_count": 1000,
             "system.species.ABC.smiles": "CCC",
             "system.species.ABC.fraction": 0.4,
@@ -68,7 +68,7 @@ def _sample_rows() -> list[dict[str, object]]:
         {
             "simulation_type": "mixedbox",
             "engine": "gromacs",
-            "parametrization": "cgenff",
+            "parametrization": "charmm",
             "system.total_count": 1500,
             "system.species.ABC.smiles": "CCC",
             "system.species.ABC.fraction": 0.5,
@@ -189,7 +189,6 @@ def protein_input_data(
     sim_type: str,
     pdb: Path,
     *,
-    config: dict[str, Any] | None = None,
     protein: dict[str, Any] | None = None,
     **top_level: Any,
 ) -> dict[str, Any]:
@@ -201,14 +200,12 @@ def protein_input_data(
         ``"proteinbox"`` or ``"protein_mixedbox"``.
     pdb : Path
         Path to an existing PDB file.
-    config : dict, optional
-        Entries for ``parametrization_config`` (its ``type`` defaults to the parametrization).
     protein : dict, optional
         Overrides merged into the ``system.protein`` mapping.
     **top_level
-        Overrides replacing top-level keys (e.g. ``parametrization="cgenff"``).
+        Overrides replacing top-level keys (e.g. ``parametrization="amber"``).
+        The parametrization defaults to the ``charmm`` family.
     """
-    parametrization = "pdb2gmx" if sim_type == "proteinbox" else "charmm"
     system: dict[str, Any] = {
         "protein": {"resname": "LYZ", "pdb_path": str(pdb), **(protein or {})},
         "padding": 12.0,
@@ -218,10 +215,8 @@ def protein_input_data(
         system["sizing"] = {"type": "fixed_box", "box_size": 72.0}
     data: dict[str, Any] = {
         "simulation_type": sim_type,
-        "parametrization": parametrization,
+        "parametrization": "charmm",
         "system": system,
     }
-    if config is not None:
-        data["parametrization_config"] = {"type": parametrization, **config}
     data.update(top_level)
     return data

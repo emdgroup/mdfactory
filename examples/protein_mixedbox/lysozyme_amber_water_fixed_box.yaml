@@ -2,19 +2,17 @@
 # TIP3P water and ions only (no small-molecule solutes).
 simulation_type: protein_mixedbox
 engine: gromacs
-parametrization: amber
-parametrization_config:
-  type: amber
-  forcefield: amber14sb
+parametrization:
+  family: amber
+  protein: amber14sb
   water_model: tip3p
-  ignore_hydrogens: true
-  sage_forcefield: openff-2.2.0.offxml
 
 system:
   protein:
     resname: LYZ
     count: 1
     pdb_path: ../proteinbox/1aki.pdb
+    ignore_hydrogens: true
     chains: [A]
     disulfide_bonds:
       - [CYS6, CYS127]

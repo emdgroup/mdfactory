@@ -5,7 +5,7 @@
 # Shell: ALC-0315 + DSPC (helper lipid) + Cholesterol + ALC-0159 (PEG-lipid)
 
 engine: gromacs
-parametrization: cgenff
+parametrization: charmm
 simulation_type: lnp
 
 system:

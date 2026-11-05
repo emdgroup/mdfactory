@@ -657,6 +657,106 @@ def write_itp_with_atom_names(src: str | Path, dest: str | Path, names: list[str
     Path(dest).write_text("".join(lines))
 
 
+def _split_code_comment(raw: str) -> tuple[str, str]:
+    """Split a topology line into its code and its ``;`` comment (without newline)."""
+    code, sep, comment = raw.rstrip("\n").partition(";")
+    return code, (sep + comment if sep else "")
+
+
+def rename_atomtypes(itp_path: str | Path, atomtypes_path: str | Path, prefix: str) -> dict:
+    """Rename the atom types of a single-molecule topology to ``<prefix>_<i>``.
+
+    The types of the ``[ atomtypes ]`` section in *atomtypes_path* are numbered
+    in order of appearance (from 0). The same names replace the type (and, if
+    present, the B-state type) column of the ``[ atoms ]`` section in
+    *itp_path*. Both files are rewritten in place; atom names are untouched.
+
+    Parameters
+    ----------
+    itp_path : str or Path
+        Moleculetype ``.itp`` with an ``[ atoms ]`` section.
+    atomtypes_path : str or Path
+        File with the ``[ atomtypes ]`` section that defines the types.
+    prefix : str
+        Name prefix; it should start with a letter and contain only ASCII
+        letters, digits and underscores.
+
+    Returns
+    -------
+    dict
+        Mapping of old to new atom-type names.
+
+    Raises
+    ------
+    ValueError
+        If no atom type is defined, a type is defined twice, or an atom uses a
+        type the atomtypes file does not define.
+
+    """
+    valid = prefix.isascii() and all(c.isalnum() or c == "_" for c in prefix)
+    if not prefix or not prefix[0].isalpha() or not valid:
+        raise ValueError(f"Invalid atom-type prefix {prefix!r}.")
+
+    atomtypes_lines = Path(atomtypes_path).read_text().splitlines(keepends=True)
+    mapping: dict[str, str] = {}
+    section = None
+    for i, raw in enumerate(atomtypes_lines):
+        code, comment = _split_code_comment(raw)
+        stripped = code.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip().lower()
+            continue
+        if section != "atomtypes":
+            continue
+        fields = stripped.split()
+        old = fields[0]
+        if old in mapping:
+            raise ValueError(f"Atom type '{old}' is defined twice in {atomtypes_path}.")
+        mapping[old] = f"{prefix}_{len(mapping)}"
+        fields[0] = mapping[old]
+        # An optional bond_type column repeats the name.
+        if len(fields) > 1 and fields[1] == old:
+            fields[1] = mapping[old]
+        atomtypes_lines[i] = " ".join(fields) + (f" {comment}" if comment else "") + "\n"
+    if not mapping:
+        raise ValueError(f"No [ atomtypes ] entries found in {atomtypes_path}.")
+
+    itp_lines = Path(itp_path).read_text().splitlines(keepends=True)
+    section = None
+    n_atoms = 0
+    for i, raw in enumerate(itp_lines):
+        code, comment = _split_code_comment(raw)
+        stripped = code.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1].strip().lower()
+            continue
+        if section != "atoms":
+            continue
+        fields = stripped.split()
+        # nr type resnr residue atom cgnr charge mass [typeB chargeB massB]
+        for column in (1, 8):
+            if column >= len(fields):
+                continue
+            if fields[column] not in mapping:
+                raise ValueError(
+                    f"Atom type '{fields[column]}' used in {itp_path} is not defined in "
+                    f"{atomtypes_path}."
+                )
+            fields[column] = mapping[fields[column]]
+        itp_lines[i] = " ".join(fields) + (f" {comment}" if comment else "") + "\n"
+        n_atoms += 1
+    if n_atoms == 0:
+        raise ValueError(f"No [ atoms ] entries found in {itp_path}.")
+
+    Path(atomtypes_path).write_text("".join(atomtypes_lines))
+    Path(itp_path).write_text("".join(itp_lines))
+    return mapping
+
+
 def validate_cgenff_atomtype_compatibility(
     prm_files: list[str | Path],
     ff_dir: str | Path,
@@ -829,14 +929,14 @@ def check_atomtype_collisions(
                 if name in forcefield_types:
                     raise ValueError(
                         f"Atom type '{name}' from {prm} is already defined by the force "
-                        "field. Rename the small-molecule residue to avoid the collision."
+                        "field; the parameter sets cannot be combined."
                     )
                 signature = _atomtype_signature(stripped)
                 previous = seen.get(name)
                 if previous is not None and previous[0] != signature:
                     raise ValueError(
                         f"Atom type '{name}' is defined with different parameters in "
-                        f"{previous[1]} and {prm}. Give the species distinct residue names."
+                        f"{previous[1]} and {prm}; the parameter sets cannot be combined."
                     )
                 seen.setdefault(name, (signature, str(prm)))
 

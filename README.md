@@ -64,7 +64,7 @@ pip install -e .[dev]
    ```yaml
    engine: gromacs
    simulation_type: mixedbox
-   parametrization: smirnoff
+   parametrization: openff
    system:
      species:
        - smiles: "O"

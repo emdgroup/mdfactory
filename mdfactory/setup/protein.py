@@ -16,12 +16,7 @@ from urllib.request import urlopen
 
 from loguru import logger
 
-from ..models.parametrization import (
-    AmberConfig,
-    CharmmConfig,
-    GromacsProteinParameterSet,
-    Pdb2gmxConfig,
-)
+from ..models.parametrization import GromacsProteinParameterSet
 from ..settings import settings
 
 _DISULFIDE_CUTOFF_ANGSTROM = 2.2
@@ -802,7 +797,10 @@ def _run_gmx(
 
 def run_pdb2gmx(
     pdb_path: Path,
-    config: Pdb2gmxConfig | CharmmConfig | AmberConfig,
+    forcefield: str,
+    water_model: str,
+    ignore_hydrogens: bool,
+    merge_all: bool,
     disulfide_bonds: list[tuple[str, str]],
     protonation_states: dict[str, str],
     output_dir: Path,
@@ -814,10 +812,14 @@ def run_pdb2gmx(
     ----------
     pdb_path : Path
         Cleaned PDB file.
-    config : Pdb2gmxConfig or CharmmConfig or AmberConfig
-        Force field and water model configuration. Only the shared
-        ``forcefield``, ``water_model``, ``ignore_hydrogens`` and ``merge_all``
-        fields are read.
+    forcefield : str
+        Protein force field as recognized by ``gmx pdb2gmx -ff`` or a registry key.
+    water_model : str
+        Water model name passed to ``gmx pdb2gmx -water``.
+    ignore_hydrogens : bool
+        Pass ``-ignh`` so pdb2gmx regenerates the hydrogens.
+    merge_all : bool
+        Pass ``-merge all`` to build all chains as one moleculetype.
     disulfide_bonds : list[tuple[str, str]]
         Cysteine residue pairs for disulfide bonds, e.g. [("CYS6", "CYS127")].
     protonation_states : dict[str, str]
@@ -836,8 +838,8 @@ def run_pdb2gmx(
     """
     chains = chains or []
     gmx_bin = str(check_gmx_available())
-    check_forcefield_available(config.forcefield)
-    resolved_ff = resolve_forcefield(config.forcefield)
+    check_forcefield_available(forcefield)
+    resolved_ff = resolve_forcefield(forcefield)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -867,20 +869,20 @@ def run_pdb2gmx(
         "-ff",
         resolved_ff,
         "-water",
-        config.water_model,
+        water_model,
     ]
 
-    if config.ignore_hydrogens:
+    if ignore_hydrogens:
         cmd.append("-ignh")
 
-    if config.merge_all:
+    if merge_all:
         cmd.extend(["-merge", "all"])
 
     # Apply protonation state overrides by renaming residues in the PDB
     # before pdb2gmx processes it (standard approach for CHARMM/AMBER FFs)
     if protonation_states:
         pdb_path = _apply_protonation_states(
-            pdb_path, protonation_states, output_dir, forcefield=config.forcefield
+            pdb_path, protonation_states, output_dir, forcefield=forcefield
         )
         cmd[cmd.index("-f") + 1] = str(pdb_path)
 
@@ -945,8 +947,8 @@ def run_pdb2gmx(
         structure_file=structure_file,
         topology_include_files=include_files,
         chains=produced_chains,
-        forcefield=config.forcefield,
-        water_model=config.water_model,
+        forcefield=forcefield,
+        water_model=water_model,
         total_charge=total_charge,
     )
 
