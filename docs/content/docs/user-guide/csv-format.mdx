@@ -145,6 +145,29 @@ to override individual components. See [Parametrization](/docs/user-guide/parame
 | `system.protein.ignore_hydrogens` | bool | Ignore hydrogens in the input structure (default `true`) |
 | `system.protein.merge_all` | bool | Merge all chains into one molecule (default `false`) |
 
+### Simulation settings (optional)
+
+Dotted `simulation_settings.*` columns set the [simulation settings](/docs/user-guide/simulation-settings)
+per row. A blank cell falls back to the protocol file (`--simulation-settings`) or the default.
+Only `temperature` and `pressure` change a row's hash; rows that differ only in other settings
+are rejected as duplicates.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `simulation_settings.temperature` | float | Temperature in K (default 300) |
+| `simulation_settings.pressure` | float | Pressure in bar (default 1.0) |
+| `simulation_settings.timestep` | float | Timestep in fs (default 2, at most 2) |
+| `simulation_settings.nvt.length`, `simulation_settings.npt.length` | float | Equilibration lengths in ps (default 100) |
+| `simulation_settings.production.length` | float | Production length in ns (default 100; 1000 for bilayer) |
+| `simulation_settings.production.output_interval` | float | Output interval in ps (default 10) |
+| `simulation_settings.gromacs_overrides.<stage>.<key>` | any | Raw mdp key for `minimization`, `nvt`, `npt` or `production` |
+
+```csv title="temperature_series.csv"
+simulation_type,parametrization,system.species.SOL.smiles,system.species.SOL.count,simulation_settings.temperature
+mixedbox,charmm,O,1000,290
+mixedbox,charmm,O,1000,310
+```
+
 <Callout type="warn">
   Invalid SMILES strings will cause parametrization to fail. Use `mdfactory check-csv` to validate before building.
 </Callout>

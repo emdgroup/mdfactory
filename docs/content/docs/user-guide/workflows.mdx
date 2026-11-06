@@ -60,6 +60,11 @@ mdfactory simulate results/ --slurm tui
 3. **NPT** — NPT equilibration using `npt.mdp`
 4. **Production** — production run using `md.mdp`
 
+The build generates these files from the input's
+[simulation settings](/docs/user-guide/simulation-settings) (temperature, pressure, stage lengths,
+output intervals, GROMACS overrides). To change them for systems that are already built, use
+`mdfactory apply-settings`.
+
 ### Stage selection
 
 Run only a subset of stages:

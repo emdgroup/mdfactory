@@ -69,9 +69,22 @@ Inside the build functions, parametrization and topology generation are dispatch
 
 The builders write simulation files directly into the working directory, including:
 
+- `<hash>.yaml`, the build input with its resolved simulation settings (written by `run_build_from_dict`)
 - `system.pdb`
 - `topology.top`
-- GROMACS `.mdp` files copied from the configured run schedule templates
+- GROMACS `.mdp` files rendered by `mdfactory.run_schedules.write_mdp_files` from the build input
+
+### Run schedules
+
+`BuildInput.simulation_settings` (`mdfactory/models/simulation_settings.py`) holds the physical
+run settings. `mdfactory/run_schedules/gromacs.py` renders each stage from plain dicts: a base per
+stage, the coupling overlay of the simulation type (`COUPLING`), the nonbonded overlay of the
+family's `nonbonded_scheme` (`NONBONDED`, `DISPCORR`), the settings converted to exact step counts,
+and the per-stage `gromacs_overrides`, applied last. There is no mdp object model; grompp validates
+the result. `BuildInput.hash` excludes every setting outside `SimulationSettings.IDENTITY_FIELDS`
+(temperature and pressure), and `mdfactory.run_schedules.apply_simulation_settings` re-renders
+existing build directories without changing their hash. The build path does not import
+`mdfactory.orchestration`; the file names match `StageSpec.mdp_file`, which a test checks.
 
 ## Analysis and artifact subsystem
 
