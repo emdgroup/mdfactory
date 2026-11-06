@@ -33,6 +33,29 @@ OPTIONAL_FIELD_PREFIXES = (
     "simulation_settings.",
 )
 
+# CSV columns holding raw GROMACS mdp overrides.
+GROMACS_OVERRIDES_PREFIX = "simulation_settings.gromacs_overrides."
+
+
+def _row_cells(row: pd.Series) -> dict[str, Any]:
+    """Return a CSV row's non-blank cells, with integer mdp overrides restored.
+
+    pandas stores a numeric column that has a blank cell as float, so an
+    integer override such as ``nstcalcenergy`` would be written as ``100.0``,
+    which grompp rejects for integer parameters. Whole-number override values
+    are therefore converted back to ``int``; GROMACS reads an integer for a
+    real-valued parameter as well.
+    """
+    cells = row.dropna().to_dict()
+    for column, value in cells.items():
+        if (
+            column.startswith(GROMACS_OVERRIDES_PREFIX)
+            and isinstance(value, float)
+            and value.is_integer()
+        ):
+            cells[column] = int(value)
+    return cells
+
 
 def _parse_delimited_protein_fields(nested: dict) -> None:
     """Parse a proteinbox row's delimited list cells into lists in place.
@@ -181,7 +204,7 @@ def df_to_build_input_models(
     errors = {}
     for ii, row in df.iterrows():
         try:
-            nested = dict_to_nested_dict_with_species_prefix(row.dropna())
+            nested = dict_to_nested_dict_with_species_prefix(_row_cells(row))
             inp = BuildInput(**apply_simulation_settings_file(nested, simulation_settings))
             ret.append(inp)
         except Exception as e:

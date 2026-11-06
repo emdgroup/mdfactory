@@ -275,6 +275,26 @@ def test_csv_settings_cells_may_be_blank():
     assert [m.simulation_settings.temperature for m in models] == [310.0, 290.0]
 
 
+def test_csv_integer_override_with_blank_cells_stays_integer(tmp_path):
+    # A blank cell makes pandas read the column as float; grompp rejects "100.0"
+    # for integer parameters, so the CSV path must resolve like the YAML path.
+    column = "simulation_settings.gromacs_overrides.npt.nstcalcenergy"
+    csv = tmp_path / "rows.csv"
+    csv.write_text(
+        f"{CSV_HEADER},simulation_settings.temperature,{column}\n"
+        "mixedbox,charmm,O,100,300,100\nmixedbox,charmm,O,100,310,\n"
+    )
+    _, models, errors = load_build_input_csv(csv)
+    assert errors == {}
+    from_yaml = _water(gromacs_overrides={"npt": {"nstcalcenergy": 100}})
+    assert models[0].simulation_settings == from_yaml.simulation_settings
+    assert models[1].simulation_settings.gromacs_overrides.npt == {}
+
+    from mdfactory.run_schedules.gromacs import format_mdp_value, render_run_schedule
+
+    assert format_mdp_value(render_run_schedule(models[0])["npt"]["nstcalcenergy"]) == "100"
+
+
 # --- duplicates ------------------------------------------------------------------------
 
 
