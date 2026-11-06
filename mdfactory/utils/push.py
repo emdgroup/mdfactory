@@ -391,7 +391,7 @@ def get_placeholder_record() -> dict[str, Any]:
     return {
         "hash": PLACEHOLDER_HASH,
         "engine": "gromacs",
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "simulation_type": "mixedbox",
         "input_data": "{}",
         "input_data_type": "BuildInput",

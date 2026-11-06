@@ -1,9 +1,10 @@
 ---
 title: Adding Parametrization Methods
-description: How to add new force field parametrization interfaces to MDFactory
+description: How to add new force fields and force-field families to MDFactory
 ---
 
-This guide explains how to add support for new force field parametrization methods in MDFactory.
+This guide explains how parametrization is organized in MDFactory and how to add a new
+small-molecule force field or a new force-field family.
 
 <Callout type="info">
   Currently, MDFactory only supports GROMACS as an MD engine. When adding a new parametrization method, you'll implement it for GROMACS first. Support for other engines can be added later following the same patterns.
@@ -11,397 +12,226 @@ This guide explains how to add support for new force field parametrization metho
 
 ## Architecture overview
 
-The parametrization system consists of three main components:
-
 ```mermaid
 graph LR
-    A[Species] --> B[Parametrize Function]
-    B --> C[ParameterSet]
-    C --> D[Topology Generation]
+    A[BuildInput.parametrization<br/>family spec] --> B[resolve_parametrizer]
+    B --> C[Parametrize function]
+    S[Species] --> C
+    C --> D[GromacsSingleMoleculeParameterSet]
+    D --> E[Topology generation]
 ```
 
-1. **Config models** (`mdfactory/models/parametrization.py`): Define configuration options
-2. **Parametrize functions** (`mdfactory/parametrize.py`): Generate parameters from species
-3. **Parameter sets** (`GromacsSingleMoleculeParameterSet`): Store generated parameters
+1. **Family specs** (`mdfactory/models/parametrization.py`): `CharmmParametrization`,
+   `AmberParametrization` and `OpenFFParametrization` describe each component (protein, small
+   molecules, water, ions) by force field. `BuildInput.parametrization` is a discriminated union
+   on `family`; a bare string is shorthand for `{family: <name>}`.
+2. **Resolution** (`BuildInput` validator → `spec.resolve(simulation_type)`): fills the family
+   defaults for the simulation type, sets components that do not apply to `None`, and rejects
+   unsupported combinations.
+3. **Dispatch** (`mdfactory/parametrize.py`): `resolve_parametrizer(spec, engine, native_forcefield)`
+   picks the function in `DISPATCH_ENGINE_PARAMETRIZE[engine][spec.small_molecules.kind]`.
+4. **Parameter sets** (`GromacsSingleMoleculeParameterSet`): record the paths plus `component`,
+   `forcefield`, `charge_method`, `water_model` and the `topology_merge` kind.
 
-## Step 1: Create a configuration model
+The spec also exposes `nonbonded_scheme` (selects the run schedule) and `components()` /
+`summary()` (metadata, dry-run output).
 
-First, define a Pydantic model for your parametrization configuration in `mdfactory/models/parametrization.py`:
+## The parametrizer contract
+
+Every function in `DISPATCH_ENGINE_PARAMETRIZE` is called as
 
 ```python
-from pydantic import BaseModel, ConfigDict, Field
+parametrize(species, spec=<resolved family spec>, native_forcefield=<NativeForceField | None>)
+```
 
-class MyForceFieldConfig(BaseModel):
-    """Configuration for MyForceField parametrization."""
+and returns a `GromacsSingleMoleculeParameterSet`. It must handle three kinds of species:
+
+- **small molecules**: generate (or reuse cached) parameters
+- **water** (`species.is_water`): use `spec.water_model`
+- **ions** (`species.is_ion`, Na⁺/Cl⁻; moleculetypes from `NATIVE_ION_MOLECULETYPES`)
+
+`native_forcefield` is set for protein builds: a `NativeForceField(name, directory, water_model)`
+pointing at the bundled protein force field. Water and ions must then come from that directory
+(no cache access) and carry `topology_merge="native"`.
+
+### Caching and locking
+
+- Cache under `settings.parameter_store / "gromacs" / <your root>`, with a key that contains
+  every input that changes the parameters.
+- Lock exactly the directory you write (`lock_local_folder(workdir)`), check the cache inside the
+  lock, and remove and regenerate an incomplete directory. The OpenFF implementation
+  (`OpenFFCacheEntry`, `_ensure_openff_entry`) writes a completion marker last and only reuses
+  entries that have it.
+
+### Topology merge kinds
+
+`topology_merge` tells the topology writers how to combine sets:
+
+| Kind | Meaning |
+|------|---------|
+| `cgenff` | Atom types are shared with the CHARMM force field; types already defined by the force field are de-duplicated after a compatibility check. |
+| `smirnoff` | Atom types are private to the set and the set carries its own `[ defaults ]`. The `[ defaults ]` must match the force field before it is dropped, and atom-type names must not collide. |
+| `native` | Water/ion topology from a force-field directory; no parameters are merged. |
+
+Private atom types must be unique per parameter set. The OpenFF parametrizer renames
+Interchange's resname-derived types with `rename_atomtypes(itp, atomtypes, prefix)`
+(`mdfactory/utils/topology_utilities.py`).
+
+## Adding a small-molecule force field
+
+### Step 1: Add a component model
+
+In `mdfactory/models/parametrization.py`, add a frozen component model with a `kind` class
+variable and a `describe()` method:
+
+```python
+class GaffSmallMolecules(BaseModel):
+    """GAFF2 small-molecule parameters via AmberTools."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    forcefield_version: str = Field(
-        "1.0",
-        description="Force field version to use",
-    )
-    charge_method: str = Field(
-        "am1bcc",
-        description="Partial charge assignment method",
-    )
-    # Add other configuration options as needed
+    kind: ClassVar[str] = "gaff"
+
+    forcefield: Literal["gaff2"] = Field("gaff2", description="GAFF version.")
+    charge_method: Literal["am1bcc", "bcc"] = Field("am1bcc", description="antechamber charges.")
+
+    def describe(self) -> str:
+        return f"{self.forcefield} (charges: {self.charge_method})"
 ```
 
-Key requirements:
-- Use `extra="forbid"` to catch typos in config keys
-- Use `frozen=True` for immutability (enables hashing)
-- Provide sensible defaults
-- Add clear descriptions
+Use `extra="forbid"` (typos are errors) and `frozen=True`, and give every field a default.
 
-## Step 2: Update the union type
+### Step 2: Use it in a family
 
-Add your config to the union type in `GromacsSingleMoleculeParameterSet`:
+Either accept it in an existing family (e.g. as an alternative in `AmberParametrization.small_molecules`)
+or create a new family (see below).
 
-```python
-class GromacsSingleMoleculeParameterSet(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    moleculetype: str
-    smiles: str
-    parametrization: Literal["cgenff", "smirnoff", "myforcefield"]  # Add here
-    parametrization_config: SmirnoffConfig | CgenffConfig | MyForceFieldConfig  # Add here
-    itp: AbsoluteFilePath
-    parameter_itp: Optional[AbsoluteFilePath]
-    forcefield_itp: Optional[AbsoluteFilePath]
-```
-
-## Step 3: Implement the parametrization function
-
-Create the parametrization function in `mdfactory/parametrize.py`:
+### Step 3: Implement the parametrizer
 
 ```python
-from .models.parametrization import MyForceFieldConfig, GromacsSingleMoleculeParameterSet
-from .models.species import SingleMoleculeSpecies
-from typing import Optional
-
-def parametrize_myforcefield_gromacs(
-    species: SingleMoleculeSpecies,
-    config: Optional[MyForceFieldConfig] = None,
+def parametrize_gaff_gromacs(
+    species: SingleMoleculeSpecies, spec, native_forcefield: NativeForceField | None = None
 ) -> GromacsSingleMoleculeParameterSet:
-    """
-    Parametrize a molecule using MyForceField.
+    """Parametrize a species with GAFF for GROMACS."""
+    if native_forcefield is not None and (species.is_water or species.is_ion):
+        ...  # return the native water/ion set from native_forcefield.directory
 
-    Parameters
-    ----------
-    species : SingleMoleculeSpecies
-        The molecule species to parametrize.
-    config : MyForceFieldConfig, optional
-        Configuration options. Uses defaults if None.
-
-    Returns
-    -------
-    GromacsSingleMoleculeParameterSet
-        The parameter set with paths to generated files.
-    """
-    # Use defaults if no config provided
-    if config is None:
-        config = MyForceFieldConfig()
-
-    # Set up cache directory
-    # Structure: parameter_store/gromacs/myforcefield/{version}/{mol_hash}/
-    version_hash = config.forcefield_version.replace(".", "_")
-    pardir = config.parameter_store / "gromacs" / "myforcefield" / version_hash
-    pardir.mkdir(parents=True, exist_ok=True)
-
-    # Handle special cases first
-    if species.is_water:
-        return _parametrize_water(species, config, pardir)
-
-    if species.is_ion:
-        return _parametrize_ion(species, config, pardir)
-
-    # Regular molecule parametrization
-    workdir = pardir / species.hash
-    itp_path = workdir / f"{species.hash}.itp"
-
-    # Check cache
-    if itp_path.is_file():
-        return GromacsSingleMoleculeParameterSet(
-            moleculetype=species.hash,
-            smiles=species.smiles,
-            parametrization="myforcefield",
-            parametrization_config=config,
-            itp=itp_path.resolve(),
-            parameter_itp=None,  # Set if your FF needs extra param files
-            forcefield_itp=None,  # Set if your FF needs FF includes
-        )
-
-    # Generate parameters
-    workdir.mkdir(parents=True, exist_ok=True)
-
-    # Your parametrization logic here:
-    # 1. Convert SMILES to 3D structure
-    # 2. Assign atom types
-    # 3. Calculate partial charges
-    # 4. Generate bonded parameters
-    # 5. Write ITP file
-
-    _generate_itp(species, config, itp_path)
-
+    small_molecules = spec.small_molecules
+    key = {"format": 1, "forcefield": small_molecules.forcefield,
+           "charge_method": small_molecules.charge_method}
+    workdir = settings.parameter_store / "gromacs" / "gaff" / _key_digest(key) / species.hash
+    workdir.parent.mkdir(parents=True, exist_ok=True)
+    with lock_local_folder(workdir):
+        if not _complete(workdir):
+            shutil.rmtree(workdir, ignore_errors=True)
+            workdir.mkdir()
+            ...  # antechamber, parmchk2, conversion to GROMACS, unique atom types
     return GromacsSingleMoleculeParameterSet(
         moleculetype=species.hash,
         smiles=species.smiles,
-        parametrization="myforcefield",
-        parametrization_config=config,
-        itp=itp_path.resolve(),
-        parameter_itp=None,
+        component="small_molecule",
+        forcefield=small_molecules.forcefield,
+        charge_method=small_molecules.charge_method,
+        topology_merge="smirnoff",  # private atom types + own [ defaults ]
+        itp=workdir / f"{species.hash}.itp",
+        parameter_itp=workdir / f"{species.hash}_params.itp",
         forcefield_itp=None,
     )
 ```
 
-### Handling water and ions
-
-Always implement special handling for water and ions:
-
-```python
-def _parametrize_water(
-    species: SingleMoleculeSpecies,
-    config: MyForceFieldConfig,
-    pardir: Path,
-) -> GromacsSingleMoleculeParameterSet:
-    """Handle water molecule parametrization."""
-    workdir = pardir / "water"
-    itp_path = workdir / "SOL.itp"
-
-    if not itp_path.is_file():
-        workdir.mkdir(parents=True, exist_ok=True)
-        # Generate or copy water parameters
-        _write_water_itp(config, itp_path)
-
-    return GromacsSingleMoleculeParameterSet(
-        moleculetype="SOL",  # Standard GROMACS water name
-        smiles=species.smiles,
-        parametrization="myforcefield",
-        parametrization_config=config,
-        itp=itp_path.resolve(),
-        parameter_itp=None,
-        forcefield_itp=None,
-    )
-
-def _parametrize_ion(
-    species: SingleMoleculeSpecies,
-    config: MyForceFieldConfig,
-    pardir: Path,
-) -> GromacsSingleMoleculeParameterSet:
-    """Handle ion parametrization."""
-    typemap = {"[Na+]": "NA", "[Cl-]": "CL"}
-    ion_type = typemap.get(species.smiles)
-
-    if ion_type is None:
-        raise ValueError(f"Unsupported ion: {species.smiles}")
-
-    workdir = pardir / "ions"
-    itp_path = workdir / f"{ion_type}.itp"
-
-    if not itp_path.is_file():
-        workdir.mkdir(parents=True, exist_ok=True)
-        _write_ion_itp(species, config, itp_path)
-
-    return GromacsSingleMoleculeParameterSet(
-        moleculetype=ion_type,
-        smiles=species.smiles,
-        parametrization="myforcefield",
-        parametrization_config=config,
-        itp=itp_path.resolve(),
-        parameter_itp=None,
-        forcefield_itp=None,
-    )
-```
-
-## Step 4: Register the parametrization function
-
-Add your function to the dispatch dictionary in `mdfactory/parametrize.py`:
+### Step 4: Register it
 
 ```python
 DISPATCH_ENGINE_PARAMETRIZE = {
     "gromacs": {
         "cgenff": parametrize_cgenff_gromacs,
-        "smirnoff": parametrize_smirnoff_gromacs,
-        "myforcefield": parametrize_myforcefield_gromacs,  # Add here
+        "openff": parametrize_openff_gromacs,
+        "gaff": parametrize_gaff_gromacs,  # keyed by the component's kind
     }
 }
 ```
 
-## Step 5: Update BuildInput model
+The builders call `resolve_parametrizer(inp.parametrization, inp.engine, ...)`; no change in
+`build.py` is needed.
 
-Update the `BuildInput` model in `mdfactory/models/input.py` to accept your config:
+## Adding a force-field family
+
+Subclass `_FamilySpec` and set its class variables:
 
 ```python
-from .parametrization import SmirnoffConfig, CgenffConfig, MyForceFieldConfig
+class GaffParametrization(_FamilySpec):
+    simulation_types: ClassVar[frozenset[str]] = frozenset({"mixedbox", "bilayer", "lnp"})
+    default_protein: ClassVar[Optional[str]] = None
+    default_water_model: ClassVar[str] = "tip3p"
+    small_molecules_model: ClassVar[type[BaseModel]] = GaffSmallMolecules
 
-class BuildInput(BaseModel):
-    # ... existing fields ...
+    family: Literal["gaff"] = "gaff"
+    small_molecules: Optional[GaffSmallMolecules] = None
 
-    parametrization: Literal["cgenff", "smirnoff", "myforcefield"] = "cgenff"
-    parametrization_config: SmirnoffConfig | CgenffConfig | MyForceFieldConfig | None = Field(
-        None,
-        description="Force field configuration. Auto-set based on parametrization if not provided.",
-    )
+    @property
+    def nonbonded_scheme(self) -> NonbondedScheme:
+        return "sage"
 
-    @model_validator(mode="after")
-    def set_default_config(self) -> "BuildInput":
-        if self.parametrization_config is None:
-            if self.parametrization == "smirnoff":
-                object.__setattr__(self, "parametrization_config", SmirnoffConfig())
-            elif self.parametrization == "cgenff":
-                object.__setattr__(self, "parametrization_config", CgenffConfig())
-            elif self.parametrization == "myforcefield":
-                object.__setattr__(self, "parametrization_config", MyForceFieldConfig())
-        return self
+    @property
+    def ions(self) -> Optional[str]:
+        return "joung-cheatham"
+
+    def _check_simulation_type(self, simulation_type: str) -> None:
+        ...  # optional: per-type restrictions on the resolved components
 ```
 
-## Step 6: Update build.py
+Then add it to `FAMILY_SPECS` and to the `ParametrizationSpec` union with a `Tag("gaff")`.
+If the family needs its own mdp settings, add a new `NonbondedScheme` value and entries with a
+matching `nonbonded_scheme:` key in `mdfactory/run_schedules/run_schedules.yaml`; entries without
+the key remain the fallback.
 
-Update the `_get_parametrize_function` helper in `mdfactory/build.py`:
+## Tests
+
+Add tests in `mdfactory/tests/test_parametrization.py` and
+`mdfactory/tests/test_parametrization_schema.py`:
+
+- the family parses in shorthand and explicit form with the same hash, and its rejection rules
+- water, ions and small molecules produce parameter sets with the right `component`,
+  `forcefield` and `topology_merge`
+- the cache key changes with every input that changes the parameters, and incomplete entries
+  are regenerated
+- the locked path equals the written directory (record `lock_local_folder` calls with monkeypatch)
+- atom types of two different molecules never collide
+
+Use a temporary parameter store:
 
 ```python
-def _get_parametrize_function(engine: str, parametrization: str, config):
-    """Get parametrization function, wrapping with config if needed."""
-    base_func = DISPATCH_ENGINE_PARAMETRIZE[engine][parametrization]
-
-    if parametrization == "smirnoff" and isinstance(config, SmirnoffConfig):
-        return functools.partial(base_func, smirnoff_config=config)
-    elif parametrization == "myforcefield" and isinstance(config, MyForceFieldConfig):
-        return functools.partial(base_func, config=config)
-
-    return base_func
-```
-
-## Step 7: Write tests
-
-Create tests in `mdfactory/tests/test_parametrization.py`:
-
-```python
-import pytest
-from pathlib import Path
-from mdfactory.models.species import SingleMoleculeSpecies
-from mdfactory.models.parametrization import MyForceFieldConfig
-from mdfactory.parametrize import parametrize_myforcefield_gromacs
-
 @pytest.fixture
-def temp_parameter_store(tmp_path, monkeypatch):
-    """Set up temporary parameter store."""
-    from mdfactory import config
-    monkeypatch.setattr(config, "parameter_store", tmp_path)
-    return tmp_path
-
-def test_myforcefield_simple_molecule(temp_parameter_store):
-    """Test parametrization of a simple molecule."""
-    species = SingleMoleculeSpecies(smiles="CCO", resname="ETH", count=1)
-    params = parametrize_myforcefield_gromacs(species)
-
-    assert params.parametrization == "myforcefield"
-    assert params.itp.is_file()
-    assert params.smiles == "CCO"
-
-def test_myforcefield_water(temp_parameter_store):
-    """Test water parametrization."""
-    species = SingleMoleculeSpecies(smiles="O", resname="SOL", count=1)
-    params = parametrize_myforcefield_gromacs(species)
-
-    assert params.moleculetype == "SOL"
-    assert params.itp.is_file()
-
-def test_myforcefield_with_config(temp_parameter_store):
-    """Test parametrization with custom config."""
-    config = MyForceFieldConfig(forcefield_version="2.0")
-    species = SingleMoleculeSpecies(smiles="CCO", resname="ETH", count=1)
-    params = parametrize_myforcefield_gromacs(species, config=config)
-
-    assert params.parametrization_config.forcefield_version == "2.0"
-
-def test_myforcefield_caching(temp_parameter_store):
-    """Test that parameters are cached correctly."""
-    species = SingleMoleculeSpecies(smiles="CCO", resname="ETH", count=1)
-
-    # First call generates
-    params1 = parametrize_myforcefield_gromacs(species)
-    mtime1 = params1.itp.stat().st_mtime
-
-    # Second call should use cache
-    params2 = parametrize_myforcefield_gromacs(species)
-    mtime2 = params2.itp.stat().st_mtime
-
-    assert mtime1 == mtime2  # File not regenerated
-```
-
-## Step 8: Update dependencies
-
-If your parametrization requires new dependencies, add them to `environment.yml`:
-
-```yaml
-dependencies:
-  - python>=3.10
-  - pydantic>=2.0
-  # ... existing deps ...
-  - my-forcefield-package  # Add your dependency
+def parameter_store(tmp_path, monkeypatch):
+    from mdfactory.settings import settings
+    store = tmp_path / "parameters"
+    monkeypatch.setattr(settings, "parameter_store", store)
+    return store
 ```
 
 ## File structure summary
 
-After implementing a new parametrization method, you should have modified:
-
 ```
 mdfactory/
 ├── models/
-│   ├── parametrization.py  # Add MyForceFieldConfig
-│   └── input.py            # Update BuildInput
-├── parametrize.py          # Add parametrize_myforcefield_gromacs
-├── build.py                # Update _get_parametrize_function
+│   └── parametrization.py  # component model, family spec, FAMILY_SPECS, ParametrizationSpec
+├── parametrize.py          # parametrizer + DISPATCH_ENGINE_PARAMETRIZE entry
+├── run_schedules/          # optional nonbonded_scheme entries
 └── tests/
-    └── test_parametrization.py  # Add tests
+    ├── test_parametrization.py
+    └── test_parametrization_schema.py
 ```
 
 ## Checklist
 
-Before submitting a PR for a new parametrization method:
-
-- [ ] Configuration model with sensible defaults
-- [ ] Parametrization function handles water and ions
-- [ ] Parameter caching implemented
-- [ ] Config stored in `GromacsSingleMoleculeParameterSet`
+- [ ] Component model (frozen, `extra="forbid"`, defaults, `kind`, `describe()`)
+- [ ] Family spec (or an existing family) accepts the component, with per-type validation
+- [ ] Parametrizer follows the contract and handles water, ions and native force fields
+- [ ] Cache key covers every parameter-changing input; the written directory is locked
+- [ ] Private atom types are unique per parameter set
 - [ ] Registered in `DISPATCH_ENGINE_PARAMETRIZE`
-- [ ] `BuildInput` model updated
-- [ ] Tests for simple molecules, water, ions, and caching
-- [ ] Dependencies added to `environment.yml`
-- [ ] Documentation updated
-
-## Example: GAFF parametrization
-
-Here's a sketch of how you might implement GAFF (General AMBER Force Field) support:
-
-```python
-class GaffConfig(BaseModel):
-    """Configuration for GAFF parametrization."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    gaff_version: Literal["gaff", "gaff2"] = Field(
-        "gaff2",
-        description="GAFF version (gaff or gaff2)",
-    )
-    charge_method: str = Field(
-        "am1bcc",
-        description="Charge method for antechamber",
-    )
-
-def parametrize_gaff_gromacs(
-    species: SingleMoleculeSpecies,
-    config: Optional[GaffConfig] = None,
-) -> GromacsSingleMoleculeParameterSet:
-    """Parametrize using GAFF via AmberTools."""
-    if config is None:
-        config = GaffConfig()
-
-    # Use antechamber for atom typing and charges
-    # Use parmchk2 for missing parameters
-    # Use acpype or ParmEd for GROMACS conversion
-    ...
-```
+- [ ] Run schedule entries for a new nonbonded scheme, if needed
+- [ ] Tests and documentation updated
 
 ## Next steps
 

@@ -940,7 +940,7 @@ def sync_pull_systems(
         str | None, Parameter(help="Filter by simulation type (mixedbox/bilayer).")
     ] = None,
     parametrization: Annotated[
-        str | None, Parameter(help="Filter by parametrization (cgenff/smirnoff).")
+        str | None, Parameter(help="Filter by force-field family (charmm/amber/openff).")
     ] = None,
     engine: Annotated[str | None, Parameter(help="Filter by engine (e.g., gromacs).")] = None,
     output: Annotated[
@@ -960,7 +960,7 @@ def sync_pull_systems(
     simulation_type : str, optional
         Filter by simulation type (mixedbox, bilayer)
     parametrization : str, optional
-        Filter by parametrization (cgenff, smirnoff)
+        Filter by force-field family (charmm, amber, openff)
     engine : str, optional
         Filter by engine (gromacs)
     output : Path, optional

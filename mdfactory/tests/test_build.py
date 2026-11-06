@@ -107,7 +107,7 @@ def test_build_mixedbox(tmp_path):
     inp = BuildInput(
         engine="gromacs",
         simulation_type="mixedbox",
-        parametrization="cgenff",
+        parametrization="charmm",
         system=comp,
     )
     with working_directory(tmp_path):
@@ -135,7 +135,7 @@ def test_build_bilayer(tmp_path):
     inp = BuildInput(
         engine="gromacs",
         simulation_type="bilayer",
-        parametrization="cgenff",
+        parametrization="charmm",
         system=comp,
     )
     with working_directory(tmp_path):

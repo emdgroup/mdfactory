@@ -9,14 +9,14 @@ Use CSV files to define multiple simulation systems at once. Each row becomes a 
 
 ```csv
 simulation_type,parametrization,engine,system.species.SOL.smiles,system.species.SOL.count,system.species.ETH.smiles,system.species.ETH.count,system.target_density
-mixedbox,smirnoff,gromacs,O,900,CCO,100,1.0
-mixedbox,cgenff,gromacs,O,800,CCO,200,1.0
+mixedbox,openff,gromacs,O,900,CCO,100,1.0
+mixedbox,charmm,gromacs,O,800,CCO,200,1.0
 ```
 
 ### Required columns
 
 - `simulation_type` (`mixedbox`, `bilayer`, or `lnp`)
-- `parametrization` (`smirnoff` or `cgenff`)
+- `parametrization` (force-field family: `charmm`, `amber` or `openff`; or the dotted `parametrization.family`)
 - `engine` (`gromacs`)
 
 ### Column naming convention
@@ -49,14 +49,14 @@ Either `count` or `fraction` must be provided for each species. If using fractio
 
 ```csv
 simulation_type,parametrization,engine,system.species.SOL.smiles,system.species.SOL.fraction,system.species.ETH.smiles,system.species.ETH.count,system.total_count,system.target_density
-mixedbox,smirnoff,gromacs,O,0.95,CCO,500,10000,1.0
+mixedbox,openff,gromacs,O,0.95,CCO,500,10000,1.0
 ```
 
 ## Example: Bilayer
 
 ```csv
 simulation_type,parametrization,engine,system.species.POPC.smiles,system.species.POPC.count,system.z_padding
-bilayer,cgenff,gromacs,POPC_SMILES_HERE,128,20.0
+bilayer,charmm,gromacs,POPC_SMILES_HERE,128,20.0
 ```
 
 ## Example: LNP
@@ -65,7 +65,7 @@ For LNP systems, core and shell species use separate column prefixes:
 
 ```csv
 simulation_type,parametrization,engine,system.radius,system.shell_thickness,system.core.species.ILN.smiles,system.core.species.ILN.fraction,system.shell.species.DSP.smiles,system.shell.species.DSP.fraction
-lnp,smirnoff,gromacs,60.0,28.0,ILN_SMILES,0.5,DSP_SMILES,0.5
+lnp,openff,gromacs,60.0,28.0,ILN_SMILES,0.5,DSP_SMILES,0.5
 ```
 
 ## Processing the CSV
@@ -105,7 +105,7 @@ graph LR
 | Column | Type | Required | Description |
 |--------|------|----------|-------------|
 | `simulation_type` | string | Yes | `mixedbox`, `bilayer`, or `lnp` |
-| `parametrization` | string | Yes | `smirnoff` or `cgenff` |
+| `parametrization` | string | Yes | Force-field family: `charmm`, `amber` or `openff`. Alternatively use `parametrization.family` |
 | `engine` | string | Yes | `gromacs` |
 
 ### System fields
@@ -125,13 +125,25 @@ These map directly to `BuildInput.system` fields using dot notation:
 | `system.shell.z0` | float | Pivotal plane offset in Å (LNP) |
 | `system.shell.area_per_lipid` | float | Area per lipid in Å² (LNP) |
 
-### Parametrization config (optional)
+### Parametrization options (optional)
+
+Use these dotted columns instead of the shorthand `parametrization` column (not both)
+to override individual components. See [Parametrization](/docs/user-guide/parametrization) for the allowed values.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `parametrization_config.forcefield` | string | OpenFF force field file (SMIRNOFF) |
-| `parametrization_config.water_model` | string | Water model file (SMIRNOFF) |
-| `parametrization_config.charge_method` | string | Charge assignment method (SMIRNOFF) |
+| `parametrization.family` | string | Force-field family (`charmm`, `amber` or `openff`) |
+| `parametrization.protein` | string | Protein force field (protein types only) |
+| `parametrization.water_model` | string | Water model name (e.g. `tip3p`, `opc3`) |
+| `parametrization.small_molecules.forcefield` | string | Small-molecule force field (e.g. an OpenFF `.offxml` file) |
+| `parametrization.small_molecules.charge_method` | string | Charge assignment method (OpenFF small molecules) |
+
+### Protein preparation options (optional)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `system.protein.ignore_hydrogens` | bool | Ignore hydrogens in the input structure (default `true`) |
+| `system.protein.merge_all` | bool | Merge all chains into one molecule (default `false`) |
 
 <Callout type="warn">
   Invalid SMILES strings will cause parametrization to fail. Use `mdfactory check-csv` to validate before building.

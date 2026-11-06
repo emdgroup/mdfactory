@@ -35,17 +35,17 @@ SOFTWARE.
 
 MDFactory integrates with several external tools. Most dependencies are open-source and installed automatically. For parametrization methods:
 
-- **SMIRNOFF (OpenFF)** can be used without an external commercial or third-party license.
-- **CGenFF** requires a separate third-party license from SilcsBio.
+- **OpenFF** (`parametrization: openff`) and **Amber** (`parametrization: amber`) can be used without an external commercial or third-party license.
+- **CGenFF** (small molecules in `parametrization: charmm`) requires a separate third-party license from SilcsBio.
 
 ### CGenFF
 
 <Callout type="warn" title="SilcsBio license required for CGenFF">
 The **CGenFF** (CHARMM General Force Field) program is third-party software developed by SilcsBio / University of Maryland. It is **not included** with MDFactory.
-You must obtain a valid **SilcsBio CGenFF license** to use `parametrization: cgenff`.
+You must obtain a valid **SilcsBio CGenFF license** for `parametrization: charmm` builds with small molecules (CGenFF).
 </Callout>
 
-If you do **not** have a SilcsBio CGenFF license, use **SMIRNOFF** (`parametrization: smirnoff`) instead.
+If you do **not** have a SilcsBio CGenFF license, use `parametrization: openff` (or `parametrization: amber` for protein systems) instead.
 
 - Website and license: [cgenff.silcsbio.com](https://cgenff.silcsbio.com/)
 - See the [Parametrization guide](/docs/user-guide/parametrization) for configuration details
