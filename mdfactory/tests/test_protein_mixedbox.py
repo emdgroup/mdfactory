@@ -28,6 +28,7 @@ from mdfactory.models.composition import (
 )
 from mdfactory.models.input import BuildInput
 from mdfactory.models.parametrization import AmberParametrization, CharmmParametrization
+from mdfactory.models.simulation_settings import SimulationSettings
 from mdfactory.models.species import ProteinSpecies, SolutionSpecies
 from mdfactory.parametrize import (
     NativeForceField,
@@ -37,7 +38,6 @@ from mdfactory.parametrize import (
     resolve_parametrizer,
 )
 from mdfactory.prepare import df_to_build_input_models
-from mdfactory.run_schedules import RunScheduleManager
 from mdfactory.settings import settings
 from mdfactory.simulation.openmm_utils import (
     _add_protein_rmsd_restraint,
@@ -782,15 +782,6 @@ class TestCompositeTopology:
         assert "SOL" in molecules
 
 
-class TestRunSchedule:
-    def test_protein_mixedbox_run_files_on_disk(self):
-        manager = RunScheduleManager()
-        paths = manager.get_all_run_file_paths(engine="gromacs", system_type="protein_mixedbox")
-        assert set(paths) == {"em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"}
-        for path in paths.values():
-            assert path.is_file()
-
-
 AMBER_FORCEFIELD_ITP = """\
 #define _FF_AMBER
 
@@ -1089,73 +1080,33 @@ class TestAmberExamplesAndSchedule:
         assert [m.parametrization for m in models] == [AMBER_PROTEIN_MIXEDBOX]
         assert models[0].system.protein.ignore_hydrogens is True
 
-    @pytest.mark.parametrize("system_type", ["proteinbox", "protein_mixedbox"])
-    def test_amber_schedule_has_sage_nonbonded_settings(self, system_type):
-        from mdfactory.orchestration.mdp import get_mdp_value, parse_mdp
-
-        manager = RunScheduleManager()
-        amber = manager.get_all_run_file_paths(
-            engine="gromacs", system_type=system_type, nonbonded_scheme="sage"
-        )
-        charmm = manager.get_all_run_file_paths(engine="gromacs", system_type=system_type)
-        assert set(amber) == set(charmm) == {"em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"}
-        expected = {
-            "coulombtype": "pme",
-            "rcoulomb": "0.9",
-            "rvdw": "0.9",
-            "vdwtype": "cutoff",
-            "vdw_modifier": "potential-switch",
-            "rvdw_switch": "0.8",
-            "dispcorr": "enerpres",
-        }
-        for name, path in amber.items():
-            assert path.parent.name == "proteinbox_amber"
-            parsed = parse_mdp(path)
-            settings_found = {key: (get_mdp_value(parsed, key) or "").lower() for key in expected}
-            assert settings_found == expected, name
-        for path in charmm.values():
-            assert path.parent.name == "proteinbox"
-            assert get_mdp_value(parse_mdp(path), "vdw_modifier").lower() == "force-switch"
-
     @pytest.mark.parametrize(
-        ("system_type", "scheme"),
+        ("parametrization", "modifier"),
         [
-            ("proteinbox", "charmm"),
-            ("protein_mixedbox", "charmm"),
-            ("proteinbox", "unknown"),
-            ("mixedbox", "sage"),
-            ("bilayer", "sage"),
+            (AMBER_PROTEIN_MIXEDBOX, "Potential-switch"),
+            (CharmmParametrization().resolve("protein_mixedbox"), "Force-switch"),
         ],
     )
-    def test_scheme_without_entry_falls_back_to_generic(self, system_type, scheme):
-        manager = RunScheduleManager()
-        generic = manager.get_all_run_file_paths("gromacs", system_type)
-        selected = manager.get_all_run_file_paths("gromacs", system_type, nonbonded_scheme=scheme)
-        assert selected == generic
-
-    def test_finalize_installs_amber_schedule(self, tmp_path, monkeypatch):
+    def test_finalize_writes_scheme_schedule_and_runs_grompp(
+        self, tmp_path, monkeypatch, parametrization, modifier
+    ):
         from mdfactory import build
 
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("mdfactory.setup.protein.validate_with_grompp", lambda *a, **k: None)
+        calls = []
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.validate_with_grompp",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
         inp = SimpleNamespace(
-            engine="gromacs",
-            parametrization=AMBER_PROTEIN_MIXEDBOX,
+            simulation_type="protein_mixedbox",
+            parametrization=parametrization,
+            simulation_settings=SimulationSettings().resolve("protein_mixedbox"),
             system=SimpleNamespace(ionization=IonizationConfig()),
         )
-        build._finalize_protein_build(inp, "protein_mixedbox", tmp_path / "topology.top")
-        assert "Potential-switch" in (tmp_path / "md.mdp").read_text()
-
-    def test_finalize_installs_generic_schedule_for_charmm(self, tmp_path, monkeypatch):
-        from mdfactory import build
-
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("mdfactory.setup.protein.validate_with_grompp", lambda *a, **k: None)
-        inp = SimpleNamespace(
-            engine="gromacs",
-            parametrization=CharmmParametrization().resolve("protein_mixedbox"),
-            system=SimpleNamespace(ionization=IonizationConfig()),
-        )
-        build._finalize_protein_build(inp, "protein_mixedbox", tmp_path / "topology.top")
-        generic = RunScheduleManager().get_all_run_file_paths("gromacs", "protein_mixedbox")
-        assert (tmp_path / "md.mdp").read_bytes() == generic["md.mdp"].read_bytes()
+        build._finalize_protein_build(inp, tmp_path / "topology.top")
+        for name in ("em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"):
+            assert f"= {modifier}" in (tmp_path / name).read_text()
+        # grompp validates the generated em.mdp unconditionally.
+        assert len(calls) == 1
+        assert Path(calls[0][0][2]).name == "em.mdp"

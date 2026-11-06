@@ -3,7 +3,6 @@
 """Core build pipeline for constructing MD simulation systems."""
 
 import json
-import os
 import shutil
 from functools import partial
 from pathlib import Path
@@ -22,7 +21,7 @@ from .check import check_bilayer_buildable
 from .models.composition import BilayerComposition, LNPComposition, MixedBoxComposition
 from .models.input import BuildInput
 from .models.species import SingleMoleculeSpecies
-from .run_schedules import RunScheduleManager
+from .run_schedules import write_mdp_files
 from .setup.solvation import ionize, solvate
 from .utils.setup_utilities import (
     N_AVOGADRO,
@@ -90,16 +89,8 @@ def build_mixedbox(inp: BuildInput):
     # TODO: maybe rewrite to use universe directly?
     # gromacs_create_position_restraint_file(structure_file="system.pdb", output="posre.itp")
 
-    # copy run files from template directory (run_schedules.yaml)
-    manager = RunScheduleManager()
-    manager.copy_run_files_with_check(
-        engine=inp.engine,
-        system_type="mixedbox",
-        target_folder=os.getcwd(),
-        force_copy=True,
-        nonbonded_scheme=inp.parametrization.nonbonded_scheme,
-    )
-    logger.info("Run schedule files copied.")
+    write_mdp_files(inp)
+    logger.info("Run schedule written.")
 
 
 @validate_call
@@ -204,16 +195,9 @@ def build_bilayer(inp: BuildInput):
     # 7. write composite topology file for final system with water and ions
     topology_function(u_ionized, inp.system.species + additional_species, parameters, "bilayer")
 
-    # 8. copy run schedule files
-    manager = RunScheduleManager()
-    manager.copy_run_files_with_check(
-        engine=inp.engine,
-        system_type="bilayer",
-        target_folder=os.getcwd(),
-        force_copy=True,
-        nonbonded_scheme=inp.parametrization.nonbonded_scheme,
-    )
-    logger.info("Run schedule files copied.")
+    # 8. write the run schedule
+    write_mdp_files(inp)
+    logger.info("Run schedule written.")
 
 
 def create_bilayer_by_compression(inp):
@@ -372,16 +356,9 @@ def build_lnp(inp: BuildInput):
     # Log composition comparison (input fractions vs actual)
     _log_lnp_composition(u_ionized, inp)
 
-    # Step 7: Copy run schedule files
-    manager = RunScheduleManager()
-    manager.copy_run_files_with_check(
-        engine=inp.engine,
-        system_type="lnp",
-        target_folder=os.getcwd(),
-        force_copy=True,
-        nonbonded_scheme=inp.parametrization.nonbonded_scheme,
-    )
-    logger.info("Run schedule files copied.")
+    # Step 7: Write the run schedule (lnp uses the mixedbox protocol)
+    write_mdp_files(inp)
+    logger.info("Run schedule written.")
 
 
 def create_lnp_core(inp: BuildInput):
@@ -820,36 +797,28 @@ def _relax_protein_system(u, topology, itps, ff_dir_name, protein_indices, **rel
         )
 
 
-def _finalize_protein_build(inp, system_type, topology, extra_intermediates=()):
-    """Install the run schedule, validate with grompp, and drop build intermediates.
+def _finalize_protein_build(inp, topology, extra_intermediates=()):
+    """Write the run schedule, validate it with grompp, and drop build intermediates.
 
-    The run schedule is selected by the family's nonbonded scheme, so Amber
-    builds get the Sage-style nonbonded mdps. Cleanup only runs on success so a failed build
-    keeps its intermediates. ``solvated.pdb`` and ``relaxation/`` are left in
-    place, as in the bilayer build.
+    The nonbonded block follows the family's nonbonded scheme, so Amber builds
+    get the Sage nonbonded settings. Cleanup only runs on success so a failed
+    build keeps its intermediates. ``solvated.pdb`` and ``relaxation/`` are left
+    in place, as in the bilayer build.
     """
     from loguru import logger
 
     from .setup.protein import validate_with_grompp
 
-    RunScheduleManager().copy_run_files_with_check(
-        engine=inp.engine,
-        system_type=system_type,
-        target_folder=os.getcwd(),
-        force_copy=True,
-        nonbonded_scheme=inp.parametrization.nonbonded_scheme,
-    )
-    logger.info("Run schedule files copied.")
+    mdp_files = write_mdp_files(inp)
+    logger.info("Run schedule written.")
 
-    em_mdp = Path("em.mdp")
-    if em_mdp.is_file():
-        validate_with_grompp(
-            topology,
-            Path("system.pdb"),
-            em_mdp,
-            Path.cwd(),
-            allow_net_charge=not inp.system.ionization.neutralize,
-        )
+    validate_with_grompp(
+        topology,
+        Path("system.pdb"),
+        mdp_files["minimization"],
+        Path.cwd(),
+        allow_net_charge=not inp.system.ionization.neutralize,
+    )
 
     for name in ("cleaned.pdb", "system_pre_relax.pdb", *extra_intermediates):
         Path(name).unlink(missing_ok=True)
@@ -913,7 +882,7 @@ def build_proteinbox(inp: BuildInput):
     u_relaxed.atoms.write("system.pdb")
     logger.info("Final system written to system.pdb")
 
-    _finalize_protein_build(inp, "proteinbox", topology_dest.resolve())
+    _finalize_protein_build(inp, topology_dest.resolve())
     logger.info("Proteinbox build complete.")
 
 
@@ -1295,7 +1264,5 @@ def build_protein_mixedbox(inp: BuildInput):
     Path("build_metadata.json").write_text(json.dumps(build_report, indent=2) + "\n")
     logger.info("Resolved counts and achieved concentrations written to build_metadata.json.")
 
-    _finalize_protein_build(
-        inp, "protein_mixedbox", topology_dest, extra_intermediates=("topol_protein.top",)
-    )
+    _finalize_protein_build(inp, topology_dest, extra_intermediates=("topol_protein.top",))
     logger.info("Protein_mixedbox build complete.")

@@ -9,6 +9,7 @@ import pytest
 parsl = pytest.importorskip("parsl", reason="parsl not installed")
 
 from mdfactory.models.parametrization import FAMILY_SPECS  # noqa: E402
+from mdfactory.models.simulation_settings import SimulationSettings  # noqa: E402
 from mdfactory.orchestration.config import ExecutorConfig  # noqa: E402
 
 
@@ -25,13 +26,15 @@ class FakeBuildInput:
         self.hash = hash
         self.simulation_type = simulation_type
         self.parametrization = FAMILY_SPECS[parametrization]().resolve(simulation_type)
+        self.simulation_settings = SimulationSettings().resolve(simulation_type)
         self.engine = engine
 
-    def model_dump(self):
+    def model_dump(self, mode="python"):
         """Return dict representation."""
         return {
             "simulation_type": self.simulation_type,
-            "parametrization": self.parametrization.model_dump(),
+            "parametrization": self.parametrization.model_dump(mode=mode),
+            "simulation_settings": self.simulation_settings.model_dump(mode=mode),
             "engine": self.engine,
         }
 

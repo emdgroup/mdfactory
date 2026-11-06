@@ -17,6 +17,7 @@ mdfactory/
     input.py           # BuildInput (central model, has .hash, .metadata)
     species.py         # Species, SingleMoleculeSpecies, LipidSpecies
     parametrization.py # charmm/amber/openff family specs, parameter sets
+    simulation_settings.py # SimulationSettings (T/P = identity; lengths, outputs, overrides)
     composition.py     # MixedBoxComposition, BilayerComposition, IonizationConfig
   analysis/
     simulation.py      # Simulation class, ANALYSIS_REGISTRY
@@ -41,10 +42,9 @@ mdfactory/
     setup_utilities.py # create_bilayer_from_model(), create_mixed_box_universe()
     topology_utilities.py   # run_cgenff_to_gmx(), merge_extra_parameter_itps()
     chemistry_utilities.py  # detect_lipid_parts_from_smiles_modified()
-  run_schedules/       # RunScheduleManager + YAML schedules + MDP templates
-    __init__.py        # RunScheduleManager class
-    run_schedules.yaml # Engine/system_type run schedule definitions
-    gromacs/           # Gromacs MDP files (bilayer/, mixedbox/)
+  run_schedules/       # Run schedules generated at build time (no mdp templates)
+    __init__.py        # write_mdp_files(), apply_simulation_settings() re-render API
+    gromacs.py         # stage dicts + type/nonbonded-scheme overlays, mdp writer
   tests/               # pytest suite
 config_templates/
   config.ini           # Default config (cgenff, storage, database, foundry paths)
@@ -57,14 +57,20 @@ Entry point: `mdfactory` (defined in pyproject.toml `[project.scripts]`). Uses c
 ### Build Group
 
 ```
-mdfactory prepare-build INPUT [--output DIR]
+mdfactory prepare-build INPUT [--output DIR] [--simulation-settings FILE]
 ```
 CSV -> BuildInput YAML files. Creates one directory per system hash.
 
 ```
-mdfactory build INPUT [--output DIR]
+mdfactory build INPUT [--output DIR] [--simulation-settings FILE]
 ```
-YAML -> built MD system (system.pdb + topology + run schedule files).
+YAML -> built MD system (system.pdb + topology + generated em/nvt/npt/md.mdp).
+The settings file fills simulation_settings fields the input leaves out (row > file > defaults).
+
+```
+mdfactory apply-settings SETTINGS SOURCE [--dry-run]
+```
+Re-render the mdps of existing builds; refuses T/P changes and changed stages with outputs.
 
 ```
 mdfactory check-csv INPUT

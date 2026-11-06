@@ -128,8 +128,31 @@ mdfactory simulate output_dir/ --clean --dry-run
 
 The `--clean` flag removes simulation outputs (`.tpr`, `.cpt`, `.log`, `.edr`, `.gro`,
 `.xtc`, `.trr`, rescue MDPs, GROMACS backup files) while preserving build inputs
-(`system.pdb`, `topology.top`, template `.mdp` files, `.itp`, `.yaml`). It respects
+(`system.pdb`, `topology.top`, the generated `.mdp` files, `.itp`, `.yaml`). It respects
 the `--stages` filter — only files belonging to requested stages are deleted.
+
+</Accordion>
+<Accordion title="grompp: cut-off longer than half the box">
+
+`charmm` builds use a 1.2 nm cutoff (Force-switch from 1.0 nm), so every box edge must be at
+least about 2.6 nm. grompp reports *"The cut-off length is longer than half the shortest box
+vector or longer than the smallest box diagonal element"* for smaller boxes. Increase the
+molecule count (mixedbox), the lipid count or `z_padding` (bilayer), or the padding (LNP,
+protein types). `sage` builds (`openff`, `amber`) use 0.9 nm.
+
+</Accordion>
+<Accordion title="Settings changes: duplicate inputs or refused re-renders">
+
+- *"Duplicate build inputs ... differ only in simulation settings outside the identity"*: only
+  temperature and pressure define a different system. Two rows that differ only in, for example,
+  the production length have the same hash and would build into the same directory. Keep one,
+  or change the settings of the built system with `mdfactory apply-settings`.
+- *"... is set by mdfactory ... and cannot be overridden"*: a `gromacs_overrides` key is owned by
+  a typed setting (use the setting, e.g. `temperature` instead of `ref-t`) or by the build
+  (nonbonded block, `tc-grps`, `pcoupltype`, `compressibility`).
+- `apply-settings` refuses a directory whose changed stage already has outputs. Delete that
+  stage's outputs (`.tpr`, `.cpt`, `.log`, `.edr`, `.gro`, `.xtc`) to rerun it with the new
+  settings. See [Simulation Settings](/docs/user-guide/simulation-settings).
 
 </Accordion>
 <Accordion title="Simulation fails with LINCS or constraint errors">
