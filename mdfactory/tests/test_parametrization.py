@@ -287,13 +287,18 @@ def test_cgenff_locks_written_directory_and_regenerates_failed_attempt(tmp_path,
     calls = []
     _fake_cgenff(monkeypatch, calls)
     locked = _record_locks(monkeypatch)
+    # Use a temporary force-field directory so the test does not need a CGenFF installation.
+    ff_dir = tmp_path / "charmm36.ff"
+    ff_dir.mkdir()
+    (ff_dir / "forcefield.itp").write_text("; forcefield.itp\n")
+    native = parametrize_module.NativeForceField("charmm36", ff_dir, "tip3p")
     spec = SingleMoleculeSpecies(smiles="CCO", count=1, resname="ETH")
     # A failed earlier attempt left a directory without outputs.
     stale = tmp_path / "parameters" / "gromacs" / "cgenff" / spec.hash
     stale.mkdir(parents=True)
     (stale / "mol2gmx_1.log").write_text("LICENSE_ERROR\n")
 
-    param = parametrize_cgenff_gromacs(spec, spec=CHARMM_MIXEDBOX)
+    param = parametrize_cgenff_gromacs(spec, spec=CHARMM_MIXEDBOX, native_forcefield=native)
 
     assert locked == [param.itp.parent] == [stale.resolve()]
     assert not (stale / "mol2gmx_1.log").exists()
@@ -304,7 +309,8 @@ def test_cgenff_locks_written_directory_and_regenerates_failed_attempt(tmp_path,
     )
     assert param.charge_method is None
     # A complete entry is reused without running CGenFF again.
-    assert parametrize_cgenff_gromacs(spec, spec=CHARMM_MIXEDBOX) == param
+    reused = parametrize_cgenff_gromacs(spec, spec=CHARMM_MIXEDBOX, native_forcefield=native)
+    assert reused == param
     assert len(calls) == 1
 
 
