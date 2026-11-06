@@ -69,7 +69,6 @@ packages = ["mdfactory"]
 [tool.hatch.build.force-include]
 "mdfactory/setup/data/spc216.gro" = "mdfactory/setup/data/spc216.gro"
 "mdfactory/tests/testfiles/cgenff_output.itp" = "mdfactory/tests/testfiles/cgenff_output.itp"
-"mdfactory/run_schedules/gromacs" = "mdfactory/run_schedules/gromacs"
 
 [tool.bumpversion]
 current_version = "0.1.0"

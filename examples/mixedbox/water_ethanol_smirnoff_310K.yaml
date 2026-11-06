@@ -1,0 +1,20 @@
+# Water/ethanol at 310 K with a 20 ns production run. Only the temperature (and
+# pressure) enter the hash; the production length and overrides do not.
+simulation_type: mixedbox
+parametrization: openff
+system:
+  species:
+  - smiles: O
+    resname: SOL
+    count: 2000
+  - smiles: CCO
+    resname: ETH
+    count: 200
+simulation_settings:
+  temperature: 310.0
+  production:
+    length: 20.0           # ns
+    output_interval: 20.0  # ps
+  gromacs_overrides:
+    npt:
+      pcoupl: C-rescale

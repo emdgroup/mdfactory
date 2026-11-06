@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from mdfactory.models.input import BuildInput
+from mdfactory.models.input import BuildInput, check_unique_hashes
+from mdfactory.models.simulation_settings import SimulationSettings, load_simulation_settings
+from mdfactory.prepare import apply_simulation_settings_file
 
 from .apps import get_build_app
 from .session import (
@@ -38,6 +41,7 @@ def build_systems(
     *,
     output_dir: Path | None = None,
     dry_run: bool = False,
+    simulation_settings: SimulationSettings | Mapping[str, Any] | Path | None = None,
 ) -> list:
     """Submit parallel builds via Parsl (or preview with dry_run).
 
@@ -52,6 +56,18 @@ def build_systems(
     dry_run : bool, optional
         If True, log what would be built and return descriptions without
         loading Parsl or submitting any work. Default False.
+    simulation_settings : SimulationSettings, mapping or Path, optional
+        Settings (or a settings YAML file) shared by every dict input; an
+        input's own ``simulation_settings`` take precedence. BuildInput
+        objects already carry resolved settings and cannot be combined
+        with this argument.
+
+    Raises
+    ------
+    ValueError
+        If two inputs have the same hash (checked before anything is
+        submitted), or if *simulation_settings* is combined with BuildInput
+        objects.
 
     Returns
     -------
@@ -61,37 +77,50 @@ def build_systems(
 
     """
     output_dir = Path(output_dir) if output_dir else Path.cwd()
+    if isinstance(simulation_settings, (str, Path)):
+        simulation_settings = load_simulation_settings(Path(simulation_settings))
 
     # Resolve all inputs upfront
     resolved: list[tuple[BuildInput, dict]] = []
     for inp in build_inputs:
         if isinstance(inp, BuildInput):
+            if simulation_settings is not None:
+                raise ValueError(
+                    "simulation_settings cannot be applied to BuildInput objects, whose "
+                    "settings are already resolved; pass dicts or set "
+                    "BuildInput.simulation_settings."
+                )
             model = inp
-            input_dict = inp.model_dump()
         elif isinstance(inp, dict):
-            model = BuildInput(**inp)
-            input_dict = inp.copy()
+            model = BuildInput(**apply_simulation_settings_file(dict(inp), simulation_settings))
         else:
             raise TypeError(f"Expected BuildInput or dict, got {type(inp)}")
+        # The worker rebuilds the model from this dict, so it carries the resolved settings.
+        input_dict = model.model_dump(mode="json")
         input_dict["_build_dir"] = str(output_dir / model.hash)
         resolved.append((model, input_dict))
+    check_unique_hashes([model for model, _ in resolved])
 
     # Dry-run: log plan and return without loading Parsl
     if dry_run:
         descriptions = []
         for model, _ in resolved:
+            settings = model.simulation_settings
             desc = {
                 "hash": model.hash,
                 "simulation_type": model.simulation_type,
                 "parametrization": model.parametrization.family,
                 "parametrization_components": model.parametrization.components(),
+                "temperature": settings.temperature,
+                "pressure": settings.pressure,
                 "engine": model.engine,
                 "output_directory": str(output_dir / model.hash),
             }
             descriptions.append(desc)
             logger.info(
                 f"[dry-run] {model.hash} | {model.simulation_type} | "
-                f"{model.parametrization.summary()} | {model.engine} -> "
+                f"{model.parametrization.summary()} | "
+                f"{settings.temperature:g} K, {settings.pressure:g} bar | {model.engine} -> "
                 f"{output_dir / model.hash}"
             )
         logger.info(f"[dry-run] {len(descriptions)} system(s) would be built")

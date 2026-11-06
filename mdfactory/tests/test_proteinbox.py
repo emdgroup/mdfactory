@@ -793,15 +793,17 @@ class TestRelativePdbPathAcrossEntryPoints:
 
         built = {}
 
-        def fake_run_build_from_dict(dct):
-            built["hash"] = BuildInput(**dct).hash
+        def fake_run_build_from_dict(model):
+            built["hash"] = model.hash
+            built["pdb_path"] = model.system.protein.pdb_path
             built["cwd"] = Path.cwd()
 
-        monkeypatch.setattr(workflows, "run_build_from_dict", fake_run_build_from_dict)
+        monkeypatch.setattr(cli, "run_build_from_dict", fake_run_build_from_dict)
         out = tmp_path / "out"
         cli._build_from_yaml(yaml_file, out)
 
         assert built["cwd"] == (out / built["hash"]).resolve()
+        assert built["pdb_path"].is_absolute() and built["pdb_path"].is_file()
 
 
 class TestCenterInCubicBox:

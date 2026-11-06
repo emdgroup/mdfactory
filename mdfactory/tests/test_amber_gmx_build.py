@@ -1,24 +1,31 @@
-# ABOUTME: Opt-in real-GROMACS test for the Amber ff14SB + OpenFF Sage protein topology
-# ABOUTME: Runs pdb2gmx amber14sb, a Sage solute composite topology, and grompp -maxwarn 0
-"""Opt-in real-GROMACS test of the Amber ff14SB + OpenFF Sage protein route.
+# ABOUTME: Opt-in real-GROMACS tests: Amber ff14SB + Sage protein topology and generated mdps
+# ABOUTME: Runs pdb2gmx amber14sb and grompp on every generated stage within its maxwarn
+"""Opt-in real-GROMACS tests of the Amber ff14SB + OpenFF Sage route and the run schedules.
 
 Skipped unless a GROMACS >= 2026 binary is available (configured or on PATH).
 The module name contains ``build``, so ``pytest -k "not build"`` (CI) skips it.
 """
 
 import json
-import shutil
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import MDAnalysis as mda
 import numpy as np
 import pytest
 
 from mdfactory.build import _stage_protein_topology
-from mdfactory.models.parametrization import AmberParametrization
-from mdfactory.models.species import SolutionSpecies
+from mdfactory.models.parametrization import (
+    AmberParametrization,
+    CharmmParametrization,
+    OpenFFParametrization,
+)
+from mdfactory.models.simulation_settings import SimulationSettings
+from mdfactory.models.species import SingleMoleculeSpecies, SolutionSpecies
+from mdfactory.orchestration.stages import STAGE_REGISTRY
 from mdfactory.parametrize import NativeForceField, resolve_parametrizer
-from mdfactory.run_schedules import RunScheduleManager
+from mdfactory.run_schedules import write_mdp_files
 from mdfactory.settings import settings
 from mdfactory.setup import protein
 from mdfactory.utils.setup_utilities import topology_atom_names
@@ -67,7 +74,24 @@ def _new_enough_gmx():
     return gmx if version >= (2026, 0) else None
 
 
-pytestmark = pytest.mark.skipif(_new_enough_gmx() is None, reason="needs GROMACS >= 2026")
+GMX = _new_enough_gmx()
+pytestmark = pytest.mark.skipif(GMX is None, reason="needs GROMACS >= 2026")
+
+
+def _grompp_all_stages(build_dir: Path, structure: Path, topology: Path) -> None:
+    """Run grompp on every generated stage within the stage's ``maxwarn``.
+
+    Restrained stages get ``-r``; the stages after EM start from the build
+    structure, which is enough for grompp's checks.
+    """
+    for spec in STAGE_REGISTRY:
+        cmd = [str(GMX), "grompp", "-f", spec.mdp_file, "-c", str(structure)]
+        cmd += ["-p", str(topology), "-o", f"{spec.deffnm}.tpr", "-po", f"{spec.deffnm}_out.mdp"]
+        if spec.ref_file is not None:
+            cmd += ["-r", str(structure)]
+        cmd += ["-maxwarn", str(spec.maxwarn)]
+        result = subprocess.run(cmd, cwd=build_dir, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, f"{spec.name}:\n{result.stdout}\n{result.stderr}"
 
 
 def _solution_universe(species, names, offsets):
@@ -114,6 +138,7 @@ def test_amber_sage_composite_topology_passes_grompp_build(tmp_path, monkeypatch
     species = [
         SolutionSpecies(smiles="CCO", resname="ETH", count=1),
         SolutionSpecies(smiles="O", resname="SOL", count=1),
+        SingleMoleculeSpecies(smiles="[Cl-]", resname="CL", count=1),
     ]
     parameters = [parametrize(spec) for spec in species]
     assert parameters[0].parameter_itp is not None
@@ -121,14 +146,14 @@ def test_amber_sage_composite_topology_passes_grompp_build(tmp_path, monkeypatch
 
     build_dir = tmp_path / "system"
     build_dir.mkdir()
-    topology = _stage_protein_topology(params, ff_dir, build_dir, species, parameters, [1, 1])
+    topology = _stage_protein_topology(params, ff_dir, build_dir, species, parameters, [1, 1, 1])
 
     u_protein = mda.Universe(str(params.structure_file))
     u_protein.atoms.translate(np.full(3, BOX_A / 2) - u_protein.atoms.center_of_geometry())
     solution = _solution_universe(
         species,
         [topology_atom_names(spec, par) for spec, par in zip(species, parameters)],
-        [np.array([5.0, 5.0, 5.0]), np.array([35.0, 35.0, 35.0])],
+        [np.array([5.0, 5.0, 5.0]), np.array([35.0, 35.0, 35.0]), np.array([5.0, 35.0, 5.0])],
     )
     u = mda.Merge(u_protein.atoms, solution.atoms)
     u.dimensions = [BOX_A, BOX_A, BOX_A, 90, 90, 90]
@@ -142,10 +167,12 @@ def test_amber_sage_composite_topology_passes_grompp_build(tmp_path, monkeypatch
     u.atoms.write(str(pdb_out))
     assert app.PDBFile(str(pdb_out)).topology.getNumAtoms() == u.atoms.n_atoms
 
-    mdp = RunScheduleManager().get_all_run_file_paths(
-        "gromacs", "protein_mixedbox", nonbonded_scheme=spec.nonbonded_scheme
-    )["em.mdp"]
-    shutil.copy(mdp, build_dir / "em.mdp")
+    inp = SimpleNamespace(
+        simulation_type="protein_mixedbox",
+        parametrization=spec,
+        simulation_settings=SimulationSettings().resolve("protein_mixedbox"),
+    )
+    write_mdp_files(inp, build_dir)
 
     text = topology.read_text()
     for include in ("forcefield.itp", "tip3p.itp", "ions_tip3p.itp"):
@@ -157,8 +184,64 @@ def test_amber_sage_composite_topology_passes_grompp_build(tmp_path, monkeypatch
     provenance = json.loads((parameters[0].itp.parent / "provenance.json").read_text())
     assert "ETH_" not in extra and f"{provenance['atomtype_prefix']}_0 " in extra
 
-    # The peptide carries a net charge (+1); accept only grompp's net-charge warning.
-    protein.validate_with_grompp(
-        topology, structure, build_dir / "em.mdp", build_dir, allow_net_charge=True
-    )
+    # One Cl- neutralizes the peptide (+1), so the build-time check runs at -maxwarn 0.
+    protein.validate_with_grompp(topology, structure, build_dir / "em.mdp", build_dir)
     assert Path(build_dir / "topology.top").is_file()
+    _grompp_all_stages(build_dir, structure, topology)
+
+
+WATER_TOPOLOGY = """\
+#include "amber14sb.ff/forcefield.itp"
+#include "amber14sb.ff/tip3p.itp"
+
+[ system ]
+water
+
+[ molecules ]
+SOL {n_water}
+"""
+
+SCHEDULE_CASES = [
+    ("mixedbox", CharmmParametrization(), {}),
+    ("mixedbox", OpenFFParametrization(), {}),
+    ("bilayer", CharmmParametrization(), {}),
+    ("bilayer", OpenFFParametrization(), {}),
+    ("lnp", CharmmParametrization(), {}),
+    (
+        "mixedbox",
+        CharmmParametrization(),
+        {
+            "temperature": 310.0,
+            "pressure": 1.5,
+            "timestep": 1.0,
+            "nvt": {"length": 20.0, "output_interval": 0.5},
+            "production": {"length": 1.0, "output_interval": 5.0},
+            "gromacs_overrides": {"npt": {"pcoupl": "C-rescale"}, "production": {"tau_p": 4.0}},
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize(("simulation_type", "family", "settings_data"), SCHEDULE_CASES)
+def test_generated_schedules_pass_grompp_build(tmp_path, simulation_type, family, settings_data):
+    """Every stage of the solvent schedules passes grompp on a 3.2 nm water box."""
+    structure = tmp_path / "water.gro"
+    result = subprocess.run(
+        [str(GMX), "solvate", "-cs", "spc216.gro", "-box", "3.2", "3.2", "3.2", "-o", "water.gro"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    n_water = mda.Universe(str(structure)).residues.n_residues
+    # amber14sb.ff ships with GROMACS 2026; its TIP3P is enough to check the mdp parameters.
+    topology = tmp_path / "topol.top"
+    topology.write_text(WATER_TOPOLOGY.format(n_water=n_water))
+    inp = SimpleNamespace(
+        simulation_type=simulation_type,
+        parametrization=family.resolve(simulation_type),
+        simulation_settings=SimulationSettings(**settings_data).resolve(simulation_type),
+    )
+    write_mdp_files(inp, tmp_path)
+    _grompp_all_stages(tmp_path, structure, topology)

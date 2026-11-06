@@ -12,7 +12,7 @@ from .build import (
     build_protein_mixedbox,
     build_proteinbox,
 )
-from .models.input import BuildInput
+from .models.input import BuildInput, write_build_record
 from .prepare import resolve_protein_pdb_path
 from .utils.utilities import load_yaml_file
 
@@ -26,7 +26,10 @@ DISPATCH_BUILD = {
 
 
 def run_build_from_dict(inp_dict: dict[Any, Any] | BuildInput):
-    """Dispatch a build from a dict or BuildInput object.
+    """Dispatch a build from a dict or BuildInput object in the working directory.
+
+    The build record ``<hash>.yaml`` (the input with its resolved simulation
+    settings) is written first, then the system and its run schedule.
 
     Parameters
     ----------
@@ -46,6 +49,7 @@ def run_build_from_dict(inp_dict: dict[Any, Any] | BuildInput):
         raise NotImplementedError(
             f"Build for simulation type {build_model.simulation_type} not yet implemented."
         )
+    write_build_record(build_model, Path.cwd())
     build_function(build_model)
 
 
