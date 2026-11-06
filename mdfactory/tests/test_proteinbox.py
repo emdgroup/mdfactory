@@ -16,10 +16,15 @@ import pytest
 import yaml
 
 from mdfactory import workflows
-from mdfactory.build import _center_in_cubic_box, _ion_counts
+from mdfactory.build import _center_in_cubic_box, _ion_counts, _prepare_protein
 from mdfactory.models.composition import ProteinBoxComposition, ProteinMixedBoxComposition
 from mdfactory.models.input import BuildInput
-from mdfactory.models.parametrization import CharmmConfig, Pdb2gmxConfig
+from mdfactory.models.parametrization import (
+    AmberConfig,
+    CharmmConfig,
+    Pdb2gmxConfig,
+    SmirnoffConfig,
+)
 from mdfactory.models.species import ProteinSpecies, SingleMoleculeSpecies
 from mdfactory.prepare import resolve_protein_pdb_path
 from mdfactory.setup import protein
@@ -31,6 +36,7 @@ from mdfactory.setup.protein import (
     check_forcefield_available,
     clean_pdb,
     download_forcefield,
+    parse_gmx_version,
     run_pdb2gmx,
     update_topology_molecules,
 )
@@ -835,3 +841,206 @@ class TestIonCounts:
             for smiles, resname, count in ions
         ]
         assert _ion_counts(species) == expected
+
+
+EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples" / "proteinbox"
+
+
+class TestAmberConfig:
+    def test_defaults_and_sage_settings(self):
+        config = AmberConfig()
+        assert (config.forcefield, config.water_model) == ("amber14sb", "tip3p")
+        assert config.ignore_hydrogens is True and config.merge_all is False
+        smirnoff = config.smirnoff_config()
+        assert isinstance(smirnoff, SmirnoffConfig)
+        assert smirnoff.forcefield == SmirnoffConfig().forcefield == config.sage_forcefield
+        assert smirnoff.charge_method == config.charge_method
+
+    def test_smirnoff_config_follows_sage_fields(self):
+        config = AmberConfig(sage_forcefield="openff-2.1.0.offxml", charge_method="am1bcc")
+        smirnoff = config.smirnoff_config()
+        assert (smirnoff.forcefield, smirnoff.charge_method) == ("openff-2.1.0.offxml", "am1bcc")
+
+    def test_frozen(self):
+        with pytest.raises(Exception):
+            AmberConfig().forcefield = "amber19sb"
+
+    @pytest.mark.parametrize(
+        ("overrides", "match"),
+        [
+            ({"forcefield": "amber19sb"}, "Only 'amber14sb'"),
+            ({"forcefield": "charmm36m"}, "Only 'amber14sb'"),
+            ({"water_model": "opc"}, "Only 'tip3p'"),
+            ({"water_model": "spce"}, "Only 'tip3p'"),
+        ],
+    )
+    def test_rejects_unsupported_choices(self, overrides, match):
+        with pytest.raises(ValueError, match=match):
+            AmberConfig(**overrides)
+
+
+class TestAmberInput:
+    @pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
+    @pytest.mark.parametrize("explicit", [False, True])
+    def test_accepts_amber_for_protein_types(self, sim_type, protein_pdb, explicit):
+        data = protein_input_data(sim_type, protein_pdb, parametrization="amber")
+        if explicit:
+            data["parametrization_config"] = {"type": "amber", "sage_forcefield": "x.offxml"}
+        inp = BuildInput(**data)
+        assert inp.parametrization == "amber"
+        assert isinstance(inp.parametrization_config, AmberConfig)
+        if explicit:
+            assert inp.parametrization_config.sage_forcefield == "x.offxml"
+
+    def test_yaml_round_trip(self, protein_pdb):
+        yaml_str = f"""
+simulation_type: proteinbox
+parametrization: amber
+parametrization_config:
+  type: amber
+  forcefield: amber14sb
+  water_model: tip3p
+system:
+  protein:
+    resname: LYZ
+    pdb_path: {protein_pdb}
+  padding: 12.0
+"""
+        inp = BuildInput(**yaml.safe_load(yaml_str))
+        assert BuildInput.from_data_row(inp.to_data_row()).hash == inp.hash
+
+    def test_rejected_for_mixedbox(self):
+        system = {"species": [{"smiles": "O", "resname": "SOL", "count": 10}]}
+        with pytest.raises(ValueError, match="not valid for simulation type"):
+            BuildInput(simulation_type="mixedbox", parametrization="amber", system=system)
+
+    @pytest.mark.parametrize("simulation_type", ["mixedbox", "bilayer", "lnp"])
+    def test_not_allowed_for_small_molecule_types(self, simulation_type):
+        from mdfactory.models.input import allowed_parametrizations
+
+        assert "amber" not in allowed_parametrizations[simulation_type]
+
+    def test_amber_merge_all_conflicts_with_chains(self, protein_pdb):
+        data = protein_input_data(
+            "proteinbox",
+            protein_pdb,
+            parametrization="amber",
+            protein={"resname": "INS", "chains": ["A", "B"]},
+        )
+        data["parametrization_config"] = {"type": "amber", "merge_all": True}
+        with pytest.raises(ValueError, match="merge_all"):
+            BuildInput(**data)
+
+    def test_example_yaml_and_csv(self):
+        import pandas as pd
+
+        from mdfactory.prepare import df_to_build_input_models
+
+        inp = BuildInput(**yaml.safe_load((EXAMPLES_DIR / "lysozyme_amber14sb.yaml").read_text()))
+        assert isinstance(inp.parametrization_config, AmberConfig)
+        models, errors = df_to_build_input_models(pd.read_csv(EXAMPLES_DIR / "proteins_amber.csv"))
+        assert errors == {}
+        assert [m.parametrization for m in models] == ["amber"]
+        assert isinstance(models[0].parametrization_config, AmberConfig)
+        assert models[0].system.protein.protonation_states == {"HIS15": "HIE"}
+
+
+class TestGmxVersion:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("2026.3-conda_forge", (2026, 3)),
+            ("2024.3", (2024, 3)),
+            ("2026.0-dev-20250101-abcdef", (2026, 0)),
+            ("2026-beta1", (2026, 0)),
+            (
+                "      :-) GROMACS - gmx, 2026.3-conda_forge (-:\n\n"
+                "GROMACS version:     2026.3-conda_forge\nPrecision: mixed\n",
+                (2026, 3),
+            ),
+        ],
+    )
+    def test_parse(self, text, expected):
+        assert parse_gmx_version(text) == expected
+
+    @pytest.mark.parametrize("text", ["", "not a version", "GROMACS version:  unknown"])
+    def test_parse_garbage_raises(self, text):
+        with pytest.raises(ValueError, match="Could not parse a GROMACS version"):
+            parse_gmx_version(text)
+
+    def test_min_version_from_topology(self, tmp_path):
+        amber = tmp_path / "amber.top"
+        amber.write_text(
+            '#include "amber14sb.ff/forcefield.itp"\n#include "amber14sb.ff/tip3p.itp"\n'
+        )
+        charmm = tmp_path / "charmm.top"
+        charmm.write_text('#include "charmm36-feb2026_cgenff-5.0.ff/forcefield.itp"\n')
+        assert protein.min_gmx_version_for_topology(amber) == (2026, 0)
+        assert protein.min_gmx_version_for_topology(charmm) is None
+        assert protein.min_gmx_version_for_topology(tmp_path / "missing.top") is None
+
+
+def _patch_prepare_protein(monkeypatch, tmp_path, version_output):
+    """Fake clean_pdb, ``gmx --version`` and pdb2gmx; return the ordered list of calls."""
+    calls = []
+    _patch_pdb2gmx(monkeypatch, ["Protein_chain_A"], ["posre.itp"])
+    pdb2gmx_run = protein.subprocess.run
+
+    def fake_run(cmd, **kwargs):
+        if cmd[1:] == ["--version"]:
+            calls.append("version")
+            return SimpleNamespace(returncode=0, stdout=version_output, stderr="")
+        calls.append(cmd[1])
+        return pdb2gmx_run(cmd, **kwargs)
+
+    def fake_clean_pdb(pdb_path, output_path):
+        calls.append("clean_pdb")
+        shutil.copy(pdb_path, output_path)
+        return output_path
+
+    monkeypatch.setattr("mdfactory.setup.protein.subprocess.run", fake_run)
+    monkeypatch.setattr("mdfactory.setup.protein.clean_pdb", fake_clean_pdb)
+    monkeypatch.chdir(tmp_path)
+    return calls
+
+
+class TestPrepareProteinVersionGate:
+    def test_new_gromacs_passes(self, tmp_path, monkeypatch, protein_pdb):
+        calls = _patch_prepare_protein(
+            monkeypatch, tmp_path, "GROMACS version:    2026.3-conda_forge\n"
+        )
+        _prepare_protein(ProteinSpecies(resname="LYZ", pdb_path=protein_pdb), AmberConfig())
+        assert calls == ["version", "clean_pdb", "pdb2gmx"]
+
+    def test_old_gromacs_fails_before_pdb2gmx(self, tmp_path, monkeypatch, protein_pdb):
+        calls = _patch_prepare_protein(monkeypatch, tmp_path, "GROMACS version:    2024.3\n")
+        with pytest.raises(RuntimeError) as exc_info:
+            _prepare_protein(ProteinSpecies(resname="LYZ", pdb_path=protein_pdb), AmberConfig())
+        message = str(exc_info.value)
+        assert "/mock/gmx" in message and "2024.3" in message and ">= 2026" in message
+        assert calls == ["version"]
+
+    @pytest.mark.parametrize("config", [Pdb2gmxConfig(), CharmmConfig()])
+    def test_charmm_configs_skip_gate(self, tmp_path, monkeypatch, protein_pdb, config):
+        calls = _patch_prepare_protein(monkeypatch, tmp_path, "GROMACS version:    2024.3\n")
+        _prepare_protein(ProteinSpecies(resname="LYZ", pdb_path=protein_pdb), config)
+        assert "version" not in calls
+        assert calls[-1] == "pdb2gmx"
+
+
+def test_run_pdb2gmx_amber_passes_forcefield_and_amber_protonation(tmp_path, monkeypatch):
+    pdb = _write_pdb(tmp_path, ("HIS", 15), ("ALA", 16))
+    calls = {}
+    _patch_pdb2gmx(monkeypatch, ["Protein_chain_A"], ["posre.itp"], calls)
+
+    params = _run(tmp_path, pdb, config=AmberConfig(), protonation_states={"HIS15": "HIE"})
+
+    cmd = calls["cmd"]
+    assert cmd[cmd.index("-ff") + 1] == "amber14sb"
+    assert cmd[cmd.index("-water") + 1] == "tip3p"
+    assert "-ignh" in cmd
+    adjusted = Path(cmd[cmd.index("-f") + 1])
+    resnames = [ln[17:20] for ln in adjusted.read_text().splitlines() if ln.startswith("ATOM")]
+    # Amber names pass through unchanged (no CHARMM HSE alias).
+    assert resnames == ["HIE", "ALA"]
+    assert params.forcefield == "amber14sb"

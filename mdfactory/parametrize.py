@@ -11,12 +11,17 @@ from .models.parametrization import CgenffConfig, GromacsSingleMoleculeParameter
 from .models.species import SingleMoleculeSpecies
 from .settings import settings
 from .utils.topology_utilities import (
+    check_atomtype_collisions,
+    check_defaults_compatible,
     collect_forcefield_atomtype_definitions,
     count_contiguous_strings,
     extract_reusable_parts_from_cgenff_gmx_top,
     merge_extra_parameter_itps,
+    read_itp_atoms,
     run_cgenff_to_gmx,
+    unique_atom_names,
     validate_cgenff_atomtype_compatibility,
+    write_itp_with_atom_names,
     write_mol2_from_rdkit,
 )
 from .utils.utilities import lock_local_folder, working_directory
@@ -226,9 +231,38 @@ def parametrize_cgenff_gromacs(
     return prm
 
 
+NATIVE_ION_MOLECULETYPES = {"[Na+]": "NA", "[Cl-]": "CL"}
+
+
+def _native_smirnoff_parameter_set(
+    species: SingleMoleculeSpecies,
+    smirnoff_config: SmirnoffConfig,
+    forcefield_dir: Path,
+    water_model: str,
+) -> GromacsSingleMoleculeParameterSet:
+    """Return water or ion parameters taken from a GROMACS-native force-field directory."""
+    if species.is_water:
+        moleculetype = "SOL"
+        itp = forcefield_dir / f"{water_model}.itp"
+    else:
+        moleculetype = NATIVE_ION_MOLECULETYPES[species.smiles]
+        itp = forcefield_dir / f"ions_{water_model}.itp"
+    return GromacsSingleMoleculeParameterSet(
+        moleculetype=moleculetype,
+        smiles=species.smiles,
+        parametrization="smirnoff",
+        parametrization_config=smirnoff_config,
+        itp=itp,
+        parameter_itp=None,
+        forcefield_itp=forcefield_dir / "forcefield.itp",
+    )
+
+
 def parametrize_smirnoff_gromacs(
     species: SingleMoleculeSpecies,
     smirnoff_config: Optional[SmirnoffConfig] = None,
+    native_forcefield_dir: Path | None = None,
+    native_water_model: str = "tip3p",
 ) -> GromacsSingleMoleculeParameterSet:
     """Parametrize a molecule using OpenFF SMIRNOFF force field.
 
@@ -240,6 +274,15 @@ def parametrize_smirnoff_gromacs(
         The molecule species to parametrize.
     smirnoff_config : SmirnoffConfig, optional
         Configuration for SMIRNOFF parametrization. If None, uses defaults.
+    native_forcefield_dir : Path or None, optional
+        GROMACS force-field directory (e.g. a bundled ``amber14sb.ff``) that
+        provides native water and ion topologies. When given, water returns
+        ``<water_model>.itp`` and Na+/Cl- return ``ions_<water_model>.itp`` from
+        it, without any OpenFF work or SMIRNOFF cache access. Other molecules
+        are parametrized with SMIRNOFF as usual. Default None.
+    native_water_model : str, optional
+        Water model selecting the native water and ion files. Only used with
+        ``native_forcefield_dir``. Default ``"tip3p"``.
 
     Returns
     -------
@@ -247,15 +290,20 @@ def parametrize_smirnoff_gromacs(
         The parameter set containing paths to generated ITP files.
 
     """
+    # Use provided config or defaults
+    if smirnoff_config is None:
+        smirnoff_config = SmirnoffConfig()
+
+    if native_forcefield_dir is not None and (species.is_water or species.is_ion):
+        return _native_smirnoff_parameter_set(
+            species, smirnoff_config, Path(native_forcefield_dir), native_water_model
+        )
+
     # Lazy imports to avoid loading OpenFF when not needed
     import numpy as np  # noqa: PLC0415
     from openff.interchange import Interchange  # noqa: PLC0415
     from openff.toolkit import ForceField, Topology  # noqa: PLC0415
     from openff.units import unit  # noqa: PLC0415
-
-    # Use provided config or defaults
-    if smirnoff_config is None:
-        smirnoff_config = SmirnoffConfig()
 
     ff_name = smirnoff_config.forcefield
     water_model = smirnoff_config.water_model
@@ -551,19 +599,28 @@ def generate_gromacs_topology_with_protein(
     """Write one GROMACS topology for a pdb2gmx protein packed with solution molecules.
 
     Builds a single composite topology in strict include order: the bundled
-    CHARMM force field, the merged CGenFF small-molecule parameters (with
-    ``[ atomtypes ]`` de-duplicated against the force field and ``[ defaults ]``
-    dropped, because the force field already bundles CGenFF), the protein
-    moleculetypes and position restraints from pdb2gmx, the CGenFF
-    small-molecule moleculetypes, and finally the water and ion topologies the
-    pdb2gmx topology already includes. The ``[ molecules ]`` section keeps the
-    protein chain entries and appends the solution molecules in the order given,
-    so it matches a coordinate file ordered protein → small molecules → water →
-    ions.
+    protein force field, the merged small-molecule parameters, the protein
+    moleculetypes and position restraints from pdb2gmx, the small-molecule
+    moleculetypes, and finally the water and ion topologies the pdb2gmx
+    topology already includes. The ``[ molecules ]`` section keeps the protein
+    chain entries and appends the solution molecules in the order given, so it
+    matches a coordinate file ordered protein → small molecules → water → ions.
+
+    The small-molecule parameters are merged according to their scheme:
+
+    - **CGenFF** (CHARMM force field): ``[ atomtypes ]`` already defined by the
+      force field are de-duplicated after a compatibility check, and
+      ``[ defaults ]`` is dropped because the force field bundles CGenFF.
+    - **SMIRNOFF** (e.g. Sage with ``amber14sb.ff``): each file's
+      ``[ defaults ]`` must match the force field's ``forcefield.itp``
+      numerically before it is dropped, and any atom-type name collision with
+      the force field (or a conflicting duplicate between solutes) raises.
+
+    Mixing CGenFF and SMIRNOFF solutes raises ``ValueError``.
 
     Native species (water and supported ions) carry no ``parameter_itp`` and use
     the moleculetypes the pdb2gmx force-field includes already provide; only
-    CGenFF small molecules contribute an ``.itp`` include and merged parameters.
+    small molecules contribute an ``.itp`` include and merged parameters.
 
     Parameters
     ----------
@@ -571,7 +628,8 @@ def generate_gromacs_topology_with_protein(
         Local pdb2gmx topology whose force-field ``#include`` lines resolve from
         its own directory (force field already bundled alongside it).
     ff_dir : Path
-        The bundled force-field directory, scanned for atom types to de-duplicate.
+        The bundled force-field directory, scanned for atom types (and, for
+        SMIRNOFF solutes, its ``forcefield.itp`` ``[ defaults ]``).
     species : list
         Non-protein solution species, in the coordinate/packing order.
     parameters : list[GromacsSingleMoleculeParameterSet]
@@ -600,27 +658,51 @@ def generate_gromacs_topology_with_protein(
             "cannot build composite topology."
         )
 
-    # CGenFF small molecules carry a parameter_itp; native water/ions do not and
-    # reuse the moleculetypes the pdb2gmx force-field includes already provide.
-    cgenff_parameters = [par for par in parameters if par.parameter_itp is not None]
+    # Small molecules carry a parameter_itp; native water/ions do not and reuse
+    # the moleculetypes the pdb2gmx force-field includes already provide.
+    solute_parameters = [par for par in parameters if par.parameter_itp is not None]
+    # Parameter sets without a parametrization tag are treated as CGenFF, the
+    # original (CHARMM-only) behavior.
+    solute_schemes = {getattr(par, "parametrization", "cgenff") for par in solute_parameters}
+    if len(solute_schemes) > 1:
+        raise ValueError(
+            "Cannot mix small-molecule parametrizations in one protein topology: "
+            f"{sorted(solute_schemes)}."
+        )
+    scheme_label = "SMIRNOFF" if solute_schemes == {"smirnoff"} else "CGenFF"
 
     extra_params_include = ""
-    if cgenff_parameters:
+    if solute_parameters:
         forcefield_types = collect_forcefield_atomtype_definitions(ff_dir)
-        prm_files = sorted({str(par.parameter_itp) for par in cgenff_parameters})
-        validate_cgenff_atomtype_compatibility(prm_files, ff_dir, forcefield_types)
-        merged = merge_extra_parameter_itps(
-            prm_files, exclude_atomtypes=forcefield_types, drop_defaults=True
-        )
+        prm_files = sorted({str(par.parameter_itp) for par in solute_parameters})
+        if scheme_label == "SMIRNOFF":
+            # SMIRNOFF files carry their own [ defaults ] and private atom types:
+            # the force field's [ defaults ] must be equivalent before it is dropped,
+            # and no atom type may shadow a force-field or another solute's type.
+            for prm in prm_files:
+                check_defaults_compatible(ff_dir / "forcefield.itp", prm)
+            check_atomtype_collisions(prm_files, forcefield_types)
+            merged = merge_extra_parameter_itps(prm_files, drop_defaults=True)
+        else:
+            validate_cgenff_atomtype_compatibility(prm_files, ff_dir, forcefield_types)
+            merged = merge_extra_parameter_itps(
+                prm_files, exclude_atomtypes=forcefield_types, drop_defaults=True
+            )
         (out_dir / "extra_params.itp").write_text(f"; merged from {prm_files}\n{merged}")
         extra_params_include = '#include "extra_params.itp"\n'
 
     # Copy each unique small-molecule ITP next to the topology and include it once.
+    # SMIRNOFF ITPs name atoms by element only; the copies get the unique names
+    # that topology_atom_names() also gives the coordinates.
     itps: dict[str, Path] = {}
-    for par in cgenff_parameters:
+    for par in solute_parameters:
         itps.setdefault(par.itp.name, par.itp)
     for itp_name, itp_path in itps.items():
-        shutil.copy(itp_path, out_dir / itp_name)
+        if scheme_label == "SMIRNOFF":
+            names = [name for name, _ in read_itp_atoms(itp_path)]
+            write_itp_with_atom_names(itp_path, out_dir / itp_name, unique_atom_names(names))
+        else:
+            shutil.copy(itp_path, out_dir / itp_name)
     smallmol_include_block = "".join(f'#include "{name}"\n' for name in itps)
 
     # Copy up to [ molecules ], inserting merged parameters after the force field,
@@ -630,7 +712,7 @@ def generate_gromacs_topology_with_protein(
     for i in range(molecules_idx):
         line = lines[i]
         if i == water_include_idx and smallmol_include_block:
-            new_lines.append("; Include CGenFF small-molecule topologies\n")
+            new_lines.append(f"; Include {scheme_label} small-molecule topologies\n")
             new_lines.append(smallmol_include_block)
         stripped = line.strip()
         if (
@@ -645,12 +727,12 @@ def generate_gromacs_topology_with_protein(
             continue
         new_lines.append(line)
         if i == ff_include_idx and extra_params_include:
-            new_lines.append("; Include merged CGenFF parameters\n")
+            new_lines.append(f"; Include merged {scheme_label} parameters\n")
             new_lines.append(extra_params_include)
 
     # No water include: append the small-molecule moleculetypes here instead.
     if smallmol_include_block and water_include_idx is None:
-        new_lines.append("; Include CGenFF small-molecule topologies\n")
+        new_lines.append(f"; Include {scheme_label} small-molecule topologies\n")
         new_lines.append(smallmol_include_block)
 
     protein_mol_lines = []

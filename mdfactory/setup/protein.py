@@ -1,5 +1,5 @@
 # ABOUTME: Protein preparation utilities for the proteinbox simulation type
-# ABOUTME: Wraps PDBFixer for cleaning and gmx pdb2gmx for topology generation
+# ABOUTME: Wraps PDBFixer cleaning, gmx pdb2gmx topology generation, and GROMACS version gates
 """Protein preparation utilities for the proteinbox simulation type."""
 
 import hashlib
@@ -16,7 +16,12 @@ from urllib.request import urlopen
 
 from loguru import logger
 
-from ..models.parametrization import GromacsProteinParameterSet, Pdb2gmxConfig
+from ..models.parametrization import (
+    AmberConfig,
+    CharmmConfig,
+    GromacsProteinParameterSet,
+    Pdb2gmxConfig,
+)
 from ..settings import settings
 
 _DISULFIDE_CUTOFF_ANGSTROM = 2.2
@@ -345,6 +350,171 @@ def check_gmx_available() -> Path:
     return Path(gmx_path)
 
 
+# Force fields that need a minimum GROMACS version, keyed by the ``.ff`` directory
+# stem, as (year, minor). amber14sb.ff ships with GROMACS 2026 and relies on the
+# LEaP dihedral atom reordering that grompp gained in 2026; older versions ignore
+# ``_FF_AMBER_LEAP_ATOM_REORDERING`` silently. Single source of truth for the
+# build-time gate and the simulate-time grompp script check.
+GMX_MIN_VERSION_BY_FORCEFIELD: dict[str, tuple[int, int]] = {
+    "amber14sb": (2026, 0),
+}
+
+_GMX_VERSION_LINE = re.compile(r"^\s*GROMACS version:\s*(\S+)", re.MULTILINE)
+_GMX_VERSION_NUMBER = re.compile(r"^(\d+)(?:\.(\d+))?(?!\d)")
+
+
+def parse_gmx_version(text: str) -> tuple[int, int]:
+    """Parse a GROMACS version from ``gmx --version`` output or a version string.
+
+    Parameters
+    ----------
+    text : str
+        Full ``gmx --version`` output (the ``GROMACS version:`` line is used) or
+        a bare version string such as ``2026.3-conda_forge``, ``2024.3``,
+        ``2026.0-dev-20250101-abcdef`` or ``2026-beta1``.
+
+    Returns
+    -------
+    tuple of int
+        ``(year, minor)``; a missing minor version (``2026-beta1``) is 0.
+
+    Raises
+    ------
+    ValueError
+        If no GROMACS version can be read from *text*.
+
+    """
+    line = _GMX_VERSION_LINE.search(text)
+    version = line.group(1) if line else text.strip()
+    match = _GMX_VERSION_NUMBER.match(version)
+    if match is None:
+        raise ValueError(f"Could not parse a GROMACS version from {text.strip()[:200]!r}.")
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def format_gmx_version(version: tuple[int, int]) -> str:
+    """Format a ``(year, minor)`` GROMACS version, omitting a zero minor version."""
+    year, minor = version
+    return f"{year}" if minor == 0 else f"{year}.{minor}"
+
+
+def min_gmx_version_for_forcefield(forcefield: str) -> tuple[int, int] | None:
+    """Return the minimum GROMACS version a force field needs, or None if any works.
+
+    Parameters
+    ----------
+    forcefield : str
+        Force-field name or ``.ff`` directory name (e.g. ``amber14sb`` or
+        ``amber14sb.ff``).
+
+    """
+    return GMX_MIN_VERSION_BY_FORCEFIELD.get(forcefield.removesuffix(".ff"))
+
+
+def min_gmx_version_for_topology(top_path: Path) -> tuple[int, int] | None:
+    """Return the minimum GROMACS version the force field included by a topology needs.
+
+    Reads the ``#include "<name>.ff/forcefield.itp"`` lines of *top_path* (not
+    following includes) and returns the highest requirement among them.
+
+    Parameters
+    ----------
+    top_path : Path
+        GROMACS topology, e.g. a simulation directory's ``topology.top``.
+
+    Returns
+    -------
+    tuple of int or None
+        ``(year, minor)``, or None if the file does not exist or its force
+        field has no version requirement.
+
+    """
+    top_path = Path(top_path)
+    if not top_path.is_file():
+        return None
+    requirements = []
+    with open(top_path) as fb:
+        for line in fb:
+            stripped = line.strip()
+            if not stripped.startswith("#include") or '"' not in stripped:
+                continue
+            parts = Path(stripped.split('"')[1]).parts
+            if len(parts) < 2 or parts[-1] != "forcefield.itp" or not parts[-2].endswith(".ff"):
+                continue
+            required = min_gmx_version_for_forcefield(parts[-2])
+            if required is not None:
+                requirements.append(required)
+    return max(requirements) if requirements else None
+
+
+def get_gmx_version(gmx_bin: str | Path) -> tuple[tuple[int, int], str]:
+    """Run ``gmx --version`` and return the parsed and the reported version.
+
+    Returns
+    -------
+    tuple
+        ``((year, minor), reported)`` where *reported* is the raw version string,
+        e.g. ``2026.3-conda_forge``.
+
+    Raises
+    ------
+    RuntimeError
+        If the binary cannot be run or reports no parseable version.
+
+    """
+    try:
+        result = subprocess.run(
+            [str(gmx_bin), "--version"],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"Could not run '{gmx_bin} --version': {exc}") from exc
+    output = result.stdout + result.stderr
+    try:
+        version = parse_gmx_version(output)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Could not read the GROMACS version of '{gmx_bin}' "
+            f"(exit code {result.returncode}): {exc}"
+        ) from exc
+    line = _GMX_VERSION_LINE.search(output)
+    reported = line.group(1) if line else format_gmx_version(version)
+    return version, reported
+
+
+def require_gmx_version(gmx_bin: str | Path, forcefield: str) -> None:
+    """Fail early if *gmx_bin* is too old for *forcefield*.
+
+    Force fields without an entry in :data:`GMX_MIN_VERSION_BY_FORCEFIELD` are
+    accepted without running the binary.
+
+    Raises
+    ------
+    RuntimeError
+        If the binary is older than the force field requires.
+
+    """
+    required = min_gmx_version_for_forcefield(forcefield)
+    if required is None:
+        return
+    version, reported = get_gmx_version(gmx_bin)
+    if version < required:
+        raise RuntimeError(
+            f"Force field '{forcefield}' requires GROMACS >= {format_gmx_version(required)}, "
+            f"but '{gmx_bin}' is GROMACS {reported}. Use a newer GROMACS, e.g. the pixi "
+            "'gmx' environment (`pixi run -e gmx ...`), or point [gromacs] GMX_PATH in "
+            "the mdfactory config at a GROMACS >= "
+            f"{format_gmx_version(required)} binary."
+        )
+    logger.info(
+        f"GROMACS {reported} satisfies the '{forcefield}' requirement "
+        f">= {format_gmx_version(required)}."
+    )
+
+
 def download_forcefield(name: str) -> Path:
     """Download a force field from the registry to the local data directory.
 
@@ -632,7 +802,7 @@ def _run_gmx(
 
 def run_pdb2gmx(
     pdb_path: Path,
-    config: Pdb2gmxConfig,
+    config: Pdb2gmxConfig | CharmmConfig | AmberConfig,
     disulfide_bonds: list[tuple[str, str]],
     protonation_states: dict[str, str],
     output_dir: Path,
@@ -644,8 +814,10 @@ def run_pdb2gmx(
     ----------
     pdb_path : Path
         Cleaned PDB file.
-    config : Pdb2gmxConfig
-        Force field and water model configuration.
+    config : Pdb2gmxConfig or CharmmConfig or AmberConfig
+        Force field and water model configuration. Only the shared
+        ``forcefield``, ``water_model``, ``ignore_hydrogens`` and ``merge_all``
+        fields are read.
     disulfide_bonds : list[tuple[str, str]]
         Cysteine residue pairs for disulfide bonds, e.g. [("CYS6", "CYS127")].
     protonation_states : dict[str, str]

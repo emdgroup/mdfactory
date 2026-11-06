@@ -389,6 +389,51 @@ def _get_gromacs_detect_script() -> str:
     )
 
 
+def _build_gmx_version_check(min_gmx_version: str) -> str:
+    """Return a bash snippet that exits unless ``$GMX_BIN`` is new enough.
+
+    The check runs on the compute node against the exact binary the job will
+    use, right after binary detection and before grompp or any mdrun.
+
+    Parameters
+    ----------
+    min_gmx_version : str
+        Minimum GROMACS version, e.g. ``"2026"`` or ``"2026.1"``.
+
+    Returns
+    -------
+    str
+        Bash block with a leading blank line and trailing newline.
+
+    Raises
+    ------
+    ValueError
+        If *min_gmx_version* is not of the form ``<major>[.<minor>]``.
+
+    """
+    major, _, minor = min_gmx_version.partition(".")
+    if not major.isdigit() or (minor and not minor.isdigit()):
+        raise ValueError(f"Invalid minimum GROMACS version: {min_gmx_version!r}")
+    threshold = int(major) * 1000 + int(minor or 0)
+    return f"""
+# Require GROMACS >= {min_gmx_version} for the force field in the topology
+GMX_VERSION=$("$GMX_BIN" --version 2>/dev/null \\
+    | awk '/^GROMACS version:/ && !n {{sub(/^GROMACS version:[ \\t]*/, ""); print; n=1}}' \\
+    || true)
+if [[ "$GMX_VERSION" =~ ^([0-9]+)(\\.([0-9]+))? ]]; then
+    GMX_VERSION_NUM=$(( 10#${{BASH_REMATCH[1]}} * 1000 + 10#${{BASH_REMATCH[3]:-0}} ))
+else
+    GMX_VERSION_NUM=-1
+fi
+if (( GMX_VERSION_NUM < {threshold} )); then
+    echo "ERROR: the topology's force field requires GROMACS >= {min_gmx_version}," >&2
+    echo "but $GMX_BIN ($(command -v "$GMX_BIN")) is GROMACS ${{GMX_VERSION:-unknown}}." >&2
+    echo "Put a newer gmx on PATH, e.g. via the pixi 'gmx' environment." >&2
+    exit 1
+fi
+"""
+
+
 def _require_bash_app():
     """Import and return Parsl's ``bash_app`` decorator.
 
@@ -490,6 +535,7 @@ def _build_grompp_script(
     ref_file: str = "",
     cpt_file: str = "",
     maxwarn: int = 1,
+    min_gmx_version: str = "",
 ) -> str:
     """Build the bash script for ``gmx grompp``.
 
@@ -514,6 +560,11 @@ def _build_grompp_script(
         Checkpoint file for velocities (-t flag).
     maxwarn : int
         Maximum number of warnings to allow.
+    min_gmx_version : str, optional
+        Minimum GROMACS version the topology's force field needs, e.g.
+        ``"2026"``. When given, the script exits with an error before grompp
+        if the detected binary is older. Empty (default) means no check, and
+        the script is unchanged.
 
     Returns
     -------
@@ -523,13 +574,14 @@ def _build_grompp_script(
     """
     ref_flag = f"-r {ref_file}" if ref_file else ""
     cpt_flag = f"-t {cpt_file}" if cpt_file else ""
+    version_check = _build_gmx_version_check(min_gmx_version) if min_gmx_version else ""
 
     return f"""
         set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
         cd {work_dir}
 
-        {_get_gromacs_detect_script()}
+        {_get_gromacs_detect_script()}{version_check}
 
         echo "GROMACS grompp: {mdp_file} -> {tpr_file} (using $GMX_BIN)" >&2
 
@@ -671,6 +723,7 @@ def get_grompp_app():
         ref_file: str = "",
         cpt_file: str = "",
         maxwarn: int = 1,
+        min_gmx_version: str = "",
         stdout=None,
         stderr=None,
         inputs=None,
@@ -695,6 +748,8 @@ def get_grompp_app():
             Checkpoint file for velocities (-t flag).
         maxwarn : int
             Maximum number of warnings to allow.
+        min_gmx_version : str, optional
+            Minimum GROMACS version required by the topology; empty for none.
         stdout : str, optional
             File path for stdout.
         stderr : str, optional
@@ -709,7 +764,15 @@ def get_grompp_app():
 
         """
         return _build_grompp_script(
-            mdp_file, gro_file, top_file, tpr_file, work_dir, ref_file, cpt_file, maxwarn
+            mdp_file,
+            gro_file,
+            top_file,
+            tpr_file,
+            work_dir,
+            ref_file,
+            cpt_file,
+            maxwarn,
+            min_gmx_version,
         )
 
     return run_grompp
