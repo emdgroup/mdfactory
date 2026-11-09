@@ -265,7 +265,10 @@ def load_build_input_csv(
 
     """
     csv_path = Path(csv_path)
-    df = pd.read_csv(csv_path)
+    # Only an empty cell is blank. pandas' default NA strings ("None", "NA",
+    # "null", ...) would otherwise silently drop legitimate values such as the
+    # GROMACS override ``comm-mode = None``.
+    df = pd.read_csv(csv_path, keep_default_na=False, na_values=[""])
     df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
     if PROTEIN_PDB_PATH_COLUMN in df.columns:
         df[PROTEIN_PDB_PATH_COLUMN] = df[PROTEIN_PDB_PATH_COLUMN].apply(

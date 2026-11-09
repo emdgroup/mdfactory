@@ -149,6 +149,8 @@ to override individual components. See [Parametrization](/docs/user-guide/parame
 
 Dotted `simulation_settings.*` columns set the [simulation settings](/docs/user-guide/simulation-settings)
 per row. A blank cell falls back to the protocol file (`--simulation-settings`) or the default.
+Only an empty cell counts as blank; text such as `None` or `NA` is kept as a value (for example
+`comm-mode = None`).
 Whole-number values in `gromacs_overrides` columns are written as integers, even when the column
 has blank cells (which pandas reads as floats). Only `temperature` and `pressure` change a row's hash; rows that differ only in other settings
 are rejected as duplicates.

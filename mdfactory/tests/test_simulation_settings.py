@@ -295,6 +295,25 @@ def test_csv_integer_override_with_blank_cells_stays_integer(tmp_path):
     assert format_mdp_value(render_run_schedule(models[0])["npt"]["nstcalcenergy"]) == "100"
 
 
+def test_csv_none_override_is_a_value_not_a_blank(tmp_path):
+    # pandas reads "None" as NaN by default; only an empty cell may fall back.
+    column = "simulation_settings.gromacs_overrides.nvt.comm-mode"
+    csv = tmp_path / "rows.csv"
+    csv.write_text(
+        f"{CSV_HEADER},simulation_settings.temperature,{column}\n"
+        "mixedbox,charmm,O,100,300,None\nmixedbox,charmm,O,100,310,\n"
+    )
+    _, models, errors = load_build_input_csv(csv)
+    assert errors == {}
+    from_yaml = _water(gromacs_overrides={"nvt": {"comm-mode": "None"}})
+    assert models[0].simulation_settings == from_yaml.simulation_settings
+    assert models[1].simulation_settings.gromacs_overrides.nvt == {}
+
+    from mdfactory.run_schedules.gromacs import render_run_schedule
+
+    assert render_run_schedule(models[0])["nvt"]["comm-mode"] == "None"
+
+
 # --- duplicates ------------------------------------------------------------------------
 
 
