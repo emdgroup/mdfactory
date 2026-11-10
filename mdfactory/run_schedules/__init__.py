@@ -51,14 +51,14 @@ class RunScheduleManager:
         engine: str,
         system_type: str,
         version: Optional[str] = None,
-        parametrization: Optional[str] = None,
+        nonbonded_scheme: Optional[str] = None,
     ) -> Dict:
         """Get the configuration for a specific engine/system_type combination.
 
-        Entries may carry an optional ``parametrization`` key. An entry whose key
-        matches *parametrization* wins; otherwise the entries without the key
-        are used, so callers that pass no parametrization (or one without a
-        dedicated schedule) get the generic schedule.
+        Entries may carry an optional ``nonbonded_scheme`` key. An entry whose key
+        matches *nonbonded_scheme* wins; otherwise the entries without the key
+        are used, so callers that pass no scheme (or one without a dedicated
+        schedule) get the generic schedule.
         """
         type_configs = [
             config
@@ -68,13 +68,13 @@ class RunScheduleManager:
         matching_configs = [
             config
             for config in type_configs
-            if parametrization is not None and config.get("parametrization") == parametrization
-        ] or [config for config in type_configs if "parametrization" not in config]
+            if nonbonded_scheme is not None and config.get("nonbonded_scheme") == nonbonded_scheme
+        ] or [config for config in type_configs if "nonbonded_scheme" not in config]
 
         if not matching_configs:
             raise ValueError(
                 f"No configuration found for engine='{engine}', system_type='{system_type}'"
-                + (f", parametrization='{parametrization}'" if parametrization else "")
+                + (f", nonbonded_scheme='{nonbonded_scheme}'" if nonbonded_scheme else "")
             )
 
         if version is None:
@@ -93,10 +93,10 @@ class RunScheduleManager:
         engine: str,
         system_type: str,
         version: Optional[str] = None,
-        parametrization: Optional[str] = None,
+        nonbonded_scheme: Optional[str] = None,
     ) -> Dict:
         """Get the computational settings for a specific configuration."""
-        config = self._get_config(engine, system_type, version, parametrization)
+        config = self._get_config(engine, system_type, version, nonbonded_scheme)
         return config.get("settings", {})
 
     def get_all_run_file_paths(
@@ -104,10 +104,10 @@ class RunScheduleManager:
         engine: str,
         system_type: str,
         version: Optional[str] = None,
-        parametrization: Optional[str] = None,
+        nonbonded_scheme: Optional[str] = None,
     ) -> Dict[str, Path]:
         """Get paths to all run files for a specific configuration."""
-        config = self._get_config(engine, system_type, version, parametrization)
+        config = self._get_config(engine, system_type, version, nonbonded_scheme)
         run_files = config.get("run_files", [])
         # ``template_dir`` lets a system type reuse another type's run files.
         template_dir = self.config_dir / engine / config.get("template_dir", system_type)
@@ -128,13 +128,13 @@ class RunScheduleManager:
         system_type: str,
         target_folder: Union[str, Path],
         version: Optional[str] = None,
-        parametrization: Optional[str] = None,
+        nonbonded_scheme: Optional[str] = None,
     ) -> Tuple[bool, Dict[str, bool], List[str]]:
         """Check if run files already exist in the target folder."""
         target_folder = Path(target_folder)
 
         # Get the expected run files for this configuration
-        config = self._get_config(engine, system_type, version, parametrization)
+        config = self._get_config(engine, system_type, version, nonbonded_scheme)
         expected_files = config.get("run_files", [])
 
         file_status = {}
@@ -158,7 +158,7 @@ class RunScheduleManager:
         target_folder: Union[str, Path],
         version: Optional[str] = None,
         force_copy: bool = False,
-        parametrization: Optional[str] = None,
+        nonbonded_scheme: Optional[str] = None,
     ) -> Dict[str, bool]:
         """Copy run files to the target folder after checking for conflicts.
 
@@ -174,9 +174,10 @@ class RunScheduleManager:
             Configuration version string. Uses the latest when *None*.
         force_copy : bool, optional
             Overwrite existing files if True. Default is False.
-        parametrization : str, optional
-            Parametrization of the build. Selects an entry with a matching
-            ``parametrization`` key when one exists; otherwise the generic entry.
+        nonbonded_scheme : str, optional
+            Nonbonded scheme of the build's force-field family (e.g. ``charmm`` or
+            ``sage``). Selects an entry with a matching ``nonbonded_scheme`` key
+            when one exists; otherwise the generic entry.
 
         Returns
         -------
@@ -187,7 +188,7 @@ class RunScheduleManager:
         """
         # First check if files already exist
         has_existing, file_status, existing_files = self.check_target_folder(
-            engine, system_type, target_folder, version, parametrization
+            engine, system_type, target_folder, version, nonbonded_scheme
         )
 
         if has_existing and not force_copy:
@@ -210,7 +211,7 @@ class RunScheduleManager:
             target_folder,
             version,
             overwrite=force_copy,
-            parametrization=parametrization,
+            nonbonded_scheme=nonbonded_scheme,
         )
 
     def copy_run_files(
@@ -220,7 +221,7 @@ class RunScheduleManager:
         target_folder: Union[str, Path],
         version: Optional[str] = None,
         overwrite: bool = False,
-        parametrization: Optional[str] = None,
+        nonbonded_scheme: Optional[str] = None,
     ) -> Dict[str, bool]:
         """Copy run files to a target folder.
 
@@ -236,8 +237,8 @@ class RunScheduleManager:
             Configuration version string. Uses the latest when *None*.
         overwrite : bool, optional
             Overwrite existing files if True. Default is False.
-        parametrization : str, optional
-            Parametrization of the build; see :meth:`copy_run_files_with_check`.
+        nonbonded_scheme : str, optional
+            Nonbonded scheme of the build; see :meth:`copy_run_files_with_check`.
 
         Returns
         -------
@@ -248,7 +249,7 @@ class RunScheduleManager:
         target_folder = Path(target_folder)
         target_folder.mkdir(parents=True, exist_ok=True)
 
-        file_paths = self.get_all_run_file_paths(engine, system_type, version, parametrization)
+        file_paths = self.get_all_run_file_paths(engine, system_type, version, nonbonded_scheme)
         copy_results = {}
 
         for filename, source_path in file_paths.items():
@@ -286,8 +287,8 @@ class RunScheduleManager:
                 "system_type": config.get("system_type"),
                 "version": str(config.get("version")),
             }
-            if "parametrization" in config:
-                entry["parametrization"] = str(config["parametrization"])
+            if "nonbonded_scheme" in config:
+                entry["nonbonded_scheme"] = str(config["nonbonded_scheme"])
             configs.append(entry)
         return configs
 

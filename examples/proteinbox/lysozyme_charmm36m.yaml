@@ -1,17 +1,16 @@
 simulation_type: proteinbox
 engine: gromacs
-parametrization: pdb2gmx
-parametrization_config:
-  type: pdb2gmx
-  forcefield: charmm36m
+parametrization:
+  family: charmm
+  protein: charmm36m
   water_model: tip3p
-  ignore_hydrogens: true
 
 system:
   protein:
     resname: LYZ
     count: 1
     pdb_path: ./1aki.pdb
+    ignore_hydrogens: true
     chains: [A]
     disulfide_bonds:
       - [CYS6, CYS127]

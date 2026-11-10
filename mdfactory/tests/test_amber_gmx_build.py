@@ -6,6 +6,7 @@ Skipped unless a GROMACS >= 2026 binary is available (configured or on PATH).
 The module name contains ``build``, so ``pytest -k "not build"`` (CI) skips it.
 """
 
+import json
 import shutil
 from pathlib import Path
 
@@ -13,9 +14,10 @@ import MDAnalysis as mda
 import numpy as np
 import pytest
 
-from mdfactory.build import _protein_solution_parametrizer, _stage_protein_topology
-from mdfactory.models.parametrization import AmberConfig
+from mdfactory.build import _stage_protein_topology
+from mdfactory.models.parametrization import AmberParametrization
 from mdfactory.models.species import SolutionSpecies
+from mdfactory.parametrize import NativeForceField, resolve_parametrizer
 from mdfactory.run_schedules import RunScheduleManager
 from mdfactory.settings import settings
 from mdfactory.setup import protein
@@ -91,11 +93,14 @@ def test_amber_sage_composite_topology_passes_grompp_build(tmp_path, monkeypatch
     monkeypatch.setattr(settings, "parameter_store", tmp_path / "parameters")
     pdb = tmp_path / "peptide.pdb"
     pdb.write_text(PEPTIDE_PDB)
-    config = AmberConfig()
+    spec = AmberParametrization().resolve("protein_mixedbox")
 
     params = protein.run_pdb2gmx(
         pdb_path=pdb,
-        config=config,
+        forcefield=spec.protein,
+        water_model=spec.water_model,
+        ignore_hydrogens=True,
+        merge_all=False,
         disulfide_bonds=[],
         protonation_states={},
         output_dir=tmp_path / "pdb2gmx",
@@ -104,7 +109,8 @@ def test_amber_sage_composite_topology_passes_grompp_build(tmp_path, monkeypatch
     assert ff_name == "amber14sb.ff"
     ff_dir = params.topology_file.parent / ff_name
 
-    _, parametrize = _protein_solution_parametrizer(config, ff_dir)
+    native = NativeForceField(name=spec.protein, directory=ff_dir, water_model=spec.water_model)
+    parametrize = resolve_parametrizer(spec, "gromacs", native)
     species = [
         SolutionSpecies(smiles="CCO", resname="ETH", count=1),
         SolutionSpecies(smiles="O", resname="SOL", count=1),
@@ -137,7 +143,7 @@ def test_amber_sage_composite_topology_passes_grompp_build(tmp_path, monkeypatch
     assert app.PDBFile(str(pdb_out)).topology.getNumAtoms() == u.atoms.n_atoms
 
     mdp = RunScheduleManager().get_all_run_file_paths(
-        "gromacs", "protein_mixedbox", parametrization="amber"
+        "gromacs", "protein_mixedbox", nonbonded_scheme=spec.nonbonded_scheme
     )["em.mdp"]
     shutil.copy(mdp, build_dir / "em.mdp")
 
@@ -146,7 +152,10 @@ def test_amber_sage_composite_topology_passes_grompp_build(tmp_path, monkeypatch
         assert f'#include "amber14sb.ff/{include}"' in text
     assert f'#include "{parameters[0].itp.name}"' in text
     extra = (build_dir / "extra_params.itp").read_text()
-    assert "[ defaults ]" not in extra and "ETH_0" in extra
+    assert "[ defaults ]" not in extra
+    # OpenFF atom types carry the parameter set's prefix, not the residue name.
+    provenance = json.loads((parameters[0].itp.parent / "provenance.json").read_text())
+    assert "ETH_" not in extra and f"{provenance['atomtype_prefix']}_0 " in extra
 
     # The peptide carries a net charge (+1); accept only grompp's net-charge warning.
     protein.validate_with_grompp(

@@ -190,6 +190,7 @@ def test_generate_input_model_from_dict():
     inp = BuildInput(
         engine="gromacs",
         simulation_type="mixedbox",
+        parametrization="charmm",
         system=comp,
     )
     print(inp)
@@ -226,6 +227,7 @@ def test_generate_input_model_from_dict():
         inp = BuildInput(
             engine="gromacs",
             simulation_type="bilayer",
+            parametrization="charmm",
             system=comp,
         )
 
@@ -241,6 +243,7 @@ def test_ionization_can_be_explicitly_disabled(disabled):
 def test_disabled_ionization_build_input_round_trip():
     input_data = {
         "simulation_type": "mixedbox",
+        "parametrization": "openff",
         "system": {
             "species": [{"smiles": "O", "count": 10, "resname": "SOL"}],
             "ionization": False,
@@ -267,7 +270,6 @@ def test_ionization_defaults_when_omitted():
 
 def test_parameter_set_dump(tmp_path):
     from mdfactory.models.parametrization import (  # noqa: PLC0415
-        CgenffConfig,
         GromacsSingleMoleculeParameterSet,
     )
 
@@ -281,8 +283,9 @@ def test_parameter_set_dump(tmp_path):
         prm = GromacsSingleMoleculeParameterSet(
             moleculetype="1234ABCD",
             smiles="CC",
-            parametrization="cgenff",
-            parametrization_config=CgenffConfig(),
+            component="small_molecule",
+            forcefield="cgenff",
+            topology_merge="cgenff",
             itp=itp,
             parameter_itp=prm,
             forcefield_itp=ff,
@@ -298,7 +301,6 @@ def test_parameter_set_dump(tmp_path):
 
 def test_gmx_parameter_model(tmp_path):
     from mdfactory.models.parametrization import (  # noqa: PLC0415
-        CgenffConfig,
         GromacsSingleMoleculeParameterSet,
     )
 
@@ -309,8 +311,9 @@ def test_gmx_parameter_model(tmp_path):
             prm = GromacsSingleMoleculeParameterSet(
                 moleculetype="1234ABCD",
                 smiles="CC",
-                parametrization="cgenff",
-                parametrization_config=CgenffConfig(),
+                component="small_molecule",
+                forcefield="cgenff",
+                topology_merge="cgenff",
                 itp=itp,
             )
             del prm

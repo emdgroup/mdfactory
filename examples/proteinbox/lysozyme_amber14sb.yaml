@@ -2,18 +2,17 @@
 # Joung-Cheatham ions. No CGenFF/SILCSBIO installation is needed.
 simulation_type: proteinbox
 engine: gromacs
-parametrization: amber
-parametrization_config:
-  type: amber
-  forcefield: amber14sb
+parametrization:
+  family: amber
+  protein: amber14sb
   water_model: tip3p
-  ignore_hydrogens: true
 
 system:
   protein:
     resname: LYZ
     count: 1
     pdb_path: ./1aki.pdb
+    ignore_hydrogens: true
     chains: [A]
     disulfide_bonds:
       - [CYS6, CYS127]

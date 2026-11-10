@@ -17,7 +17,7 @@ Each engine requires three things:
 
 ### 1. Implement parametrization
 
-Create a function that takes a `SingleMoleculeSpecies` and returns a parameter set. The function should handle water and ions as special cases.
+Create a function that takes a `SingleMoleculeSpecies`, the resolved family spec and an optional native force field, and returns a parameter set. The function should handle water and ions as special cases. See [Adding Parametrization Methods](/docs/developer-guide/adding-parametrization) for the full parametrizer contract.
 
 ```python
 # In mdfactory/parametrize.py (or a new module)
@@ -25,19 +25,22 @@ Create a function that takes a `SingleMoleculeSpecies` and returns a parameter s
 from mdfactory.models.species import SingleMoleculeSpecies
 from mdfactory.models.parametrization import GromacsSingleMoleculeParameterSet
 
-def parametrize_smirnoff_myengine(
+def parametrize_openff_myengine(
     species: SingleMoleculeSpecies,
-    smirnoff_config=None,
+    spec,
+    native_forcefield=None,
 ) -> MyEngineParameterSet:
-    """Generate parameters for a molecule using SMIRNOFF for MyEngine."""
+    """Generate parameters for a molecule using OpenFF for MyEngine."""
 
     if species.is_water:
-        return _parametrize_water(species, smirnoff_config)
+        return _parametrize_water(species, spec.water_model)
     if species.is_ion:
-        return _parametrize_ion(species, smirnoff_config)
+        return _parametrize_ion(species, spec)
 
-    # Generate parameters for regular molecules
-    # Cache results in parameter_store/{engine}/{method}/{ff_hash}/{mol_hash}/
+    # Generate parameters for regular molecules using spec.small_molecules
+    # (forcefield, charge_method). Cache results in
+    # parameter_store/{engine}/{method}/{key}/{mol_hash}/ and lock the directory
+    # that is written.
     ...
 ```
 
@@ -74,8 +77,11 @@ from pydantic import BaseModel
 class MyEngineParameterSet(BaseModel):
     moleculetype: str
     smiles: str
-    parametrization: str
-    parametrization_config: ParametrizationConfig
+    component: Literal["small_molecule", "water", "ion"]
+    forcefield: str
+    charge_method: Optional[str] = None
+    water_model: Optional[str] = None
+    topology_merge: Literal["cgenff", "smirnoff", "native"]
     # Add engine-specific fields (e.g., paths to parameter files)
 ```
 
@@ -87,10 +93,10 @@ Add entries to the dispatch dicts in `mdfactory/parametrize.py`:
 DISPATCH_ENGINE_PARAMETRIZE = {
     "gromacs": {
         "cgenff": parametrize_cgenff_gromacs,
-        "smirnoff": parametrize_smirnoff_gromacs,
+        "openff": parametrize_openff_gromacs,
     },
     "myengine": {  # Add new engine
-        "smirnoff": parametrize_smirnoff_myengine,
+        "openff": parametrize_openff_myengine,
     },
 }
 
@@ -105,6 +111,10 @@ parameter_set_types = {
 }
 ```
 
+The inner keys are the small-molecule force-field kinds (`spec.small_molecules.kind`). Builders
+obtain the function with `resolve_parametrizer(spec, engine, native_forcefield)` from
+`mdfactory/parametrize.py`.
+
 ### 5. Update the BuildInput model
 
 Add the new engine to the `engine` Literal type in `mdfactory/models/input.py`:
@@ -117,7 +127,7 @@ class BuildInput(BaseModel):
 
 ### 6. Update build functions
 
-If the new engine requires different build logic, update the build functions in `mdfactory/build.py` to handle the new engine. The `_get_parametrize_function` helper may need updating to pass engine-specific config.
+If the new engine requires different build logic, update the build functions in `mdfactory/build.py` to handle the new engine. Builders look up the parametrizer through `resolve_parametrizer`, which dispatches on the engine and the spec's small-molecule force-field kind.
 
 ## Testing
 

@@ -83,14 +83,16 @@ def build_systems(
             desc = {
                 "hash": model.hash,
                 "simulation_type": model.simulation_type,
-                "parametrization": model.parametrization,
+                "parametrization": model.parametrization.family,
+                "parametrization_components": model.parametrization.components(),
                 "engine": model.engine,
                 "output_directory": str(output_dir / model.hash),
             }
             descriptions.append(desc)
             logger.info(
                 f"[dry-run] {model.hash} | {model.simulation_type} | "
-                f"{model.parametrization} | {model.engine} -> {output_dir / model.hash}"
+                f"{model.parametrization.summary()} | {model.engine} -> "
+                f"{output_dir / model.hash}"
             )
         logger.info(f"[dry-run] {len(descriptions)} system(s) would be built")
         logger.info(f"[dry-run] Provider: {config.provider}")

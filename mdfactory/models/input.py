@@ -6,7 +6,7 @@ import hashlib
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .composition import (
     BilayerComposition,
@@ -15,14 +15,7 @@ from .composition import (
     ProteinBoxComposition,
     ProteinMixedBoxComposition,
 )
-from .parametrization import (
-    AmberConfig,
-    CgenffConfig,
-    CharmmConfig,
-    ParametrizationConfig,
-    Pdb2gmxConfig,
-    SmirnoffConfig,
-)
+from .parametrization import ParametrizationSpec
 
 # Map system_type to the corresponding model class
 # TODO: StrEnum?
@@ -34,21 +27,12 @@ type_mapping = {
     "protein_mixedbox": ProteinMixedBoxComposition,
 }
 
-# Parametrizations each simulation type accepts. Proteins are parametrized with
-# gmx pdb2gmx; small-molecule systems use CGenFF or SMIRNOFF. A protein packed
-# with small molecules uses the combined CHARMM/CGenFF parametrization. Both
-# protein types also accept the open-source Amber ff14SB + OpenFF Sage route.
-allowed_parametrizations = {
-    "mixedbox": {"cgenff", "smirnoff"},
-    "bilayer": {"cgenff", "smirnoff"},
-    "lnp": {"cgenff", "smirnoff"},
-    "proteinbox": {"pdb2gmx", "amber"},
-    "protein_mixedbox": {"charmm", "amber"},
-}
-
 
 class BuildInput(BaseModel):
     """Represent a complete simulation build specification with composition and parametrization."""
+
+    # Unknown keys are rejected so a misspelled or removed key is never dropped silently.
+    model_config = ConfigDict(extra="forbid")
 
     simulation_type: Literal["mixedbox", "bilayer", "lnp", "proteinbox", "protein_mixedbox"]
     system: (
@@ -58,11 +42,13 @@ class BuildInput(BaseModel):
         | ProteinBoxComposition
         | ProteinMixedBoxComposition
     )
-    parametrization: Literal["cgenff", "smirnoff", "pdb2gmx", "charmm", "amber"] = Field(
-        "cgenff", description="Parametrization to use."
-    )
-    parametrization_config: ParametrizationConfig | None = Field(
-        None, description="Parametrization-specific configuration. If None, uses defaults."
+    parametrization: ParametrizationSpec = Field(
+        ...,
+        description=(
+            "Force-field family (charmm, amber or openff) with optional per-component "
+            "overrides (protein, small_molecules, water_model). A bare family name "
+            "takes every component's family default."
+        ),
     )
     engine: Literal["gromacs"] = Field("gromacs", description="MD engine.")
 
@@ -141,7 +127,8 @@ class BuildInput(BaseModel):
             "hash": self.hash,
             "simulation_type": self.simulation_type,
             "engine": self.engine,
-            "parametrization": self.parametrization,
+            "parametrization": self.parametrization.family,
+            "parametrization_components": self.parametrization.components(),
             "total_count": self.system.total_count,
             "species_composition": species_composition,
             "system_specific": system_specific,
@@ -154,7 +141,7 @@ class BuildInput(BaseModel):
         row = {
             "hash": self.hash,
             "engine": self.engine,
-            "parametrization": self.parametrization,
+            "parametrization": self.parametrization.family,
             "simulation_type": self.simulation_type,
             "input_data": self.model_dump_json(),
             "input_data_type": "BuildInput",
@@ -217,34 +204,10 @@ class BuildInput(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def set_default_parametrization_config(self) -> "BuildInput":
-        """Set default config based on parametrization type if not provided."""
-        if self.parametrization_config is None:
-            config_class = {
-                "smirnoff": SmirnoffConfig,
-                "cgenff": CgenffConfig,
-                "pdb2gmx": Pdb2gmxConfig,
-                "charmm": CharmmConfig,
-                "amber": AmberConfig,
-            }[self.parametrization]
-            object.__setattr__(self, "parametrization_config", config_class())
-        return self
-
-    @model_validator(mode="after")
-    def validate_parametrization_consistency(self) -> "BuildInput":
-        """Ensure simulation type, parametrization, and config discriminator agree."""
-        allowed = allowed_parametrizations[self.simulation_type]
-        if self.parametrization not in allowed:
-            raise ValueError(
-                f"Parametrization '{self.parametrization}' is not valid for "
-                f"simulation type '{self.simulation_type}'. Allowed: {sorted(allowed)}."
-            )
-        config_type = self.parametrization_config.type
-        if config_type != self.parametrization:
-            raise ValueError(
-                f"Parametrization config type '{config_type}' does not match "
-                f"parametrization '{self.parametrization}'."
-            )
+    def resolve_parametrization(self) -> "BuildInput":
+        """Fill family defaults for the simulation type and reject invalid components."""
+        resolved = self.parametrization.resolve(self.simulation_type)
+        object.__setattr__(self, "parametrization", resolved)
         return self
 
     @model_validator(mode="after")
@@ -259,20 +222,21 @@ class BuildInput(BaseModel):
         """
         if self.simulation_type not in ("proteinbox", "protein_mixedbox"):
             return self
+        protein = self.system.protein
         if (
             self.simulation_type == "protein_mixedbox"
-            and len(self.system.protein.chains) > 1
-            and not getattr(self.parametrization_config, "merge_all", False)
+            and len(protein.chains) > 1
+            and not protein.merge_all
         ):
             raise ValueError(
                 "A multi-chain protein_mixedbox must be one pdb2gmx moleculetype so "
                 "the barostat moves the complete protein as a rigid unit. Set "
-                "parametrization_config.merge_all=true and omit protein.chains."
+                "system.protein.merge_all=true and omit protein.chains."
             )
-        if getattr(self.parametrization_config, "merge_all", False) and self.system.protein.chains:
+        if protein.merge_all and protein.chains:
             raise ValueError(
                 "protein.chains declares subunits to build as separate moleculetypes, but "
-                "parametrization_config.merge_all merges all chains into one. Set "
+                "system.protein.merge_all merges all chains into one. Set "
                 "merge_all=false to keep per-chain subunits, or drop protein.chains to merge."
             )
         return self

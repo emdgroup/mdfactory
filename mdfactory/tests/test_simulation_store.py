@@ -11,6 +11,7 @@ import pytest
 from mdfactory.analysis.artifacts import ARTIFACT_REGISTRY
 from mdfactory.analysis.store import SimulationStore
 from mdfactory.models.input import BuildInput
+from mdfactory.models.parametrization import CharmmParametrization
 
 
 @pytest.fixture
@@ -20,7 +21,7 @@ def mock_build_input():
     mock.hash = "ABC123"
     mock.simulation_type = "bilayer"
     mock.engine = "gromacs"
-    mock.parametrization = "cgenff"
+    mock.parametrization = CharmmParametrization().resolve("bilayer")
     mock.system = Mock()
     mock.system.total_count = 600
     return mock

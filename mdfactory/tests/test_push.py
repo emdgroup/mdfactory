@@ -233,7 +233,7 @@ def test_load_models_csv_with_errors(tmp_path):
             {
                 "simulation_type": "mixedbox",
                 "engine": "gromacs",
-                "parametrization": "cgenff",
+                "parametrization": "charmm",
                 "system.total_count": 1000,
                 "system.species.ABC.smiles": "CCC",
                 "system.species.ABC.fraction": 0.5,
@@ -243,7 +243,7 @@ def test_load_models_csv_with_errors(tmp_path):
             {
                 "simulation_type": "mixedbox",
                 "engine": "gromacs",
-                "parametrization": "cgenff",
+                "parametrization": "charmm",
                 "system.total_count": 1000,
                 "system.species.ABC.smiles": "INVALID_SMILES_XYZ",
                 "system.species.ABC.fraction": 0.5,
