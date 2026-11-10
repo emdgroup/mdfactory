@@ -69,6 +69,37 @@ mdfactory check-csv input.csv
 For bilayer rows, this runs the current buildability checks in addition to model validation.
 
 </Accordion>
+<Accordion title="Force field 'amber14sb' requires GROMACS >= 2026">
+
+`parametrization: amber` uses the `amber14sb.ff` that ships with GROMACS 2026 and later. The check
+runs when the protein is prepared at build time, and again on the compute node before the first
+`grompp` of `mdfactory simulate`.
+
+- Locally: run mdfactory inside the pixi `gmx` (CPU) or `gmx-cuda` (GPU) environment, for example
+  `pixi run -e gmx mdfactory build ...`, or set `[gromacs] GMX_PATH` in the config to a
+  GROMACS 2026 binary.
+- On SLURM: cluster modules (`gromacs/2024.x`) do not satisfy the check. Activate the pixi
+  environment on the workers with `environment.extra_init`; see
+  [examples/pipeline/slurm_gpu.yaml](https://github.com/emdgroup/mdfactory/blob/main/examples/pipeline/slurm_gpu.yaml).
+- Also run the controller (`mdfactory ... --slurm`) from the same environment, otherwise Parsl
+  versions of controller and workers can differ.
+
+</Accordion>
+<Accordion title="Protein builds fail in pdb2gmx or on box size">
+
+- **Multi-chain structures.** `proteinbox` needs `chains` to list every chain; `protein_mixedbox`
+  needs `merge_all: true` and no `chains`.
+- **Box too small.** For `protein_mixedbox`, `sizing.box_size` (or the box implied by
+  `count_density`) must be at least the protein extent plus 2 × `padding`. The error states the
+  minimum edge.
+- **Residue naming.** `disulfide_bonds` and `protonation_states` use the residue names and numbers of
+  the input PDB (for example `CYS6`, `HIS15`); an entry that matches no residue is an error.
+- **Missing residues** in the structure are handled by PDBFixer: missing internal segments are
+  modeled and terminal tails dropped, with a warning for every segment.
+- **Net charge.** The build ends with a `grompp` check. With `neutralize: false`, only the
+  net-charge warning is tolerated.
+
+</Accordion>
 <Accordion title="Large systems fail during compression">
 
 The build code uses OpenMM-based compression or equilibration steps. For difficult systems, start with smaller molecule counts or a less aggressive target density and verify the input chemistry first.
@@ -128,8 +159,31 @@ mdfactory simulate output_dir/ --clean --dry-run
 
 The `--clean` flag removes simulation outputs (`.tpr`, `.cpt`, `.log`, `.edr`, `.gro`,
 `.xtc`, `.trr`, rescue MDPs, GROMACS backup files) while preserving build inputs
-(`system.pdb`, `topology.top`, template `.mdp` files, `.itp`, `.yaml`). It respects
+(`system.pdb`, `topology.top`, the generated `.mdp` files, `.itp`, `.yaml`). It respects
 the `--stages` filter — only files belonging to requested stages are deleted.
+
+</Accordion>
+<Accordion title="grompp: cut-off longer than half the box">
+
+`charmm` builds use a 1.2 nm cutoff (Force-switch from 1.0 nm), so every box edge must be at
+least about 2.6 nm. grompp reports *"The cut-off length is longer than half the shortest box
+vector or longer than the smallest box diagonal element"* for smaller boxes. Increase the
+molecule count (mixedbox), the lipid count or `z_padding` (bilayer), or the padding (LNP,
+protein types). `sage` builds (`openff`, `amber`) use 0.9 nm.
+
+</Accordion>
+<Accordion title="Settings changes: duplicate inputs or refused re-renders">
+
+- *"Duplicate build inputs ... differ only in simulation settings outside the identity"*: only
+  temperature and pressure define a different system. Two rows that differ only in, for example,
+  the production length have the same hash and would build into the same directory. Keep one,
+  or change the settings of the built system with `mdfactory apply-settings`.
+- *"... is set by mdfactory ... and cannot be overridden"*: a `gromacs_overrides` key is owned by
+  a typed setting (use the setting, e.g. `temperature` instead of `ref-t`) or by the build
+  (nonbonded block, `tc-grps`, `pcoupltype`, `compressibility`).
+- `apply-settings` refuses a directory whose changed stage already has outputs. Delete that
+  stage's outputs (`.tpr`, `.cpt`, `.log`, `.edr`, `.gro`, `.xtc`) to rerun it with the new
+  settings. See [Simulation Settings](/docs/user-guide/simulation-settings).
 
 </Accordion>
 <Accordion title="Simulation fails with LINCS or constraint errors">

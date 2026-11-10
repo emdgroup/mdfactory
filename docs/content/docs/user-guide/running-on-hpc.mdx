@@ -10,7 +10,7 @@ MDFactory works well on SLURM-based HPC clusters for large-scale simulation camp
 - SSH access to your HPC cluster
 - SLURM workload manager
 - Python 3.11+
-- GROMACS available (via modules or otherwise)
+- GROMACS available (via modules or otherwise). The `amber` protein route needs **GROMACS 2026 or later**, see [below](#gromacs-2026-and-pixi-environments)
 
 ## Installation on HPC
 
@@ -106,6 +106,28 @@ environment:
 
 
 
+### GROMACS 2026 and pixi environments
+
+`parametrization: amber` (proteinbox, protein_mixedbox) uses the `amber14sb.ff` bundled with
+GROMACS 2026+. mdfactory checks `gmx --version` at build time and again on the worker before the
+first `grompp`, so a `gromacs/2024.x` module fails fast. The pixi workspace provides compatible
+environments: `gmx` (CPU) and `gmx-cuda` (CUDA 12, linux-64).
+
+The wizard's `pixi_manifest` option activates pixi's `default` environment. To use `gmx` or
+`gmx-cuda` on the workers, activate it in `extra_init`:
+
+```yaml
+environment:
+  extra_init: >-
+    export CONDA_OVERRIDE_CUDA=12.9;
+    eval "$(pixi shell-hook --as-is --manifest-path /path/to/mdfactory/pyproject.toml -e gmx-cuda)"
+```
+
+Run the controller (`mdfactory build/simulate --slurm ...`) from the same environment
+(`pixi run -e gmx-cuda mdfactory ...`) so that the Parsl versions of controller and workers
+agree. The complete, annotated setup is `examples/pipeline/slurm_gpu.yaml`; see also the
+[protein tutorial](/docs/user-guide/tutorial-protein-mixedbox).
+
 ### Per-stage resource overrides
 
 Override `cpus_per_node`, `gres`, or `gmx_binary` for individual simulation stages:
@@ -137,11 +159,12 @@ stage_overrides:
 | `max_blocks` | Max concurrent SLURM allocations | `1` |
 | `available_accelerators` | GPU count or device IDs for `CUDA_VISIBLE_DEVICES` | `0` |
 | `retries` | Infrastructure retry count (OOM, timeout, preemption) | `3` |
+| `max_rescue` | Rescue tiers for physics failures (same as `--max-rescue`) | `3` |
 | `gmx_binary` | `"auto"`, `"gmx"`, or `"gmx_mpi"` | `"auto"` |
 | `environment.modules` | Module loads for workers (e.g. `["gromacs/2024"]`) | `[]` |
 | `environment.pixi_manifest` | Path to pixi project root | auto-detected |
 | `environment.conda_env` | Conda env name to activate | — |
-| `environment.extra_init` | Custom shell commands | `""` |
+| `environment.extra_init` | Custom shell commands, e.g. activating a pixi environment | `""` |
 
 ## Running simulations on SLURM
 
@@ -163,6 +186,26 @@ MDFactory has two independent retry mechanisms on SLURM:
 
 When sizing walltime, account for potential rescue tiers — each tier roughly doubles the wall-clock cost of a rescue-eligible stage.
 </Callout>
+
+### Simulation settings and SLURM
+
+The mdp files that `simulate` runs are rendered during `build`, from the `BuildInput` and its
+[simulation settings](/docs/user-guide/simulation-settings). Pass them to the build step, not to
+`simulate`:
+
+```bash
+mdfactory build systems.csv --output results \
+    --simulation-settings protocol.yaml --slurm slurm_executor.yaml
+mdfactory simulate results/ --slurm slurm_executor.yaml
+```
+
+Size `walltime` for the longest stage of the protocol (`production.length`). To change the protocol
+of existing builds without rebuilding (for example a longer production run), use
+`mdfactory apply-settings protocol.yaml results/`.
+
+`mdfactory build ... --slurm tui` and `mdfactory simulate ... --slurm tui` start the wizard inline
+instead of reading a YAML file. A complete pipeline (CSV, shared protocol, GPU executor config,
+batch wrapper) is in `examples/pipeline/`.
 
 ### SLURM job wrapper
 

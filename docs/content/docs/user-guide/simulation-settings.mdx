@@ -1,0 +1,189 @@
+---
+title: Simulation Settings
+description: Configure temperature, pressure, stage lengths and GROMACS overrides of the generated run schedules
+---
+
+A build has two parts:
+
+- the **`BuildInput`** (`simulation_type`, `system`, `parametrization`) says *what* is simulated;
+- the **`SimulationSettings`** (`simulation_settings:`) say *how* it is run, in physical units.
+
+`mdfactory build` renders the four GROMACS run files (`em.mdp`, `nvt.mdp`, `npt.mdp`, `md.mdp`)
+from both. No mdp templates ship with the package. Every field is optional, and a build without
+`simulation_settings` runs the default protocol below.
+
+## Settings and defaults
+
+| Field | Unit | Default | Part of the hash |
+|---|---|---|---|
+| `temperature` | K | 300 | **yes** |
+| `pressure` | bar | 1.0 | **yes** |
+| `timestep` | fs | 2 (maximum 2: H-bond constraints, no hydrogen mass repartitioning) | no |
+| `minimization.max_steps` | – | 50 000 | no |
+| `minimization.force_tolerance` | kJ mol⁻¹ nm⁻¹ | 1000 | no |
+| `nvt.length` / `nvt.output_interval` | ps | 100 / 1 | no |
+| `npt.length` / `npt.output_interval` | ps | 100 / 1 | no |
+| `production.length` | ns | 100; **1000 for `bilayer`** | no |
+| `production.output_interval` | ps | 10 (compressed coordinates, energies, log) | no |
+| `gromacs_overrides.{minimization,nvt,npt,production}` | raw mdp keys | none | no |
+
+Validation:
+
+- all values are positive;
+- lengths and output intervals are integer multiples of the timestep;
+- the production length is a multiple of its output interval, so the expected frame count is exact;
+- an output interval does not exceed its stage length.
+
+```yaml
+simulation_type: bilayer
+parametrization: charmm
+system: { ... }
+simulation_settings:
+  temperature: 310.0                                   # K, part of the hash
+  production: {length: 500.0, output_interval: 20.0}   # ns / ps, not part of the hash
+  gromacs_overrides:
+    npt: {pcoupl: C-rescale}
+```
+
+## Identity: which settings change the hash
+
+The build hash names the build directory and the run-database row. It covers the `BuildInput`
+and, from the settings, **only the state point** (temperature and pressure):
+
+- A different temperature or pressure is a different data point: a new hash, a new directory.
+- A longer production run, another timestep, other output intervals, minimization limits and
+  overrides keep the hash.
+- Omitted settings and spelled-out defaults give the same hash.
+
+Inputs of one build call that have the same hash are rejected before anything is built,
+including inputs that differ only in settings outside the identity.
+
+A temperature series is therefore one row per temperature:
+
+```csv title="temperature_series.csv"
+simulation_type,parametrization,system.species.SOL.smiles,system.species.SOL.count,simulation_settings.temperature
+mixedbox,charmm,O,1000,290
+mixedbox,charmm,O,1000,310
+```
+
+## Supplying settings
+
+There are three ways, and they combine with this precedence: **the input's own settings, then
+the protocol file, then the per-type defaults**.
+
+1. **Inline** in the build YAML, as the `simulation_settings:` section shown above.
+2. **Dotted CSV columns**, for example `simulation_settings.temperature`,
+   `simulation_settings.production.length` or
+   `simulation_settings.gromacs_overrides.npt.pcoupl`. A blank cell falls back to the protocol
+   file or the default, so rows can differ in which settings they set.
+3. **A protocol file** applied to every system of a build call. It holds the content of a
+   `simulation_settings:` section:
+
+   ```yaml title="protocol.yaml"
+   temperature: 310.0
+   production: {length: 250.0}
+   ```
+
+   ```bash
+   mdfactory build systems.csv runs/ --simulation-settings protocol.yaml
+   mdfactory prepare-build systems.csv runs/ --simulation-settings protocol.yaml
+   ```
+
+   `--simulation-settings` is not accepted with a summary YAML: its systems were prepared with
+   their settings (use `apply-settings` below to change them).
+
+In Python, the same applies to `build_systems(inputs, config, simulation_settings=...)`, which
+accepts a `SimulationSettings` object, a mapping or a YAML path for dict inputs. A
+`SimulationSettings` object contributes only the fields that were set explicitly.
+
+The resolved settings are recorded in each build directory's `<hash>.yaml` and in the header of
+every mdp file.
+
+<Callout type="warn" title="Protocol files and CSV-based lookups">
+`mdfactory sync push systems --csv` and `mdfactory check-csv` compute hashes from the CSV alone.
+If a protocol file changed the temperature or pressure of a build, push the build directories
+instead (`mdfactory sync push systems --source <output_dir>`), which reads the recorded
+`<hash>.yaml`.
+</Callout>
+
+## GROMACS overrides
+
+`gromacs_overrides` sets raw mdp keys per stage (`minimization`, `nvt`, `npt`, `production`).
+They are applied last and replace a generated key of the same name. GROMACS ignores case, `-`
+and `_` in key names, and so does mdfactory.
+
+Keys that a typed setting or the build owns are rejected:
+
+- from typed settings: `nsteps`, `dt`, `emtol`, `ref-t`, `gen-temp`, `ref-p`, `nstxout`,
+  `nstvout`, `nstfout`, `nstenergy`, `nstlog`, `nstxout-compressed` (and its old name
+  `nstxtcout`);
+- from the build: the nonbonded block (`coulombtype`, `rcoulomb`, `vdwtype`, `rvdw`,
+  `vdw-modifier`, `rvdw-switch`, `DispCorr`), `tc-grps`, `pcoupltype` and `compressibility`.
+
+Everything else can be overridden, for example `pcoupl: C-rescale`, `tau-p`, `nstcalcenergy` or
+`define`. grompp validates the result when the stage runs (and, for protein systems, `em.mdp`
+already at build time).
+
+## The generated protocol
+
+**Nonbonded block.** It follows the force-field family (see
+[Parametrization](/docs/user-guide/parametrization)) and is identical in all four stages:
+
+| Scheme | Families | Electrostatics | van der Waals | `DispCorr` |
+|---|---|---|---|---|
+| `charmm` | `charmm` | PME, `rcoulomb = 1.2` | `cutoff`, `rvdw = 1.2`, `Force-switch` from 1.0 nm | `EnerPres` for `mixedbox` and `lnp`; `no` for `bilayer` and the protein types |
+| `sage` | `openff`, `amber` | PME, `rcoulomb = 0.9` | `cutoff`, `rvdw = 0.9`, `Potential-switch` from 0.8 nm | `EnerPres` |
+
+**Coupling by simulation type** (`lnp` runs the `mixedbox` protocol):
+
+| | `mixedbox`, `lnp` | `bilayer` | `proteinbox`, `protein_mixedbox` |
+|---|---|---|---|
+| Thermostat groups (`tc-grps`) | `System` | `System` | `Protein Non-Protein` |
+| NPT barostat | Berendsen, isotropic, `tau-p = 2.0` | Berendsen, semi-isotropic, `tau-p = 5.0` | Berendsen, isotropic, `tau-p = 2.0` |
+| Production barostat | Berendsen, isotropic, `tau-p = 2.0` | Berendsen, semi-isotropic, `tau-p = 5.0` | Parrinello-Rahman, isotropic, `tau-p = 5.0` |
+
+**Fixed choices:** steepest-descent minimization (`emstep = 0.01`); position restraints
+(`define = -DPOSRES`) in NVT and NPT; V-rescale thermostat (`tau-t = 0.1`); compressibility
+`4.5e-5` bar⁻¹; H-bond constraints with LINCS; Verlet neighbour search; PME order 4 with
+`fourierspacing = 0.16`; NVT generates velocities, NPT and production continue; production writes
+compressed coordinates only (no `.trr`) with `refcoord-scaling = com`.
+
+<Callout type="info" title="Sage for lipids">
+OpenFF does not validate Sage for lipid bilayers. `openff` bilayer and LNP builds use the Sage
+nonbonded settings, which are part of the force field, but the lipid parameters themselves are
+not validated.
+</Callout>
+
+## Changing the settings of existing builds
+
+`apply-settings` re-renders the mdp files of build directories without rebuilding:
+
+```bash
+mdfactory apply-settings longer.yaml runs/ --dry-run
+mdfactory apply-settings longer.yaml runs/
+```
+
+```yaml title="longer.yaml"
+production: {length: 500.0}
+```
+
+For each directory, the new settings are merged over the recorded ones and validated against
+the build. Then:
+
+- a change of temperature or pressure is **refused**: it would change the identity; build a new
+  system instead;
+- a directory where a changed stage already has outputs (for example `prod.tpr` or `prod.xtc`)
+  is **refused**; delete that stage's outputs first if you want to rerun it with the new
+  settings;
+- otherwise the mdp files of all stages without outputs and `<hash>.yaml` are rewritten. The hash
+  stays the same.
+
+`apply-settings` does not extend finished runs; it only prepares stages that have not run yet.
+The Python API is `mdfactory.run_schedules.apply_simulation_settings(build_dirs, settings,
+dry_run=False)`.
+
+<Callout type="info" title="Records after a re-render">
+The directory's `<hash>.yaml` and the mdp headers record the current protocol. A row pushed to
+the run database before the re-render keeps the settings it was pushed with; push it again
+with `mdfactory sync push systems --source <dir> --force` to update it.
+</Callout>

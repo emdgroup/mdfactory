@@ -33,8 +33,8 @@ graph LR
 4. **Parameter sets** (`GromacsSingleMoleculeParameterSet`): record the paths plus `component`,
    `forcefield`, `charge_method`, `water_model` and the `topology_merge` kind.
 
-The spec also exposes `nonbonded_scheme` (selects the run schedule) and `components()` /
-`summary()` (metadata, dry-run output).
+The spec also exposes `nonbonded_scheme` (selects the nonbonded block of the generated run
+schedule) and `components()` / `summary()` (metadata, dry-run output).
 
 ## The parametrizer contract
 
@@ -181,9 +181,11 @@ class GaffParametrization(_FamilySpec):
 ```
 
 Then add it to `FAMILY_SPECS` and to the `ParametrizationSpec` union with a `Tag("gaff")`.
-If the family needs its own mdp settings, add a new `NonbondedScheme` value and entries with a
-matching `nonbonded_scheme:` key in `mdfactory/run_schedules/run_schedules.yaml`; entries without
-the key remain the fallback.
+If the family needs its own nonbonded settings, add a new `NonbondedScheme` value and its overlay
+in `mdfactory/run_schedules/gromacs.py`: an entry in `NONBONDED` (electrostatics and van der
+Waals keys) and one in `DISPCORR` (the dispersion correction per simulation type). Extend the
+nonbonded table in `mdfactory/tests/test_run_schedules.py` and the table in the Simulation
+Settings user guide.
 
 ## Tests
 
@@ -216,7 +218,8 @@ mdfactory/
 ├── models/
 │   └── parametrization.py  # component model, family spec, FAMILY_SPECS, ParametrizationSpec
 ├── parametrize.py          # parametrizer + DISPATCH_ENGINE_PARAMETRIZE entry
-├── run_schedules/          # optional nonbonded_scheme entries
+├── run_schedules/
+│   └── gromacs.py          # NONBONDED / DISPCORR overlay for a new nonbonded scheme
 └── tests/
     ├── test_parametrization.py
     └── test_parametrization_schema.py
@@ -230,7 +233,7 @@ mdfactory/
 - [ ] Cache key covers every parameter-changing input; the written directory is locked
 - [ ] Private atom types are unique per parameter set
 - [ ] Registered in `DISPATCH_ENGINE_PARAMETRIZE`
-- [ ] Run schedule entries for a new nonbonded scheme, if needed
+- [ ] Nonbonded overlay for a new nonbonded scheme, if needed
 - [ ] Tests and documentation updated
 
 ## Next steps

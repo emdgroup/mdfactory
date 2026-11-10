@@ -1,0 +1,19 @@
+# The OpenFF family with every per-component choice spelled out. These are the
+# defaults for `parametrization: openff`; change them to select another Sage
+# release, charge model or water model.
+simulation_type: mixedbox
+engine: gromacs
+parametrization:
+  family: openff
+  small_molecules:
+    forcefield: openff-2.2.0.offxml
+    charge_method: openff-gnn-am1bcc-0.1.0-rc.3.pt   # alias: nagl
+  water_model: opc3
+system:
+  species:
+  - smiles: O
+    resname: SOL
+    count: 2000
+  - smiles: CCO
+    resname: ETH
+    count: 200

@@ -1,0 +1,15 @@
+# POPC bilayer above the lipid phase transition, with a short 200 ns production
+# run instead of the 1 us bilayer default. Temperature is part of the build
+# identity; the production length and the overrides are not.
+simulation_type: bilayer
+parametrization: openff
+system:
+  species:
+  - smiles: 'CCCCCCCC/C=C\CCCCCCCC(=O)OC[C@H](CO[P@](=O)([O-])OCC[N+](C)(C)C)OC(=O)CCCCCCC/C=C\CCCCCCCC'
+    resname: POC
+    count: 128
+simulation_settings:
+  temperature: 310.0
+  production:
+    length: 200.0          # ns
+    output_interval: 50.0  # ps

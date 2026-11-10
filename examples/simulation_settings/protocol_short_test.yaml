@@ -1,0 +1,14 @@
+# Short protocol for smoke-testing a pipeline end to end (minutes, not days).
+# Temperature and pressure are left at the defaults so the build hashes are the
+# same as for the full-length protocol: only the run length differs.
+minimization:
+  max_steps: 5000
+nvt:
+  length: 10.0
+  output_interval: 1.0
+npt:
+  length: 10.0
+  output_interval: 1.0
+production:
+  length: 0.1            # ns
+  output_interval: 10.0  # ps

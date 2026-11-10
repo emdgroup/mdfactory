@@ -165,7 +165,7 @@ def flatten_species_composition(
 
 
 def flatten_system_parameters(build_input: BuildInput) -> dict[str, Any]:
-    """Flatten system-specific parameters (z_padding, target_density, etc.).
+    """Flatten system-specific parameters (z_padding, target_density, etc.) and the state point.
 
     Useful for analyses focusing on system configuration rather than composition.
 
@@ -184,6 +184,8 @@ def flatten_system_parameters(build_input: BuildInput) -> dict[str, Any]:
         "simulation_type": build_input.simulation_type,
         "engine": build_input.engine,
         "parametrization": build_input.parametrization.family,
+        "temperature": build_input.simulation_settings.temperature,
+        "pressure": build_input.simulation_settings.pressure,
     }
 
     # Add system-specific parameters from metadata

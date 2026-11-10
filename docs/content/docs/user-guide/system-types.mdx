@@ -1,9 +1,9 @@
 ---
 title: System Types
-description: Understanding mixed box, bilayer, and LNP simulations
+description: Understanding mixed box, bilayer, LNP, protein box, and protein mixed box simulations
 ---
 
-MDFactory supports three system-building strategies. Each uses different Pydantic composition models and build functions.
+MDFactory supports five system-building strategies. Each uses different Pydantic composition models and build functions: three for small-molecule and lipid systems (`mixedbox`, `bilayer`, `lnp`) and two for a protein in solution (`proteinbox`, `protein_mixedbox`).
 
 ## Mixed Box
 
@@ -88,7 +88,7 @@ parametrization: charmm
 system:
   species:
     - smiles: "CCCCCCCCCCCCCCCC(=O)OC[C@H](COP(=O)([O-])OCC[N+](C)(C)C)OC(=O)CCCCCCC/C=C\\CCCCCCCC"
-      resname: POPC
+      resname: POC
       count: 128
       head_atoms: [32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
       tail_atoms: []
@@ -114,7 +114,7 @@ system:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `smiles` | string | — | Canonical SMILES |
-| `resname` | string | — | Residue name (max 4 chars) |
+| `resname` | string | — | Residue name (max 3 chars) |
 | `count` or `fraction` | int or float | — | Number or molar fraction |
 | `head_atoms` | list of int | [] | 0-based atom indices for headgroup (auto-detected if empty) |
 | `tail_atoms` | list of int | [] | 0-based atom indices for tail (auto-detected if empty) |
@@ -220,6 +220,136 @@ system:
 - Molecule counts are calculated automatically from the geometry and density
 - Include both neutral and protonated forms of ionizable lipids as separate species
 
+## Protein Box
+
+Places one protein in a cubic box of water with ions. The protein is cleaned with PDBFixer and
+parametrized with `pdb2gmx`; the solvated system is relaxed with the protein restrained and
+validated with `grompp` before the build finishes.
+
+```mermaid
+graph LR
+    A[Clean PDB + pdb2gmx] --> B[Center in cubic box]
+    B --> C[Solvate]
+    C --> D[Ionize]
+    D --> E[Restrained relaxation]
+    E --> F[Topology + grompp check]
+```
+
+### Use cases
+
+- Plain protein MD in water
+- Starting structures for free-energy or mutational studies
+- Protein-only baselines for `protein_mixedbox` studies
+
+### Configuration
+
+```yaml
+engine: gromacs
+simulation_type: proteinbox
+parametrization:
+  family: amber          # or charmm (CHARMM36m)
+  protein: amber14sb
+  water_model: tip3p
+
+system:
+  protein:
+    resname: LYZ
+    pdb_path: ./1aki.pdb
+    chains: [A]
+  padding: 12.0
+  ionization:
+    neutralize: true
+    concentration: 0.15
+```
+
+### ProteinBoxComposition fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `protein` | `ProteinSpecies` | — | Protein structure and `pdb2gmx` options, see [YAML Format](/docs/user-guide/yaml-format#protein-species) |
+| `padding` | float | 10.0 | Minimum protein-to-box-edge distance in Å |
+| `relax_steps` | int | 10000 | OpenMM steps of the protein-restrained relaxation |
+| `ionization` | IonizationConfig | defaults | Neutralization and salt; cannot be disabled with `null`/`false` |
+
+### Tips
+
+- `parametrization.family` is `amber` (ff14SB + TIP3P, needs GROMACS 2026+, no CGenFF license) or `charmm` (CHARMM36m). `openff` is not available for protein types
+- A multi-chain structure needs the `chains` list
+- List disulfide bonds and non-default protonation states explicitly when the structure needs them
+
+## Protein Mixed Box
+
+Packs water, ions and SMILES co-solutes around one protein in a cubic box of fixed edge or fixed
+density. Build steps: protein preparation, dilute packing with Packmol, OpenMM compression with
+the protein's internal geometry restrained, re-imaging, ionization, restrained relaxation,
+`grompp` validation.
+
+```mermaid
+graph LR
+    A[Clean PDB + pdb2gmx] --> B[Pack species around protein]
+    B --> C[Compress with OpenMM]
+    C --> D[Ionize]
+    D --> E[Restrained relaxation]
+    E --> F[Topology + grompp check]
+```
+
+### Use cases
+
+- Protein in co-solvent (ethanol, urea, ...) at a defined concentration
+- Crowding and ionic-strength series
+- Small molecules in solution next to a protein
+
+### Configuration
+
+```yaml
+engine: gromacs
+simulation_type: protein_mixedbox
+parametrization:
+  family: amber
+  protein: amber14sb
+  water_model: tip3p
+
+system:
+  protein:
+    resname: LYZ
+    pdb_path: ./1aki.pdb
+    chains: [A]
+  species:
+    - smiles: O
+      resname: SOL
+      concentration: 53.0
+    - smiles: CCO
+      resname: ETH
+      concentration: 1.0
+  sizing:
+    type: fixed_box
+    box_size: 72.0
+  padding: 12.0
+```
+
+### ProteinMixedBoxComposition fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `protein` | `ProteinSpecies` | — | Protein structure and `pdb2gmx` options |
+| `species` | list of `SolutionSpecies` | — | Solution molecules, including water (`smiles: O`, `resname: SOL`); each with `count` **or** `concentration` (mol/L) |
+| `sizing` | `fixed_box` \| `count_density` | — | `fixed_box`: `box_size` in Å. `count_density`: `target_density` in g/cm³ (every species needs a `count`) |
+| `padding` | float | 10.0 | Minimum protein-to-box-edge distance in Å; the box must be at least protein extent + 2 × padding |
+| `concentration_volume_basis` | `protein_excluded` \| `box` | `protein_excluded` | Volume that molar concentrations refer to |
+| `partial_specific_volume` | float | 0.73 | Protein partial specific volume in mL/g (for `protein_excluded`) |
+| `relax_steps` | int | 10000 | OpenMM steps of the protein-restrained relaxation |
+| `ionization` | IonizationConfig | defaults | Neutralization and salt, added on top of packed ions |
+
+### Tips
+
+- Water, `[Na+]` (`NA`) and `[Cl-]` (`CL`) use the protein force field's parameters and fixed residue names
+- All other species use the family's small-molecule force field: CGenFF for `charmm`, OpenFF Sage for `amber`
+- `build_metadata.json` in the build directory records requested versus achieved counts and concentrations
+- Multi-chain proteins use `merge_all: true` instead of `chains`
+- The compression stage is an OpenMM simulation that is much faster on a GPU
+
+See the [protein tutorial](/docs/user-guide/tutorial-protein-mixedbox) for an end-to-end example.
+
 ## IonizationConfig (shared)
 
 All system types support ionization configuration:
@@ -231,8 +361,10 @@ All system types support ionization configuration:
 | `min_distance` | float | 5.0 | Minimum distance between ions in Å |
 | `seed` | int \| null | null | Random seed for ion placement |
 
-To disable ionization explicitly, set `ionization` to `null` or `false`. Both forms
-skip ion placement and are normalized to the same disabled state. Omitting the field
+To disable ionization explicitly in `mixedbox`, `bilayer` and `lnp`, set `ionization` to `null`
+or `false`. Both forms skip ion placement and are normalized to the same disabled state. The
+protein types always take an `IonizationConfig`; use `concentration: 0` and `neutralize: false`
+there. Omitting the field
 keeps the default `IonizationConfig`; a configuration with zero concentration and
 `neutralize: false` also performs no ion placement.
 
@@ -241,7 +373,7 @@ keeps the default `IonizationConfig`; a configuration with zero concentration an
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `smiles` | string | — | Canonical isomeric SMILES |
-| `resname` | string | — | Residue name (max 4 chars) |
+| `resname` | string | — | Residue name (max 3 chars) |
 | `count` | int \| null | null | Absolute molecule count |
 | `fraction` | float \| null | null | Molar fraction (0 to 1) |
 
@@ -254,14 +386,17 @@ Either `count` or `fraction` must be provided (not both).
 | `mixedbox` | Solution chemistry, bulk properties | Low |
 | `bilayer` | Membrane systems, lipid studies | Medium |
 | `lnp` | Drug delivery, mRNA vaccines | High |
+| `proteinbox` | Protein in water | Medium |
+| `protein_mixedbox` | Protein in co-solvent, crowding, ionic-strength series | High |
 
 <Callout type="info">
-  All system types use the same parametrization and topology generation workflows. Switch between them by changing the `simulation_type` field.
+  All system types share the build, simulate and analysis workflows; switch between them with the `simulation_type` field. The force-field family has to fit the type: `openff` for `mixedbox`, `bilayer` and `lnp`, `amber` for `proteinbox` and `protein_mixedbox`, `charmm` for all. See [Parametrization](/docs/user-guide/parametrization).
 </Callout>
 
 ## Next steps
 
 <Cards>
+  <Card title="Protein Tutorial" href="/docs/user-guide/tutorial-protein-mixedbox" />
   <Card title="Workflows" href="/docs/user-guide/workflows" />
   <Card title="Configuration" href="/docs/user-guide/configuration" />
 </Cards>

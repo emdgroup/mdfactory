@@ -12,8 +12,12 @@ MDFactory uses a `cyclopts` CLI. Run `mdfactory --help` or `mdfactory <command> 
 Create one hash directory per CSV row plus a summary YAML in the output directory.
 
 ```bash
-mdfactory prepare-build <input.csv> [output_dir]
+mdfactory prepare-build <input.csv> [output_dir] [--simulation-settings protocol.yaml]
 ```
+
+Each directory's `<hash>.yaml` records the input with its resolved simulation settings.
+`--simulation-settings` applies a settings file to every row; the rows'
+`simulation_settings.*` columns take precedence. Rows with the same hash are rejected.
 
 ### `mdfactory build`
 
@@ -31,7 +35,25 @@ Options:
 
 - `--output` — output directory (default: `.`)
 - `--slurm` — SLURM executor config: path to YAML file, or `'tui'` for interactive setup
-- `--dry-run` — print what would be built without executing
+- `--dry-run` — print what would be built without executing (the line shows the state point)
+- `--simulation-settings` — [simulation settings](/docs/user-guide/simulation-settings) YAML applied to every system; an input's own `simulation_settings` take precedence. Not accepted for summary YAMLs
+
+The build writes `<hash>.yaml` and generates `em.mdp`, `nvt.mdp`, `npt.mdp` and `md.mdp` from the
+input and its settings. Inputs with the same hash are rejected before anything is built.
+
+### `mdfactory apply-settings`
+
+Re-render the mdp files of existing builds with new simulation settings, without rebuilding.
+
+```bash
+mdfactory apply-settings <settings.yaml> <source> [--dry-run]
+```
+
+`source` is a build directory, a directory of build directories, or a summary YAML. The settings
+are merged over each directory's recorded settings. Temperature and pressure changes are
+refused, and so is a directory where a changed stage already has outputs. Exits with status 1
+if any directory was refused. See
+[Changing the settings of existing builds](/docs/user-guide/simulation-settings#changing-the-settings-of-existing-builds).
 
 ### `mdfactory check-csv`
 
@@ -98,12 +120,24 @@ mdfactory simulate output_dir/ --clean --dry-run
 
 Interactive wizard to configure a SLURM executor and save to YAML. Queries the local SLURM scheduler for available accounts, partitions, and hardware, then walks through resource selection interactively.
 
+For GROMACS 2026 from a pixi environment (`gmx`, `gmx-cuda`), edit `environment.extra_init` in the saved YAML; see [Running on HPC](/docs/user-guide/running-on-hpc#gromacs-2026-and-pixi-environments).
+
 The result is saved to a YAML file that can be reused with `mdfactory build --slurm <file>` or `mdfactory simulate --slurm <file>`.
 
 On non-SLURM machines, falls back to manual text entry.
 
 ```bash
 mdfactory config slurm
+```
+
+### `mdfactory config environment`
+
+Interactive wizard for the worker execution environment (pixi, conda or virtualenv activation,
+GROMACS modules, extra init commands). The result is saved to the global config directory and
+used by every SLURM executor YAML that has no `environment:` section.
+
+```bash
+mdfactory config environment
 ```
 
 ### `mdfactory config cluster`

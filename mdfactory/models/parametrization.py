@@ -25,6 +25,9 @@ from pydantic import (
 )
 
 SimulationType = Literal["mixedbox", "bilayer", "lnp", "proteinbox", "protein_mixedbox"]
+#: Nonbonded block of the generated run schedule (see ``mdfactory.run_schedules.gromacs``):
+#: ``charmm`` = PME, force switch 1.0 -> 1.2 nm; ``sage`` = PME, 0.9 nm cutoff with a
+#: potential switch from 0.8 nm. Adding a scheme means adding its nonbonded overlay.
 NonbondedScheme = Literal["charmm", "sage"]
 
 PROTEIN_SIMULATION_TYPES = frozenset({"proteinbox", "protein_mixedbox"})
@@ -137,7 +140,11 @@ class _FamilySpec(BaseModel):
 
     @property
     def nonbonded_scheme(self) -> NonbondedScheme:
-        """Return the nonbonded scheme the family's run schedules must use."""
+        """Return the nonbonded scheme of the family's generated run schedule.
+
+        It selects the nonbonded block (cutoffs, switching, dispersion
+        correction) of every stage, for every simulation type.
+        """
         raise NotImplementedError
 
     @property

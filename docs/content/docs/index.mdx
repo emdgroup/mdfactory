@@ -7,20 +7,20 @@ MDFactory is an open source, end-to-end simulation manager for high-throughput m
 
 <img
   src={`${process.env.NEXT_PUBLIC_BASE_PATH || ''}/diagrams/light/architecture/pipeline-overview.png`}
-  alt="MDFactory pipeline: CSV/YAML input → Structure Generation (RDKit) → Parametrization (OpenFF, CGenFF) → System Build (Mixedbox, Bilayer, LNP) → Simulation (GROMACS, OpenMM) → Analysis, with Database sync to Simulation DB and Analysis DB"
+  alt="MDFactory pipeline: CSV/YAML input → Structure Generation (RDKit) → Parametrization (OpenFF, CHARMM/CGenFF, Amber) → System Build (Mixedbox, Bilayer, LNP, Protein) → Simulation (GROMACS, OpenMM) → Analysis, with Database sync to Simulation DB and Analysis DB"
   className="block dark:hidden"
   style={{ width: '100%', maxWidth: '900px', margin: '1.5rem auto' }}
 />
 <img
   src={`${process.env.NEXT_PUBLIC_BASE_PATH || ''}/diagrams/dark/architecture/pipeline-overview.png`}
-  alt="MDFactory pipeline: CSV/YAML input → Structure Generation (RDKit) → Parametrization (OpenFF, CGenFF) → System Build (Mixedbox, Bilayer, LNP) → Simulation (GROMACS, OpenMM) → Analysis, with Database sync to Simulation DB and Analysis DB"
+  alt="MDFactory pipeline: CSV/YAML input → Structure Generation (RDKit) → Parametrization (OpenFF, CHARMM/CGenFF, Amber) → System Build (Mixedbox, Bilayer, LNP, Protein) → Simulation (GROMACS, OpenMM) → Analysis, with Database sync to Simulation DB and Analysis DB"
   className="hidden dark:block"
   style={{ width: '100%', maxWidth: '900px', margin: '1.5rem auto' }}
 />
 
 <FeatureCards>
   <FeatureCard icon="layers" title="Batch Processing" description="CSV-driven: one row = one system. Run hundreds of systems in parallel via Parsl on HPC." />
-  <FeatureCard icon="puzzle" title="Modular Pipeline" description="Pluggable build types (mixedbox, bilayer, LNP) with swappable force fields (OpenFF, CGenFF)." />
+  <FeatureCard icon="puzzle" title="Modular Pipeline" description="Pluggable build types (mixedbox, bilayer, LNP, protein box, protein mixed box) with swappable force-field families (OpenFF, CHARMM/CGenFF, Amber)." />
   <FeatureCard icon="bar-chart" title="Analysis Framework" description="11+ registered analysis types with parquet + JSON metadata output and extensible registry." />
   <FeatureCard icon="database" title="Data Integration" description="SQLite, CSV, and Palantir Foundry backends with intelligent push/pull/sync via CLI." />
 </FeatureCards>
@@ -38,6 +38,7 @@ MDFactory is an open source, end-to-end simulation manager for high-throughput m
 <Cards>
   <Card title="Executing Analyses" href="/docs/user-guide/executing-analyses" description="Run registered analyses and artifacts" />
   <Card title="20-System Tutorial" href="/docs/user-guide/tutorial-mixedbox-campaign" description="Hands-on campaign with SQLite sync and notebook aggregation" />
+  <Card title="Protein Tutorial" href="/docs/user-guide/tutorial-protein-mixedbox" description="proteinbox and protein_mixedbox from PDB to a SLURM campaign with simulation settings" />
   <Card title="Foundry Dev Tools" href="/docs/user-guide/foundry-dev-tools" description="Configure and use the Foundry backend" />
   <Card title="Architecture" href="/docs/developer-guide/architecture" description="Understand the current code structure" />
 </Cards>

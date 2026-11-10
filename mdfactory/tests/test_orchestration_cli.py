@@ -2,6 +2,7 @@
 # ABOUTME: Tests CSV/YAML/summary-YAML dispatch, dry-run, and error handling
 """Integration tests for CLI build command with orchestration."""
 
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -118,17 +119,18 @@ class TestBuildCommandYAML:
     """Tests for single-YAML input dispatch path."""
 
     def test_yaml_sequential_builds_into_hash_dir(self, sample_yaml, tmp_path, monkeypatch):
-        """Single YAML without --config builds into output/{hash}/."""
+        """Single YAML without --config builds the validated model into output/{hash}/."""
         from mdfactory.cli import _build_from_yaml
 
-        with patch("mdfactory.cli.run_build_from_file") as mock_build:
+        cwds = []
+        with patch(
+            "mdfactory.cli.run_build_from_dict", side_effect=lambda m: cwds.append(Path.cwd())
+        ) as mock_build:
             _build_from_yaml(sample_yaml, tmp_path)
 
         mock_build.assert_called_once()
-        # Verify the working directory was a hash-based subdirectory
-        call_args = mock_build.call_args
-        # run_build_from_file is called with the input path
-        assert call_args[0][0] == sample_yaml
+        model = mock_build.call_args[0][0]
+        assert cwds == [tmp_path / model.hash]
 
     def test_yaml_dry_run(self, sample_yaml, tmp_path, monkeypatch):
         """Single YAML with --dry-run calls build_systems with dry_run=True."""
@@ -295,7 +297,7 @@ class TestBuildCommandRouting:
         """build_system() with .yaml file routes to YAML handler."""
         from mdfactory.cli import build_system
 
-        with patch("mdfactory.cli.run_build_from_file") as mock_build:
+        with patch("mdfactory.cli.run_build_from_dict") as mock_build:
             build_system(sample_yaml, output=tmp_path)
 
         mock_build.assert_called_once()

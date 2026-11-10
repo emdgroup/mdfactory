@@ -1,0 +1,45 @@
+# Ionic strength set by packed ion species instead of the ionization salt step.
+# Ions use the fixed native residue names NA / CL (Joung-Cheatham, from the
+# force-field directory). `ionization.concentration: 0` adds no extra salt;
+# `neutralize: true` still balances the protein charge on top of the packed ions.
+# Species counts are explicit, so sizing can be `count_density` (target density
+# decides the box edge).
+simulation_type: protein_mixedbox
+engine: gromacs
+parametrization:
+  family: amber
+  protein: amber14sb
+  water_model: tip3p
+
+system:
+  protein:
+    resname: LYZ
+    count: 1
+    pdb_path: ../proteinbox/1aki.pdb
+    ignore_hydrogens: true
+    chains: [A]
+    disulfide_bonds:
+      - [CYS6, CYS127]
+      - [CYS30, CYS115]
+      - [CYS64, CYS80]
+      - [CYS76, CYS94]
+    protonation_states:
+      HIS15: HIE
+  species:
+    - smiles: O
+      resname: SOL
+      count: 13000
+    - smiles: "[Na+]"
+      resname: NA
+      count: 25
+    - smiles: "[Cl-]"
+      resname: CL
+      count: 25
+  sizing:
+    type: count_density
+    target_density: 1.0
+  padding: 12.0
+  relax_steps: 10000
+  ionization:
+    neutralize: true
+    concentration: 0
