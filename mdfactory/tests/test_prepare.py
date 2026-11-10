@@ -120,3 +120,76 @@ def test_df_to_models():
     assert 1 in errors
     assert 3 in errors
     # df.to_csv("test_errors.csv")
+
+
+def _proteinbox_row(pdb, **overrides):
+    row = {
+        "simulation_type": "proteinbox",
+        "engine": "gromacs",
+        "parametrization": "pdb2gmx",
+        "parametrization_config.type": "pdb2gmx",
+        "parametrization_config.forcefield": "charmm36m",
+        "parametrization_config.water_model": "tip3p",
+        "system.protein.resname": "LYZ",
+        "system.protein.pdb_path": str(pdb),
+        "system.padding": 12.0,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_proteinbox_row_parses_delimited_and_dotted_fields(protein_pdb):
+    row = _proteinbox_row(
+        protein_pdb,
+        **{
+            "system.protein.chains": "H;L;Y",
+            "system.protein.disulfide_bonds": "CYS6-CYS127;CYS30-CYS115",
+            "system.protein.protonation_states.HIS15": "HIE",
+        },
+    )
+    inp = BuildInput(**dict_to_nested_dict_with_species_prefix(row))
+    assert inp.system.protein.chains == ["H", "L", "Y"]
+    assert inp.system.protein.disulfide_bonds == [("CYS6", "CYS127"), ("CYS30", "CYS115")]
+    assert inp.system.protein.protonation_states == {"HIS15": "HIE"}
+
+
+def test_proteinbox_invalid_disulfide_cell_raises(protein_pdb):
+    row = _proteinbox_row(protein_pdb, **{"system.protein.disulfide_bonds": "CYS6_CYS127"})
+    with pytest.raises(ValueError, match="Invalid disulfide bond"):
+        dict_to_nested_dict_with_species_prefix(row)
+
+
+def test_df_to_models_allows_blank_optional_protein_fields(protein_pdb):
+    # Two proteins in one CSV: one single-chain with disulfides+protonation, one
+    # multi-chain with neither. The blank optional cells become NaN but must not
+    # fail the NaN guard.
+    with_extras = _proteinbox_row(
+        protein_pdb,
+        **{
+            "system.protein.chains": "A",
+            "system.protein.disulfide_bonds": "CYS6-CYS127",
+            "system.protein.protonation_states.HIS15": "HIE",
+        },
+    )
+    multichain = _proteinbox_row(
+        protein_pdb,
+        **{"system.protein.resname": "INS", "system.protein.chains": "A;B"},
+    )
+    df = pd.DataFrame(data=[with_extras, multichain])
+    models, errors = df_to_build_input_models(df)
+    assert errors == {}
+    assert len(models) == 2
+    assert models[0].system.protein.chains == ["A"]
+    assert models[0].system.protein.disulfide_bonds == [("CYS6", "CYS127")]
+    assert models[1].system.protein.chains == ["A", "B"]
+    assert models[1].system.protein.disulfide_bonds == []
+    assert models[1].system.protein.protonation_states == {}
+
+
+def test_df_to_models_still_flags_missing_required_field(protein_pdb):
+    good = _proteinbox_row(protein_pdb, **{"system.protein.chains": "A"})
+    bad = dict(good)
+    del bad["simulation_type"]
+    df = pd.DataFrame(data=[good, bad])
+    with pytest.raises(ValueError, match="NaN"):
+        df_to_build_input_models(df)

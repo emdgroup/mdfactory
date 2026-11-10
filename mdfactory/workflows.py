@@ -5,14 +5,23 @@
 from pathlib import Path
 from typing import Any
 
-from .build import build_bilayer, build_lnp, build_mixedbox
+from .build import (
+    build_bilayer,
+    build_lnp,
+    build_mixedbox,
+    build_protein_mixedbox,
+    build_proteinbox,
+)
 from .models.input import BuildInput
+from .prepare import resolve_protein_pdb_path
 from .utils.utilities import load_yaml_file
 
 DISPATCH_BUILD = {
     "mixedbox": build_mixedbox,
     "bilayer": build_bilayer,
     "lnp": build_lnp,
+    "proteinbox": build_proteinbox,
+    "protein_mixedbox": build_protein_mixedbox,
 }
 
 
@@ -43,6 +52,9 @@ def run_build_from_dict(inp_dict: dict[Any, Any] | BuildInput):
 def run_build_from_file(fname: Path):
     """Load a YAML build specification and dispatch the build.
 
+    Relative protein PDB paths are resolved against the YAML file's directory so
+    the build finds them regardless of the process working directory.
+
     Parameters
     ----------
     fname : Path
@@ -50,4 +62,5 @@ def run_build_from_file(fname: Path):
 
     """
     dct = load_yaml_file(fname)
+    resolve_protein_pdb_path(dct, Path(fname).parent)
     run_build_from_dict(dct)

@@ -89,12 +89,16 @@ def test_run_config_wizard_can_initialize_databases(monkeypatch, tmp_path):
     )
 
     # Mock questionary prompts in order:
-    # 1. confirm CGenFF -> False
-    # 2. text parameter store -> default
-    # 3. select backend -> "sqlite"
-    # 4. text RUN_DB_PATH -> "runs.db"
-    # 5. text ANALYSIS_DB_PATH -> "analysis.db"
-    # 6. confirm initialize -> True
+    # 1. confirm GROMACS -> True
+    # 2. text GMX_PATH -> ""
+    # 3. text FORCEFIELD_DIR -> default
+    # 4. confirm force field download -> False
+    # 5. confirm CGenFF -> False
+    # 6. text parameter store -> default
+    # 7. select backend -> "sqlite"
+    # 8. text RUN_DB_PATH -> "runs.db"
+    # 9. text ANALYSIS_DB_PATH -> "analysis.db"
+    # 10. confirm initialize -> True
     class FakeQuestion:
         def __init__(self, value):
             self._value = value
@@ -102,8 +106,16 @@ def test_run_config_wizard_can_initialize_databases(monkeypatch, tmp_path):
         def ask(self):
             return self._value
 
-    answers_confirm = iter([False, True])
-    answers_text = iter([str(tmp_path / "data" / "parameters"), "runs.db", "analysis.db"])
+    answers_confirm = iter([True, False, False, True])
+    answers_text = iter(
+        [
+            "",
+            str(tmp_path / "data" / "forcefields"),
+            str(tmp_path / "data" / "parameters"),
+            "runs.db",
+            "analysis.db",
+        ]
+    )
     answers_select = iter(["sqlite"])
 
     monkeypatch.setattr(
@@ -122,4 +134,10 @@ def test_run_config_wizard_can_initialize_databases(monkeypatch, tmp_path):
     run_config_wizard()
 
     assert called["value"] is True
-    assert (tmp_path / "config.ini").exists()
+    config_path = tmp_path / "config.ini"
+    assert config_path.exists()
+
+    config = configparser.ConfigParser()
+    config.read(config_path)
+    assert config["gromacs"]["GMX_PATH"] == ""
+    assert config["gromacs"]["FORCEFIELD_DIR"] == str(tmp_path / "data" / "forcefields")

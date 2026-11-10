@@ -97,6 +97,7 @@ openff-interchange = ">=0.3"
 openff-units = "*"
 openff-nagl = "*"
 openmm = "*"
+pdbfixer = "*"
 
 [tool.pixi.pypi-dependencies]
 mdfactory = { path = ".", editable = true }
