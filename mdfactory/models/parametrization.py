@@ -1,5 +1,5 @@
 # ABOUTME: Pydantic models for force field parametrization configuration and results
-# ABOUTME: Defines CGenFF/SMIRNOFF configs and GROMACS parameter set storage
+# ABOUTME: Defines CGenFF/SMIRNOFF/CHARMM/Amber configs and GROMACS parameter set storage
 """Pydantic models for force field parametrization configuration and results."""
 
 import json
@@ -17,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 
-# The proteinbox pipeline solvates with 3-site spc216 coordinates and uses
+# The CHARMM protein pipelines solvate with 3-site spc216 coordinates and use
 # CHARMM Force-switch LJ in every mdp, so only these combinations are supported.
 SUPPORTED_WATER_MODELS = frozenset({"tip3p", "spc", "spce"})
 
@@ -139,11 +139,69 @@ class CharmmConfig(_CharmmFamilyConfig):
         return self
 
 
+class AmberConfig(BaseModel):
+    """Configuration for the open-source Amber ff14SB + OpenFF Sage parametrization.
+
+    The protein is built with gmx pdb2gmx and the ``amber14sb.ff`` force field that
+    ships with GROMACS 2026 or later. Native TIP3P water and Joung-Cheatham ions
+    come from the same force-field directory. SMILES solutes are parametrized with
+    OpenFF Sage through SMIRNOFF, so no CGenFF/SILCSBIO installation is needed.
+
+    Used by both ``proteinbox`` and ``protein_mixedbox``. A ``proteinbox`` has no
+    small molecules, so it accepts the Sage fields and ignores them.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: Literal["amber"] = Field("amber", description="Config type discriminator.")
+    forcefield: str = Field(
+        "amber14sb",
+        description="Protein force field as recognized by gmx pdb2gmx (only amber14sb).",
+    )
+    water_model: str = Field(
+        "tip3p", description="Water model as recognized by gmx pdb2gmx (only tip3p)."
+    )
+    ignore_hydrogens: bool = Field(
+        True, description="Ignore hydrogens in input PDB (regenerate with pdb2gmx)."
+    )
+    merge_all: bool = Field(False, description="Merge all chains into a single moleculetype.")
+    sage_forcefield: str = Field(
+        SmirnoffConfig.model_fields["forcefield"].default,
+        description="OpenFF force field file for small-molecule solutes.",
+    )
+    charge_method: str = Field(
+        SmirnoffConfig.model_fields["charge_method"].default,
+        description="Partial charge assignment method for small-molecule solutes.",
+    )
+
+    @model_validator(mode="after")
+    def _check_amber_forcefield_and_water(self) -> "AmberConfig":
+        """Reject protein force fields and water models other than amber14sb + tip3p."""
+        if self.forcefield != "amber14sb":
+            raise ValueError(
+                f"Force field '{self.forcefield}' is not supported for the amber "
+                "parametrization. Only 'amber14sb' (bundled with GROMACS >= 2026) is "
+                "supported; its run schedule uses Sage-style nonbonded settings."
+            )
+        if self.water_model != "tip3p":
+            raise ValueError(
+                f"Water model '{self.water_model}' is not supported for the amber "
+                "parametrization. Only 'tip3p' is supported: solvation uses 3-site "
+                "spc216 coordinates and ff14SB is paired with TIP3P."
+            )
+        return self
+
+    def smirnoff_config(self) -> SmirnoffConfig:
+        """Return the SMIRNOFF configuration used for the small-molecule solutes."""
+        return SmirnoffConfig(forcefield=self.sage_forcefield, charge_method=self.charge_method)
+
+
 ParametrizationConfig = Annotated[
     Annotated[SmirnoffConfig, Tag("smirnoff")]
     | Annotated[CgenffConfig, Tag("cgenff")]
     | Annotated[Pdb2gmxConfig, Tag("pdb2gmx")]
-    | Annotated[CharmmConfig, Tag("charmm")],
+    | Annotated[CharmmConfig, Tag("charmm")]
+    | Annotated[AmberConfig, Tag("amber")],
     Discriminator("type"),
 ]
 

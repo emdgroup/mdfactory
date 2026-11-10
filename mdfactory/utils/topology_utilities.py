@@ -575,6 +575,88 @@ def read_itp_atoms(itp_path: Path) -> list[tuple[str, float]]:
     return atoms
 
 
+def unique_atom_names(names: list[str]) -> list[str]:
+    """Return atom names that are unique within one molecule.
+
+    Names that are already unique are returned unchanged (e.g. CGenFF). SMIRNOFF
+    topologies name atoms by element only (``C``, ``C``, ``O``, ``H``, ...);
+    those get a per-name counter (``C1``, ``C2``, ``O1``, ``H1``, ...). PDB
+    readers such as OpenMM's drop atoms whose name repeats within a residue, so
+    coordinates must carry unique names.
+
+    Parameters
+    ----------
+    names : list of str
+        Atom names in topology order.
+
+    Returns
+    -------
+    list of str
+        Unique atom names in the same order.
+
+    Raises
+    ------
+    ValueError
+        If numbering does not make the names unique.
+
+    """
+    if len(set(names)) == len(names):
+        return list(names)
+    counters: dict[str, int] = defaultdict(int)
+    numbered = []
+    for name in names:
+        counters[name] += 1
+        numbered.append(f"{name}{counters[name]}")
+    if len(set(numbered)) != len(numbered):
+        raise ValueError(f"Could not derive unique atom names from {names}.")
+    return numbered
+
+
+def write_itp_with_atom_names(src: str | Path, dest: str | Path, names: list[str]) -> None:
+    """Copy an ITP, replacing the atom names of its first ``[ atoms ]`` section.
+
+    Parameters
+    ----------
+    src : str or Path
+        Source ``.itp`` with a single-molecule ``[ atoms ]`` section.
+    dest : str or Path
+        Destination path.
+    names : list of str
+        New atom names in topology order; must match the number of atoms.
+
+    Raises
+    ------
+    ValueError
+        If the number of names does not match the ``[ atoms ]`` entries.
+
+    """
+    lines = Path(src).read_text().splitlines(keepends=True)
+    in_atoms = False
+    done = False
+    index = 0
+    for i, raw in enumerate(lines):
+        line = raw.split(";", 1)[0].strip()
+        if done or not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            if in_atoms:
+                done = True
+                continue
+            in_atoms = line[1:-1].strip().lower() == "atoms"
+            continue
+        if in_atoms:
+            if index >= len(names):
+                raise ValueError(f"{src} has more atoms than the {len(names)} names given.")
+            fields = line.split()
+            fields[4] = names[index]
+            comment = raw.split(";", 1)[1].rstrip("\n") if ";" in raw else ""
+            lines[i] = " ".join(fields) + (f" ;{comment}" if comment else "") + "\n"
+            index += 1
+    if index != len(names):
+        raise ValueError(f"{src} has {index} atoms but {len(names)} names were given.")
+    Path(dest).write_text("".join(lines))
+
+
 def validate_cgenff_atomtype_compatibility(
     prm_files: list[str | Path],
     ff_dir: str | Path,
@@ -607,6 +689,156 @@ def validate_cgenff_atomtype_compatibility(
                         f"force-field bundle ({generated} != {existing}). Use a CGenFF "
                         "installation matching the registered charmm36m bundle."
                     )
+
+
+DEFAULTS_FUDGE_TOLERANCE = 1e-6
+
+
+def read_topology_defaults(path: str | Path) -> tuple[int, int, str, float, float] | None:
+    """Return the ``[ defaults ]`` entry of a GROMACS topology or include file.
+
+    Parameters
+    ----------
+    path : str or Path
+        Topology, ``forcefield.itp``, or parameter ``.itp`` file. Includes are
+        not followed.
+
+    Returns
+    -------
+    tuple or None
+        ``(nbfunc, comb_rule, gen_pairs, fudgeLJ, fudgeQQ)``, with ``gen_pairs``
+        lower-cased, or None if the file has no ``[ defaults ]`` section.
+
+    Raises
+    ------
+    ValueError
+        If the ``[ defaults ]`` section has no entry or a malformed one.
+
+    """
+    in_defaults = False
+    with open(path) as fb:
+        for raw in fb:
+            line = raw.split(";", 1)[0].strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                if in_defaults:
+                    break
+                in_defaults = line[1:-1].strip().lower() == "defaults"
+                continue
+            if not in_defaults:
+                continue
+            fields = line.split()
+            if len(fields) < 5:
+                raise ValueError(f"Malformed [ defaults ] entry in {path}: {raw.strip()!r}")
+            try:
+                return (
+                    int(fields[0]),
+                    int(fields[1]),
+                    fields[2].lower(),
+                    float(fields[3]),
+                    float(fields[4]),
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Malformed [ defaults ] entry in {path}: {raw.strip()!r}"
+                ) from exc
+    if in_defaults:
+        raise ValueError(f"[ defaults ] section in {path} has no entry.")
+    return None
+
+
+def check_defaults_compatible(
+    reference_path: str | Path,
+    other_path: str | Path,
+    tolerance: float = DEFAULTS_FUDGE_TOLERANCE,
+) -> None:
+    """Raise unless two files declare equivalent ``[ defaults ]`` entries.
+
+    ``nbfunc``, ``comb-rule`` and ``gen-pairs`` must match exactly; ``fudgeLJ``
+    and ``fudgeQQ`` must agree within *tolerance*, because force fields write
+    the 1-4 scaling with different precision (``0.833333`` versus
+    ``0.83333333333333333``).
+
+    Parameters
+    ----------
+    reference_path : str or Path
+        File whose ``[ defaults ]`` is kept, e.g. the force field's ``forcefield.itp``.
+    other_path : str or Path
+        File whose ``[ defaults ]`` would be dropped, e.g. a SMIRNOFF parameter file.
+    tolerance : float, optional
+        Absolute tolerance for the fudge factors. Default is 1e-6.
+
+    Raises
+    ------
+    ValueError
+        If either file lacks ``[ defaults ]`` or the entries differ.
+
+    """
+    reference = read_topology_defaults(reference_path)
+    other = read_topology_defaults(other_path)
+    if reference is None or other is None:
+        missing = reference_path if reference is None else other_path
+        raise ValueError(f"No [ defaults ] section found in {missing}.")
+    exact_match = reference[:3] == other[:3]
+    fudge_match = all(abs(a - b) <= tolerance for a, b in zip(reference[3:], other[3:]))
+    if not (exact_match and fudge_match):
+        raise ValueError(
+            "Incompatible [ defaults ] (nbfunc, comb-rule, gen-pairs, fudgeLJ, fudgeQQ): "
+            f"{reference_path} has {reference}, but {other_path} has {other}. "
+            "The small-molecule parameters cannot be combined with this force field."
+        )
+
+
+def check_atomtype_collisions(
+    prm_files: list[str | Path],
+    forcefield_types: dict[str, tuple[str, ...]],
+) -> None:
+    """Reject small-molecule atom types that clash with the force field or each other.
+
+    Unlike CGenFF, whose atom types are meant to be shared with the CHARMM force
+    field, SMIRNOFF atom types are private per molecule. Any name that the force
+    field already defines is therefore a collision. A name defined by two
+    parameter files is accepted only if both give the same parameters.
+
+    Parameters
+    ----------
+    prm_files : list of str or Path
+        Parameter files with an ``[ atomtypes ]`` section.
+    forcefield_types : dict
+        Force-field atom types from :func:`collect_forcefield_atomtype_definitions`.
+
+    Raises
+    ------
+    ValueError
+        On a collision with a force-field atom type, or a name defined with
+        different parameters in two parameter files.
+
+    """
+    seen: dict[str, tuple[tuple[str, ...], str]] = {}
+    for prm in prm_files:
+        *_, sections = extract_reusable_parts_from_cgenff_gmx_top(prm, must_have_moleculetype=False)
+        for section_name, section_text in sections:
+            if section_name != "atomtypes":
+                continue
+            for line in section_text.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith((";", "[")):
+                    continue
+                name = stripped.split()[0]
+                if name in forcefield_types:
+                    raise ValueError(
+                        f"Atom type '{name}' from {prm} is already defined by the force "
+                        "field. Rename the small-molecule residue to avoid the collision."
+                    )
+                signature = _atomtype_signature(stripped)
+                previous = seen.get(name)
+                if previous is not None and previous[0] != signature:
+                    raise ValueError(
+                        f"Atom type '{name}' is defined with different parameters in "
+                        f"{previous[1]} and {prm}. Give the species distinct residue names."
+                    )
+                seen.setdefault(name, (signature, str(prm)))
 
 
 def merge_extra_parameter_itps(

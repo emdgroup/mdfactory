@@ -17,6 +17,7 @@ from mdfactory.build import (
     PROTEIN_MIXEDBOX_RMSD_TOLERANCE_A,
     _check_no_protein_clashes,
     _check_no_solution_clashes,
+    _protein_solution_parametrizer,
     _reimage_protein_centered,
     ionize_solvated_system,
 )
@@ -27,11 +28,12 @@ from mdfactory.models.composition import (
     ProteinMixedBoxComposition,
 )
 from mdfactory.models.input import BuildInput
-from mdfactory.models.parametrization import CharmmConfig
+from mdfactory.models.parametrization import AmberConfig, CharmmConfig
 from mdfactory.models.species import ProteinSpecies, SolutionSpecies
 from mdfactory.parametrize import (
     generate_gromacs_topology_with_protein,
     parametrize_cgenff_gromacs,
+    parametrize_smirnoff_gromacs,
 )
 from mdfactory.prepare import df_to_build_input_models
 from mdfactory.run_schedules import RunScheduleManager
@@ -45,8 +47,15 @@ from mdfactory.utils.setup_utilities import (
     charmm_native_atom_names,
     create_protein_mixedbox_universe,
     cubic_box_edge_for_density,
+    native_atom_names,
     protein_displaced_volume_a3,
     resolve_solution_counts,
+    topology_atom_names,
+)
+from mdfactory.utils.topology_utilities import (
+    read_itp_atoms,
+    unique_atom_names,
+    write_itp_with_atom_names,
 )
 
 from .conftest import protein_input_data
@@ -111,7 +120,7 @@ class TestSolutionSpecies:
         [("O", "WAT"), ("[Na+]", "SOD"), ("[Cl-]", "CLA")],
     )
     def test_native_species_require_charmm_resname(self, smiles, wrong_resname):
-        with pytest.raises(ValueError, match="Native CHARMM species"):
+        with pytest.raises(ValueError, match="Native water/ion species"):
             SolutionSpecies(smiles=smiles, resname=wrong_resname, count=1)
 
 
@@ -763,3 +772,321 @@ class TestRunSchedule:
         assert set(paths) == {"em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"}
         for path in paths.values():
             assert path.is_file()
+
+
+AMBER_FORCEFIELD_ITP = """\
+#define _FF_AMBER
+
+[ defaults ]
+; nbfunc        comb-rule       gen-pairs       fudgeLJ fudgeQQ
+1 2 yes 0.5 0.83333333333333333
+
+#include "ffnonbonded.itp"
+"""
+
+SAGE_PARAMS_ITP = """\
+[ defaults ]
+; nbfunc        comb-rule       gen-pairs       fudgeLJ fudgeQQ
+     1       2  yes     {fudge_lj}        {fudge_qq}
+
+[ atomtypes ]
+;type, bondingtype, atomic_number, mass, charge, ptype, sigma, epsilon
+{type_a}                6  12.01078        0.0000000000000000      A       0.33795317     {eps}
+ETH_1                8  15.99943        0.0000000000000000      A       0.30398122     0.87950232
+"""
+
+
+def _amber_ff_dir(tmp_path):
+    """Write a minimal amber14sb.ff whose forcefield.itp and atom types mirror GROMACS 2026."""
+    ff_dir = tmp_path / "amber14sb.ff"
+    ff_dir.mkdir()
+    (ff_dir / "forcefield.itp").write_text(AMBER_FORCEFIELD_ITP)
+    (ff_dir / "ffnonbonded.itp").write_text(
+        "[ atomtypes ]\n"
+        "    CT       6         12.01    0.0000   A   0.339966950842   0.457729600000\n"
+        "    OW_tip3p  8          16.0    0.0000   A   0.315075240658   0.635968000000\n"
+    )
+    for name in ("tip3p.itp", "ions_tip3p.itp"):
+        (ff_dir / name).write_text(f"; {name}\n")
+    return ff_dir
+
+
+def _sage_parameters(tmp_path, name="ETH0", **fmt):
+    """Write a Sage-style parameter file and moleculetype ITP; return a parameter stand-in."""
+    values = {"fudge_lj": "0.500000", "fudge_qq": "0.833333", "type_a": "ETH_0", "eps": "0.45"}
+    values.update(fmt)
+    src = tmp_path / "params" / name
+    src.mkdir(parents=True)
+    params = src / f"{name}_params.itp"
+    params.write_text(SAGE_PARAMS_ITP.format(**values))
+    itp = src / f"{name}.itp"
+    # Interchange names atoms by element only, so names repeat within the molecule.
+    itp.write_text(
+        f"[ moleculetype ]\n{name} 3\n\n[ atoms ]\n"
+        "     1 ETH_0        1 ETH      C          1     -0.09     12.01078\n"
+        "     2 ETH_0        1 ETH      C          1      0.13     12.01078\n"
+        "     3 ETH_1        1 ETH      O          1     -0.04     15.99943 ; hydroxyl\n"
+        "\n[ bonds ]\n     1     2     1\n"
+    )
+    return SimpleNamespace(
+        moleculetype=name, parameter_itp=params, itp=itp, parametrization="smirnoff"
+    )
+
+
+def _write_amber_protein_topology(path):
+    path.write_text(
+        textwrap.dedent("""\
+        #include "amber14sb.ff/forcefield.itp"
+
+        [ moleculetype ]
+        Protein_chain_A     3
+
+        #include "amber14sb.ff/tip3p.itp"
+        #include "amber14sb.ff/ions_tip3p.itp"
+
+        [ system ]
+        Protein in water
+
+        [ molecules ]
+        ; Compound        #mols
+        Protein_chain_A     1
+        """)
+    )
+
+
+def _gen_amber(tmp_path, parameters, counts=None):
+    top = tmp_path / "topol_protein.top"
+    _write_amber_protein_topology(top)
+    out = tmp_path / "topology.top"
+    species = [
+        SolutionSpecies(smiles="CCO", resname=f"ET{i}", count=1) for i in range(len(parameters))
+    ]
+    generate_gromacs_topology_with_protein(
+        top,
+        _amber_ff_dir(tmp_path),
+        species,
+        parameters,
+        counts or [5] * len(parameters),
+        "protein_mixedbox",
+        out_path=out,
+    )
+    return out.read_text()
+
+
+class TestAmberSolutionParametrization:
+    def test_native_water_and_ions_come_from_forcefield_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(settings, "parameter_store", tmp_path / "parameters")
+        ff_dir = _amber_ff_dir(tmp_path)
+        config = AmberConfig().smirnoff_config()
+
+        results = {
+            smiles: parametrize_smirnoff_gromacs(
+                SolutionSpecies(smiles=smiles, resname=resname, count=1),
+                smirnoff_config=config,
+                native_forcefield_dir=ff_dir,
+            )
+            for smiles, resname in (("O", "SOL"), ("[Na+]", "NA"), ("[Cl-]", "CL"))
+        }
+
+        assert results["O"].itp == ff_dir / "tip3p.itp"
+        assert results["[Na+]"].itp == ff_dir / "ions_tip3p.itp"
+        assert results["[Cl-]"].itp == ff_dir / "ions_tip3p.itp"
+        assert [r.moleculetype for r in results.values()] == ["SOL", "NA", "CL"]
+        for result in results.values():
+            assert result.parameter_itp is None
+            assert result.forcefield_itp == ff_dir / "forcefield.itp"
+            assert result.parametrization == "smirnoff"
+            assert result.parametrization_config == config
+        # The native short-circuit never touches the SMIRNOFF cache.
+        assert not (tmp_path / "parameters" / "gromacs" / "smirnoff").exists()
+
+    def test_parametrizer_selection(self, tmp_path):
+        scheme, function = _protein_solution_parametrizer(CharmmConfig(), tmp_path)
+        assert scheme == "cgenff"
+        assert function.func is parametrize_cgenff_gromacs
+        assert function.keywords == {"native_forcefield_dir": tmp_path}
+
+        config = AmberConfig(charge_method="am1bcc")
+        scheme, function = _protein_solution_parametrizer(config, tmp_path)
+        assert scheme == "smirnoff"
+        assert function.func is parametrize_smirnoff_gromacs
+        assert function.keywords["native_forcefield_dir"] == tmp_path
+        assert function.keywords["native_water_model"] == "tip3p"
+        assert function.keywords["smirnoff_config"] == config.smirnoff_config()
+
+    def test_native_atom_names_and_alias(self):
+        assert native_atom_names("O") == ["OW", "HW1", "HW2"]
+        assert native_atom_names("[Na+]") == ["NA"]
+        assert native_atom_names("CCO") is None
+        assert charmm_native_atom_names is native_atom_names
+
+    def test_topology_atom_names_for_sage_solute(self, tmp_path):
+        species = SolutionSpecies(smiles="CO", resname="MEO", count=1)
+        elements = [atom.GetSymbol() for atom in species.rdkit_molecule.GetAtoms()]
+        masses = {"C": 12.011, "O": 15.999, "H": 1.008}
+        # Interchange writes element-only names; coordinates get them numbered.
+        atoms = "".join(
+            f"{i:5d} MEO_{i - 1}  1 MEO {el} 1 0.0 {masses[el]}\n"
+            for i, el in enumerate(elements, 1)
+        )
+        counts = {}
+        names = []
+        for el in elements:
+            counts[el] = counts.get(el, 0) + 1
+            names.append(f"{el}{counts[el]}")
+        itp = tmp_path / "MEO.itp"
+        itp.write_text(f"[ moleculetype ]\nMEO 3\n\n[ atoms ]\n{atoms}\n[ bonds ]\n")
+        params = tmp_path / "MEO_params.itp"
+        params.write_text("[ atomtypes ]\n")
+        parameter_set = SimpleNamespace(itp=itp, parameter_itp=params)
+        assert topology_atom_names(species, parameter_set) == names
+
+
+class TestUniqueAtomNames:
+    @pytest.mark.parametrize(
+        ("names", "expected"),
+        [
+            (["C1", "C2", "O3"], ["C1", "C2", "O3"]),
+            (["C", "C", "O", "H", "H"], ["C1", "C2", "O1", "H1", "H2"]),
+        ],
+    )
+    def test_unique_atom_names(self, names, expected):
+        assert unique_atom_names(names) == expected
+
+    def test_write_itp_with_atom_names_rejects_count_mismatch(self, tmp_path):
+        itp = tmp_path / "a.itp"
+        itp.write_text("[ atoms ]\n1 X 1 RES C 1 0.0 12.0\n")
+        with pytest.raises(ValueError, match="1 atoms but 2 names"):
+            write_itp_with_atom_names(itp, tmp_path / "b.itp", ["C1", "C2"])
+
+
+class TestAmberCompositeTopology:
+    def test_matching_defaults_dropped_and_sage_types_merged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "mdfactory.parametrize.validate_cgenff_atomtype_compatibility",
+            lambda *a, **k: pytest.fail("CGenFF validation must not run for SMIRNOFF solutes"),
+        )
+        text = _gen_amber(tmp_path, [_sage_parameters(tmp_path)])
+
+        merged = (tmp_path / "extra_params.itp").read_text()
+        assert "[ defaults ]" not in merged
+        assert "ETH_0" in merged and "ETH_1" in merged
+        # The copied ITP carries unique atom names (the source keeps element names).
+        assert [name for name, _ in read_itp_atoms(tmp_path / "ETH0.itp")] == ["C1", "C2", "O1"]
+        assert "; hydroxyl" in (tmp_path / "ETH0.itp").read_text()
+        source_names = read_itp_atoms(tmp_path / "params" / "ETH0" / "ETH0.itp")
+        assert [name for name, _ in source_names] == ["C", "C", "O"]
+        assert text.count('#include "amber14sb.ff/forcefield.itp"') == 1
+        assert '#include "extra_params.itp"' in text
+        assert text.index('#include "extra_params.itp"') > text.index("forcefield.itp")
+        assert text.index('#include "ETH0.itp"') < text.index("amber14sb.ff/tip3p.itp")
+        assert (tmp_path / "ETH0.itp").is_file()
+        assert "ETH0" in text.split("[ molecules ]", 1)[1]
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [{"fudge_qq": "1.0"}, {"fudge_lj": "1.0"}],
+    )
+    def test_mismatching_defaults_raise(self, tmp_path, overrides):
+        with pytest.raises(ValueError, match="Incompatible \\[ defaults \\]"):
+            _gen_amber(tmp_path, [_sage_parameters(tmp_path, **overrides)])
+
+    def test_mismatching_comb_rule_raises(self, tmp_path):
+        par = _sage_parameters(tmp_path)
+        par.parameter_itp.write_text(
+            par.parameter_itp.read_text().replace("1       2  yes", "1       3  yes")
+        )
+        with pytest.raises(ValueError, match="amber14sb.ff/forcefield.itp"):
+            _gen_amber(tmp_path, [par])
+
+    def test_forcefield_atomtype_collision_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="'CT'.*already defined by the force field"):
+            _gen_amber(tmp_path, [_sage_parameters(tmp_path, type_a="CT")])
+
+    def test_conflicting_duplicate_between_solutes_raises(self, tmp_path):
+        first = _sage_parameters(tmp_path, name="ETH0")
+        second = _sage_parameters(tmp_path, name="ETH1", eps="0.99")
+        with pytest.raises(ValueError, match="'ETH_0' is defined with different parameters"):
+            _gen_amber(tmp_path, [first, second])
+
+    def test_identical_duplicate_between_solutes_accepted(self, tmp_path):
+        _gen_amber(
+            tmp_path, [_sage_parameters(tmp_path, "ETH0"), _sage_parameters(tmp_path, "ETH1")]
+        )
+        merged = (tmp_path / "extra_params.itp").read_text()
+        assert merged.count("ETH_0 ") == 1
+
+    def test_mixed_cgenff_and_smirnoff_raises(self, tmp_path):
+        cgenff = _sage_parameters(tmp_path, name="CG0")
+        cgenff.parametrization = "cgenff"
+        with pytest.raises(ValueError, match="Cannot mix small-molecule parametrizations"):
+            _gen_amber(tmp_path, [_sage_parameters(tmp_path), cgenff])
+
+
+class TestAmberExamplesAndSchedule:
+    @pytest.mark.parametrize(
+        ("filename", "resnames"),
+        [
+            ("lysozyme_amber_fixed_box.yaml", {"SOL", "ETH"}),
+            ("lysozyme_amber_water_fixed_box.yaml", {"SOL"}),
+        ],
+    )
+    def test_yaml_loads(self, filename, resnames):
+        inp = BuildInput(**yaml.safe_load((EXAMPLES_DIR / filename).read_text()))
+        assert inp.parametrization == "amber"
+        assert isinstance(inp.parametrization_config, AmberConfig)
+        assert {s.resname for s in inp.system.species} == resnames
+
+    def test_csv_loads(self):
+        models, errors = df_to_build_input_models(
+            pd.read_csv(EXAMPLES_DIR / "protein_mixedbox_amber.csv")
+        )
+        assert errors == {}
+        assert [m.parametrization for m in models] == ["amber"]
+        assert isinstance(models[0].parametrization_config, AmberConfig)
+
+    @pytest.mark.parametrize("system_type", ["proteinbox", "protein_mixedbox"])
+    def test_amber_schedule_has_sage_nonbonded_settings(self, system_type):
+        from mdfactory.orchestration.mdp import get_mdp_value, parse_mdp
+
+        manager = RunScheduleManager()
+        amber = manager.get_all_run_file_paths(
+            engine="gromacs", system_type=system_type, parametrization="amber"
+        )
+        charmm = manager.get_all_run_file_paths(engine="gromacs", system_type=system_type)
+        assert set(amber) == set(charmm) == {"em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"}
+        expected = {
+            "coulombtype": "pme",
+            "rcoulomb": "0.9",
+            "rvdw": "0.9",
+            "vdwtype": "cutoff",
+            "vdw_modifier": "potential-switch",
+            "rvdw_switch": "0.8",
+            "dispcorr": "enerpres",
+        }
+        for name, path in amber.items():
+            assert path.parent.name == "proteinbox_amber"
+            parsed = parse_mdp(path)
+            settings_found = {key: (get_mdp_value(parsed, key) or "").lower() for key in expected}
+            assert settings_found == expected, name
+        for path in charmm.values():
+            assert path.parent.name == "proteinbox"
+            assert get_mdp_value(parse_mdp(path), "vdw_modifier").lower() == "force-switch"
+
+    def test_unknown_parametrization_falls_back_to_generic(self):
+        manager = RunScheduleManager()
+        charmm = manager.get_all_run_file_paths("gromacs", "proteinbox", parametrization="pdb2gmx")
+        assert {p.parent.name for p in charmm.values()} == {"proteinbox"}
+
+    def test_finalize_installs_amber_schedule(self, tmp_path, monkeypatch):
+        from mdfactory import build
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("mdfactory.setup.protein.validate_with_grompp", lambda *a, **k: None)
+        inp = SimpleNamespace(
+            engine="gromacs",
+            parametrization="amber",
+            system=SimpleNamespace(ionization=IonizationConfig()),
+        )
+        build._finalize_protein_build(inp, "protein_mixedbox", tmp_path / "topology.top")
+        assert "Potential-switch" in (tmp_path / "md.mdp").read_text()

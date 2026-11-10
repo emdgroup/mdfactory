@@ -3,7 +3,7 @@ title: Parametrization
 description: Force field parametrization methods in MDFactory
 ---
 
-MDFactory supports two force field parametrization methods for generating molecular mechanics parameters from SMILES strings. Both generate GROMACS-compatible ITP files.
+MDFactory supports two force field parametrization methods for generating molecular mechanics parameters from SMILES strings, SMIRNOFF and CGenFF. Both generate GROMACS-compatible ITP files. Protein systems additionally support an open-source Amber ff14SB + OpenFF Sage route.
 
 ## Available parametrization methods
 
@@ -106,6 +106,55 @@ parametrization: cgenff
 
 CGenFF does not require additional configuration options as it uses the global installation settings.
 
+### Amber ff14SB + OpenFF Sage (protein systems)
+
+The **amber** parametrization is a fully open-source route for the `proteinbox` and
+`protein_mixedbox` system types. It needs no CGenFF or SILCSBIO license:
+
+- **Protein:** Amber ff14SB, using the `amber14sb.ff` force field that ships with GROMACS, through `gmx pdb2gmx`.
+- **Small-molecule solutes** (`protein_mixedbox`): OpenFF Sage through SMIRNOFF.
+- **Water and ions:** TIP3P and Joung–Cheatham Na⁺/Cl⁻ from `amber14sb.ff`.
+
+<Callout type="warn" title="Requires GROMACS 2026 or later">
+`amber14sb.ff` is only shipped with, and only correct for, GROMACS ≥ 2026 (older versions silently
+ignore its LEaP dihedral reordering). MDFactory checks the `gmx` version before `pdb2gmx` at build
+time and again before the first `grompp` of `mdfactory simulate`, on the node that runs the job.
+Use the pixi `gmx` environment (`pixi run -e gmx ...`, or `gmx-cuda` for the CUDA build) or point
+`[gromacs] GMX_PATH` at a GROMACS 2026 binary.
+</Callout>
+
+**Configuration:**
+
+```yaml
+engine: gromacs
+parametrization: amber
+parametrization_config:
+  type: amber
+  forcefield: amber14sb        # only amber14sb is supported
+  water_model: tip3p           # only tip3p is supported
+  ignore_hydrogens: true
+  merge_all: false
+  sage_forcefield: openff-2.2.0.offxml
+  charge_method: openff-gnn-am1bcc-0.1.0-rc.3.pt
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `forcefield` | `amber14sb` | Protein force field passed to `pdb2gmx`. Only `amber14sb` is supported. |
+| `water_model` | `tip3p` | Water model passed to `pdb2gmx`. Only `tip3p` is supported. |
+| `ignore_hydrogens` | `true` | Drop input hydrogens and let `pdb2gmx` rebuild them. |
+| `merge_all` | `false` | Merge all chains into one moleculetype. |
+| `sage_forcefield` | `openff-2.2.0.offxml` | OpenFF force field for small-molecule solutes. Ignored for `proteinbox`. |
+| `charge_method` | `openff-gnn-am1bcc-0.1.0-rc.3.pt` | Partial charge method for solutes (see [Charge methods](#charge-methods)). Ignored for `proteinbox`. |
+
+Amber builds install their own run schedule with Sage-style nonbonded settings
+(`rcoulomb = rvdw = 0.9`, PME, `vdw-modifier = Potential-switch`, `rvdw-switch = 0.8`,
+`DispCorr = EnerPres`). Protonation states use Amber residue names directly (e.g. `HIE`, `HID`, `HIP`).
+
+Sage solute parameters share the regular SMIRNOFF parameter cache (see below). The cache is keyed
+by the OpenFF force field only, so a solute parametrized earlier with a different `charge_method`
+is reused as-is.
+
 ## Choosing a parametrization method
 
 | Use Case | Recommended Method |
@@ -115,6 +164,7 @@ CGenFF does not require additional configuration options as it uses the global i
 | Lipid bilayer simulations | CGenFF (CHARMM36 compatible) |
 | Quick prototyping | SMIRNOFF (faster, no license) |
 | Compatibility with existing CHARMM systems | CGenFF |
+| Protein systems without a CGenFF license | Amber (ff14SB + Sage, GROMACS ≥ 2026) |
 
 ## Parameter caching
 
