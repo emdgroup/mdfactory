@@ -38,6 +38,9 @@ gres: "gpu:1"
 # pixi/conda/venv and GROMACS modules.
 environment:
   # Module loads (each becomes "module load <name>")
+  # Note: parametrization `amber` (proteinbox / protein_mixedbox) needs
+  # GROMACS >= 2026, which cluster modules rarely ship. Use the pixi `gmx` /
+  # `gmx-cuda` environments via `extra_init` instead; see pipeline/slurm_gpu.yaml.
   modules:
     - gromacs/2024
 

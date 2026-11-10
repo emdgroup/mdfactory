@@ -19,9 +19,9 @@ The YAML is parsed into the `BuildInput` model, which combines:
 
 | Key | Required | Type | Notes |
 |---|---|---|---|
-| `simulation_type` | Yes | string | One of `mixedbox`, `bilayer`, `lnp` |
+| `simulation_type` | Yes | string | One of `mixedbox`, `bilayer`, `lnp`, `proteinbox`, `protein_mixedbox` |
 | `system` | Yes | object | Shape depends on `simulation_type` |
-| `parametrization` | Yes | string or object | Force-field family: `charmm`, `amber` or `openff` (no default). See [Parametrization](/docs/user-guide/parametrization) |
+| `parametrization` | Yes | string or object | Force-field family: `charmm`, `amber` or `openff` (no default). `amber` is for the protein types only, `openff` for the other three. See [Parametrization](/docs/user-guide/parametrization) |
 | `engine` | No | string | Currently only `gromacs` (default: `gromacs`) |
 | `simulation_settings` | No | object | How the system is run; only `temperature` and `pressure` enter the hash. See [Simulation Settings](/docs/user-guide/simulation-settings) |
 
@@ -32,6 +32,8 @@ The `system` block is type-dispatched from `simulation_type`:
 - `mixedbox` -> `MixedBoxComposition`
 - `bilayer` -> `BilayerComposition`
 - `lnp` -> `LNPComposition`
+- `proteinbox` -> `ProteinBoxComposition`
+- `protein_mixedbox` -> `ProteinMixedBoxComposition`
 
 Each type has different required fields and validation rules.
 
@@ -103,7 +105,7 @@ overrides and the identity rule.
 
 ## Ionization block
 
-`mixedbox`, `bilayer`, and `lnp` all support:
+All five system types support:
 
 ```yaml
 ionization:
@@ -131,11 +133,15 @@ Both forms skip ion placement. If ionization is omitted, the defaults above are
 applied. A configured `concentration: 0.0` with `neutralize: false` likewise leaves
 the system unchanged without attempting to add zero ions.
 
+`proteinbox` and `protein_mixedbox` do not accept `false`/`null`: use
+`concentration: 0` (no salt) and `neutralize: false` instead. With `neutralize: false`, the
+net-charge `grompp` warning is the only one tolerated at build time.
+
 ## Full examples by simulation type
 
 These examples intentionally use compounds from the repository example inputs under `examples/` so docs stay aligned with tested/public examples.
 
-<Tabs items={['Mixedbox', 'Bilayer', 'LNP']}>
+<Tabs items={['Mixedbox', 'Bilayer', 'LNP', 'Proteinbox', 'Protein mixedbox']}>
 <Tab value="Mixedbox">
 
 ```yaml
@@ -252,7 +258,112 @@ LNP-specific behavior:
 - `core_radius = radius - shell_thickness` must stay positive
 
 </Tab>
+<Tab value="Proteinbox">
+
+```yaml
+simulation_type: proteinbox
+engine: gromacs
+parametrization:
+  family: amber
+  protein: amber14sb
+  water_model: tip3p
+system:
+  protein:
+    resname: LYZ
+    pdb_path: ./1aki.pdb
+    chains: [A]
+    disulfide_bonds:
+      - [CYS6, CYS127]
+      - [CYS30, CYS115]
+    protonation_states:
+      HIS15: HIE
+    ignore_hydrogens: true
+  padding: 12.0
+  relax_steps: 10000
+  ionization:
+    neutralize: true
+    concentration: 0.15
+```
+
+`ProteinBoxComposition` fields:
+
+- `protein` (`ProteinSpecies`) required, see below
+- `padding` optional, default `10.0` Å (minimum protein-to-box-edge distance)
+- `relax_steps` optional, default `10000` (OpenMM steps of the protein-restrained relaxation)
+- `ionization` optional, defaults applied
+
+</Tab>
+<Tab value="Protein mixedbox">
+
+```yaml
+simulation_type: protein_mixedbox
+engine: gromacs
+parametrization:
+  family: amber
+  protein: amber14sb
+  small_molecules:
+    forcefield: openff-2.2.0.offxml
+  water_model: tip3p
+system:
+  protein:
+    resname: LYZ
+    pdb_path: ./1aki.pdb
+    chains: [A]
+  species:
+    - smiles: O
+      resname: SOL
+      concentration: 53.0
+    - smiles: CCO
+      resname: ETH
+      concentration: 1.0
+  sizing:
+    type: fixed_box        # or: count_density (+ target_density)
+    box_size: 72.0
+  padding: 12.0
+  concentration_volume_basis: protein_excluded
+  partial_specific_volume: 0.73
+  relax_steps: 10000
+  ionization:
+    neutralize: true
+    concentration: 0.15
+```
+
+`ProteinMixedBoxComposition` fields:
+
+- `protein` (`ProteinSpecies`) required
+- `species` (`SolutionSpecies[]`) required; each has `smiles`, `resname` and exactly one of
+  `count` or `concentration` (molar). `fraction` is not accepted. Water is an explicit `smiles: O`
+  species; `O` must use `SOL`, `[Na+]` `NA` and `[Cl-]` `CL`
+- `sizing` required: `type: fixed_box` with `box_size` (Å; at least protein extent + 2 × `padding`), or
+  `type: count_density` with `target_density` (default `1.0` g/cm³; every species needs a `count`)
+- `padding` optional, default `10.0` Å
+- `concentration_volume_basis` optional: `protein_excluded` (default) or `box`
+- `partial_specific_volume` optional, default `0.73` mL/g (used for `protein_excluded`)
+- `relax_steps` optional, default `10000`
+- `ionization` optional; salt is added on top of neutralization and any packed ions
+
+See the [protein tutorial](/docs/user-guide/tutorial-protein-mixedbox) for a walkthrough.
+
+</Tab>
 </Tabs>
+
+## Protein species
+
+`system.protein` (`ProteinSpecies`) is shared by both protein types:
+
+| Key | Default | Notes |
+|---|---|---|
+| `resname` | – | Required, max 3 characters |
+| `pdb_path` | – | Required. A relative path is resolved against the YAML (or CSV) file's directory |
+| `count`, `fraction` | `1`, `1.0` | Only one protein is supported |
+| `chains` | `[]` | Chains to keep. Each becomes a `Protein_chain_<ID>` molecule. Required for multi-chain `proteinbox` inputs |
+| `merge_all` | `false` | Merge all chains into one molecule. Required for multi-chain `protein_mixedbox`; cannot be combined with `chains` |
+| `disulfide_bonds` | `[]` | Pairs of residues, e.g. `[[CYS6, CYS127]]`; chain-qualified (`A:CYS6`) is allowed |
+| `protonation_states` | `{}` | Residue to state, e.g. `HIS15: HIE`. CHARMM translates `HID/HIE/HIP/LYN` to `HSD/HSE/HSP/LSN` |
+| `ignore_hydrogens` | `true` | Passes `-ignh` to `pdb2gmx` |
+
+`pdb2gmx` needs GROMACS on `PATH` (or `[gromacs] GMX_PATH`), and `parametrization.protein:
+amber14sb` needs GROMACS 2026 or later.
 
 ## Compounds used in docs YAML examples
 
@@ -288,13 +399,17 @@ Spelling out a default does not change the hash, but any change of the system, t
 - Fraction sums not equal to `1.0`
 - Missing `total_count` when using fractions in mixedbox/bilayer
 - Bilayer odd lipid counts when `monolayer: false`
+- `protein_mixedbox`: a species with both or neither of `count`/`concentration`, a `fraction`, or `merge_all` together with `chains`
+- A box that is smaller than the protein extent plus 2 × `padding`
+- `parametrization` family that does not fit the system type (for example `amber` for `mixedbox`)
 - LNP `radius <= shell_thickness`
 
 ## Related pages
 
 <Cards>
-  <Card title="System Types" href="/docs/user-guide/system-types" description="Conceptual differences and field notes for mixedbox, bilayer, and lnp." />
+  <Card title="System Types" href="/docs/user-guide/system-types" description="Conceptual differences and field notes for all system types." />
   <Card title="CSV Format" href="/docs/user-guide/csv-format" description="How the CSV schema maps onto the same BuildInput model." />
   <Card title="Parametrization" href="/docs/user-guide/parametrization" description="Force-field families and per-component options." />
   <Card title="Simulation Settings" href="/docs/user-guide/simulation-settings" description="Temperature, pressure, stage lengths and GROMACS overrides." />
+  <Card title="Protein Tutorial" href="/docs/user-guide/tutorial-protein-mixedbox" description="proteinbox and protein_mixedbox from PDB to SLURM campaign." />
 </Cards>

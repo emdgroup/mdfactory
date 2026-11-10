@@ -48,6 +48,8 @@ flowchart LR
 - `mixedbox -> MixedBoxComposition`
 - `bilayer -> BilayerComposition`
 - `lnp -> LNPComposition`
+- `proteinbox -> ProteinBoxComposition`
+- `protein_mixedbox -> ProteinMixedBoxComposition`
 
 The current `engine` model field is restricted to `gromacs`.
 
@@ -60,6 +62,8 @@ DISPATCH_BUILD = {
     "mixedbox": build_mixedbox,
     "bilayer": build_bilayer,
     "lnp": build_lnp,
+    "proteinbox": build_proteinbox,
+    "protein_mixedbox": build_protein_mixedbox,
 }
 ```
 

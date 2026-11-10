@@ -1,0 +1,31 @@
+# SLURM executor for the full pipeline: Parsl workers on a GPU partition running
+# GROMACS >= 2026 from the pixi `gmx-cuda` environment (needed for
+# `parametrization: amber`). Used for BOTH `build` and `simulate`: the
+# protein_mixedbox compression stage runs OpenMM, which is orders of magnitude
+# faster on a GPU than on CPUs.
+#
+# Edit: account, partition, gres, and the manifest path in extra_init.
+# Generate a starting point interactively with `mdfactory config slurm`.
+provider: slurm
+account: my-account
+partition: gpu
+walltime: "12:00:00"     # one allocation per stage; production for 50 ns on one GPU
+nodes: 1
+cpus_per_node: 16
+gres: "gpu:1"
+mem: "32G"
+
+environment:
+  # The wizard's `pixi_manifest` option always activates pixi's default
+  # environment, so activate gmx-cuda yourself:
+  extra_init: >-
+    export CONDA_OVERRIDE_CUDA=12.9;
+    eval "$(pixi shell-hook --as-is --manifest-path /path/to/mdfactory/pyproject.toml -e gmx-cuda)";
+    gmx --version | grep -E "GROMACS version|GPU support"
+
+max_workers_per_node: 1
+max_blocks: 4              # up to 4 systems at the same time
+available_accelerators: 1  # GPUs per node, exposed through CUDA_VISIBLE_DEVICES
+retries: 2                 # infrastructure failures (OOM, timeout, preemption)
+max_rescue: 3              # physics failures: smaller step, more steps (EM/NVT/NPT)
+gmx_binary: auto

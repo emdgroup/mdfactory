@@ -1,0 +1,22 @@
+# Multi-chain protein in a solvated box (open-source Amber route, GROMACS >= 2026).
+# `chains` must list every chain of the structure; each becomes one
+# Protein_chain_<ID> moleculetype. Disulfide bonds and protonation states are
+# left to pdb2gmx here, set them explicitly if the structure needs it.
+simulation_type: proteinbox
+engine: gromacs
+parametrization:
+  family: amber
+  protein: amber14sb
+  water_model: tip3p
+
+system:
+  protein:
+    resname: INS
+    count: 1
+    pdb_path: ./1zni.pdb
+    ignore_hydrogens: true
+    chains: [A, B, C, D]
+  padding: 12.0
+  ionization:
+    neutralize: true
+    concentration: 0.15

@@ -1,0 +1,39 @@
+# A complete SimulationSettings protocol file: every field spelled out.
+#
+# Pass it to every system of a build call:
+#   mdfactory build systems.csv runs/ --simulation-settings protocol_full.yaml
+#   mdfactory prepare-build systems.csv runs/ --simulation-settings protocol_full.yaml
+#
+# Precedence: a system's own `simulation_settings` (inline or CSV columns) >
+# this file > defaults for the system type. Only temperature and pressure enter
+# the build hash; everything else can change without creating a new system.
+
+temperature: 300.0        # K     (identity)
+pressure: 1.0             # bar   (identity)
+timestep: 2.0             # fs    (maximum 2.0)
+
+minimization:
+  max_steps: 50000
+  force_tolerance: 1000.0   # kJ/mol/nm
+
+nvt:
+  length: 100.0             # ps, integer multiple of the timestep
+  output_interval: 1.0      # ps
+npt:
+  length: 100.0             # ps
+  output_interval: 1.0      # ps
+
+production:
+  length: 100.0             # ns (default: 100; 1000 for bilayer)
+  output_interval: 10.0     # ps, compressed coordinates, energies and log
+
+# Raw mdp keys per stage, applied last. Keys owned by a typed setting (nsteps,
+# dt, ref-t, nstxout-compressed, ...) or by the build (coulombtype, vdwtype,
+# tc-grps, ...) are rejected.
+gromacs_overrides:
+  minimization: {}
+  nvt: {}
+  npt:
+    pcoupl: C-rescale
+  production:
+    nstcalcenergy: 100

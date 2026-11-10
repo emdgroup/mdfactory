@@ -17,8 +17,9 @@ MDFactory is a high-throughput library for setting up molecular dynamics (MD) si
 
 ## Features
 
-- **System building** — Mixedbox, bilayer, and LNP build types from YAML or CSV input
-- **Parametrization** — OpenFF/SMIRNOFF and CGenFF with automatic per-molecule caching
+- **System building** — Mixedbox, bilayer, LNP, protein-in-water (`proteinbox`) and protein-in-mixture (`protein_mixedbox`) build types from YAML or CSV input
+- **Parametrization** — force-field families `openff` (Sage), `charmm` (CHARMM36m + CGenFF) and `amber` (ff14SB + Sage, open source) with automatic per-molecule caching
+- **Run protocols** — `SimulationSettings` (temperature, pressure, stage lengths, mdp overrides) rendered into GROMACS run files at build time
 - **Batch processing** — CSV-driven Parsl pipelines for parallel builds and GROMACS runs on HPC
 - **Analysis** — Registered analysis and artifact types with parquet output, local or SLURM execution
 - **Data integration** — Push/pull/sync across SQLite, CSV, and Palantir Foundry backends
@@ -37,6 +38,7 @@ cd mdfactory
 pixi install          # creates the environment and installs everything
 pixi run mdfactory    # run the CLI
 pixi run -e dev test  # run the test suite
+pixi install -e gmx   # GROMACS >= 2026 (needed for the open-source `amber` protein route); `gmx-cuda` for GPUs
 ```
 
 ### Without pixi
@@ -84,6 +86,8 @@ pip install -e .[dev]
    ```
 
 See the [Quick Start guide](https://emdgroup.github.io/mdfactory/docs/quick-start) for details on bulk CSV input and running simulations.
+
+The [`examples/`](examples/README.md) directory has inputs for every system type, `SimulationSettings` protocols, and a complete CSV → build → simulate → analysis pipeline with a SLURM config (`examples/pipeline/`). The [protein tutorial](https://emdgroup.github.io/mdfactory/docs/user-guide/tutorial-protein-mixedbox) walks through it.
 
 ## Configuration
 

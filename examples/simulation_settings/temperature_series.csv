@@ -1,0 +1,5 @@
+simulation_type,parametrization,system.species.SOL.smiles,system.species.SOL.count,system.species.ETH.smiles,system.species.ETH.count,simulation_settings.temperature,simulation_settings.production.length,simulation_settings.gromacs_overrides.npt.pcoupl
+mixedbox,openff,O,2000,CCO,200,290,20,C-rescale
+mixedbox,openff,O,2000,CCO,200,300,20,C-rescale
+mixedbox,openff,O,2000,CCO,200,310,20,C-rescale
+mixedbox,openff,O,2000,CCO,200,320,,

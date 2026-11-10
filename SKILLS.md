@@ -1,6 +1,6 @@
 # MDFactory — Agent Quick Reference
 
-High-throughput MD simulation setup and analysis library. Builds mixedbox and bilayer systems, runs analyses, and syncs results to SQLite/CSV/Foundry backends.
+High-throughput MD simulation setup and analysis library. Builds mixedbox, bilayer, LNP, proteinbox and protein_mixedbox systems, runs analyses, and syncs results to SQLite/CSV/Foundry backends.
 
 ## Project Layout
 
@@ -8,17 +8,19 @@ High-throughput MD simulation setup and analysis library. Builds mixedbox and bi
 mdfactory/
   cli.py              # CLI entry point (cyclopts App)
   config.py            # Reads config_templates/config.ini, sets env vars
-  build.py             # build_mixedbox(), build_bilayer()
+  build.py             # build_mixedbox(), build_bilayer(), build_lnp(), build_proteinbox(), build_protein_mixedbox()
   workflows.py         # run_build_from_file() — dispatches to build.py
   prepare.py           # df_to_build_input_models() — CSV row -> BuildInput
   check.py             # check_bilayer_buildable()
+  setup/protein.py     # PDBFixer cleanup, pdb2gmx, GROMACS version gate (amber14sb needs >= 2026)
+  run_schedules/       # mdp rendering from SimulationSettings (gromacs.py)
   parametrize.py       # Parametrization dispatch (cgenff/openff), OpenFF cache, resolve_parametrizer
   models/
     input.py           # BuildInput (central model, has .hash, .metadata)
     species.py         # Species, SingleMoleculeSpecies, LipidSpecies
     parametrization.py # charmm/amber/openff family specs, parameter sets
     simulation_settings.py # SimulationSettings (T/P = identity; lengths, outputs, overrides)
-    composition.py     # MixedBoxComposition, BilayerComposition, IonizationConfig
+    composition.py     # Mixedbox/Bilayer/LNP/ProteinBox/ProteinMixedBox compositions, IonizationConfig
   analysis/
     simulation.py      # Simulation class, ANALYSIS_REGISTRY
     store.py           # SimulationStore — multi-simulation discovery/aggregation
@@ -251,7 +253,7 @@ Key sections: `[cgenff]` (SILCSBIODIR), `[storage]` (parameter store path), `[da
 
 ## Dispatch Tables
 
-Build: `DISPATCH_BUILD = {"mixedbox": build_mixedbox, "bilayer": build_bilayer}`
+Build: `DISPATCH_BUILD = {"mixedbox": build_mixedbox, "bilayer": build_bilayer, "lnp": build_lnp, "proteinbox": build_proteinbox, "protein_mixedbox": build_protein_mixedbox}`
 
 Parametrize: `DISPATCH_ENGINE_PARAMETRIZE = {"gromacs": {"cgenff": ..., "openff": ...}}`
 

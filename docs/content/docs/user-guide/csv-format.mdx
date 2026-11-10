@@ -15,7 +15,7 @@ mixedbox,charmm,gromacs,O,800,CCO,200,1.0
 
 ### Required columns
 
-- `simulation_type` (`mixedbox`, `bilayer`, or `lnp`)
+- `simulation_type` (`mixedbox`, `bilayer`, `lnp`, `proteinbox`, or `protein_mixedbox`)
 - `parametrization` (force-field family: `charmm`, `amber` or `openff`; or the dotted `parametrization.family`)
 - `engine` (`gromacs`)
 
@@ -68,6 +68,26 @@ simulation_type,parametrization,engine,system.radius,system.shell_thickness,syst
 lnp,openff,gromacs,60.0,28.0,ILN_SMILES,0.5,DSP_SMILES,0.5
 ```
 
+## Example: Protein systems
+
+Protein systems add `system.protein.*` columns. `pdb_path` is resolved relative to the CSV file.
+Lists are `;`-separated, and every protonation state is its own column. A `proteinbox` table
+(`examples/proteinbox/proteins_amber.csv`):
+
+```csv
+simulation_type,engine,parametrization.family,parametrization.protein,parametrization.water_model,system.protein.resname,system.protein.pdb_path,system.protein.chains,system.protein.disulfide_bonds,system.protein.protonation_states.HIS15,system.padding,system.ionization.neutralize,system.ionization.concentration
+proteinbox,gromacs,amber,amber14sb,tip3p,LYZ,1aki.pdb,A,CYS6-CYS127;CYS30-CYS115;CYS64-CYS80;CYS76-CYS94,HIE,12.0,True,0.15
+```
+
+`protein_mixedbox` adds species, sizing and volume columns
+(`examples/protein_mixedbox/protein_mixedbox_amber.csv`, and the four-system campaign
+`examples/pipeline/systems.csv`):
+
+```csv
+simulation_type,engine,parametrization.family,parametrization.protein,...,system.species.SOL.smiles,system.species.SOL.concentration,system.species.ETH.smiles,system.species.ETH.concentration,system.sizing.type,system.sizing.box_size,system.padding,system.concentration_volume_basis,system.relax_steps
+protein_mixedbox,gromacs,amber,amber14sb,...,O,53.0,CCO,1.0,fixed_box,72.0,12.0,protein_excluded,10000
+```
+
 ## Processing the CSV
 
 Convert CSV to individual system directories:
@@ -104,7 +124,7 @@ graph LR
 
 | Column | Type | Required | Description |
 |--------|------|----------|-------------|
-| `simulation_type` | string | Yes | `mixedbox`, `bilayer`, or `lnp` |
+| `simulation_type` | string | Yes | `mixedbox`, `bilayer`, `lnp`, `proteinbox`, or `protein_mixedbox` |
 | `parametrization` | string | Yes | Force-field family: `charmm`, `amber` or `openff`. Alternatively use `parametrization.family` |
 | `engine` | string | Yes | `gromacs` |
 
@@ -124,6 +144,15 @@ These map directly to `BuildInput.system` fields using dot notation:
 | `system.core.target_density` | float | Core density in g/cm³ (LNP) |
 | `system.shell.z0` | float | Pivotal plane offset in Å (LNP) |
 | `system.shell.area_per_lipid` | float | Area per lipid in Å² (LNP) |
+| `system.padding` | float | Minimum protein-to-box-edge distance in Å (`proteinbox`, `protein_mixedbox`) |
+| `system.relax_steps` | integer | Restrained-relaxation OpenMM steps (protein types) |
+| `system.sizing.type` | string | `fixed_box` or `count_density` (`protein_mixedbox`) |
+| `system.sizing.box_size` | float | Cubic box edge in Å (`fixed_box`) |
+| `system.sizing.target_density` | float | Target density in g/cm³ (`count_density`) |
+| `system.concentration_volume_basis` | string | `protein_excluded` or `box` (`protein_mixedbox`) |
+| `system.partial_specific_volume` | float | Protein partial specific volume in mL/g (`protein_mixedbox`) |
+| `system.species.{RESNAME}.concentration` | float | Molar concentration instead of `count` (`protein_mixedbox`) |
+| `system.ionization.neutralize`, `.concentration`, `.min_distance`, `.seed` | bool/float/int | Ionization options (all types) |
 
 ### Parametrization options (optional)
 
@@ -142,6 +171,11 @@ to override individual components. See [Parametrization](/docs/user-guide/parame
 
 | Column | Type | Description |
 |--------|------|-------------|
+| `system.protein.resname` | string | Residue name of the protein (required for protein types) |
+| `system.protein.pdb_path` | path | Input structure; relative paths resolve against the CSV directory (required) |
+| `system.protein.chains` | `;`-list | Chains to keep, e.g. `A;B` |
+| `system.protein.disulfide_bonds` | `;`-list | Residue pairs, e.g. `CYS6-CYS127;CYS30-CYS115` |
+| `system.protein.protonation_states.<RESIDUE>` | string | One column per residue, e.g. `system.protein.protonation_states.HIS15` = `HIE` |
 | `system.protein.ignore_hydrogens` | bool | Ignore hydrogens in the input structure (default `true`) |
 | `system.protein.merge_all` | bool | Merge all chains into one molecule (default `false`) |
 
@@ -180,5 +214,6 @@ mixedbox,charmm,O,1000,310
 <Cards>
   <Card title="Quick Start" href="/docs/quick-start" />
   <Card title="System Types" href="/docs/user-guide/system-types" />
+  <Card title="Protein Tutorial" href="/docs/user-guide/tutorial-protein-mixedbox" />
   <Card title="Workflows" href="/docs/user-guide/workflows" />
 </Cards>

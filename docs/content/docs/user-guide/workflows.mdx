@@ -35,7 +35,7 @@ mdfactory build systems.csv --output results --slurm slurm_executor.yaml
 What it does:
 
 1. Runs `mdfactory prepare-build` internally (CSV → per-hash YAML + summary YAML).
-2. Builds each hash directory using the appropriate builder (mixedbox, bilayer, LNP).
+2. Builds each hash directory using the appropriate builder (mixedbox, bilayer, LNP, proteinbox, protein_mixedbox).
 3. With `--slurm`, builds run as parallel Parsl `python_app` tasks on allocated nodes.
 
 The summary YAML filename is derived from the CSV stem. For example, `systems.csv` produces `results/systems.yaml`.
