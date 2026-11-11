@@ -15,6 +15,7 @@ from pydantic import (
     model_validator,
 )
 
+from ..utils.units import A3_TO_CM3, N_AVOGADRO
 from .species import (
     LipidSpecies,
     ProteinSpecies,
@@ -220,9 +221,9 @@ class CoreComposition(BaseModel):
 
         """
         V_angstrom3 = (4 / 3) * np.pi * radius**3
-        V_cm3 = V_angstrom3 * 1e-24  # Å³ to cm³
+        V_cm3 = V_angstrom3 * A3_TO_CM3
         mass_g = self.target_density * V_cm3
-        mass_dalton = mass_g * 6.022e23  # g to Daltons
+        mass_dalton = mass_g * N_AVOGADRO
 
         # Weighted average mass
         fractions = np.array([s.fraction for s in self.species])

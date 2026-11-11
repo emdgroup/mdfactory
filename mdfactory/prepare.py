@@ -11,10 +11,8 @@ from typing import Any
 import pandas as pd
 
 from .models.input import BuildInput
+from .models.parametrization import PROTEIN_SIMULATION_TYPES
 from .models.simulation_settings import SimulationSettings, merge_simulation_settings
-
-# Simulation types whose system carries a protein with a pdb_path to resolve.
-PROTEIN_PDB_SIMULATION_TYPES = frozenset({"proteinbox", "protein_mixedbox"})
 
 # CSV column holding the protein PDB path (flat, dotted notation).
 PROTEIN_PDB_PATH_COLUMN = "system.protein.pdb_path"
@@ -212,6 +210,13 @@ def df_to_build_input_models(
     return ret, errors
 
 
+def _resolve_relative(path: Any, base_dir: Path) -> Any:
+    """Return *path* made absolute against *base_dir*; blanks and absolute paths pass through."""
+    if pd.isna(path) or Path(path).is_absolute():
+        return path
+    return str((Path(base_dir) / path).resolve())
+
+
 def resolve_protein_pdb_path(dct: Any, base_dir: Path) -> None:
     """Rewrite a relative protein ``pdb_path`` in a build dict to be absolute.
 
@@ -228,15 +233,13 @@ def resolve_protein_pdb_path(dct: Any, base_dir: Path) -> None:
         Directory that relative paths are resolved against
 
     """
-    if not isinstance(dct, dict) or dct.get("simulation_type") not in PROTEIN_PDB_SIMULATION_TYPES:
+    if not isinstance(dct, dict) or dct.get("simulation_type") not in PROTEIN_SIMULATION_TYPES:
         return
     protein = (dct.get("system") or {}).get("protein")
     if not isinstance(protein, dict):
         return
-    pdb_path = protein.get("pdb_path")
-    if pdb_path is None or Path(pdb_path).is_absolute():
-        return
-    protein["pdb_path"] = str((Path(base_dir) / pdb_path).resolve())
+    if protein.get("pdb_path") is not None:
+        protein["pdb_path"] = _resolve_relative(protein["pdb_path"], base_dir)
 
 
 def load_build_input_csv(
@@ -272,9 +275,7 @@ def load_build_input_csv(
     df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
     if PROTEIN_PDB_PATH_COLUMN in df.columns:
         df[PROTEIN_PDB_PATH_COLUMN] = df[PROTEIN_PDB_PATH_COLUMN].apply(
-            lambda p: (
-                p if pd.isna(p) or Path(p).is_absolute() else str((csv_path.parent / p).resolve())
-            )
+            _resolve_relative, base_dir=csv_path.parent
         )
     models, errors = df_to_build_input_models(df, simulation_settings)
     return df, models, errors

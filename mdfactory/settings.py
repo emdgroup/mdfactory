@@ -82,39 +82,6 @@ class Settings:
             },
         }
 
-    # Keep DEFAULT_CONFIG as class attribute for backward compat in tests
-    DEFAULT_CONFIG = {
-        "cgenff": {"SILCSBIODIR": ""},
-        "gromacs": {"GMX_PATH": "", "FORCEFIELD_DIR": ""},
-        "storage": {"PARAMETERS": ""},
-        "database": {"TYPE": "sqlite"},
-        "databases": {
-            "USE_RUN_DB": "true",
-            "USE_ANALYSIS_DB": "true",
-        },
-        "sqlite": {
-            "RUN_DB_PATH": "",
-            "ANALYSIS_DB_PATH": "",
-        },
-        "csv": {
-            "RUN_DB_PATH": "",
-            "ANALYSIS_DB_PATH": "",
-        },
-        "foundry": {
-            "BASE_PATH": "/Group Functions/mdfactory",
-            "ANALYSIS_NAME": "analysis",
-            "RUN_DB_PATH": "/Group Functions/mdfactory/runs",
-            "ANALYSIS_DB_PATH": "/Group Functions/mdfactory/analysis",
-            "ARTIFACT_DB_PATH": "/Group Functions/mdfactory/artifacts",
-        },
-        "slurm": {
-            "ACCOUNT": "",
-            "PARTITION_CPU": "",
-            "PARTITION_GPU": "",
-            "DEFAULT_QOS": "",
-        },
-    }
-
     def __init__(self):
         self.config = configparser.ConfigParser()
         self._config_base_dir = Path.cwd()

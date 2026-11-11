@@ -18,7 +18,7 @@ from .composition import (
     ProteinBoxComposition,
     ProteinMixedBoxComposition,
 )
-from .parametrization import ParametrizationSpec
+from .parametrization import PROTEIN_SIMULATION_TYPES, ParametrizationSpec, SimulationType
 from .simulation_settings import SimulationSettings
 
 # Map system_type to the corresponding model class
@@ -32,13 +32,25 @@ type_mapping = {
 }
 
 
+def protein_anchor(build_input: Any) -> dict[str, Any] | None:
+    """Return the species entry (resname, count, fraction) of a protein_mixedbox's protein.
+
+    The protein anchors a protein_mixedbox but is not part of ``system.species``,
+    which holds the packed solution only. Returns None for every other type.
+    """
+    if build_input.simulation_type != "protein_mixedbox":
+        return None
+    protein = build_input.system.protein
+    return {"resname": protein.resname, "count": protein.count, "fraction": protein.fraction}
+
+
 class BuildInput(BaseModel):
     """Represent a complete simulation build specification with composition and parametrization."""
 
     # Unknown keys are rejected so a misspelled or removed key is never dropped silently.
     model_config = ConfigDict(extra="forbid")
 
-    simulation_type: Literal["mixedbox", "bilayer", "lnp", "proteinbox", "protein_mixedbox"]
+    simulation_type: SimulationType
     system: (
         MixedBoxComposition
         | BilayerComposition
@@ -130,16 +142,7 @@ class BuildInput(BaseModel):
             # The protein anchors the box but is not part of system.species
             # (packing is solution-only); list it as a species so metadata
             # matches proteinbox.
-            protein = self.system.protein
-            species_composition.insert(
-                0,
-                {
-                    "resname": protein.resname,
-                    "count": protein.count,
-                    "fraction": protein.fraction,
-                    "concentration": None,
-                },
-            )
+            species_composition.insert(0, {**protein_anchor(self), "concentration": None})
 
         return {
             "hash": self.hash,
@@ -247,7 +250,7 @@ class BuildInput(BaseModel):
         Compression additionally requires a multi-chain complex to be merged so
         the barostat cannot scale chain centers independently.
         """
-        if self.simulation_type not in ("proteinbox", "protein_mixedbox"):
+        if self.simulation_type not in PROTEIN_SIMULATION_TYPES:
             return self
         protein = self.system.protein
         if (

@@ -3,30 +3,31 @@
 """Tests for the per-component force-field family specs on BuildInput."""
 
 import json
-from pathlib import Path
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from mdfactory.models.input import BuildInput
+from mdfactory.models.input import BuildInput, type_mapping
 from mdfactory.models.parametrization import (
+    ALL_SIMULATION_TYPES,
     DEFAULT_NAGL_MODEL,
     DEFAULT_OPENFF_FORCEFIELD,
+    PROTEIN_SIMULATION_TYPES,
+    SMALL_MOLECULE_SIMULATION_TYPES,
     AmberParametrization,
     CgenffSmallMolecules,
     CharmmParametrization,
     OpenFFParametrization,
     OpenFFSmallMolecules,
 )
+from mdfactory.models.simulation_settings import DEFAULT_PRODUCTION_LENGTH_NS
 from mdfactory.prepare import load_build_input_csv, resolve_protein_pdb_path
+from mdfactory.run_schedules.gromacs import COUPLING
 
-from .conftest import protein_input_data
-
-EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples"
+from .conftest import EXAMPLES_DIR, PROTEIN_TYPES, protein_input_data
 
 SMALL_MOLECULE_TYPES = ["mixedbox", "bilayer", "lnp"]
-PROTEIN_TYPES = ["proteinbox", "protein_mixedbox"]
 
 VALID_COMBINATIONS = [
     ("charmm", "mixedbox"),
@@ -219,11 +220,41 @@ def test_charmm_proteinbox_accepts_other_charmm_forcefields_and_waters(protein_p
     assert (spec.protein, spec.water_model) == ("charmm27", "spce")
 
 
-def test_resolved_spec_is_frozen(protein_pdb):
+def test_resolved_spec_keeps_cgenff_small_molecules(protein_pdb):
     spec = _build("mixedbox", "charmm", protein_pdb).parametrization
-    with pytest.raises(ValidationError):
-        spec.water_model = "spce"
     assert isinstance(spec.small_molecules, CgenffSmallMolecules)
+
+
+@pytest.mark.parametrize(
+    ("simulation_type", "family", "attribute", "value"),
+    [
+        ("mixedbox", "charmm", "water_model", "spce"),
+        *[(t, f, "protein", "other") for t in PROTEIN_TYPES for f in ("charmm", "amber")],
+    ],
+)
+def test_resolved_spec_is_frozen(simulation_type, family, attribute, value, protein_pdb):
+    spec = _build(simulation_type, family, protein_pdb).parametrization
+    with pytest.raises(ValidationError):
+        setattr(spec, attribute, value)
+
+
+# Unsupported protein force-field and water choices, rejected for both protein types.
+PROTEIN_CHOICE_REJECTIONS = [
+    (sim_type, {"family": family, **overrides}, match)
+    for sim_type in PROTEIN_TYPES
+    for family, overrides, match in [
+        ("charmm", {"protein": "amber99sb-ildn"}, "CHARMM"),
+        ("charmm", {"water_model": "tip4p"}, "3-site"),
+        ("charmm", {"protein": "charmm36m-ljpme"}, "LJ-PME"),
+        ("amber", {"protein": "amber19sb"}, "Only 'amber14sb'"),
+        ("amber", {"protein": "charmm36m"}, "Only 'amber14sb'"),
+        ("amber", {"water_model": "opc"}, "Only 'tip3p'"),
+        ("amber", {"water_model": "spce"}, "Only 'tip3p'"),
+    ]
+] + [
+    ("protein_mixedbox", {"family": "charmm", "protein": "charmm27"}, "only the registered"),
+    ("protein_mixedbox", {"family": "charmm", "water_model": "spce"}, "only 'tip3p'"),
+]
 
 
 @pytest.mark.parametrize(
@@ -242,10 +273,9 @@ def test_resolved_spec_is_frozen(protein_pdb):
             {"family": "charmm", "small_molecules": {"forcefield": "cgenff"}},
             "small_molecules does not apply",
         ),
-        ("bilayer", {"family": "openff", "protein": "x"}, "no protein force field"),
+        ("bilayer", {"family": "openff", "protein": "x"}, "protein does not apply"),
         # CHARMM restrictions.
         ("proteinbox", {"family": "charmm", "protein": "amber14sb"}, "only CHARMM force fields"),
-        ("proteinbox", {"family": "charmm", "protein": "charmm36m-ljpme"}, "LJ-PME"),
         ("proteinbox", {"family": "charmm", "water_model": "tip4p"}, "3-site"),
         ("mixedbox", {"family": "charmm", "water_model": "spce"}, "TIP3P water of its"),
         ("protein_mixedbox", {"family": "charmm", "protein": "charmm27"}, "'charmm36m' bundle"),
@@ -265,6 +295,7 @@ def test_resolved_spec_is_frozen(protein_pdb):
             {"family": "openff", "small_molecules": {"forcefield": "openff-2.2.0"}},
             "must be an .offxml file name",
         ),
+        *PROTEIN_CHOICE_REJECTIONS,
     ],
 )
 def test_rejections(simulation_type, parametrization, match, protein_pdb):
@@ -340,3 +371,14 @@ def test_example_csv_parses(path):
     assert errors == {}
     assert len(models) == len(df) > 0
     assert {m.parametrization.family for m in models} <= {"charmm", "amber", "openff"}
+
+
+def test_simulation_type_tables_cover_the_literal():
+    """Per-type tables are keyed by the one SimulationType definition."""
+    assert set(type_mapping) == ALL_SIMULATION_TYPES
+    assert set(DEFAULT_PRODUCTION_LENGTH_NS) == ALL_SIMULATION_TYPES
+    assert set(COUPLING) == ALL_SIMULATION_TYPES
+    assert PROTEIN_SIMULATION_TYPES <= ALL_SIMULATION_TYPES
+    assert SMALL_MOLECULE_SIMULATION_TYPES <= ALL_SIMULATION_TYPES
+    assert CharmmParametrization.simulation_types == ALL_SIMULATION_TYPES
+    assert OpenFFParametrization.simulation_types.isdisjoint(PROTEIN_SIMULATION_TYPES)

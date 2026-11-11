@@ -2,7 +2,6 @@
 # ABOUTME: Covers defaults, validation, hashing, YAML/CSV/file/object inputs, precedence, duplicates
 """Tests for :mod:`mdfactory.models.simulation_settings` and its BuildInput integration."""
 
-from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -23,13 +22,7 @@ from mdfactory.prepare import (
     load_build_input_csv,
 )
 
-WATER = {
-    "simulation_type": "mixedbox",
-    "parametrization": "charmm",
-    "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
-}
-
-EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
+from .conftest import EXAMPLES_DIR, WATER
 
 CSV_HEADER = "simulation_type,parametrization,system.species.SOL.smiles,system.species.SOL.count"
 
@@ -121,7 +114,7 @@ def test_metadata_and_record_carry_settings(tmp_path):
 
 def test_record_round_trip_keeps_hash_of_dict_fields(tmp_path):
     """Dict fields (LNP input_fractions) keep their order, so the record keeps the hash."""
-    data = yaml.safe_load((EXAMPLES / "lnp" / "lnp_alc0315_smirnoff.yaml").read_text())
+    data = yaml.safe_load((EXAMPLES_DIR / "lnp" / "lnp_alc0315_smirnoff.yaml").read_text())
     model = BuildInput(**data)
     fractions = model.system.shell.input_fractions
     assert list(fractions) != sorted(fractions)  # the case that a sorted dump breaks

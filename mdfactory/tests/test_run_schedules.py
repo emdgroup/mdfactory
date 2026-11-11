@@ -27,6 +27,8 @@ from mdfactory.run_schedules import (
     write_mdp_files,
 )
 
+from .conftest import PROTEIN_TYPES, WATER
+
 # Every simulation type with each family that supports it (both nonbonded schemes).
 COMBINATIONS = [
     ("mixedbox", CharmmParametrization),
@@ -40,7 +42,6 @@ COMBINATIONS = [
     ("protein_mixedbox", CharmmParametrization),
     ("protein_mixedbox", AmberParametrization),
 ]
-PROTEIN_TYPES = ("proteinbox", "protein_mixedbox")
 
 
 def _inp(simulation_type, family=CharmmParametrization, **settings):
@@ -347,12 +348,6 @@ def test_sage_scheme_matches_the_openff_force_fields(tmp_path):
 
 
 # --- re-render existing directories -----------------------------------------------------
-
-WATER = {
-    "simulation_type": "mixedbox",
-    "parametrization": "charmm",
-    "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
-}
 
 
 @pytest.fixture()

@@ -165,11 +165,12 @@ the `--stages` filter — only files belonging to requested stages are deleted.
 </Accordion>
 <Accordion title="grompp: cut-off longer than half the box">
 
-`charmm` builds use a 1.2 nm cutoff (Force-switch from 1.0 nm), so every box edge must be at
-least about 2.6 nm. grompp reports *"The cut-off length is longer than half the shortest box
+`charmm` builds use the longer nonbonded cutoff of the two schemes (see
+[Simulation Settings](/docs/user-guide/simulation-settings#the-generated-protocol)), so every box
+edge must be at least about 2.6 nm. grompp reports *"The cut-off length is longer than half the shortest box
 vector or longer than the smallest box diagonal element"* for smaller boxes. Increase the
 molecule count (mixedbox), the lipid count or `z_padding` (bilayer), or the padding (LNP,
-protein types). `sage` builds (`openff`, `amber`) use 0.9 nm.
+protein types). `sage` builds (`openff`, `amber`) have a shorter cutoff and rarely hit this.
 
 </Accordion>
 <Accordion title="Settings changes: duplicate inputs or refused re-renders">

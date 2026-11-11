@@ -7,7 +7,7 @@ import io
 import warnings
 from functools import cached_property
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, NamedTuple, Optional
 
 from pydantic import BaseModel, Field, model_validator
 from rdkit import Chem
@@ -38,6 +38,24 @@ class Species(BaseModel):
         raise NotImplementedError("Charge property not implemented for base Species class.")
 
 
+class NativeSpecies(NamedTuple):
+    """Naming of a water or ion that the force-field directory provides itself."""
+
+    #: Residue name, which is also the GROMACS moleculetype name.
+    resname: str
+    #: Atom names in packing order (the same in CHARMM36m and ``amber14sb.ff``).
+    atom_names: tuple[str, ...]
+
+
+#: Native water and monatomic ions, keyed by SMILES.
+NATIVE_SPECIES: dict[str, NativeSpecies] = {
+    "O": NativeSpecies("SOL", ("OW", "HW1", "HW2")),
+    "[Na+]": NativeSpecies("NA", ("NA",)),
+    "[Cl-]": NativeSpecies("CL", ("CL",)),
+}
+WATER_RESNAME = NATIVE_SPECIES["O"].resname
+
+
 class SingleMoleculeSpecies(Species):
     """Represent a single-molecule species identified by its canonical SMILES string."""
 
@@ -59,12 +77,11 @@ class SingleMoleculeSpecies(Species):
     @property
     def is_ion(self):
         """Return True if the species is a monatomic ion."""
-        # TODO: expose/central location?
-        allowed_ions = {"[Na+]", "[Cl-]"}
-        ret = (
-            self.smiles in allowed_ions and self.rdkit_molecule.GetAtoms()[0].GetFormalCharge() != 0
+        return (
+            self.smiles in NATIVE_SPECIES
+            and not self.is_water
+            and self.rdkit_molecule.GetAtoms()[0].GetFormalCharge() != 0
         )
-        return ret
 
     @cached_property
     def rdkit_molecule(self) -> "Chem.rdchem.Mol":
@@ -180,12 +197,11 @@ class SolutionSpecies(SingleMoleculeSpecies):
             )
         if (self.count is None) == (self.concentration is None):
             raise ValueError("SolutionSpecies requires exactly one of 'count' or 'concentration'.")
-        native_resnames = {"O": "SOL", "[Na+]": "NA", "[Cl-]": "CL"}
-        expected_resname = native_resnames.get(self.smiles)
-        if expected_resname is not None and self.resname.upper() != expected_resname:
+        native = NATIVE_SPECIES.get(self.smiles)
+        if native is not None and self.resname.upper() != native.resname:
             raise ValueError(
                 f"Native water/ion species {self.smiles!r} must use resname "
-                f"'{expected_resname}', not '{self.resname}'."
+                f"'{native.resname}', not '{self.resname}'."
             )
         return self
 

@@ -9,7 +9,7 @@ mdfactory/
   cli.py              # CLI entry point (cyclopts App)
   config.py            # Reads config_templates/config.ini, sets env vars
   build.py             # build_mixedbox(), build_bilayer(), build_lnp(), build_proteinbox(), build_protein_mixedbox()
-  workflows.py         # run_build_from_file() — dispatches to build.py
+  workflows.py         # run_build_from_dict() — dispatches to build.py
   prepare.py           # df_to_build_input_models() — CSV row -> BuildInput
   check.py             # check_bilayer_buildable()
   setup/protein.py     # PDBFixer cleanup, pdb2gmx, GROMACS version gate (amber14sb needs >= 2026)
@@ -149,14 +149,14 @@ mdfactory clean [--molecules] [--database]
 ### Building Systems
 ```python
 from mdfactory.prepare import df_to_build_input_models
-from mdfactory.workflows import run_build_from_file
+from mdfactory.workflows import run_build_from_dict
 from mdfactory.build import build_mixedbox, build_bilayer
 
 # CSV -> models
 models, errors = df_to_build_input_models(df)
 
-# YAML -> build
-run_build_from_file(Path("hash.yaml"))
+# BuildInput (or raw dict) -> build in the working directory
+run_build_from_dict(models[0])
 ```
 
 ### Models

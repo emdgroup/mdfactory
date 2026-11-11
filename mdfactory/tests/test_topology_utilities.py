@@ -13,9 +13,13 @@ from mdfactory.settings import settings
 from mdfactory.utils.topology_utilities import (
     _atomtype_signature,
     _get_sybyl_atom_type,
+    _iter_prm_atomtypes,
     collect_forcefield_atomtype_definitions,
     extract_reusable_parts_from_cgenff_gmx_top,
+    iter_includes,
+    iter_topology_entries,
     merge_extra_parameter_itps,
+    read_topology_defaults,
     rename_atomtypes,
     validate_cgenff_atomtype_compatibility,
     write_mol2_from_rdkit,
@@ -139,7 +143,9 @@ def test_cgenff_atomtype_compatibility_ignores_inline_comment(tmp_path):
     generated.write_text("[ atomtypes ]\nCG331 6 12.011 0.0 A 0.36 0.28 ; sp3 carbon\n")
 
     # Identical physical parameters, only a comment differs -> no conflict raised.
-    validate_cgenff_atomtype_compatibility([generated], ff_dir)
+    validate_cgenff_atomtype_compatibility(
+        [generated], collect_forcefield_atomtype_definitions(ff_dir)
+    )
 
 
 def test_cgenff_atomtype_compatibility_rejects_conflict(tmp_path):
@@ -150,7 +156,9 @@ def test_cgenff_atomtype_compatibility_rejects_conflict(tmp_path):
     generated.write_text("[ atomtypes ]\nCG331 6 12.011 0.0 A 0.40 0.28\n")
 
     with pytest.raises(ValueError, match="conflicts with the selected CHARMM"):
-        validate_cgenff_atomtype_compatibility([generated], ff_dir)
+        validate_cgenff_atomtype_compatibility(
+            [generated], collect_forcefield_atomtype_definitions(ff_dir)
+        )
 
 
 def test_collect_atomtypes_honors_preprocessor_conditionals(tmp_path):
@@ -435,3 +443,89 @@ def test_oco2_carboxylate_partner():
     o_neutral = mol.GetAtomWithIdx(2)
     assert o_neutral.GetFormalCharge() == 0
     assert _get_sybyl_atom_type(o_neutral) == "O.co2"
+
+
+ENTRY_TEXT = """\
+; title
+#define FLEXIBLE
+[ Atoms ]
+; nr type
+1  CT  ; first
+#ifdef X
+2  CT
+#endif
+
+[ bonds ] ; trailing comment
+1 2
+"""
+
+
+def test_iter_topology_entries_tracks_sections_and_keeps_comments():
+    entries = list(iter_topology_entries(ENTRY_TEXT.splitlines(keepends=True)))
+    # Blank, comment-only and preprocessor lines are not data; sections are lower-cased.
+    assert [(e.section, e.code) for e in entries] == [
+        ("atoms", "1  CT"),
+        ("atoms", "2  CT"),
+        ("bonds", "1 2"),
+    ]
+    assert entries[0].comment == "; first"
+    assert entries[1].comment == ""
+    # The index addresses the original line, so a caller can rewrite it.
+    assert ENTRY_TEXT.splitlines()[entries[2].index] == "1 2"
+
+
+def test_iter_topology_entries_headers_are_opt_in():
+    lines = ENTRY_TEXT.splitlines()
+    headers = [e for e in iter_topology_entries(lines, headers=True) if e.is_header]
+    assert [(e.section, e.index) for e in headers] == [("atoms", 2), ("bonds", 9)]
+    assert not any(e.is_header for e in iter_topology_entries(lines))
+
+
+def test_iter_topology_entries_supports_early_stop():
+    seen = []
+    for entry in iter_topology_entries(ENTRY_TEXT.splitlines()):
+        if entry.section != "atoms":
+            break
+        seen.append(entry.code)
+    assert seen == ["1  CT", "2  CT"]
+
+
+def test_iter_includes_reports_paths_and_line_indices():
+    lines = [
+        '#include "charmm36.ff/forcefield.itp"\n',
+        '; #include "commented.itp"\n',
+        '   #include "local.itp" ; trailing\n',
+        "#include <system.itp>\n",
+        "[ system ]\n",
+    ]
+    assert list(iter_includes(lines)) == [(0, "charmm36.ff/forcefield.itp"), (2, "local.itp")]
+
+
+def test_read_topology_defaults(tmp_path):
+    top = tmp_path / "forcefield.itp"
+    top.write_text(
+        "[ defaults ]\n; nbfunc comb\n1  2  YES  0.5  0.8333 ; amber\n[ atomtypes ]\nX 1\n"
+    )
+    assert read_topology_defaults(top) == (1, 2, "yes", 0.5, 0.8333)
+
+    top.write_text("[ atomtypes ]\nX 1\n")
+    assert read_topology_defaults(top) is None
+
+    top.write_text("[ defaults ]\n[ atomtypes ]\nX 1\n")
+    with pytest.raises(ValueError, match="has no entry"):
+        read_topology_defaults(top)
+
+    top.write_text("[ defaults ]\n1 2 yes\n")
+    with pytest.raises(ValueError, match="Malformed"):
+        read_topology_defaults(top)
+
+
+def test_iter_prm_atomtypes_reads_every_file(tmp_path):
+    first = tmp_path / "a.itp"
+    first.write_text("[ atomtypes ]\n; name\nCG331 6 12.011 0.0 A 0.36 0.28\n")
+    second = tmp_path / "b.itp"
+    second.write_text("[ atomtypes ]\nNA1 11 22.99 1.0 A 0.2 0.1 ; sodium\n")
+    assert [(prm, name) for prm, name, _ in _iter_prm_atomtypes([first, second])] == [
+        (first, "CG331"),
+        (second, "NA1"),
+    ]

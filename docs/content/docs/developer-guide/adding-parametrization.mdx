@@ -48,7 +48,7 @@ and returns a `GromacsSingleMoleculeParameterSet`. It must handle three kinds of
 
 - **small molecules**: generate (or reuse cached) parameters
 - **water** (`species.is_water`): use `spec.water_model`
-- **ions** (`species.is_ion`, Na⁺/Cl⁻; moleculetypes from `NATIVE_ION_MOLECULETYPES`)
+- **ions** (`species.is_ion`, Na⁺/Cl⁻; moleculetypes from `NATIVE_SPECIES` in `mdfactory/models/species.py`)
 
 `native_forcefield` is set for protein builds: a `NativeForceField(name, directory, water_model)`
 pointing at the bundled protein force field. Water and ions must then come from that directory
@@ -163,7 +163,6 @@ class GaffParametrization(_FamilySpec):
     simulation_types: ClassVar[frozenset[str]] = frozenset({"mixedbox", "bilayer", "lnp"})
     default_protein: ClassVar[Optional[str]] = None
     default_water_model: ClassVar[str] = "tip3p"
-    small_molecules_model: ClassVar[type[BaseModel]] = GaffSmallMolecules
 
     family: Literal["gaff"] = "gaff"
     small_molecules: Optional[GaffSmallMolecules] = None
@@ -180,7 +179,8 @@ class GaffParametrization(_FamilySpec):
         ...  # optional: per-type restrictions on the resolved components
 ```
 
-Then add it to `FAMILY_SPECS` and to the `ParametrizationSpec` union with a `Tag("gaff")`.
+The default small-molecule spec is the model named in the `small_molecules` annotation. Add the
+family to `FAMILY_SPECS` and to the `ParametrizationSpec` union with a `Tag("gaff")`.
 If the family needs its own nonbonded settings, add a new `NonbondedScheme` value and its overlay
 in `mdfactory/run_schedules/gromacs.py`: an entry in `NONBONDED` (electrostatics and van der
 Waals keys) and one in `DISPCORR` (the dispersion correction per simulation type). Extend the

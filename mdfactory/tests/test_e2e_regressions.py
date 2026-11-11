@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import openmm as mm
 import pytest
+from loguru import logger
 from openmm import unit
 
 from mdfactory.models.species import SingleMoleculeSpecies
@@ -98,10 +99,9 @@ class TestRescaleToVolume:
 
 
 def _finish(context, target, **kwargs):
-    """Call finish_compression with a converged, strict, 15%-tolerance default."""
+    """Call finish_compression with a converged, strict default."""
     kwargs.setdefault("converged", True)
     kwargs.setdefault("require_convergence", True)
-    kwargs.setdefault("overshoot_tolerance", 0.15)
     kwargs.setdefault("not_reached_message", "did not reach")
     return finish_compression(context, target, **kwargs)
 
@@ -109,21 +109,25 @@ def _finish(context, target, **kwargs):
 class TestFinishCompression:
     def test_corrects_overshoot_within_tolerance(self):
         context = _three_dimer_context()  # 27 nm³, i.e. 4.5% below a 28.27 nm³ target
-        overshoot = _finish(context, 28.27)
-        assert overshoot == pytest.approx(28.27 / 27.0 - 1)
+        assert _finish(context, 28.27) is None
         assert _volume(context) == pytest.approx(28.27)
 
     def test_raises_beyond_tolerance(self):
         with pytest.raises(RuntimeError, match="overshot the target density"):
             _finish(_three_dimer_context(), 40.0)
 
-    def test_unreached_target_raises_or_warns(self, capsys):
+    def test_unreached_target_raises_or_warns(self):
         context = _three_dimer_context()
         with pytest.raises(RuntimeError, match="did not reach"):
             _finish(context, 20.0, converged=False)
-        assert _finish(context, 20.0, converged=False, require_convergence=False) is None
+        messages = []
+        sink = logger.add(messages.append, level="WARNING")
+        try:
+            assert _finish(context, 20.0, converged=False, require_convergence=False) is None
+        finally:
+            logger.remove(sink)
         assert _volume(context) == pytest.approx(27.0)
-        assert "WARNING" in capsys.readouterr().out
+        assert any("did not reach" in str(m) for m in messages)
 
 
 ETHANOL_ATOM_NAMES = ["C1", "C2", "O3", "H4", "H5", "H6", "H7", "H8", "H9"]

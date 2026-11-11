@@ -9,7 +9,7 @@ by force field and gives every component a default, which a run may override.
 
 import json
 from pathlib import Path
-from typing import Annotated, Any, ClassVar, Literal, Optional, Self
+from typing import Annotated, Any, ClassVar, Literal, Optional, Self, get_args
 
 from pydantic import (
     AfterValidator,
@@ -30,9 +30,10 @@ SimulationType = Literal["mixedbox", "bilayer", "lnp", "proteinbox", "protein_mi
 #: potential switch from 0.8 nm. Adding a scheme means adding its nonbonded overlay.
 NonbondedScheme = Literal["charmm", "sage"]
 
+ALL_SIMULATION_TYPES = frozenset(get_args(SimulationType))
 PROTEIN_SIMULATION_TYPES = frozenset({"proteinbox", "protein_mixedbox"})
 # Simulation types that parametrize small molecules (a proteinbox has none).
-SMALL_MOLECULE_SIMULATION_TYPES = frozenset({"mixedbox", "bilayer", "lnp", "protein_mixedbox"})
+SMALL_MOLECULE_SIMULATION_TYPES = ALL_SIMULATION_TYPES - {"proteinbox"}
 
 # The CHARMM proteinbox pipeline solvates with 3-site spc216 coordinates and uses
 # CHARMM Force-switch LJ in every mdp, so only these water models are supported.
@@ -131,12 +132,20 @@ class _FamilySpec(BaseModel):
     simulation_types: ClassVar[frozenset[str]]
     default_protein: ClassVar[Optional[str]]
     default_water_model: ClassVar[str]
-    small_molecules_model: ClassVar[type[BaseModel]]
-
     family: str
     protein: Optional[str] = None
     small_molecules: Optional[BaseModel] = None
     water_model: WaterModelName = None
+
+    @classmethod
+    def _default_small_molecules(cls) -> BaseModel:
+        """Return the family's default small-molecule spec (from the field's annotation)."""
+        (model,) = (
+            arg
+            for arg in get_args(cls.model_fields["small_molecules"].annotation)
+            if arg is not type(None)
+        )
+        return model()
 
     @property
     def nonbonded_scheme(self) -> NonbondedScheme:
@@ -204,7 +213,7 @@ class _FamilySpec(BaseModel):
             "family": self.family,
             "protein": (self.protein or self.default_protein) if has_protein else None,
             "small_molecules": (
-                (self.small_molecules or self.small_molecules_model()).model_dump()
+                (self.small_molecules or self._default_small_molecules()).model_dump()
                 if has_small_molecules
                 else None
             ),
@@ -227,12 +236,9 @@ class CharmmParametrization(_FamilySpec):
     silently mismatch the mdp settings.
     """
 
-    simulation_types: ClassVar[frozenset[str]] = frozenset(
-        {"mixedbox", "bilayer", "lnp", "proteinbox", "protein_mixedbox"}
-    )
+    simulation_types: ClassVar[frozenset[str]] = ALL_SIMULATION_TYPES
     default_protein: ClassVar[Optional[str]] = "charmm36m"
     default_water_model: ClassVar[str] = "tip3p"
-    small_molecules_model: ClassVar[type[BaseModel]] = CgenffSmallMolecules
 
     family: Literal["charmm"] = Field("charmm", description="Force-field family.")
     protein: Optional[str] = Field(
@@ -309,7 +315,6 @@ class AmberParametrization(_FamilySpec):
     simulation_types: ClassVar[frozenset[str]] = PROTEIN_SIMULATION_TYPES
     default_protein: ClassVar[Optional[str]] = "amber14sb"
     default_water_model: ClassVar[str] = "tip3p"
-    small_molecules_model: ClassVar[type[BaseModel]] = OpenFFSmallMolecules
 
     family: Literal["amber"] = Field("amber", description="Force-field family.")
     protein: Optional[str] = Field(
@@ -349,15 +354,11 @@ class AmberParametrization(_FamilySpec):
 class OpenFFParametrization(_FamilySpec):
     """OpenFF family: Sage small molecules with OpenFF water and ions (no protein)."""
 
-    simulation_types: ClassVar[frozenset[str]] = frozenset({"mixedbox", "bilayer", "lnp"})
+    simulation_types: ClassVar[frozenset[str]] = ALL_SIMULATION_TYPES - PROTEIN_SIMULATION_TYPES
     default_protein: ClassVar[Optional[str]] = None
     default_water_model: ClassVar[str] = "opc3"
-    small_molecules_model: ClassVar[type[BaseModel]] = OpenFFSmallMolecules
 
     family: Literal["openff"] = Field("openff", description="Force-field family.")
-    protein: Optional[str] = Field(
-        None, description="Not supported: the openff family has no protein force field."
-    )
     small_molecules: Optional[OpenFFSmallMolecules] = Field(
         None, description="Small-molecule force field (OpenFF Sage)."
     )
@@ -374,15 +375,6 @@ class OpenFFParametrization(_FamilySpec):
     def ions(self) -> Optional[str]:
         # Ion parameters come from the small-molecule .offxml.
         return self.small_molecules.forcefield if self.small_molecules is not None else None
-
-    @model_validator(mode="after")
-    def _check_no_protein(self) -> Self:
-        if self.protein is not None:
-            raise ValueError(
-                "The openff family has no protein force field; use family 'amber' "
-                "for protein systems."
-            )
-        return self
 
 
 FAMILY_SPECS: dict[str, type[_FamilySpec]] = {
@@ -466,7 +458,4 @@ class GromacsProteinParameterSet(BaseModel):
     topology_file: Path
     structure_file: Path
     topology_include_files: list[Path]
-    chains: list[str]
-    forcefield: str
-    water_model: str
     total_charge: int

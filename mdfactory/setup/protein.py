@@ -17,7 +17,9 @@ from urllib.request import urlopen
 from loguru import logger
 
 from ..models.parametrization import GromacsProteinParameterSet
+from ..models.species import NATIVE_SPECIES
 from ..settings import settings
+from ..utils.topology_utilities import iter_includes, iter_topology_entries
 
 _DISULFIDE_CUTOFF_ANGSTROM = 2.2
 _CYSTEINE_RESNAMES = {"CYS", "CYM", "CYX"}
@@ -27,11 +29,6 @@ FORCEFIELD_REGISTRY: dict[str, dict[str, str]] = {
         "url": "https://mackerell.umaryland.edu/download.php?filename=CHARMM_ff_params_files/charmm36-feb2026_cgenff-5.0.ff.tgz",
         "dirname": "charmm36-feb2026_cgenff-5.0.ff",
         "sha256": "c2b0c70e21cced150528ee25d205e5bd3367a5e55e85c2ff0403911980528151",
-    },
-    "charmm36m-ljpme": {
-        "url": "https://mackerell.umaryland.edu/download.php?filename=CHARMM_ff_params_files/charmm36-feb2026_ljpme_cgenff-5.0.ff.tgz",
-        "dirname": "charmm36-feb2026_ljpme_cgenff-5.0.ff",
-        "sha256": "b2221dcba73066b6b5c30a52b9894216d03ea6c3e68206d9ce43857dd8116c21",
     },
 }
 
@@ -54,10 +51,10 @@ _CHARMM_PROTONATION_ALIASES = {
 _HISTIDINE_RESNAMES = {"HIS", "HID", "HIE", "HIP", "HSD", "HSE", "HSP"}
 
 
-def _resolve_protonation_residue_name(residue_name: str, forcefield: str | None) -> str:
+def _resolve_protonation_residue_name(residue_name: str, forcefield: str) -> str:
     """Return the residue name to write into the PDB for a protonation override."""
     residue_name = residue_name.upper()
-    if forcefield and forcefield.lower().startswith("charmm"):
+    if forcefield.lower().startswith("charmm"):
         residue_name = _CHARMM_PROTONATION_ALIASES.get(residue_name, residue_name)
 
     if len(residue_name) != 3:
@@ -192,7 +189,6 @@ def _resolve_cysteine_reference(
 def _build_disulfide_prompt_input(
     pdb_path: Path,
     disulfide_bonds: list[tuple[str, str]],
-    cutoff_angstrom: float = _DISULFIDE_CUTOFF_ANGSTROM,
 ) -> str:
     """Build deterministic yes/no input for pdb2gmx disulfide prompts."""
     sg_atoms = _read_cysteine_sg_atoms(pdb_path)
@@ -210,7 +206,7 @@ def _build_disulfide_prompt_input(
     candidate_pairs = [
         (key_a, key_b)
         for key_a, key_b in itertools.combinations(sg_atoms, 2)
-        if math.dist(sg_atoms[key_a], sg_atoms[key_b]) <= cutoff_angstrom
+        if math.dist(sg_atoms[key_a], sg_atoms[key_b]) <= _DISULFIDE_CUTOFF_ANGSTROM
     ]
 
     candidate_identities = {frozenset(pair) for pair in candidate_pairs}
@@ -219,7 +215,7 @@ def _build_disulfide_prompt_input(
         formatted_missing = sorted(tuple(sorted(pair)) for pair in missing_pairs)
         raise ValueError(
             "Requested disulfide bonds were not detected as close CYS SG pairs "
-            f"within {cutoff_angstrom:.1f} A in {pdb_path}: {formatted_missing}"
+            f"within {_DISULFIDE_CUTOFF_ANGSTROM:.1f} A in {pdb_path}: {formatted_missing}"
         )
 
     answers = ["y" if frozenset(pair) in requested else "n" for pair in candidate_pairs]
@@ -270,7 +266,7 @@ def _apply_protonation_states(
     pdb_path: Path,
     protonation_states: dict[str, str],
     output_dir: Path,
-    forcefield: str | None = None,
+    forcefield: str,
 ) -> Path:
     """Rename residues in the PDB so pdb2gmx applies the requested protonation states.
 
@@ -428,17 +424,13 @@ def min_gmx_version_for_topology(top_path: Path) -> tuple[int, int] | None:
     if not top_path.is_file():
         return None
     requirements = []
-    with open(top_path) as fb:
-        for line in fb:
-            stripped = line.strip()
-            if not stripped.startswith("#include") or '"' not in stripped:
-                continue
-            parts = Path(stripped.split('"')[1]).parts
-            if len(parts) < 2 or parts[-1] != "forcefield.itp" or not parts[-2].endswith(".ff"):
-                continue
-            required = min_gmx_version_for_forcefield(parts[-2])
-            if required is not None:
-                requirements.append(required)
+    for _, include in iter_includes(top_path.read_text().splitlines()):
+        parts = Path(include).parts
+        if len(parts) < 2 or parts[-1] != "forcefield.itp" or not parts[-2].endswith(".ff"):
+            continue
+        required = min_gmx_version_for_forcefield(parts[-2])
+        if required is not None:
+            requirements.append(required)
     return max(requirements) if requirements else None
 
 
@@ -757,19 +749,11 @@ def _parse_protein_molecule_names(top_path: Path) -> list[str]:
     pdb2gmx names each protein moleculetype ``Protein_chain_<ID>`` (or ``Protein``
     when chains are merged), listing each once. Water and ion entries are ignored.
     """
-    names: list[str] = []
-    in_molecules = False
-    with open(top_path) as f:
-        for line in f:
-            stripped = line.strip()
-            if not stripped or stripped.startswith(";"):
-                continue
-            if stripped.startswith("["):
-                in_molecules = stripped.strip("[] ").lower() == "molecules"
-                continue
-            if in_molecules and stripped.split()[0].startswith("Protein"):
-                names.append(stripped.split()[0])
-    return names
+    return [
+        entry.code.split()[0]
+        for entry in iter_topology_entries(Path(top_path).read_text().splitlines())
+        if entry.section == "molecules" and entry.code.startswith("Protein")
+    ]
 
 
 def _run_gmx(
@@ -804,7 +788,7 @@ def run_pdb2gmx(
     disulfide_bonds: list[tuple[str, str]],
     protonation_states: dict[str, str],
     output_dir: Path,
-    chains: list[str] | None = None,
+    chains: list[str],
 ) -> GromacsProteinParameterSet:
     """Run gmx pdb2gmx to generate GROMACS topology from a protein PDB.
 
@@ -826,9 +810,9 @@ def run_pdb2gmx(
         Residue-specific protonation state overrides.
     output_dir : Path
         Directory for output files.
-    chains : list[str] | None
+    chains : list[str]
         Declared chain identifiers. When given, the chains pdb2gmx produces must
-        match exactly. When omitted, the PDB must yield a single protein chain.
+        match exactly. When empty, the PDB must yield a single protein chain.
 
     Returns
     -------
@@ -836,7 +820,6 @@ def run_pdb2gmx(
         Paths to the generated topology, structure, and per-chain include files.
 
     """
-    chains = chains or []
     gmx_bin = str(check_gmx_available())
     check_forcefield_available(forcefield)
     resolved_ff = resolve_forcefield(forcefield)
@@ -946,9 +929,6 @@ def run_pdb2gmx(
         topology_file=topology_file,
         structure_file=structure_file,
         topology_include_files=include_files,
-        chains=produced_chains,
-        forcefield=forcefield,
-        water_model=water_model,
         total_charge=total_charge,
     )
 
@@ -960,24 +940,20 @@ def _sum_atoms_column(path: Path, column: int, follow_includes: bool = True) -> 
     level; force-field library includes (``.ff/``) are skipped.
     """
     total = 0.0
-    in_atoms = False
-    for line in path.read_text().splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#include"):
-            include = stripped.split('"')[1] if '"' in stripped else None
-            if follow_includes and include and ".ff/" not in include:
-                itp_path = path.parent / include
-                if itp_path.is_file():
-                    total += _sum_atoms_column(itp_path, column, follow_includes=False)
-        elif stripped.startswith("["):
-            in_atoms = stripped.strip("[] ").lower() == "atoms"
-        elif in_atoms and stripped and not stripped.startswith(";"):
-            parts = stripped.split()
-            if len(parts) > column:
-                try:
-                    total += float(parts[column])
-                except ValueError:
-                    pass
+    lines = path.read_text().splitlines()
+    if follow_includes:
+        for _, include in iter_includes(lines):
+            if ".ff/" not in include and (path.parent / include).is_file():
+                total += _sum_atoms_column(path.parent / include, column, follow_includes=False)
+    for entry in iter_topology_entries(lines):
+        if entry.section != "atoms":
+            continue
+        parts = entry.code.split()
+        if len(parts) > column:
+            try:
+                total += float(parts[column])
+            except ValueError:
+                pass
     return total
 
 
@@ -991,9 +967,7 @@ def extract_mass_from_topology(top_path: Path) -> float:
     return _sum_atoms_column(top_path, 7)
 
 
-def update_topology_molecules(
-    top_path: Path, n_water: int, num_na: int, num_cl: int, water_name: str = "SOL"
-) -> None:
+def update_topology_molecules(top_path: Path, n_water: int, num_na: int, num_cl: int) -> None:
     """Update the [ molecules ] section of a topology file after solvation/ionization.
 
     Appends water and ion molecule counts to the topology.
@@ -1008,17 +982,13 @@ def update_topology_molecules(
         Number of Na+ ions.
     num_cl : int
         Number of Cl- ions.
-    water_name : str
-        Residue name for water (default "SOL").
 
     """
+    entries = [("O", n_water), ("[Na+]", num_na), ("[Cl-]", num_cl)]
     with open(top_path, "a") as f:
-        if n_water > 0:
-            f.write(f"{water_name:<20s} {n_water}\n")
-        if num_na > 0:
-            f.write(f"{'NA':<20s} {num_na}\n")
-        if num_cl > 0:
-            f.write(f"{'CL':<20s} {num_cl}\n")
+        for smiles, count in entries:
+            if count > 0:
+                f.write(f"{NATIVE_SPECIES[smiles].resname:<20s} {count}\n")
 
     logger.info(f"Topology updated: {n_water} water, {num_na} Na+, {num_cl} Cl-")
 
@@ -1059,11 +1029,7 @@ def bundle_forcefield_into_topology(top_path: Path) -> str | None:
     search_paths: list[Path] | None = None
     rewrote_line = False
 
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped.startswith("#include") or '"' not in stripped:
-            continue
-        include_path = stripped.split('"')[1]
+    for i, include_path in iter_includes(lines):
         if ".ff/" not in include_path:
             continue
 
@@ -1100,7 +1066,7 @@ def bundle_forcefield_into_topology(top_path: Path) -> str | None:
         # Relative includes already resolve from the topology's directory; only
         # absolute includes need rewriting to the bundled relative form.
         if is_absolute:
-            lines[i] = line.replace(include_path, f"{ff_dir_name}/{remainder}")
+            lines[i] = lines[i].replace(include_path, f"{ff_dir_name}/{remainder}")
             rewrote_line = True
 
     if rewrote_line:

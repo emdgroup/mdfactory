@@ -15,8 +15,14 @@ import numpy as np
 import pytest
 import yaml
 
-from mdfactory import workflows
-from mdfactory.build import _center_in_cubic_box, _ion_counts, _prepare_protein
+from mdfactory import build, cli
+from mdfactory.build import (
+    _bounding_box,
+    _center_in_cubic_box,
+    _ion_counts,
+    _prepare_protein,
+    _solvate_with_water,
+)
 from mdfactory.models.composition import ProteinBoxComposition, ProteinMixedBoxComposition
 from mdfactory.models.input import BuildInput
 from mdfactory.models.parametrization import (
@@ -30,6 +36,7 @@ from mdfactory.setup import protein
 from mdfactory.setup.protein import (
     _apply_protonation_states,
     _build_disulfide_prompt_input,
+    _parse_protein_molecule_names,
     _sum_atoms_column,
     bundle_forcefield_into_topology,
     check_forcefield_available,
@@ -40,9 +47,8 @@ from mdfactory.setup.protein import (
     update_topology_molecules,
 )
 
-from .conftest import protein_input_data
+from .conftest import EXAMPLES_DIR, PROTEIN_TYPES, protein_input_data
 
-PROTEIN_SIM_TYPES = ["proteinbox", "protein_mixedbox"]
 COMPOSITION_CLASSES = {
     "proteinbox": ProteinBoxComposition,
     "protein_mixedbox": ProteinMixedBoxComposition,
@@ -98,6 +104,7 @@ def _run(tmp_path, pdb, **kwargs):
     kwargs.setdefault("merge_all", False)
     kwargs.setdefault("disulfide_bonds", [])
     kwargs.setdefault("protonation_states", {})
+    kwargs.setdefault("chains", [])
     kwargs.setdefault("output_dir", tmp_path / "out")
     return run_pdb2gmx(pdb_path=pdb, **kwargs)
 
@@ -172,31 +179,6 @@ class TestProteinBoxComposition:
         assert comp.ionization.concentration == 0.10
 
 
-@pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
-class TestCharmmProteinSpec:
-    """CHARMM protein force-field and water constraints for both protein types."""
-
-    def test_frozen(self, sim_type, protein_pdb):
-        inp = BuildInput(**protein_input_data(sim_type, protein_pdb))
-        with pytest.raises(Exception):
-            inp.parametrization.protein = "other"
-
-    @pytest.mark.parametrize(
-        ("overrides", "match"),
-        [
-            ({"protein": "amber99sb-ildn"}, "CHARMM"),
-            ({"water_model": "tip4p"}, "3-site"),
-            ({"protein": "charmm36m-ljpme"}, "LJ-PME"),
-        ],
-    )
-    def test_rejects_unsupported_choices(self, sim_type, protein_pdb, overrides, match):
-        data = protein_input_data(
-            sim_type, protein_pdb, parametrization={"family": "charmm", **overrides}
-        )
-        with pytest.raises(ValueError, match=match):
-            BuildInput(**data)
-
-
 class TestForceFieldCheck:
     def test_available_forcefield_passes(self, tmp_path, gmx_search_paths):
         (tmp_path / "charmm27.ff").mkdir()
@@ -258,7 +240,7 @@ class TestForceFieldDownload:
         assert not (tmp_path / "test.ff").exists()
 
 
-@pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
+@pytest.mark.parametrize("sim_type", PROTEIN_TYPES)
 class TestProteinInput:
     """BuildInput validation shared by proteinbox and protein_mixedbox."""
 
@@ -389,7 +371,7 @@ class TestTopologyParsing:
             (
                 [("HIS", 15), ("HIS", 15), ("ALA", 16), ("GLU", 35)],
                 {"HIS15": "HIE", "GLU35": "GLH"},
-                None,
+                "amber14sb",
                 ["HIE", "HIE", "ALA", "GLH"],
             ),
             # CHARMM histidine aliases.
@@ -397,45 +379,48 @@ class TestTopologyParsing:
             # An existing tautomer (HID) still matches an unqualified HIS key.
             ([("HID", 15)], {"HIS15": "HIE"}, "charmm36m", ["HSE"]),
             # A chain-qualified key renames only the residue in that chain.
-            ([("HIS", 15, "A"), ("HIS", 15, "B")], {"A:HIS15": "HIE"}, None, ["HIE", "HIS"]),
+            ([("HIS", 15, "A"), ("HIS", 15, "B")], {"A:HIS15": "HIE"}, "amber14sb", ["HIE", "HIS"]),
             # Insertion codes distinguish otherwise identical residue numbers.
             (
                 [("HIS", 100, "H"), ("HIS", 100, "H", 0.0, "A")],
                 {"H:HIS100A": "HIE"},
-                None,
+                "amber14sb",
                 ["HIS", "HIE"],
             ),
             (
                 [("HIS", 100, "H"), ("HIS", 100, "H", 0.0, "A")],
                 {"H:HIS100": "HID"},
-                None,
+                "amber14sb",
                 ["HID", "HIS"],
             ),
         ],
     )
     def test_apply_protonation_states(self, tmp_path, atoms, states, forcefield, expected):
         pdb = _write_pdb(tmp_path, *atoms)
-        kwargs = {"forcefield": forcefield} if forcefield else {}
-        result = _apply_protonation_states(pdb, states, tmp_path, **kwargs)
+        result = _apply_protonation_states(pdb, states, tmp_path, forcefield)
         lines = [ln for ln in result.read_text().splitlines() if ln.startswith("ATOM")]
         assert [ln[17:20].strip() for ln in lines] == expected
 
     @pytest.mark.parametrize(
         ("atoms", "states", "forcefield", "match"),
         [
-            ([("GLU", 35)], {"GLU35": "GLUP"}, None, "cannot be written to a PDB"),
+            ([("GLU", 35)], {"GLU35": "GLUP"}, "amber14sb", "cannot be written to a PDB"),
             # GLH aliases to CHARMM GLUP (4 chars), which cannot fit a PDB column.
             ([("GLU", 35)], {"GLU35": "GLH"}, "charmm36m", "cannot be written to a PDB"),
-            ([("HIS", 15)], {"HIS99": "HIE"}, None, "matched no residue"),
+            ([("HIS", 15)], {"HIS99": "HIE"}, "amber14sb", "matched no residue"),
             # HIS15 exists in both chains; an unqualified key cannot say which.
-            ([("HIS", 15, "A"), ("HIS", 15, "B")], {"HIS15": "HIE"}, None, "ambiguous across"),
+            (
+                [("HIS", 15, "A"), ("HIS", 15, "B")],
+                {"HIS15": "HIE"},
+                "amber14sb",
+                "ambiguous across",
+            ),
         ],
     )
     def test_apply_protonation_states_rejects(self, tmp_path, atoms, states, forcefield, match):
         pdb = _write_pdb(tmp_path, *atoms)
-        kwargs = {"forcefield": forcefield} if forcefield else {}
         with pytest.raises(ValueError, match=match):
-            _apply_protonation_states(pdb, states, tmp_path, **kwargs)
+            _apply_protonation_states(pdb, states, tmp_path, forcefield)
 
     @pytest.mark.parametrize(
         ("atoms", "bonds", "expected"),
@@ -531,7 +516,6 @@ class TestTopologyParsing:
 
         params = _run(tmp_path, pdb, chains=chains)
 
-        assert params.chains == chains
         assert sorted(p.name for p in params.topology_include_files) == sorted(extra)
 
     @pytest.mark.parametrize(
@@ -696,7 +680,7 @@ class TestCleanPdb:
         assert "internal" in text
 
 
-@pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
+@pytest.mark.parametrize("sim_type", PROTEIN_TYPES)
 class TestPdbPathResolution:
     def test_relative_pdb_path_resolved_against_yaml_dir(self, tmp_path, sim_type):
         base = tmp_path / "specs"
@@ -757,15 +741,13 @@ class TestRelativePdbPathAcrossEntryPoints:
         assert prepared[0].system.protein.pdb_path == pdb.resolve()
         assert [m.hash for m in pushed] == [m.hash for m in prepared]
 
-    @pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
-    def test_run_from_file_resolves_relative_path(
-        self, tmp_path, protein_pdb, monkeypatch, sim_type
-    ):
+    @pytest.mark.parametrize("sim_type", PROTEIN_TYPES)
+    def test_yaml_build_resolves_relative_path(self, tmp_path, protein_pdb, monkeypatch, sim_type):
         _, pdb, yaml_file, _ = _write_spec_dir(tmp_path, protein_pdb, sim_type)
-        captured = {}
-        monkeypatch.setattr(workflows, "run_build_from_dict", captured.update)
-        workflows.run_build_from_file(yaml_file)
-        assert captured["system"]["protein"]["pdb_path"] == str(pdb.resolve())
+        captured = []
+        monkeypatch.setattr(cli, "run_build_from_dict", captured.append)
+        cli._build_from_yaml(yaml_file, tmp_path / "out")
+        assert captured[0].system.protein.pdb_path == pdb.resolve()
 
     def test_yaml_dry_run_resolves_before_dispatch(self, tmp_path, protein_pdb, monkeypatch):
         import mdfactory.orchestration
@@ -834,6 +816,45 @@ class TestCenterInCubicBox:
         assert abs((box_size - bbox_max[long_axis]) - padding) < 1e-3
 
 
+def test_bounding_box_returns_corners_and_center():
+    positions = np.array([[0.0, 2.0, -4.0], [10.0, 6.0, 0.0], [3.0, 4.0, 2.0]])
+    lower, upper, center = _bounding_box(positions)
+    assert lower.tolist() == [0.0, 2.0, -4.0]
+    assert upper.tolist() == [10.0, 6.0, 2.0]
+    assert center.tolist() == [5.0, 4.0, -1.0]
+
+
+class TestSolvateWithWater:
+    @staticmethod
+    def _solvated(n_water):
+        u = mda.Universe.empty(
+            n_water, n_residues=n_water, atom_resindex=np.arange(n_water), trajectory=True
+        )
+        u.add_TopologyAttr("resnames", ["SOL"] * n_water)
+        u.dimensions = [50.0, 50.0, 50.0, 90, 90, 90]
+        return u
+
+    def test_returns_water_species_and_keeps_the_box(self, monkeypatch):
+        solvated = self._solvated(4)
+        solvated.dimensions = None
+        monkeypatch.setattr(build, "solvate", lambda u, **kwargs: solvated)
+        reference = self._solvated(1)
+        reference.dimensions = [20.0, 20.0, 20.0, 90, 90, 90]
+
+        result, water = _solvate_with_water(reference, prune_in_z=False)
+
+        assert result is solvated
+        assert list(result.dimensions) == [20.0, 20.0, 20.0, 90, 90, 90]
+        assert (water.smiles, water.resname, water.count) == ("O", "SOL", 4)
+
+    def test_no_water_raises(self, monkeypatch):
+        dry = self._solvated(1)
+        dry.residues.resnames = ["LIP"]
+        monkeypatch.setattr(build, "solvate", lambda u, **kwargs: dry)
+        with pytest.raises(ValueError, match="did not add any water"):
+            _solvate_with_water(self._solvated(1))
+
+
 class TestIonCounts:
     """ionize_solvated_system returns only the ions it added; counts map by resname."""
 
@@ -855,11 +876,11 @@ class TestIonCounts:
         assert _ion_counts(species) == expected
 
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples" / "proteinbox"
+PROTEINBOX_EXAMPLES = EXAMPLES_DIR / "proteinbox"
 
 
 class TestAmberSpec:
-    @pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
+    @pytest.mark.parametrize("sim_type", PROTEIN_TYPES)
     def test_family_defaults(self, sim_type, protein_pdb):
         inp = BuildInput(**protein_input_data(sim_type, protein_pdb, parametrization="amber"))
         spec = inp.parametrization
@@ -871,28 +892,6 @@ class TestAmberSpec:
         else:
             # A proteinbox has no small molecules, so the component is not shown.
             assert spec.small_molecules is None
-
-    def test_frozen(self, protein_pdb):
-        inp = BuildInput(**protein_input_data("proteinbox", protein_pdb, parametrization="amber"))
-        with pytest.raises(Exception):
-            inp.parametrization.protein = "amber19sb"
-
-    @pytest.mark.parametrize(
-        ("overrides", "match"),
-        [
-            ({"protein": "amber19sb"}, "Only 'amber14sb'"),
-            ({"protein": "charmm36m"}, "Only 'amber14sb'"),
-            ({"water_model": "opc"}, "Only 'tip3p'"),
-            ({"water_model": "spce"}, "Only 'tip3p'"),
-        ],
-    )
-    @pytest.mark.parametrize("sim_type", PROTEIN_SIM_TYPES)
-    def test_rejects_unsupported_choices(self, sim_type, protein_pdb, overrides, match):
-        data = protein_input_data(
-            sim_type, protein_pdb, parametrization={"family": "amber", **overrides}
-        )
-        with pytest.raises(ValueError, match=match):
-            BuildInput(**data)
 
 
 class TestAmberInput:
@@ -954,9 +953,13 @@ system:
 
         from mdfactory.prepare import df_to_build_input_models
 
-        inp = BuildInput(**yaml.safe_load((EXAMPLES_DIR / "lysozyme_amber14sb.yaml").read_text()))
+        inp = BuildInput(
+            **yaml.safe_load((PROTEINBOX_EXAMPLES / "lysozyme_amber14sb.yaml").read_text())
+        )
         assert isinstance(inp.parametrization, AmberParametrization)
-        models, errors = df_to_build_input_models(pd.read_csv(EXAMPLES_DIR / "proteins_amber.csv"))
+        models, errors = df_to_build_input_models(
+            pd.read_csv(PROTEINBOX_EXAMPLES / "proteins_amber.csv")
+        )
         assert errors == {}
         assert [m.parametrization.family for m in models] == ["amber"]
         assert models[0].parametrization == inp.parametrization
@@ -1064,14 +1067,13 @@ def test_prepare_protein_takes_forcefield_from_spec_and_options_from_protein(
         resname="LYZ", pdb_path=protein_pdb, ignore_hydrogens=False, merge_all=True
     )
 
-    params = _prepare_protein(species, spec)
+    _prepare_protein(species, spec)
 
     cmd = calls["cmd"]
     assert cmd[cmd.index("-ff") + 1] == "charmm27"
     assert cmd[cmd.index("-water") + 1] == "spce"
     assert "-ignh" not in cmd
     assert cmd[cmd.index("-merge") + 1] == "all"
-    assert (params.forcefield, params.water_model) == ("charmm27", "spce")
 
 
 def test_run_pdb2gmx_amber_passes_forcefield_and_amber_protonation(tmp_path, monkeypatch):
@@ -1079,7 +1081,7 @@ def test_run_pdb2gmx_amber_passes_forcefield_and_amber_protonation(tmp_path, mon
     calls = {}
     _patch_pdb2gmx(monkeypatch, ["Protein_chain_A"], ["posre.itp"], calls)
 
-    params = _run(
+    _run(
         tmp_path,
         pdb,
         forcefield="amber14sb",
@@ -1095,4 +1097,13 @@ def test_run_pdb2gmx_amber_passes_forcefield_and_amber_protonation(tmp_path, mon
     resnames = [ln[17:20] for ln in adjusted.read_text().splitlines() if ln.startswith("ATOM")]
     # Amber names pass through unchanged (no CHARMM HSE alias).
     assert resnames == ["HIE", "ALA"]
-    assert params.forcefield == "amber14sb"
+
+
+def test_parse_protein_molecule_names_lists_only_protein_entries(tmp_path):
+    top = tmp_path / "topol.top"
+    top.write_text(
+        "[ system ]\nProtein_chain_X in water\n\n"
+        "[ molecules ]\n; Compound  #mols\n"
+        "Protein_chain_A  1\nProtein_chain_B  1 ; second\nSOL  100\nNA  2\n"
+    )
+    assert _parse_protein_molecule_names(top) == ["Protein_chain_A", "Protein_chain_B"]

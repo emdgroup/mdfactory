@@ -18,28 +18,15 @@ every simulation type; there is no global default.
 
 | Family | Protein | Small molecules | Water | Ions | Nonbonded scheme | Simulation types |
 |--------|---------|-----------------|-------|------|------------------|------------------|
-| `charmm` | `charmm36m` | CGenFF | `tip3p` | CHARMM (`ions.itp`) | `charmm` (Force-switch) | all five |
-| `amber` | `amber14sb` | OpenFF Sage | `tip3p` | Joung–Cheatham (`ions_tip3p.itp`) | `sage` (Potential-switch, `DispCorr EnerPres`) | `proteinbox`, `protein_mixedbox` |
+| `charmm` | `charmm36m` | CGenFF | `tip3p` | CHARMM (`ions.itp`) | `charmm` | all five |
+| `amber` | `amber14sb` | OpenFF Sage | `tip3p` | Joung–Cheatham (`ions_tip3p.itp`) | `sage` | `proteinbox`, `protein_mixedbox` |
 | `openff` | n/a | OpenFF Sage | `opc3` | from the Sage `.offxml` | `sage` | `mixedbox`, `bilayer`, `lnp` |
 
-The **nonbonded scheme** sets the nonbonded block of the generated run schedule, identical in all
-four stages and for every simulation type:
-
-- `charmm`: PME with `rcoulomb = 1.2`, `vdwtype = cutoff`, `vdw-modifier = Force-switch` from
-  `rvdw-switch = 1.0` to `rvdw = 1.2`, as all CHARMM36/CGenFF parameter files specify.
-  `DispCorr = EnerPres` for `mixedbox` and `lnp`, `no` for `bilayer` and the protein types
-  (CHARMM lipids and proteins were parametrized without a long-range correction).
-- `sage`: PME with `rcoulomb = 0.9`, `vdwtype = cutoff`, `vdw-modifier = Potential-switch`
-  from `rvdw-switch = 0.8` to `rvdw = 0.9`, and `DispCorr = EnerPres`. These are the cutoff and
-  switch of the Sage `.offxml` files, which OpenFF treats as part of the force field.
-
-See [Simulation Settings](/docs/user-guide/simulation-settings) for the rest of the protocol and
-how to configure it.
-
-<Callout type="info" title="Box size with the CHARMM cutoff">
-The 1.2 nm CHARMM cutoff needs a box edge of at least about 2.6 nm (twice the pair-list
-radius). The repository examples are far larger.
-</Callout>
+The **nonbonded scheme** sets the nonbonded block of the generated run schedule: `charmm` uses the
+cutoffs and force switch that all CHARMM36/CGenFF parameter files specify, `sage` those of the
+Sage `.offxml` files, which OpenFF treats as part of the force field. The values are listed once,
+under [the generated protocol](/docs/user-guide/simulation-settings#the-generated-protocol) in
+Simulation Settings, together with the coupling and the rest of the protocol.
 
 ## Syntax
 
@@ -247,28 +234,6 @@ Each parametrized species produces a `GromacsSingleMoleculeParameterSet`:
 | `itp` | Path to the molecule's ITP file |
 | `parameter_itp` | Path to the extra parameters ITP (`None` for native water/ions) |
 | `forcefield_itp` | Path to the force field's `forcefield.itp` (CGenFF and native sets) |
-
-## Migrating from the old keys
-
-The flat `parametrization: cgenff | smirnoff | pdb2gmx` values and the `parametrization_config`
-block were removed. They are rejected with a validation error:
-
-| Old | New |
-|-----|-----|
-| `parametrization: cgenff` | `parametrization: charmm` |
-| `parametrization: smirnoff` | `parametrization: openff` |
-| `parametrization: pdb2gmx` | `parametrization: charmm` |
-| `parametrization_config.forcefield` (protein) | `parametrization.protein` |
-| `parametrization_config.water_model: opc3.offxml` | `parametrization.water_model: opc3` |
-| `parametrization_config.forcefield` / `sage_forcefield` (OpenFF) | `parametrization.small_molecules.forcefield` |
-| `parametrization_config.charge_method` | `parametrization.small_molecules.charge_method` |
-| `parametrization_config.ignore_hydrogens` / `merge_all` | `system.protein.ignore_hydrogens` / `system.protein.merge_all` |
-
-This is a clean break: build hashes change, and old build directories, run-database rows
-(`input_data`) and pushed data cannot be parsed into the new `BuildInput`. Old OpenFF cache
-entries under `parameter_store/gromacs/smirnoff/` are not reused; OpenFF parameters (including
-NAGL/AM1-BCC charges) are regenerated once under `gromacs/openff/`. The CGenFF cache under
-`gromacs/cgenff/` is unchanged and still valid.
 
 ## Troubleshooting
 

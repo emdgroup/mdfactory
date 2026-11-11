@@ -13,8 +13,6 @@ from .build import (
     build_proteinbox,
 )
 from .models.input import BuildInput, write_build_record
-from .prepare import resolve_protein_pdb_path
-from .utils.utilities import load_yaml_file
 
 DISPATCH_BUILD = {
     "mixedbox": build_mixedbox,
@@ -51,20 +49,3 @@ def run_build_from_dict(inp_dict: dict[Any, Any] | BuildInput):
         )
     write_build_record(build_model, Path.cwd())
     build_function(build_model)
-
-
-def run_build_from_file(fname: Path):
-    """Load a YAML build specification and dispatch the build.
-
-    Relative protein PDB paths are resolved against the YAML file's directory so
-    the build finds them regardless of the process working directory.
-
-    Parameters
-    ----------
-    fname : Path
-        Path to the YAML build specification file
-
-    """
-    dct = load_yaml_file(fname)
-    resolve_protein_pdb_path(dct, Path(fname).parent)
-    run_build_from_dict(dct)

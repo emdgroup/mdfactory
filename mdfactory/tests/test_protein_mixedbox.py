@@ -44,7 +44,6 @@ from mdfactory.simulation.openmm_utils import (
     simulate_compression_until_density_reached,
 )
 from mdfactory.utils.setup_utilities import (
-    N_AVOGADRO,
     create_protein_mixedbox_universe,
     cubic_box_edge_for_density,
     native_atom_names,
@@ -57,10 +56,11 @@ from mdfactory.utils.topology_utilities import (
     unique_atom_names,
     write_itp_with_atom_names,
 )
+from mdfactory.utils.units import N_AVOGADRO
 
-from .conftest import protein_input_data
+from .conftest import EXAMPLES_DIR, make_forcefield_dir, protein_input_data
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples" / "protein_mixedbox"
+MIXEDBOX_EXAMPLES = EXAMPLES_DIR / "protein_mixedbox"
 
 
 def _write_pdb2gmx_topology(path):
@@ -125,20 +125,6 @@ class TestSolutionSpecies:
 
 
 class TestCharmmSpec:
-    @pytest.mark.parametrize(
-        ("overrides", "match"),
-        [
-            ({"protein": "charmm27"}, "only the registered 'charmm36m'"),
-            ({"water_model": "spce"}, "only 'tip3p'"),
-        ],
-    )
-    def test_rejects_unpinned_choices(self, protein_pdb, overrides, match):
-        data = protein_input_data(
-            "protein_mixedbox", protein_pdb, parametrization={"family": "charmm", **overrides}
-        )
-        with pytest.raises(ValueError, match=match):
-            BuildInput(**data)
-
     def test_resolves_cgenff_small_molecules(self, protein_pdb):
         spec = BuildInput(**protein_input_data("protein_mixedbox", protein_pdb)).parametrization
         assert spec.small_molecules.forcefield == "cgenff"
@@ -245,14 +231,14 @@ class TestExampleFiles:
         ],
     )
     def test_yaml_loads(self, filename, sizing_cls, total_count):
-        inp = BuildInput(**yaml.safe_load((EXAMPLES_DIR / filename).read_text()))
+        inp = BuildInput(**yaml.safe_load((MIXEDBOX_EXAMPLES / filename).read_text()))
         assert isinstance(inp.system, ProteinMixedBoxComposition)
         assert isinstance(inp.parametrization, CharmmParametrization)
         assert isinstance(inp.system.sizing, sizing_cls)
         assert inp.system.total_count == total_count
 
     def test_csv_roundtrip(self):
-        df = pd.read_csv(EXAMPLES_DIR / "protein_mixedbox.csv")
+        df = pd.read_csv(MIXEDBOX_EXAMPLES / "protein_mixedbox.csv")
         models, errors = df_to_build_input_models(df)
         assert errors == {}
         assert len(models) == 1
@@ -492,10 +478,9 @@ class TestPackingAndRestraints:
 
     def test_native_parameters_come_from_selected_forcefield(self, tmp_path, monkeypatch):
         monkeypatch.setattr(settings, "parameter_store", tmp_path / "parameters")
-        ff_dir = tmp_path / "selected.ff"
-        ff_dir.mkdir()
-        for filename in ("forcefield.itp", "tip3p.itp", "ions.itp"):
-            (ff_dir / filename).touch()
+        ff_dir = make_forcefield_dir(
+            tmp_path, "selected.ff", ["forcefield.itp", "tip3p.itp", "ions.itp"]
+        )
 
         native = NativeForceField(name="charmm36m", directory=ff_dir, water_model="tip3p")
         spec = CharmmParametrization().resolve("protein_mixedbox")
@@ -609,7 +594,7 @@ class TestPackingAndRestraints:
         system = mm.System()
         for _ in positions:
             system.addParticle(12.0)
-        _add_protein_rmsd_restraint(system, positions, [0, 1, 2], 1000.0)
+        _add_protein_rmsd_restraint(system, positions, [0, 1, 2])
         integrator = mm.VerletIntegrator(0.001 * unit.picoseconds)
         context = mm.Context(system, integrator)
         context.setPositions(positions)
@@ -721,10 +706,10 @@ class TestCompositeTopology:
     def test_cgenff_small_molecule_merges_params_and_includes_itp(self, tmp_path):
         # A force field that already defines CG331, so it is de-duplicated out of
         # the merged small-molecule parameters.
-        ff_dir = tmp_path / "charmm36m.ff"
-        ff_dir.mkdir()
-        (ff_dir / "atomtypes.itp").write_text(
-            "[ atomtypes ]\nCG331   6   12.011   0.000   A   0.36  0.28\n"
+        ff_dir = make_forcefield_dir(
+            tmp_path,
+            "charmm36m.ff",
+            {"atomtypes.itp": "[ atomtypes ]\nCG331   6   12.011   0.000   A   0.36  0.28\n"},
         )
 
         # The parameter files live in a separate source directory (as in the
@@ -806,17 +791,20 @@ ETH_1                8  15.99943        0.0000000000000000      A       0.303981
 
 def _amber_ff_dir(tmp_path):
     """Write a minimal amber14sb.ff whose forcefield.itp and atom types mirror GROMACS 2026."""
-    ff_dir = tmp_path / "amber14sb.ff"
-    ff_dir.mkdir()
-    (ff_dir / "forcefield.itp").write_text(AMBER_FORCEFIELD_ITP)
-    (ff_dir / "ffnonbonded.itp").write_text(
-        "[ atomtypes ]\n"
-        "    CT       6         12.01    0.0000   A   0.339966950842   0.457729600000\n"
-        "    OW_tip3p  8          16.0    0.0000   A   0.315075240658   0.635968000000\n"
+    return make_forcefield_dir(
+        tmp_path,
+        "amber14sb.ff",
+        {
+            "forcefield.itp": AMBER_FORCEFIELD_ITP,
+            "ffnonbonded.itp": (
+                "[ atomtypes ]\n"
+                "    CT       6         12.01    0.0000   A   0.339966950842   0.457729600000\n"
+                "    OW_tip3p  8          16.0    0.0000   A   0.315075240658   0.635968000000\n"
+            ),
+            "tip3p.itp": "; tip3p.itp\n",
+            "ions_tip3p.itp": "; ions_tip3p.itp\n",
+        },
     )
-    for name in ("tip3p.itp", "ions_tip3p.itp"):
-        (ff_dir / name).write_text(f"; {name}\n")
-    return ff_dir
 
 
 def _sage_parameters(tmp_path, name="ETH0", **fmt):
@@ -1068,13 +1056,13 @@ class TestAmberExamplesAndSchedule:
         ],
     )
     def test_yaml_loads(self, filename, resnames):
-        inp = BuildInput(**yaml.safe_load((EXAMPLES_DIR / filename).read_text()))
+        inp = BuildInput(**yaml.safe_load((MIXEDBOX_EXAMPLES / filename).read_text()))
         assert inp.parametrization == AMBER_PROTEIN_MIXEDBOX
         assert {s.resname for s in inp.system.species} == resnames
 
     def test_csv_loads(self):
         models, errors = df_to_build_input_models(
-            pd.read_csv(EXAMPLES_DIR / "protein_mixedbox_amber.csv")
+            pd.read_csv(MIXEDBOX_EXAMPLES / "protein_mixedbox_amber.csv")
         )
         assert errors == {}
         assert [m.parametrization for m in models] == [AMBER_PROTEIN_MIXEDBOX]
@@ -1110,3 +1098,19 @@ class TestAmberExamplesAndSchedule:
         # grompp validates the generated em.mdp unconditionally.
         assert len(calls) == 1
         assert Path(calls[0][0][2]).name == "em.mdp"
+
+
+def test_read_include_layout_finds_anchors():
+    from mdfactory.parametrize import _read_include_layout
+
+    lines = [
+        '#include "amber14sb.ff/forcefield.itp"\n',
+        '#include "topol_Protein.itp"\n',
+        '#include "amber14sb.ff/tip3p.itp"\n',
+        "[ system ]\n",
+        "Protein\n",
+        "[ molecules ]\n",
+        "Protein 1\n",
+    ]
+    assert _read_include_layout(lines) == (0, 2, 3, 5)
+    assert _read_include_layout(lines[1:2]) == (None, None, None, None)
