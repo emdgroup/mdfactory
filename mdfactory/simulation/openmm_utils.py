@@ -9,10 +9,17 @@ import matplotlib.pyplot as plt
 import MDAnalysis as mda
 import numpy as np
 import openmm as mm
+from loguru import logger
 from openmm import app, unit
 
+# Force constant (kJ/mol/nm^2) of the harmonic protein position restraint.
+RESTRAINT_K = 1000.0
+# Largest relative density overshoot (target_volume / volume - 1) that
+# finish_compression corrects by rescaling; larger overshoots raise.
+OVERSHOOT_TOLERANCE = 0.15
 
-def _add_protein_rmsd_restraint(system, positions, protein_indices, restraint_k):
+
+def _add_protein_rmsd_restraint(system, positions, protein_indices):
     """Restrain protein shape without opposing barostat translations.
 
     ``RMSDForce`` removes the best-fit rigid translation and rotation before
@@ -21,7 +28,7 @@ def _add_protein_rmsd_restraint(system, positions, protein_indices, restraint_k)
     rmsd = mm.RMSDForce(positions, list(protein_indices))
     restraint = mm.CustomCVForce("k*rmsd^2")
     # rmsd^2 is a mean; scaling by the atom count gives k * sum(displacement**2).
-    effective_k = restraint_k * len(protein_indices)
+    effective_k = RESTRAINT_K * len(protein_indices)
     restraint.addGlobalParameter("k", effective_k * unit.kilojoules_per_mole / unit.nanometer**2)
     restraint.addCollectiveVariable("rmsd", rmsd)
     system.addForce(restraint)
@@ -41,15 +48,17 @@ def _state_data_reporter(target):
     )
 
 
-def _universe_from_simulation(simulation, u, stem):
+def _universe_from_simulation(simulation, u, stem, periodic=True):
     """Write ``<stem>.pdb``/``<stem>.mmcif`` and return a copy of *u* with the final state.
 
-    The returned universe keeps the topology of *u* and takes positions and
-    box dimensions from the simulation's current state.
+    The returned universe keeps the topology of *u* and takes positions from the
+    simulation's current state. With *periodic* it also takes the box dimensions
+    and writes the box into the files; otherwise the universe has no box.
     """
     state = simulation.context.getState(getPositions=True)
     positions = state.getPositions()
-    simulation.topology.setPeriodicBoxVectors(state.getPeriodicBoxVectors())
+    if periodic:
+        simulation.topology.setPeriodicBoxVectors(state.getPeriodicBoxVectors())
     with open(f"{stem}.pdb", "w") as f:
         app.PDBFile.writeFile(simulation.topology, positions, f, keepIds=True)
     with open(f"{stem}.mmcif", "w") as f:
@@ -58,7 +67,7 @@ def _universe_from_simulation(simulation, u, stem):
     # Use Merge instead of copy() to avoid file reference issues
     ret = mda.Merge(u.atoms)
     ret.atoms.positions = u_tmp.atoms.positions
-    ret.dimensions = u_tmp.dimensions
+    ret.dimensions = u_tmp.dimensions if periodic else None
     return ret
 
 
@@ -141,7 +150,6 @@ def finish_compression(
     converged,
     require_convergence,
     not_reached_message,
-    overshoot_tolerance=0.15,
     rigid_indices=None,
 ):
     """Settle a compressed box exactly on its target volume.
@@ -158,38 +166,29 @@ def finish_compression(
         Raise when not converged; otherwise warn and keep the box as is.
     not_reached_message : str
         Message used when the target was not reached.
-    overshoot_tolerance : float, optional
-        Largest relative density overshoot (``target_volume / volume - 1``)
-        that is corrected by rescaling. Default is 0.15.
     rigid_indices : iterable of int or None, optional
         Particles moved as one rigid unit during rescaling.
-
-    Returns
-    -------
-    float or None
-        Relative overshoot that was corrected, or None when the target was not
-        reached.
 
     Raises
     ------
     RuntimeError
         If the target was not reached and *require_convergence* is True, or the
-        overshoot exceeds *overshoot_tolerance*.
+        overshoot exceeds :data:`OVERSHOOT_TOLERANCE`.
 
     """
     if not converged:
         if require_convergence:
             raise RuntimeError(not_reached_message)
-        print(f"WARNING: {not_reached_message} Continuing with the box as compressed.")
-        return None
+        logger.warning(f"{not_reached_message} Continuing with the box as compressed.")
+        return
 
     box = context.getState().getPeriodicBoxVectors()
     volume_nm3 = (box[0][0] * box[1][1] * box[2][2]).value_in_unit(unit.nanometer**3)
     overshoot = target_volume_nm3 / volume_nm3 - 1.0
-    if overshoot > overshoot_tolerance:
+    if overshoot > OVERSHOOT_TOLERANCE:
         raise RuntimeError(
             f"Box compression overshot the target density by {overshoot:.1%}, exceeding "
-            f"the {overshoot_tolerance:.1%} that can be corrected by rescaling."
+            f"the {OVERSHOOT_TOLERANCE:.1%} that can be corrected by rescaling."
         )
     if volume_nm3 < target_volume_nm3:
         scale = rescale_to_volume(context, target_volume_nm3, rigid_indices=rigid_indices)
@@ -197,7 +196,6 @@ def finish_compression(
             f"Compression overshot the target density by {overshoot:.2%}; expanded the box "
             f"from {volume_nm3:.3f} to {target_volume_nm3:.3f} nm³ (edge x{scale:.4f})."
         )
-    return max(overshoot, 0.0)
 
 
 def monitor_volume_convergence(volumes, window_size=10, tolerance=0.02):
@@ -443,17 +441,7 @@ def create_sphere(u, pdb, top, radius, steps: int = 100_000):
 
     simulation.step(steps)
 
-    positions = simulation.context.getState(getPositions=True).getPositions()
-    with open("sphere.pdb", "w") as f_sphere_pdb:
-        app.PDBFile.writeFile(simulation.topology, positions, f_sphere_pdb, keepIds=True)
-    with open("sphere.mmcif", "w") as f_sphere_mmcif:
-        app.PDBxFile.writeFile(simulation.topology, positions, f_sphere_mmcif, keepIds=True)
-    u_tmp = mda.Universe(app.PDBxFile("sphere.mmcif"))
-    # Use Merge instead of copy() to avoid file reference issues
-    ret = mda.Merge(u.atoms)
-    ret.dimensions = None
-    ret.atoms.positions = u_tmp.atoms.positions
-    return ret
+    return _universe_from_simulation(simulation, u, "sphere", periodic=False)
 
 
 def compress_box(
@@ -465,8 +453,6 @@ def compress_box(
     steps_compression=200_000,
     target_volume=None,
     protein_indices=None,
-    restraint_k=1000.0,
-    overshoot_tolerance=0.15,
     require_convergence=True,
 ):
     """Compress a periodic box to a target density using high-pressure NPT.
@@ -503,15 +489,10 @@ def compress_box(
     protein_indices : list of int or None, optional
         0-based atom indices to hold with harmonic position restraints. Default
         is None (no restraints).
-    restraint_k : float, optional
-        Restraint force constant in kJ/mol/nm^2. Default is 1000.0.
-    overshoot_tolerance : float, optional
-        Largest relative density overshoot corrected by rescaling; larger
-        overshoots raise. Default is 0.15 (15%).
     require_convergence : bool, optional
         Raise when the target is not reached within *steps_compression*. When
-        False, only warn and return the box as compressed so far (the behavior
-        LNP core compression relies on). Default is True.
+        False, only warn and return the box as compressed so far (used for the
+        LNP core, which cannot always reach its nominal density). Default is True.
 
     Returns
     -------
@@ -525,7 +506,7 @@ def compress_box(
     RuntimeError
         If the requested density or volume is not reached (and
         *require_convergence* is True), or compression overshoots its target
-        beyond *overshoot_tolerance*.
+        beyond :data:`OVERSHOOT_TOLERANCE`.
 
     """
     # TODO: use proper logging
@@ -540,7 +521,7 @@ def compress_box(
     )
 
     if protein_indices is not None:
-        _add_protein_rmsd_restraint(system, gro.positions, protein_indices, restraint_k)
+        _add_protein_rmsd_restraint(system, gro.positions, protein_indices)
 
     barostat = mm.MonteCarloBarostat(
         pressure * unit.bar,
@@ -599,7 +580,6 @@ def compress_box(
         target_volume_nm3=target_volume_nm3,
         converged=converged,
         require_convergence=require_convergence,
-        overshoot_tolerance=overshoot_tolerance,
         rigid_indices=protein_indices,
         not_reached_message=(
             f"Box compression did not reach {target_volume_nm3:.3f} nm³ "
@@ -846,7 +826,6 @@ def relax_with_protein_restraints(
     pdb,
     top,
     protein_indices,
-    restraint_k=1000.0,
     steps=10000,
     pressure=1.0,
 ):
@@ -867,8 +846,6 @@ def relax_with_protein_restraints(
         Path to the GROMACS topology file.
     protein_indices : list of int
         0-based atom indices to restrain (typically protein heavy atoms).
-    restraint_k : float, optional
-        Restraint force constant in kJ/mol/nm^2. Default is 1000.0.
     steps : int, optional
         Number of MD steps after minimization. Default is 10000.
     pressure : float or None, optional
@@ -893,7 +870,7 @@ def relax_with_protein_restraints(
         constraints=app.HBonds,
     )
 
-    _add_protein_rmsd_restraint(system, gro.positions, protein_indices, restraint_k)
+    _add_protein_rmsd_restraint(system, gro.positions, protein_indices)
 
     if pressure is not None:
         barostat = mm.MonteCarloBarostat(pressure * unit.bar, 300 * unit.kelvin)

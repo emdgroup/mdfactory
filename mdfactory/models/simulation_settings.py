@@ -301,10 +301,6 @@ class SimulationSettings(BaseModel):
             data["production"]["length"] = DEFAULT_PRODUCTION_LENGTH_NS[simulation_type]
         return type(self).model_validate(data)
 
-    def identity(self) -> dict[str, Any]:
-        """Return the fields that enter the build hash."""
-        return {name: getattr(self, name) for name in sorted(self.IDENTITY_FIELDS)}
-
 
 def _as_mapping(settings: "SimulationSettings | Mapping[str, Any] | None") -> dict[str, Any]:
     if settings is None:

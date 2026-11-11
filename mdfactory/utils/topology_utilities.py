@@ -6,9 +6,10 @@ import os
 import subprocess
 import warnings
 from collections import defaultdict
-from collections.abc import Collection
+from collections.abc import Collection, Iterable, Iterator
 from itertools import groupby
 from pathlib import Path
+from typing import NamedTuple
 
 from rdkit import Chem
 
@@ -348,6 +349,63 @@ def run_cgenff_to_gmx(mol2_file):
         raise RuntimeError("cgenff failed.") from e
 
 
+class TopologyEntry(NamedTuple):
+    """One line of a GROMACS topology as seen by :func:`iter_topology_entries`."""
+
+    index: int
+    #: Lower-cased name of the section the line belongs to ("" before the first header).
+    section: str
+    #: The line without its comment, stripped.
+    code: str
+    #: The ``;`` comment including the semicolon ("" when there is none).
+    comment: str
+    is_header: bool = False
+
+
+def iter_topology_entries(
+    lines: Iterable[str], *, headers: bool = False
+) -> Iterator[TopologyEntry]:
+    """Walk the data lines of GROMACS topology text, tracking the current section.
+
+    Blank lines, comment-only lines and preprocessor (``#``) lines are skipped.
+    Section names are lower-cased.
+
+    Parameters
+    ----------
+    lines : iterable of str
+        Topology lines, with or without line endings.
+    headers : bool, optional
+        Also yield the ``[ section ]`` header lines (``is_header=True``, with
+        the new section as ``section``). Default is False.
+
+    Yields
+    ------
+    TopologyEntry
+        Line index, section, comment-free code and comment of each data line.
+
+    """
+    section = ""
+    for index, raw in enumerate(lines):
+        code, sep, comment = raw.rstrip("\n").partition(";")
+        code = code.strip()
+        if not code or code.startswith("#"):
+            continue
+        is_header = code.startswith("[") and code.endswith("]")
+        if is_header:
+            section = code[1:-1].strip().lower()
+            if not headers:
+                continue
+        yield TopologyEntry(index, section, code, sep + comment if sep else "", is_header)
+
+
+def iter_includes(lines: Iterable[str]) -> Iterator[tuple[int, str]]:
+    """Yield ``(line index, path)`` for each ``#include "path"`` line."""
+    for index, raw in enumerate(lines):
+        stripped = raw.strip()
+        if stripped.startswith("#include") and '"' in stripped:
+            yield index, stripped.split('"')[1]
+
+
 def count_contiguous_strings(str_list: list[str]) -> list[tuple[str, int]]:
     """Generate from a list of strings a list of tuples with the string
     as the first element and the number of continuous repetitions as
@@ -555,21 +613,15 @@ def read_itp_atoms(itp_path: Path) -> list[tuple[str, float]]:
 
     """
     atoms: list[tuple[str, float]] = []
-    in_atoms = False
-    for raw in Path(itp_path).read_text().splitlines():
-        line = raw.split(";", 1)[0].strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            if in_atoms:
+    for entry in iter_topology_entries(Path(itp_path).read_text().splitlines()):
+        if entry.section != "atoms":
+            if atoms:
                 break
-            in_atoms = line[1:-1].strip().lower() == "atoms"
             continue
-        if in_atoms:
-            fields = line.split()
-            if len(fields) < 8:
-                raise ValueError(f"Atom line without a mass in {itp_path}: {raw!r}")
-            atoms.append((fields[4], float(fields[7])))
+        fields = entry.code.split()
+        if len(fields) < 8:
+            raise ValueError(f"Atom line without a mass in {itp_path}: {entry.code!r}")
+        atoms.append((fields[4], float(fields[7])))
     if not atoms:
         raise ValueError(f"No [ atoms ] section found in {itp_path}.")
     return atoms
@@ -631,36 +683,26 @@ def write_itp_with_atom_names(src: str | Path, dest: str | Path, names: list[str
 
     """
     lines = Path(src).read_text().splitlines(keepends=True)
-    in_atoms = False
-    done = False
     index = 0
-    for i, raw in enumerate(lines):
-        line = raw.split(";", 1)[0].strip()
-        if done or not line or line.startswith("#"):
+    for entry in iter_topology_entries(lines):
+        if entry.section != "atoms":
+            if index:
+                break
             continue
-        if line.startswith("[") and line.endswith("]"):
-            if in_atoms:
-                done = True
-                continue
-            in_atoms = line[1:-1].strip().lower() == "atoms"
-            continue
-        if in_atoms:
-            if index >= len(names):
-                raise ValueError(f"{src} has more atoms than the {len(names)} names given.")
-            fields = line.split()
-            fields[4] = names[index]
-            comment = raw.split(";", 1)[1].rstrip("\n") if ";" in raw else ""
-            lines[i] = " ".join(fields) + (f" ;{comment}" if comment else "") + "\n"
-            index += 1
+        if index >= len(names):
+            raise ValueError(f"{src} has more atoms than the {len(names)} names given.")
+        fields = entry.code.split()
+        fields[4] = names[index]
+        lines[entry.index] = _join_fields(fields, entry.comment)
+        index += 1
     if index != len(names):
         raise ValueError(f"{src} has {index} atoms but {len(names)} names were given.")
     Path(dest).write_text("".join(lines))
 
 
-def _split_code_comment(raw: str) -> tuple[str, str]:
-    """Split a topology line into its code and its ``;`` comment (without newline)."""
-    code, sep, comment = raw.rstrip("\n").partition(";")
-    return code, (sep + comment if sep else "")
+def _join_fields(fields: list[str], comment: str) -> str:
+    """Rebuild a topology line from its fields and trailing comment."""
+    return " ".join(fields) + (f" {comment}" if comment else "") + "\n"
 
 
 def rename_atomtypes(itp_path: str | Path, atomtypes_path: str | Path, prefix: str) -> dict:
@@ -699,18 +741,10 @@ def rename_atomtypes(itp_path: str | Path, atomtypes_path: str | Path, prefix: s
 
     atomtypes_lines = Path(atomtypes_path).read_text().splitlines(keepends=True)
     mapping: dict[str, str] = {}
-    section = None
-    for i, raw in enumerate(atomtypes_lines):
-        code, comment = _split_code_comment(raw)
-        stripped = code.strip()
-        if not stripped or stripped.startswith("#"):
+    for entry in iter_topology_entries(atomtypes_lines):
+        if entry.section != "atomtypes":
             continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            section = stripped[1:-1].strip().lower()
-            continue
-        if section != "atomtypes":
-            continue
-        fields = stripped.split()
+        fields = entry.code.split()
         old = fields[0]
         if old in mapping:
             raise ValueError(f"Atom type '{old}' is defined twice in {atomtypes_path}.")
@@ -719,24 +753,16 @@ def rename_atomtypes(itp_path: str | Path, atomtypes_path: str | Path, prefix: s
         # An optional bond_type column repeats the name.
         if len(fields) > 1 and fields[1] == old:
             fields[1] = mapping[old]
-        atomtypes_lines[i] = " ".join(fields) + (f" {comment}" if comment else "") + "\n"
+        atomtypes_lines[entry.index] = _join_fields(fields, entry.comment)
     if not mapping:
         raise ValueError(f"No [ atomtypes ] entries found in {atomtypes_path}.")
 
     itp_lines = Path(itp_path).read_text().splitlines(keepends=True)
-    section = None
     n_atoms = 0
-    for i, raw in enumerate(itp_lines):
-        code, comment = _split_code_comment(raw)
-        stripped = code.strip()
-        if not stripped or stripped.startswith("#"):
+    for entry in iter_topology_entries(itp_lines):
+        if entry.section != "atoms":
             continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            section = stripped[1:-1].strip().lower()
-            continue
-        if section != "atoms":
-            continue
-        fields = stripped.split()
+        fields = entry.code.split()
         # nr type resnr residue atom cgnr charge mass [typeB chargeB massB]
         for column in (1, 8):
             if column >= len(fields):
@@ -747,7 +773,7 @@ def rename_atomtypes(itp_path: str | Path, atomtypes_path: str | Path, prefix: s
                     f"{atomtypes_path}."
                 )
             fields[column] = mapping[fields[column]]
-        itp_lines[i] = " ".join(fields) + (f" {comment}" if comment else "") + "\n"
+        itp_lines[entry.index] = _join_fields(fields, entry.comment)
         n_atoms += 1
     if n_atoms == 0:
         raise ValueError(f"No [ atoms ] entries found in {itp_path}.")
@@ -757,18 +783,8 @@ def rename_atomtypes(itp_path: str | Path, atomtypes_path: str | Path, prefix: s
     return mapping
 
 
-def validate_cgenff_atomtype_compatibility(
-    prm_files: list[str | Path],
-    ff_dir: str | Path,
-    forcefield_types: dict[str, tuple[str, ...]] | None = None,
-) -> None:
-    """Reject CGenFF atom types that conflict with the selected CHARMM bundle.
-
-    *forcefield_types* may pass the already-parsed result of
-    :func:`collect_forcefield_atomtype_definitions` to avoid re-reading *ff_dir*.
-    """
-    if forcefield_types is None:
-        forcefield_types = collect_forcefield_atomtype_definitions(ff_dir)
+def _iter_prm_atomtypes(prm_files: list[str | Path]) -> Iterator[tuple[str | Path, str, str]]:
+    """Yield ``(file, atom-type name, definition line)`` for the ``[ atomtypes ]`` of each file."""
     for prm in prm_files:
         *_, sections = extract_reusable_parts_from_cgenff_gmx_top(prm, must_have_moleculetype=False)
         for section_name, section_text in sections:
@@ -778,17 +794,29 @@ def validate_cgenff_atomtype_compatibility(
                 stripped = line.strip()
                 if not stripped or stripped.startswith((";", "[")):
                     continue
-                name = stripped.split()[0]
-                existing = forcefield_types.get(name)
-                if existing is None:
-                    continue
-                generated = _atomtype_signature(stripped)
-                if generated != existing:
-                    raise ValueError(
-                        f"CGenFF atom type '{name}' conflicts with the selected CHARMM "
-                        f"force-field bundle ({generated} != {existing}). Use a CGenFF "
-                        "installation matching the registered charmm36m bundle."
-                    )
+                yield prm, stripped.split()[0], stripped
+
+
+def validate_cgenff_atomtype_compatibility(
+    prm_files: list[str | Path],
+    forcefield_types: dict[str, tuple[str, ...]],
+) -> None:
+    """Reject CGenFF atom types that conflict with the selected CHARMM bundle.
+
+    *forcefield_types* is the result of :func:`collect_forcefield_atomtype_definitions`
+    for the bundle.
+    """
+    for _, name, line in _iter_prm_atomtypes(prm_files):
+        existing = forcefield_types.get(name)
+        if existing is None:
+            continue
+        generated = _atomtype_signature(line)
+        if generated != existing:
+            raise ValueError(
+                f"CGenFF atom type '{name}' conflicts with the selected CHARMM "
+                f"force-field bundle ({generated} != {existing}). Use a CGenFF "
+                "installation matching the registered charmm36m bundle."
+            )
 
 
 DEFAULTS_FUDGE_TOLERANCE = 1e-6
@@ -816,33 +844,27 @@ def read_topology_defaults(path: str | Path) -> tuple[int, int, str, float, floa
 
     """
     in_defaults = False
-    with open(path) as fb:
-        for raw in fb:
-            line = raw.split(";", 1)[0].strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("[") and line.endswith("]"):
-                if in_defaults:
-                    break
-                in_defaults = line[1:-1].strip().lower() == "defaults"
-                continue
-            if not in_defaults:
-                continue
-            fields = line.split()
-            if len(fields) < 5:
-                raise ValueError(f"Malformed [ defaults ] entry in {path}: {raw.strip()!r}")
-            try:
-                return (
-                    int(fields[0]),
-                    int(fields[1]),
-                    fields[2].lower(),
-                    float(fields[3]),
-                    float(fields[4]),
-                )
-            except ValueError as exc:
-                raise ValueError(
-                    f"Malformed [ defaults ] entry in {path}: {raw.strip()!r}"
-                ) from exc
+    for entry in iter_topology_entries(Path(path).read_text().splitlines(), headers=True):
+        if entry.is_header:
+            if in_defaults:
+                break
+            in_defaults = entry.section == "defaults"
+            continue
+        if not in_defaults:
+            continue
+        fields = entry.code.split()
+        if len(fields) < 5:
+            raise ValueError(f"Malformed [ defaults ] entry in {path}: {entry.code!r}")
+        try:
+            return (
+                int(fields[0]),
+                int(fields[1]),
+                fields[2].lower(),
+                float(fields[3]),
+                float(fields[4]),
+            )
+        except ValueError as exc:
+            raise ValueError(f"Malformed [ defaults ] entry in {path}: {entry.code!r}") from exc
     if in_defaults:
         raise ValueError(f"[ defaults ] section in {path} has no entry.")
     return None
@@ -851,12 +873,11 @@ def read_topology_defaults(path: str | Path) -> tuple[int, int, str, float, floa
 def check_defaults_compatible(
     reference_path: str | Path,
     other_path: str | Path,
-    tolerance: float = DEFAULTS_FUDGE_TOLERANCE,
 ) -> None:
     """Raise unless two files declare equivalent ``[ defaults ]`` entries.
 
     ``nbfunc``, ``comb-rule`` and ``gen-pairs`` must match exactly; ``fudgeLJ``
-    and ``fudgeQQ`` must agree within *tolerance*, because force fields write
+    and ``fudgeQQ`` must agree within :data:`DEFAULTS_FUDGE_TOLERANCE`, because force fields write
     the 1-4 scaling with different precision (``0.833333`` versus
     ``0.83333333333333333``).
 
@@ -866,8 +887,6 @@ def check_defaults_compatible(
         File whose ``[ defaults ]`` is kept, e.g. the force field's ``forcefield.itp``.
     other_path : str or Path
         File whose ``[ defaults ]`` would be dropped, e.g. a SMIRNOFF parameter file.
-    tolerance : float, optional
-        Absolute tolerance for the fudge factors. Default is 1e-6.
 
     Raises
     ------
@@ -881,7 +900,9 @@ def check_defaults_compatible(
         missing = reference_path if reference is None else other_path
         raise ValueError(f"No [ defaults ] section found in {missing}.")
     exact_match = reference[:3] == other[:3]
-    fudge_match = all(abs(a - b) <= tolerance for a, b in zip(reference[3:], other[3:]))
+    fudge_match = all(
+        abs(a - b) <= DEFAULTS_FUDGE_TOLERANCE for a, b in zip(reference[3:], other[3:])
+    )
     if not (exact_match and fudge_match):
         raise ValueError(
             "Incompatible [ defaults ] (nbfunc, comb-rule, gen-pairs, fudgeLJ, fudgeQQ): "
@@ -916,29 +937,20 @@ def check_atomtype_collisions(
 
     """
     seen: dict[str, tuple[tuple[str, ...], str]] = {}
-    for prm in prm_files:
-        *_, sections = extract_reusable_parts_from_cgenff_gmx_top(prm, must_have_moleculetype=False)
-        for section_name, section_text in sections:
-            if section_name != "atomtypes":
-                continue
-            for line in section_text.splitlines():
-                stripped = line.strip()
-                if not stripped or stripped.startswith((";", "[")):
-                    continue
-                name = stripped.split()[0]
-                if name in forcefield_types:
-                    raise ValueError(
-                        f"Atom type '{name}' from {prm} is already defined by the force "
-                        "field; the parameter sets cannot be combined."
-                    )
-                signature = _atomtype_signature(stripped)
-                previous = seen.get(name)
-                if previous is not None and previous[0] != signature:
-                    raise ValueError(
-                        f"Atom type '{name}' is defined with different parameters in "
-                        f"{previous[1]} and {prm}; the parameter sets cannot be combined."
-                    )
-                seen.setdefault(name, (signature, str(prm)))
+    for prm, name, line in _iter_prm_atomtypes(prm_files):
+        if name in forcefield_types:
+            raise ValueError(
+                f"Atom type '{name}' from {prm} is already defined by the force "
+                "field; the parameter sets cannot be combined."
+            )
+        signature = _atomtype_signature(line)
+        previous = seen.get(name)
+        if previous is not None and previous[0] != signature:
+            raise ValueError(
+                f"Atom type '{name}' is defined with different parameters in "
+                f"{previous[1]} and {prm}; the parameter sets cannot be combined."
+            )
+        seen.setdefault(name, (signature, str(prm)))
 
 
 def merge_extra_parameter_itps(

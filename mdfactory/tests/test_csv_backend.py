@@ -11,7 +11,7 @@ from mdfactory.settings import Settings
 from mdfactory.utils.data_manager import DataManager
 from mdfactory.utils.db_operations import local_upload_with_modes
 
-from .conftest import make_test_record
+from .conftest import default_settings_loader, make_test_record
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -30,13 +30,8 @@ def temp_csv_run_db(tmp_path, monkeypatch):
             return str(csv_path)
         return original_get_csv_path(self, db_name)
 
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "csv"
-
     monkeypatch.setattr(Settings, "get_csv_path", patched_get_csv_path)
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("csv"))
 
     from mdfactory.utils.push import init_systems_database
 
@@ -54,13 +49,8 @@ def temp_csv_analysis_db(tmp_path, monkeypatch):
             return str(analysis_dir / f"{db_name}.csv")
         return Settings.get_csv_path(self, db_name)
 
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "csv"
-
     monkeypatch.setattr(Settings, "get_csv_path", patched_get_csv_path)
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("csv"))
 
     from mdfactory.utils.push_analysis import init_analysis_database
 
@@ -115,13 +105,8 @@ def test_csv_init_creates_directories(tmp_path, monkeypatch):
             return str(nested_path)
         return str(tmp_path / f"{db_name}.csv")
 
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "csv"
-
     monkeypatch.setattr(Settings, "get_csv_path", patched_get_csv_path)
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("csv"))
 
     from mdfactory.utils.push import init_systems_database
 
@@ -370,13 +355,8 @@ def test_csv_database_not_exists(tmp_path, monkeypatch):
     def patched_get_csv_path(self, db_name: str) -> str:
         return str(csv_path)
 
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "csv"
-
     monkeypatch.setattr(Settings, "get_csv_path", patched_get_csv_path)
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("csv"))
 
     exists, path = DataManager.database_exists("RUN_DATABASE")
     assert exists is False

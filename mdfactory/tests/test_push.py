@@ -28,7 +28,12 @@ from mdfactory.utils.push import (
 )
 
 # Import shared helpers from conftest
-from .conftest import _create_simulation_folder, _write_csv_with_models, make_test_record
+from .conftest import (
+    _create_simulation_folder,
+    _write_csv_with_models,
+    default_settings_loader,
+    make_test_record,
+)
 
 
 def _record(hash_value: str, status: str = "build") -> dict[str, str]:
@@ -811,12 +816,7 @@ def test_init_systems_database_creates_file(tmp_path, monkeypatch):
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
 
     results = init_systems_database()
 
@@ -847,12 +847,7 @@ def test_init_systems_database_already_exists(tmp_path, monkeypatch):
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
 
     results_first = init_systems_database()
     results_second = init_systems_database()
@@ -871,13 +866,8 @@ def test_init_systems_database_reset_recreates(tmp_path, monkeypatch):
             return str(db_path)
         return original_get_db_path(self, db_name, db_type)
 
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
 
     # Init and insert a row
     init_systems_database()
@@ -907,12 +897,7 @@ def test_cli_sync_init_systems(tmp_path, monkeypatch):
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
     monkeypatch.chdir(tmp_path)
 
     sync_init_systems()

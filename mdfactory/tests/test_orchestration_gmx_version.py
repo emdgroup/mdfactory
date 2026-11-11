@@ -10,13 +10,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from mdfactory.orchestration.apps import _build_grompp_script
-from mdfactory.orchestration.stages import STAGE_BY_NAME, min_gmx_version_for_sim_dir, run_stage
+from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
 
 AMBER_TOP = '#include "amber14sb.ff/forcefield.itp"\n#include "amber14sb.ff/tip3p.itp"\n'
 CHARMM_TOP = '#include "charmm36-feb2026_cgenff-5.0.ff/forcefield.itp"\n'
 
 
-def _script(work_dir, min_gmx_version=""):
+def _script(work_dir, min_gmx_version=None):
     return _build_grompp_script(
         "em.mdp",
         "system.pdb",
@@ -28,15 +28,7 @@ def _script(work_dir, min_gmx_version=""):
 
 
 class TestRequirementDetection:
-    @pytest.mark.parametrize(("top", "expected"), [(AMBER_TOP, "2026"), (CHARMM_TOP, "")])
-    def test_from_topology(self, tmp_path, top, expected):
-        (tmp_path / "topology.top").write_text(top)
-        assert min_gmx_version_for_sim_dir(tmp_path) == expected
-
-    def test_missing_topology_has_no_requirement(self, tmp_path):
-        assert min_gmx_version_for_sim_dir(tmp_path) == ""
-
-    @pytest.mark.parametrize(("top", "expected"), [(AMBER_TOP, "2026"), (CHARMM_TOP, None)])
+    @pytest.mark.parametrize(("top", "expected"), [(AMBER_TOP, (2026, 0)), (CHARMM_TOP, None)])
     def test_run_stage_passes_requirement_only_when_needed(self, tmp_path, top, expected):
         (tmp_path / "topology.top").write_text(top)
         grompp_app = MagicMock(return_value=MagicMock())
@@ -53,16 +45,16 @@ class TestGromppScript:
         )
 
     def test_check_runs_after_detection_and_before_grompp(self, tmp_path):
-        script = _script(tmp_path, "2026")
+        script = _script(tmp_path, (2026, 0))
         assert "GROMACS >= 2026" in script
         detect = script.index("GMX_BIN=gmx")
         check = script.index("GMX_VERSION=")
         assert detect < check < script.index("$GMX_BIN grompp")
 
-    @pytest.mark.parametrize("bad", ["abc", "2026.x", "-1"])
-    def test_rejects_invalid_minimum(self, tmp_path, bad):
-        with pytest.raises(ValueError, match="Invalid minimum GROMACS version"):
-            _script(tmp_path, bad)
+    def test_minor_version_is_part_of_the_threshold(self, tmp_path):
+        script = _script(tmp_path, (2026, 1))
+        assert "GROMACS >= 2026.1" in script
+        assert "GMX_VERSION_NUM < 2026001" in script
 
 
 def _fake_gmx(bin_dir, name="gmx"):
@@ -109,7 +101,7 @@ class TestVersionCheckExecution:
         _fake_gmx(bin_dir)
         log = tmp_path / "grompp.log"
         result = subprocess.run(
-            ["bash", "-c", _script(sim_dir, "2026")],
+            ["bash", "-c", _script(sim_dir, (2026, 0))],
             capture_output=True,
             text=True,
             env={

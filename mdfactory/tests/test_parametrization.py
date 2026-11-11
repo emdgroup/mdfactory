@@ -36,6 +36,7 @@ from mdfactory.settings import settings as config
 from mdfactory.utils.data_manager import DataManager, SQLiteDataSource
 from mdfactory.utils.utilities import working_directory
 
+from .conftest import make_forcefield_dir
 from .utils import ProcessWithException
 
 CHARMM_MIXEDBOX = CharmmParametrization().resolve("mixedbox")
@@ -68,7 +69,7 @@ def is_cgenff_available():
 
 
 @pytest.mark.skipif(not is_cgenff_available(), reason="CGenFF not available")
-def test_parametrization_simple(tmp_path, mocker):
+def test_parametrization_simple(tmp_path, mocker, parameter_store):
     mock_data_source = SQLiteDataSource(
         db_path=str(tmp_path / "molecule_database.db"), table_name="molecules"
     )
@@ -76,8 +77,7 @@ def test_parametrization_simple(tmp_path, mocker):
     patcher = patch.object(DataManager, "_initialize_data_source", return_value=mock_data_source)
     patcher.start()
 
-    config.parameter_store = tmp_path / "parameters"
-    path = config.parameter_store / "gromacs" / "cgenff"
+    path = parameter_store / "gromacs" / "cgenff"
 
     parametrize = partial(parametrize_cgenff_gromacs, spec=CHARMM_MIXEDBOX)
 
@@ -124,9 +124,8 @@ def test_parametrization_simple(tmp_path, mocker):
 
 
 @pytest.mark.skipif(not is_cgenff_available(), reason="CGenFF not available")
-def test_parametrization_simultaneously(tmp_path):
-    config.parameter_store = tmp_path / "parameters"
-    path = config.parameter_store / "gromacs" / "cgenff"
+def test_parametrization_simultaneously(tmp_path, parameter_store):
+    path = parameter_store / "gromacs" / "cgenff"
 
     parametrize = partial(parametrize_cgenff_gromacs, spec=CHARMM_MIXEDBOX)
 
@@ -288,9 +287,7 @@ def test_cgenff_locks_written_directory_and_regenerates_failed_attempt(tmp_path,
     _fake_cgenff(monkeypatch, calls)
     locked = _record_locks(monkeypatch)
     # Use a temporary force-field directory so the test does not need a CGenFF installation.
-    ff_dir = tmp_path / "charmm36.ff"
-    ff_dir.mkdir()
-    (ff_dir / "forcefield.itp").write_text("; forcefield.itp\n")
+    ff_dir = make_forcefield_dir(tmp_path, "charmm36.ff", ["forcefield.itp"])
     native = parametrize_module.NativeForceField("charmm36", ff_dir, "tip3p")
     spec = SingleMoleculeSpecies(smiles="CCO", count=1, resname="ETH")
     # A failed earlier attempt left a directory without outputs.
@@ -315,10 +312,9 @@ def test_cgenff_locks_written_directory_and_regenerates_failed_attempt(tmp_path,
 
 
 def test_cgenff_native_water_and_ions_record_forcefield(tmp_path, monkeypatch):
-    ff_dir = tmp_path / "charmm36.ff"
-    ff_dir.mkdir()
-    for name in ("forcefield.itp", "tip3p.itp", "ions.itp"):
-        (ff_dir / name).write_text(f"; {name}\n")
+    ff_dir = make_forcefield_dir(
+        tmp_path, "charmm36.ff", ["forcefield.itp", "tip3p.itp", "ions.itp"]
+    )
     monkeypatch.setattr(config, "parameter_store", tmp_path / "parameters")
     native = parametrize_module.NativeForceField("charmm36m", ff_dir, "tip3p")
 

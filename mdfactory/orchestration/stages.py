@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from ..run_schedules.gromacs import STAGE_FILES
+
 if TYPE_CHECKING:
     from parsl import AppFuture
 
@@ -74,7 +76,7 @@ STAGE_REGISTRY: list[StageSpec] = [
     StageSpec(
         name="EM",
         deffnm="min",
-        mdp_file="em.mdp",
+        mdp_file=STAGE_FILES["minimization"],
         gro_in="system.pdb",
         gro_out="min.gro",
         tpr_file="min.tpr",
@@ -88,7 +90,7 @@ STAGE_REGISTRY: list[StageSpec] = [
     StageSpec(
         name="NVT",
         deffnm="nvt",
-        mdp_file="nvt.mdp",
+        mdp_file=STAGE_FILES["nvt"],
         gro_in="min.gro",
         gro_out="nvt.gro",
         tpr_file="nvt.tpr",
@@ -102,7 +104,7 @@ STAGE_REGISTRY: list[StageSpec] = [
     StageSpec(
         name="NPT",
         deffnm="npt",
-        mdp_file="npt.mdp",
+        mdp_file=STAGE_FILES["npt"],
         gro_in="nvt.gro",
         gro_out="npt.gro",
         tpr_file="npt.tpr",
@@ -116,7 +118,7 @@ STAGE_REGISTRY: list[StageSpec] = [
     StageSpec(
         name="Production",
         deffnm="prod",
-        mdp_file="md.mdp",
+        mdp_file=STAGE_FILES["production"],
         gro_in="npt.gro",
         gro_out="",
         tpr_file="prod.tpr",
@@ -186,19 +188,6 @@ def _extract_resource_hints(stage_config: Any) -> ResourceHints:
     disable_gpu = gres is None or "gpu" not in str(gres).lower()
     gmx_binary = getattr(stage_config, "gmx_binary", "auto")
     return ResourceHints(ntasks=ntasks, disable_gpu=disable_gpu, gmx_binary=gmx_binary)
-
-
-def min_gmx_version_for_sim_dir(sim_dir: Path) -> str:
-    """Return the minimum GROMACS version a simulation directory's topology needs.
-
-    Derived from the force field ``topology.top`` includes (e.g.
-    ``amber14sb.ff/forcefield.itp`` needs 2026). Returns ``""`` when there is no
-    requirement (CHARMM and small-molecule builds) or no topology.
-    """
-    from ..setup.protein import format_gmx_version, min_gmx_version_for_topology
-
-    required = min_gmx_version_for_topology(Path(sim_dir) / "topology.top")
-    return format_gmx_version(required) if required is not None else ""
 
 
 def run_stage(
@@ -287,8 +276,10 @@ def run_stage(
         grompp_kwargs["cpt_file"] = spec.prereq_cpt
     # Force fields that need a newer GROMACS (amber14sb) make grompp check the
     # node's binary first; other topologies keep the unchanged script.
-    min_gmx_version = min_gmx_version_for_sim_dir(sim_dir)
-    if min_gmx_version:
+    from ..setup.protein import min_gmx_version_for_topology
+
+    min_gmx_version = min_gmx_version_for_topology(Path(sim_dir) / "topology.top")
+    if min_gmx_version is not None:
         grompp_kwargs["min_gmx_version"] = min_gmx_version
 
     grompp_fut = grompp_app(**grompp_kwargs)

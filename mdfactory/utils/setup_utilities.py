@@ -20,16 +20,14 @@ from scipy.spatial.distance import cdist
 
 from mdfactory.models.composition import BilayerComposition
 from mdfactory.models.input import MixedBoxComposition
-from mdfactory.models.species import LipidSpecies
+from mdfactory.models.species import NATIVE_SPECIES, LipidSpecies
+from mdfactory.utils.units import A3_TO_L, CM3_TO_A3, N_AVOGADRO
 from mdfactory.utils.utilities import temporary_working_directory, working_directory
 
-# Avogadro's number, matching the g<->Dalton conventions used in composition.py.
-N_AVOGADRO = 6.022e23
-
-# A protein_mixedbox is packed at 0.1x the final density so water and solutes have
-# room to be placed around the fixed protein before compression squeezes the box
-# down to its requested size (mirrors the mixedbox 0.1x loose-packing idiom).
-PROTEIN_MIXEDBOX_DILUTION_FACTOR = 0.1
+# Mixed boxes (and protein_mixedbox) are packed at 0.1x the final density so the
+# molecules have room to be placed before compression squeezes the box down to
+# its requested size.
+LOOSE_PACKING_FACTOR = 0.1
 
 
 def generate_lipid_structure_legacy(
@@ -742,18 +740,18 @@ def protein_displaced_volume_a3(
 
     ``partial_specific_volume`` is in mL/g. The mass converts to grams via
     Avogadro's number, multiplies by the specific volume to give cm³, and cm³
-    converts to Å³ (1 cm³ = 1e24 Å³).
+    converts to Å³.
     """
     mass_g = protein_mass_dalton / N_AVOGADRO
     volume_cm3 = mass_g * partial_specific_volume
-    return volume_cm3 * 1e24
+    return volume_cm3 * CM3_TO_A3
 
 
 def cubic_box_edge_for_density(total_mass_dalton: float, target_density: float) -> float:
     """Return box edge (Å) holding ``total_mass_dalton`` at the density."""
     mass_g = total_mass_dalton / N_AVOGADRO
     volume_cm3 = mass_g / target_density
-    volume_a3 = volume_cm3 * 1e24
+    volume_a3 = volume_cm3 * CM3_TO_A3
     return float(volume_a3 ** (1.0 / 3.0))
 
 
@@ -815,8 +813,8 @@ def resolve_solution_counts(
     v_basis_a3 = concentration_reference_volume_a3(
         box_volume_a3, protein_mass_dalton, partial_specific_volume, basis
     )
-    # 1 Å³ = 1e-27 L, so count = concentration[mol/L] * V[L] * N_A.
-    v_basis_liters = v_basis_a3 * 1e-27
+    # count = concentration[mol/L] * V[L] * N_A.
+    v_basis_liters = v_basis_a3 * A3_TO_L
     counts = []
     for spec in species:
         if spec.count is not None:
@@ -988,11 +986,8 @@ def native_atom_names(smiles: str) -> list[str] | None:
         Atom names in packing order, or None if the species is not native.
 
     """
-    return {
-        "O": ["OW", "HW1", "HW2"],
-        "[Na+]": ["NA"],
-        "[Cl-]": ["CL"],
-    }.get(smiles)
+    native = NATIVE_SPECIES.get(smiles)
+    return list(native.atom_names) if native is not None else None
 
 
 def topology_atom_names(species, parameter_set) -> list[str] | None:

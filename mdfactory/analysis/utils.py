@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from mdfactory.models.input import BuildInput
+from mdfactory.models.input import BuildInput, protein_anchor
 from mdfactory.utils.utilities import load_yaml_file
 
 from .constants import STATUS_ORDER
@@ -408,6 +408,14 @@ def get_chemistry_extractor(
         raise ValueError(f"Unknown mode '{mode}'. Use 'all', 'lnp', or 'custom'.")
 
 
+def read_build_metadata(directory: str | Path | None) -> dict[str, Any] | None:
+    """Return the parsed ``build_metadata.json`` of a build directory, or None if absent."""
+    if directory is None:
+        return None
+    path = Path(directory) / "build_metadata.json"
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
 def system_chemistry(simulation, **kwargs) -> pd.DataFrame:
     """Extract species composition as a long-format DataFrame.
 
@@ -436,25 +444,18 @@ def system_chemistry(simulation, **kwargs) -> pd.DataFrame:
 
     """
     build_input = simulation.build_input
-    achieved_species = []
-    build_metadata_path = getattr(simulation, "path", None)
-    if build_metadata_path is not None:
-        build_metadata_path = Path(build_metadata_path) / "build_metadata.json"
-        if build_metadata_path.is_file():
-            build_metadata = json.loads(build_metadata_path.read_text())
-            achieved_species = build_metadata.get("species", [])
+    build_metadata = read_build_metadata(getattr(simulation, "path", None))
+    achieved_species = (build_metadata or {}).get("species", [])
     rows = []
-    if build_input.simulation_type == "protein_mixedbox":
-        # The protein anchors the box but is not part of system.species (packing
-        # is solution-only). List it as a species row here to match proteinbox
-        # output; it consumes no achieved_species index.
-        protein = build_input.system.protein
+    if (anchor := protein_anchor(build_input)) is not None:
+        # List the protein as a species row to match proteinbox output; it
+        # consumes no achieved_species index.
         rows.append(
             {
-                "resname": protein.resname,
+                "resname": anchor["resname"],
                 "smiles": None,
-                "count": protein.count,
-                "fraction": protein.fraction,
+                "count": anchor["count"],
+                "fraction": anchor["fraction"],
                 "simulation_type": build_input.simulation_type,
                 "concentration": None,
                 "resolved_count": None,

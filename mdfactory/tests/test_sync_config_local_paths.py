@@ -50,7 +50,7 @@ def test_config_resolves_relative_local_paths_against_config_directory(monkeypat
 
     def patched_load_config(self):
         self.config = configparser.ConfigParser()
-        for section, options in self.DEFAULT_CONFIG.items():
+        for section, options in self._get_defaults().items():
             self.config[section] = {}
             for key, value in options.items():
                 self.config[section][key] = str(value)

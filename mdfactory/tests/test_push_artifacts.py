@@ -28,7 +28,7 @@ from mdfactory.utils.push_artifacts import (
 )
 
 # Import shared helpers from conftest (temp_analysis_db-like fixture will be temp_artifact_db)
-from .conftest import _write_csv_with_models
+from .conftest import _write_csv_with_models, default_settings_loader
 
 
 def _create_simulation_folder_artifact(tmp_path: Path, hash_value: str, build_input) -> Path:
@@ -138,12 +138,7 @@ def temp_artifact_db(tmp_path, monkeypatch):
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
 
     # Initialize both analysis and artifact database
     init_analysis_database()
@@ -167,12 +162,7 @@ def test_init_artifact_database_creates_file(tmp_path, monkeypatch):
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
 
     results = init_artifact_database()
 
@@ -204,12 +194,7 @@ def test_init_artifact_database_reset_preserves_overview(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
 
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
 
     init_analysis_database()
     init_artifact_database()
@@ -338,12 +323,7 @@ def test_discover_and_prepare_artifact_data(tmp_path, monkeypatch):
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
     init_artifact_database()
 
     # Create simulation folder with artifact data
@@ -386,12 +366,7 @@ def test_push_artifacts_integration(tmp_path, monkeypatch):
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
     init_analysis_database()
     init_artifact_database()
 
@@ -427,12 +402,7 @@ def test_push_artifacts_diff_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
     init_analysis_database()
     init_artifact_database()
 
@@ -510,12 +480,7 @@ def test_cli_sync_init_artifacts(tmp_path, monkeypatch):
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
     monkeypatch.chdir(tmp_path)
 
     sync_init_artifacts()
@@ -590,12 +555,7 @@ def test_cli_sync_push_artifacts_path_success(tmp_path, monkeypatch):
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
     init_analysis_database()
     init_artifact_database()
 
@@ -649,13 +609,8 @@ def test_push_artifacts_duplicate_raises(tmp_path, monkeypatch):
             return str(db_path)
         return original_get_db_path(self, db_name, db_type)
 
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
     init_analysis_database()
     init_artifact_database()
 

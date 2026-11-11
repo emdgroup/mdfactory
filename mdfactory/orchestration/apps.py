@@ -389,7 +389,7 @@ def _get_gromacs_detect_script() -> str:
     )
 
 
-def _build_gmx_version_check(min_gmx_version: str) -> str:
+def _build_gmx_version_check(min_gmx_version: tuple[int, int]) -> str:
     """Return a bash snippet that exits unless ``$GMX_BIN`` is new enough.
 
     The check runs on the compute node against the exact binary the job will
@@ -397,24 +397,19 @@ def _build_gmx_version_check(min_gmx_version: str) -> str:
 
     Parameters
     ----------
-    min_gmx_version : str
-        Minimum GROMACS version, e.g. ``"2026"`` or ``"2026.1"``.
+    min_gmx_version : tuple of int
+        Minimum GROMACS version as ``(year, minor)``, e.g. ``(2026, 0)``.
 
     Returns
     -------
     str
         Bash block with a leading blank line and trailing newline.
 
-    Raises
-    ------
-    ValueError
-        If *min_gmx_version* is not of the form ``<major>[.<minor>]``.
-
     """
-    major, _, minor = min_gmx_version.partition(".")
-    if not major.isdigit() or (minor and not minor.isdigit()):
-        raise ValueError(f"Invalid minimum GROMACS version: {min_gmx_version!r}")
-    threshold = int(major) * 1000 + int(minor or 0)
+    from ..setup.protein import format_gmx_version
+
+    threshold = min_gmx_version[0] * 1000 + min_gmx_version[1]
+    min_gmx_version = format_gmx_version(min_gmx_version)
     return f"""
 # Require GROMACS >= {min_gmx_version} for the force field in the topology
 GMX_VERSION=$("$GMX_BIN" --version 2>/dev/null \\
@@ -535,7 +530,7 @@ def _build_grompp_script(
     ref_file: str = "",
     cpt_file: str = "",
     maxwarn: int = 1,
-    min_gmx_version: str = "",
+    min_gmx_version: tuple[int, int] | None = None,
 ) -> str:
     """Build the bash script for ``gmx grompp``.
 
@@ -560,11 +555,11 @@ def _build_grompp_script(
         Checkpoint file for velocities (-t flag).
     maxwarn : int
         Maximum number of warnings to allow.
-    min_gmx_version : str, optional
-        Minimum GROMACS version the topology's force field needs, e.g.
-        ``"2026"``. When given, the script exits with an error before grompp
-        if the detected binary is older. Empty (default) means no check, and
-        the script is unchanged.
+    min_gmx_version : tuple of int, optional
+        Minimum GROMACS version ``(year, minor)`` the topology's force field
+        needs, e.g. ``(2026, 0)``. When given, the script exits with an error
+        before grompp if the detected binary is older. None (default) means no
+        check, and the script is unchanged.
 
     Returns
     -------
@@ -574,7 +569,7 @@ def _build_grompp_script(
     """
     ref_flag = f"-r {ref_file}" if ref_file else ""
     cpt_flag = f"-t {cpt_file}" if cpt_file else ""
-    version_check = _build_gmx_version_check(min_gmx_version) if min_gmx_version else ""
+    version_check = _build_gmx_version_check(min_gmx_version) if min_gmx_version is not None else ""
 
     return f"""
         set -euo pipefail  # Exit on error, undefined vars, pipe failures
@@ -723,7 +718,7 @@ def get_grompp_app():
         ref_file: str = "",
         cpt_file: str = "",
         maxwarn: int = 1,
-        min_gmx_version: str = "",
+        min_gmx_version: tuple[int, int] | None = None,
         stdout=None,
         stderr=None,
         inputs=None,
@@ -748,8 +743,8 @@ def get_grompp_app():
             Checkpoint file for velocities (-t flag).
         maxwarn : int
             Maximum number of warnings to allow.
-        min_gmx_version : str, optional
-            Minimum GROMACS version required by the topology; empty for none.
+        min_gmx_version : tuple of int, optional
+            Minimum GROMACS version ``(year, minor)`` required by the topology.
         stdout : str, optional
             File path for stdout.
         stderr : str, optional

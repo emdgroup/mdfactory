@@ -15,7 +15,7 @@ from .models.parametrization import (
     GromacsSingleMoleculeParameterSet,
     OpenFFSmallMolecules,
 )
-from .models.species import SingleMoleculeSpecies
+from .models.species import NATIVE_SPECIES, WATER_RESNAME, SingleMoleculeSpecies
 from .settings import settings
 from .utils.topology_utilities import (
     check_atomtype_collisions,
@@ -23,6 +23,8 @@ from .utils.topology_utilities import (
     collect_forcefield_atomtype_definitions,
     count_contiguous_strings,
     extract_reusable_parts_from_cgenff_gmx_top,
+    iter_includes,
+    iter_topology_entries,
     merge_extra_parameter_itps,
     read_itp_atoms,
     rename_atomtypes,
@@ -98,9 +100,6 @@ def _build_smirnoff_parameter_itp(top_path: Path, atomtypes_path: Path, out_path
                 fb.write(atom_fb.read())
 
 
-NATIVE_ION_MOLECULETYPES = {"[Na+]": "NA", "[Cl-]": "CL"}
-
-
 @dataclass(frozen=True)
 class NativeForceField:
     """A GROMACS force-field directory that provides native water and ion topologies.
@@ -161,29 +160,8 @@ def parametrize_cgenff_gromacs(
     forcefield_itp = native.directory / "forcefield.itp"
 
     # check for water/ions and return standard parameters
-    if species.is_water:
-        return GromacsSingleMoleculeParameterSet(
-            moleculetype="SOL",
-            smiles=species.smiles,
-            component="water",
-            forcefield=native.name,
-            water_model=native.water_model,
-            topology_merge="native",
-            itp=native.directory / f"{native.water_model}.itp",
-            parameter_itp=None,
-            forcefield_itp=forcefield_itp,
-        )
-    if species.is_ion:
-        return GromacsSingleMoleculeParameterSet(
-            moleculetype=NATIVE_ION_MOLECULETYPES[species.smiles],
-            smiles=species.smiles,
-            component="ion",
-            forcefield=native.name,
-            topology_merge="native",
-            itp=native.directory / "ions.itp",
-            parameter_itp=None,
-            forcefield_itp=forcefield_itp,
-        )
+    if species.is_water or species.is_ion:
+        return _native_parameter_set(species, native, water_specific_ions=False)
 
     # parametrize molecule with cgenff
     pardir = settings.parameter_store / "gromacs" / "cgenff"
@@ -313,7 +291,7 @@ class OpenFFCacheEntry:
 
     def is_complete(self) -> bool:
         """Return True if every artifact exists and the completion marker was written."""
-        artifacts = (self.itp, self.atomtypes, self.params, self.top, self.provenance)
+        artifacts = (self.itp, self.atomtypes, self.params, self.top)
         return self.marker.is_file() and all(path.is_file() for path in artifacts)
 
 
@@ -344,12 +322,12 @@ def openff_water_cache_entry(species: SingleMoleculeSpecies, water_model: str) -
     """Return the cache entry of OpenFF water, keyed on the water model."""
     key = {"format": OPENFF_CACHE_FORMAT_VERSION, "component": "water", "water_model": water_model}
     workdir = _openff_root() / "water" / f"{_readable_stem(water_model)}_{_key_digest(key)}"
-    return OpenFFCacheEntry(workdir.resolve(), "SOL", key, species.hash)
+    return OpenFFCacheEntry(workdir.resolve(), WATER_RESNAME, key, species.hash)
 
 
 def openff_ion_cache_entry(species: SingleMoleculeSpecies, forcefield: str) -> OpenFFCacheEntry:
     """Return the cache entry of an OpenFF ion, keyed on the force field."""
-    ion = NATIVE_ION_MOLECULETYPES[species.smiles]
+    ion = NATIVE_SPECIES[species.smiles].resname
     key = {"format": OPENFF_CACHE_FORMAT_VERSION, "component": "ion", "forcefield": forcefield}
     keydir = f"{_readable_stem(forcefield)}_{_key_digest(key)}"
     workdir = _openff_root() / "ions" / keydir / ion
@@ -428,26 +406,27 @@ def _ensure_openff_entry(
         entry.marker.touch()
 
 
-def _native_openff_parameter_set(
-    species: SingleMoleculeSpecies, native: NativeForceField
+def _native_parameter_set(
+    species: SingleMoleculeSpecies, native: NativeForceField, *, water_specific_ions: bool
 ) -> GromacsSingleMoleculeParameterSet:
-    """Return water or ion parameters taken from a GROMACS-native force-field directory."""
-    if species.is_water:
-        moleculetype = "SOL"
-        component = "water"
-        itp = native.directory / f"{native.water_model}.itp"
+    """Return water or ion parameters taken from a GROMACS-native force-field directory.
+
+    ``water_specific_ions`` selects ``ions_<water_model>.itp`` (Amber's Joung-Cheatham
+    ions, recorded with their water model) over the CHARMM ``ions.itp``.
+    """
+    is_water = species.is_water
+    if is_water:
+        itp_name = f"{native.water_model}.itp"
     else:
-        moleculetype = NATIVE_ION_MOLECULETYPES[species.smiles]
-        component = "ion"
-        itp = native.directory / f"ions_{native.water_model}.itp"
+        itp_name = f"ions_{native.water_model}.itp" if water_specific_ions else "ions.itp"
     return GromacsSingleMoleculeParameterSet(
-        moleculetype=moleculetype,
+        moleculetype=NATIVE_SPECIES[species.smiles].resname,
         smiles=species.smiles,
-        component=component,
+        component="water" if is_water else "ion",
         forcefield=native.name,
-        water_model=native.water_model,
+        water_model=native.water_model if is_water or water_specific_ions else None,
         topology_merge="native",
-        itp=itp,
+        itp=native.directory / itp_name,
         parameter_itp=None,
         forcefield_itp=native.directory / "forcefield.itp",
     )
@@ -483,7 +462,7 @@ def parametrize_openff_gromacs(
 
     """
     if native_forcefield is not None and (species.is_water or species.is_ion):
-        return _native_openff_parameter_set(species, native_forcefield)
+        return _native_parameter_set(species, native_forcefield, water_specific_ions=True)
 
     # Lazy imports to avoid loading OpenFF when not needed
     import numpy as np  # noqa: PLC0415
@@ -504,13 +483,13 @@ def parametrize_openff_gromacs(
     if species.is_water:
         entry = openff_water_cache_entry(species, spec.water_model)
         forcefield_name = f"{spec.water_model}.offxml"
-        moleculetype = "SOL"
+        moleculetype = WATER_RESNAME
 
         def build():
             molecule = species.openff_molecule
             # Name the molecule SOL regardless of the user's resname (e.g. WAT),
             # so the generated ITP is always SOL_SOL.itp.
-            molecule.name = "SOL"
+            molecule.name = WATER_RESNAME
             return to_interchange(molecule, forcefield_name), molecule.name
 
         _ensure_openff_entry(entry, species, moleculetype, build)
@@ -712,26 +691,19 @@ def _read_include_layout(
     """
     ff_include_idx = None
     water_include_idx = None
-    system_idx = None
-    molecules_idx = None
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("#include") and '"' in stripped:
-            include_path = stripped.split('"')[1]
-            if ".ff/" not in include_path:
-                continue
-            if "forcefield.itp" in include_path:
-                if ff_include_idx is None:
-                    ff_include_idx = i
-            elif ff_include_idx is not None and water_include_idx is None:
-                water_include_idx = i
-        elif stripped.startswith("[") and stripped.endswith("]"):
-            section = stripped[1:-1].strip().lower()
-            if section == "system" and system_idx is None:
-                system_idx = i
-            elif section == "molecules" and molecules_idx is None:
-                molecules_idx = i
-    return ff_include_idx, water_include_idx, system_idx, molecules_idx
+    for i, include_path in iter_includes(lines):
+        if ".ff/" not in include_path:
+            continue
+        if "forcefield.itp" in include_path:
+            if ff_include_idx is None:
+                ff_include_idx = i
+        elif ff_include_idx is not None and water_include_idx is None:
+            water_include_idx = i
+    header_idx: dict[str, int] = {}
+    for entry in iter_topology_entries(lines, headers=True):
+        if entry.is_header:
+            header_idx.setdefault(entry.section, entry.index)
+    return ff_include_idx, water_include_idx, header_idx.get("system"), header_idx.get("molecules")
 
 
 def generate_gromacs_topology_with_protein(
@@ -741,7 +713,7 @@ def generate_gromacs_topology_with_protein(
     parameters: list[GromacsSingleMoleculeParameterSet],
     counts: list[int],
     system_name: str,
-    out_path: Path = Path("topology.top"),
+    out_path: Path,
 ) -> None:
     """Write one GROMACS topology for a pdb2gmx protein packed with solution molecules.
 
@@ -786,9 +758,9 @@ def generate_gromacs_topology_with_protein(
         Actual molecule count for each species, aligned with ``species``.
     system_name : str
         Name written into the ``[ system ]`` section (inherited from pdb2gmx).
-    out_path : Path, optional
+    out_path : Path
         Destination topology path. Its parent receives the merged parameter file
-        and copied small-molecule ITPs. Default ``topology.top`` in the cwd.
+        and copied small-molecule ITPs.
 
     """
     out_path = Path(out_path)
@@ -831,7 +803,7 @@ def generate_gromacs_topology_with_protein(
             check_atomtype_collisions(prm_files, forcefield_types)
             merged = merge_extra_parameter_itps(prm_files, drop_defaults=True)
         else:
-            validate_cgenff_atomtype_compatibility(prm_files, ff_dir, forcefield_types)
+            validate_cgenff_atomtype_compatibility(prm_files, forcefield_types)
             merged = merge_extra_parameter_itps(
                 prm_files, exclude_atomtypes=forcefield_types, drop_defaults=True
             )

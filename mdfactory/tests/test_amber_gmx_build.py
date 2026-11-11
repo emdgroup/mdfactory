@@ -128,6 +128,7 @@ def test_amber_sage_composite_topology_passes_grompp_build(tmp_path, monkeypatch
         disulfide_bonds=[],
         protonation_states={},
         output_dir=tmp_path / "pdb2gmx",
+        chains=[],
     )
     ff_name = protein.bundle_forcefield_into_topology(params.topology_file)
     assert ff_name == "amber14sb.ff"

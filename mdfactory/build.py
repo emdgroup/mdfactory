@@ -20,15 +20,57 @@ from mdfactory.parametrize import (
 from .check import check_bilayer_buildable
 from .models.composition import BilayerComposition, LNPComposition, MixedBoxComposition
 from .models.input import BuildInput
-from .models.species import SingleMoleculeSpecies
+from .models.species import NATIVE_SPECIES, SingleMoleculeSpecies
 from .run_schedules import write_mdp_files
 from .setup.solvation import ionize, solvate
 from .utils.setup_utilities import (
-    N_AVOGADRO,
+    LOOSE_PACKING_FACTOR,
     create_bilayer_from_model,
     create_mixed_box_universe,
 )
+from .utils.units import A3_TO_L, N_AVOGADRO
 from .utils.utilities import working_directory
+
+
+def _native_species(smiles: str, count: int) -> SingleMoleculeSpecies:
+    """Return the water or ion species of *smiles* with its native residue name."""
+    return SingleMoleculeSpecies(count=count, smiles=smiles, resname=NATIVE_SPECIES[smiles].resname)
+
+
+def _resolve_engine_functions(inp: BuildInput):
+    """Return ``(parametrize_function, topology_function)`` for the build's family and engine."""
+    parametrize_function = resolve_parametrizer(inp.parametrization, inp.engine)
+    topology_function = DISPATCH_TOPOLOGY_BUILD.get(inp.engine, None)
+    if topology_function is None:
+        raise NotImplementedError(f"Cannot build topology for engine {inp.engine}.")
+    return parametrize_function, topology_function
+
+
+def _solvate_with_water(u: mda.Universe, **solvate_kwargs):
+    """Solvate *u* keeping its box; return the solvated universe and the water species.
+
+    Raises
+    ------
+    ValueError
+        If solvation added no water.
+    """
+    from loguru import logger
+
+    u_solvated = solvate(u, **solvate_kwargs)
+    u_solvated.dimensions = u.dimensions
+    n_water = len(u_solvated.select_atoms("water").residues)
+    logger.info(f"Solvation added {n_water} water molecules.")
+
+    if n_water == 0:
+        raise ValueError("Solvation did not add any water molecules.")
+    return u_solvated, _native_species("O", n_water)
+
+
+def _bounding_box(positions: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the minimum corner, maximum corner and center of the bounding box of *positions*."""
+    lower = positions.min(axis=0)
+    upper = positions.max(axis=0)
+    return lower, upper, (lower + upper) / 2
 
 
 def _compute_charge_from_universe(u: mda.Universe, species: list) -> int:
@@ -116,16 +158,13 @@ def create_mixedbox_by_compression(inp: BuildInput, require_target_density: bool
     from loguru import logger
 
     loose = inp.system.model_copy()
-    loose.target_density = inp.system.target_density * 0.1
+    loose.target_density = inp.system.target_density * LOOSE_PACKING_FACTOR
 
     u, _ = create_mixed_box_universe(loose)
     logger.info("Successfully created universe for mixed box system.")
 
     # parametrize all species in the box for the FF/engine combination
-    parametrize_function = resolve_parametrizer(inp.parametrization, inp.engine)
-    topology_function = DISPATCH_TOPOLOGY_BUILD.get(inp.engine, None)
-    if topology_function is None:
-        raise NotImplementedError(f"Cannot build topology for engine {inp.engine}.")
+    parametrize_function, topology_function = _resolve_engine_functions(inp)
 
     parameters = [parametrize_function(spec) for spec in inp.system.species]
     logger.info("Parametrization done.")
@@ -168,21 +207,7 @@ def build_bilayer(inp: BuildInput):
     logger.info("Bilayer system equilibrated in vacuum.")
     # 5. solvate
     # TODO: solvation settings in model?
-    u_solvated = solvate(u_equil, prune_in_z=True)
-    u_solvated.dimensions = u_equil.dimensions
-    n_water = len(u_solvated.select_atoms("water").residues)
-
-    logger.info(f"Solvation added {n_water} water molecules.")
-
-    if n_water == 0:
-        raise ValueError("Solvation did not add any water molecules.")
-
-    # TODO: refactor for more reusability?
-    water_spec = SingleMoleculeSpecies(
-        count=n_water,
-        smiles="O",
-        resname="SOL",
-    )
+    u_solvated, water_spec = _solvate_with_water(u_equil, prune_in_z=True)
 
     u_ionized, ion_species = ionize_solvated_system(
         inp.system.ionization, u_solvated, inp.system.charge
@@ -223,16 +248,13 @@ def create_bilayer_by_compression(inp):
 
     # 1. parametrize lipid species
     # parametrize all species in the box for the FF/engine combination
-    parametrize_function = resolve_parametrizer(inp.parametrization, inp.engine)
+    parametrize_function, topology_function = _resolve_engine_functions(inp)
 
     # preliminary parameters (only lipids)
     parameters = [parametrize_function(spec) for spec in inp.system.species]
 
     logger.info("Parametrization done.")
     # 2. write temporary toplogy file
-    topology_function = DISPATCH_TOPOLOGY_BUILD.get(inp.engine, None)
-    if topology_function is None:
-        raise NotImplementedError(f"Cannot build topology for engine {inp.engine}.")
 
     with working_directory("bilayer_squeeze", create=True, cleanup=True) as wd:
         topology_function(u, inp.system.species, parameters, "bilayer")
@@ -299,9 +321,7 @@ def build_lnp(inp: BuildInput):
 
     # Step 4: Solvate with spherical exclusion
     # Calculate box size and center for solvation
-    mins = u_lnp.atoms.positions.min(axis=0)
-    maxs = u_lnp.atoms.positions.max(axis=0)
-    center = (mins + maxs) / 2
+    mins, maxs, _ = _bounding_box(u_lnp.atoms.positions)
 
     # Set box dimensions with padding
     box_size = maxs - mins + 2 * inp.system.padding
@@ -314,17 +334,9 @@ def build_lnp(inp: BuildInput):
     # Remove water inside the LNP core using remove_sphere
     # Use a slightly smaller radius to avoid water clashing with shell
     exclusion_radius = inp.system.core_radius * 0.9
-    u_solvated = solvate(
+    u_solvated, water_spec = _solvate_with_water(
         u_lnp, prune_in_z=False, remove_sphere=(center[0], center[1], center[2], exclusion_radius)
     )
-    u_solvated.dimensions = u_lnp.dimensions
-    n_water = len(u_solvated.select_atoms("water").residues)
-    logger.info(f"Solvation added {n_water} water molecules.")
-
-    if n_water == 0:
-        raise ValueError("Solvation did not add any water molecules.")
-
-    water_spec = SingleMoleculeSpecies(count=n_water, smiles="O", resname="SOL")
 
     # Step 5: Ionize
     # Compute charge from actual residue counts (not input counts) since transformations
@@ -393,8 +405,8 @@ def create_lnp_core(inp: BuildInput):
     )
 
     # Use the existing mixedbox compression workflow for the unit cell. The lipid
-    # core often cannot reach the nominal density within the compression budget;
-    # keep the pre-existing behavior of continuing with a warning instead of failing.
+    # core often cannot reach the nominal density within the compression budget, so
+    # compression continues with a warning instead of failing.
     u_unit, parameters, parametrize_function, topology_function = create_mixedbox_by_compression(
         core_inp, require_target_density=False
     )
@@ -665,8 +677,8 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge, solvent_volume_
     if n_water == 0:
         raise ValueError("Cannot ionize system without water.")
     if solvent_volume_a3 is not None:
-        # 1 Å³ = 1e-27 L, so n_salt = concentration[mol/L] * V[L] * N_A.
-        v_liters = solvent_volume_a3 * 1e-27
+        # n_salt = concentration[mol/L] * V[L] * N_A.
+        v_liters = solvent_volume_a3 * A3_TO_L
         n_ions = int(round(c_ions * v_liters * N_AVOGADRO))
     else:
         M_water = 55.55  # mol/l
@@ -694,9 +706,9 @@ def ionize_solvated_system(ion_config, u_solvated, total_charge, solvent_volume_
 
     additional_species = []
     if num_na > 0:
-        additional_species.append(SingleMoleculeSpecies(count=num_na, smiles="[Na+]", resname="NA"))
+        additional_species.append(_native_species("[Na+]", num_na))
     if num_cl > 0:
-        additional_species.append(SingleMoleculeSpecies(count=num_cl, smiles="[Cl-]", resname="CL"))
+        additional_species.append(_native_species("[Cl-]", num_cl))
     return u_ionized, additional_species
 
 
@@ -708,7 +720,9 @@ def _ion_counts(ion_species) -> tuple[int, int]:
     up by residue name; indexing by position would report a lone Cl- as Na+.
     """
     counts = {spec.resname: spec.count for spec in ion_species}
-    return counts.get("NA", 0), counts.get("CL", 0)
+    return counts.get(NATIVE_SPECIES["[Na+]"].resname, 0), counts.get(
+        NATIVE_SPECIES["[Cl-]"].resname, 0
+    )
 
 
 def _center_in_cubic_box(u: mda.Universe, padding: float) -> float:
@@ -718,13 +732,10 @@ def _center_in_cubic_box(u: mda.Universe, padding: float) -> float:
     geometry), so an asymmetric molecule keeps the requested clearance to each
     face. Returns the cubic box edge length in Angstroms.
     """
-    bbox_min = u.atoms.positions.min(axis=0)
-    bbox_max = u.atoms.positions.max(axis=0)
-    extent = bbox_max - bbox_min
-    box_size = float(extent.max() + 2 * padding)
+    bbox_min, bbox_max, bbox_center = _bounding_box(u.atoms.positions)
+    box_size = float((bbox_max - bbox_min).max() + 2 * padding)
     u.dimensions = [box_size, box_size, box_size, 90, 90, 90]
     box_center = np.array([box_size / 2, box_size / 2, box_size / 2])
-    bbox_center = (bbox_min + bbox_max) / 2
     u.atoms.translate(box_center - bbox_center)
     return box_size
 
@@ -766,6 +777,19 @@ def _prepare_protein(protein, spec):
     )
     logger.info(f"pdb2gmx output: {params.structure_file}")
     return params
+
+
+def _copy_protein_topology(params, dest_dir: Path, topology_name: str) -> Path:
+    """Copy the pdb2gmx topology as ``dest_dir/topology_name``, with its chain and posre itps.
+
+    The topology references its per-chain and position-restraint itps by bare
+    name, so they must sit beside it. Returns the copied topology's path.
+    """
+    topology = dest_dir / topology_name
+    shutil.copy(params.topology_file, topology)
+    for include_file in params.topology_include_files:
+        shutil.copy(include_file, dest_dir / include_file.name)
+    return topology
 
 
 def _relax_protein_system(u, topology, itps, ff_dir_name, protein_indices, **relax_kwargs):
@@ -844,13 +868,7 @@ def build_proteinbox(inp: BuildInput):
     logger.info(f"Protein centered in cubic box: {box_size:.1f} A")
 
     # Solvate (reuse existing solvation)
-    u_solvated = solvate(u, prune_in_z=False)
-    u_solvated.dimensions = u.dimensions
-    n_water = len(u_solvated.select_atoms("water").residues)
-    logger.info(f"Solvation added {n_water} water molecules.")
-
-    if n_water == 0:
-        raise ValueError("Solvation did not add any water molecules.")
+    u_solvated, _ = _solvate_with_water(u, prune_in_z=False)
 
     # Ionize (reuse existing ionization)
     u_ionized, ion_species = ionize_solvated_system(
@@ -861,10 +879,7 @@ def build_proteinbox(inp: BuildInput):
 
     # Update topology [ molecules ] section. topol.top references its per-chain and
     # posre .itp files by bare name, so they must sit alongside it.
-    topology_dest = Path("topology.top")
-    shutil.copy(params.topology_file, topology_dest)
-    for include_file in params.topology_include_files:
-        shutil.copy(include_file, Path(include_file.name))
+    topology_dest = _copy_protein_topology(params, Path(), "topology.top")
     ff_dir_name = bundle_forcefield_into_topology(topology_dest)
     update_topology_molecules(topology_dest, n_water_final, num_na, num_cl)
 
@@ -909,7 +924,7 @@ def _reimage_protein_centered(u: mda.Universe, n_protein_atoms: int, protein_ref
     delta = current_displacement - reference_displacement
     protein_whole = protein - box * np.round(delta / box)
 
-    bbox_center = (protein_whole.min(axis=0) + protein_whole.max(axis=0)) / 2.0
+    bbox_center = _bounding_box(protein_whole)[2]
     shift = box / 2.0 - bbox_center
     pos[:n_protein_atoms] = protein_whole
     pos += shift
@@ -920,10 +935,8 @@ def _reimage_protein_centered(u: mda.Universe, n_protein_atoms: int, protein_ref
         solution.positions = solution.wrap(compound="residues")
 
 
-def _check_no_protein_clashes(
-    u: mda.Universe, n_protein_atoms: int, cutoff: float = PROTEIN_MIXEDBOX_CLASH_CUTOFF_A
-) -> None:
-    """Raise if any protein atom is closer than ``cutoff`` Å to a solution atom (periodic)."""
+def _check_no_protein_clashes(u: mda.Universe, n_protein_atoms: int) -> None:
+    """Raise if a protein atom is closer than the clash cutoff to a solution atom (periodic)."""
     if n_protein_atoms >= u.atoms.n_atoms:
         return
     from MDAnalysis.lib.distances import capped_distance
@@ -931,18 +944,20 @@ def _check_no_protein_clashes(
     protein_positions = u.atoms.positions[:n_protein_atoms]
     solution_positions = u.atoms.positions[n_protein_atoms:]
     pairs, _ = capped_distance(
-        protein_positions, solution_positions, max_cutoff=cutoff, box=u.dimensions
+        protein_positions,
+        solution_positions,
+        max_cutoff=PROTEIN_MIXEDBOX_CLASH_CUTOFF_A,
+        box=u.dimensions,
     )
     if len(pairs) > 0:
         raise ValueError(
-            f"{len(pairs)} protein-solution atom pairs are closer than {cutoff} Å after "
-            "re-imaging; the protein was likely mis-imaged across the PBC boundary."
+            f"{len(pairs)} protein-solution atom pairs are closer than "
+            f"{PROTEIN_MIXEDBOX_CLASH_CUTOFF_A} Å after re-imaging; the protein was "
+            "likely mis-imaged across the PBC boundary."
         )
 
 
-def _check_no_solution_clashes(
-    u: mda.Universe, n_protein_atoms: int, cutoff: float = PROTEIN_MIXEDBOX_CLASH_CUTOFF_A
-) -> None:
+def _check_no_solution_clashes(u: mda.Universe, n_protein_atoms: int) -> None:
     """Raise when atoms from different solution residues overlap under PBC."""
     if n_protein_atoms >= u.atoms.n_atoms:
         return
@@ -950,7 +965,10 @@ def _check_no_solution_clashes(
 
     solution = u.atoms[n_protein_atoms:]
     pairs, _ = capped_distance(
-        solution.positions, solution.positions, max_cutoff=cutoff, box=u.dimensions
+        solution.positions,
+        solution.positions,
+        max_cutoff=PROTEIN_MIXEDBOX_CLASH_CUTOFF_A,
+        box=u.dimensions,
     )
     if len(pairs) == 0:
         return
@@ -960,7 +978,7 @@ def _check_no_solution_clashes(
     if n_clashes:
         raise ValueError(
             f"{n_clashes} solution-solution atom pairs from different residues are "
-            f"closer than {cutoff} Å."
+            f"closer than {PROTEIN_MIXEDBOX_CLASH_CUTOFF_A} Å."
         )
 
 
@@ -998,12 +1016,9 @@ def _stage_protein_topology(params, protein_ff_dir, dest_dir, species, parameter
     """
     from .parametrize import generate_gromacs_topology_with_protein
 
-    top_src = dest_dir / "topol_protein.top"
+    top_src = _copy_protein_topology(params, dest_dir, "topol_protein.top")
     ff_dir = dest_dir / protein_ff_dir.name
-    shutil.copy(params.topology_file, top_src)
     shutil.copytree(protein_ff_dir, ff_dir, dirs_exist_ok=True)
-    for include_file in params.topology_include_files:
-        shutil.copy(include_file, dest_dir / include_file.name)
     topology = dest_dir / "topology.top"
     generate_gromacs_topology_with_protein(
         top_src, ff_dir, species, parameters, counts, "protein_mixedbox", out_path=topology
@@ -1034,7 +1049,6 @@ def build_protein_mixedbox(inp: BuildInput):
     from .setup.protein import bundle_forcefield_into_topology, extract_mass_from_topology
     from .simulation.openmm_utils import compress_box
     from .utils.setup_utilities import (
-        PROTEIN_MIXEDBOX_DILUTION_FACTOR,
         concentration_reference_volume_a3,
         create_protein_mixedbox_universe,
         cubic_box_edge_for_density,
@@ -1076,9 +1090,8 @@ def build_protein_mixedbox(inp: BuildInput):
 
     # Reject a box that cannot hold the protein with the requested padding.
     u_protein = mda.Universe(str(params.structure_file))
-    extent = float(
-        (u_protein.atoms.positions.max(axis=0) - u_protein.atoms.positions.min(axis=0)).max()
-    )
+    lower, upper, _ = _bounding_box(u_protein.atoms.positions)
+    extent = float((upper - lower).max())
     if box_edge < extent + 2 * system.padding:
         raise ValueError(
             f"Protein extent {extent:.1f} Å needs a box of at least "
@@ -1121,7 +1134,7 @@ def build_protein_mixedbox(inp: BuildInput):
 
     # Pack the solution around the centered protein in a dilute cubic box (0.1×
     # density idiom), then compress it down to the target box.
-    dilute_edge = box_edge / PROTEIN_MIXEDBOX_DILUTION_FACTOR ** (1.0 / 3.0)
+    dilute_edge = box_edge / LOOSE_PACKING_FACTOR ** (1.0 / 3.0)
     size_kw = (
         {"target_volume": box_volume_a3}
         if fixed_box
@@ -1235,7 +1248,7 @@ def build_protein_mixedbox(inp: BuildInput):
 
     final_box_volume_a3 = float(u_relaxed.trajectory.ts.volume)
     final_concentration_volume_a3 = reference_volume(final_box_volume_a3)
-    final_concentration_volume_l = final_concentration_volume_a3 * 1e-27
+    final_concentration_volume_l = final_concentration_volume_a3 * A3_TO_L
     build_report = {
         "simulation_type": "protein_mixedbox",
         "requested_box_volume_a3": box_volume_a3,
