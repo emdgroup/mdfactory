@@ -48,10 +48,12 @@ ANALYSIS_REGISTRY: dict[str, dict[str, Callable]] = {
         "lipid_rg": lipid_rg,
     },
     "mixedbox": {},
+    "proteinbox": {},
+    "protein_mixedbox": {},
 }
 
 # Register system_chemistry for all simulation types
-from .utils import system_chemistry  # noqa: E402
+from .utils import read_build_metadata, system_chemistry  # noqa: E402
 
 for _sim_type, _registry in ANALYSIS_REGISTRY.items():
     _registry["system_chemistry"] = system_chemistry
@@ -228,7 +230,11 @@ class Simulation:
             Simulation metadata including species composition
 
         """
-        return self.build_input.metadata
+        metadata = self.build_input.metadata
+        build_metadata = read_build_metadata(self.path)
+        if build_metadata is not None:
+            metadata["build_metadata"] = build_metadata
+        return metadata
 
     @property
     def analysis_dir(self) -> Path:

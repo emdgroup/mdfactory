@@ -8,6 +8,8 @@ import pytest
 
 parsl = pytest.importorskip("parsl", reason="parsl not installed")
 
+from mdfactory.models.parametrization import FAMILY_SPECS  # noqa: E402
+from mdfactory.models.simulation_settings import SimulationSettings  # noqa: E402
 from mdfactory.orchestration.config import ExecutorConfig  # noqa: E402
 
 
@@ -18,19 +20,21 @@ class FakeBuildInput:
         self,
         hash="TEST",
         simulation_type="mixedbox",
-        parametrization="cgenff",
+        parametrization="charmm",
         engine="gromacs",
     ):
         self.hash = hash
         self.simulation_type = simulation_type
-        self.parametrization = parametrization
+        self.parametrization = FAMILY_SPECS[parametrization]().resolve(simulation_type)
+        self.simulation_settings = SimulationSettings().resolve(simulation_type)
         self.engine = engine
 
-    def model_dump(self):
+    def model_dump(self, mode="python"):
         """Return dict representation."""
         return {
             "simulation_type": self.simulation_type,
-            "parametrization": self.parametrization,
+            "parametrization": self.parametrization.model_dump(mode=mode),
+            "simulation_settings": self.simulation_settings.model_dump(mode=mode),
             "engine": self.engine,
         }
 
@@ -40,9 +44,7 @@ def test_build_systems_dry_run(monkeypatch, tmp_path):
     import mdfactory.orchestration.build as build_mod
     from mdfactory.orchestration.build import build_systems
 
-    mock_model = FakeBuildInput(
-        hash="ABC123", simulation_type="bilayer", parametrization="smirnoff"
-    )
+    mock_model = FakeBuildInput(hash="ABC123", simulation_type="bilayer", parametrization="openff")
     monkeypatch.setattr(build_mod, "BuildInput", FakeBuildInput)
 
     results = build_systems(
@@ -56,6 +58,28 @@ def test_build_systems_dry_run(monkeypatch, tmp_path):
     assert results[0]["hash"] == "ABC123"
     assert results[0]["simulation_type"] == "bilayer"
     assert str(tmp_path / "ABC123") in results[0]["output_directory"]
+
+
+def test_build_systems_dry_run_logs_family_and_components(monkeypatch, tmp_path):
+    """The dry-run line names the force-field family and its components."""
+    from loguru import logger
+
+    import mdfactory.orchestration.build as build_mod
+    from mdfactory.orchestration.build import build_systems
+
+    monkeypatch.setattr(build_mod, "BuildInput", FakeBuildInput)
+    messages = []
+    sink = logger.add(lambda message: messages.append(str(message)), level="INFO")
+    try:
+        model = FakeBuildInput(hash="ABC123", simulation_type="bilayer", parametrization="openff")
+        results = build_systems([model], ExecutorConfig(), output_dir=tmp_path, dry_run=True)
+    finally:
+        logger.remove(sink)
+
+    assert results[0]["parametrization"] == "openff"
+    line = next(message for message in messages if "[dry-run] ABC123" in message)
+    assert "| openff (" in line
+    assert "water=opc3" in line and "small_molecules=openff-2.2.0.offxml" in line
 
 
 def test_build_systems_dry_run_multiple(monkeypatch, tmp_path):
@@ -160,7 +184,7 @@ def test_build_system_impl_strips_internal_keys_and_chdirs(monkeypatch, tmp_path
     # Provide minimal valid BuildInput fields plus internal keys
     input_dict = {
         "simulation_type": "mixedbox",
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "engine": "gromacs",
         "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
         "_build_dir": str(build_dir),
@@ -191,7 +215,7 @@ def test_build_system_impl_restores_cwd_on_failure(monkeypatch, tmp_path):
 
     input_dict = {
         "simulation_type": "mixedbox",
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "engine": "gromacs",
         "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
         "_build_dir": str(build_dir),
@@ -302,7 +326,7 @@ def test_build_systems_dry_run_with_dict_input(monkeypatch, tmp_path):
 
     input_dict = {
         "simulation_type": "mixedbox",
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "engine": "gromacs",
         "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
     }
@@ -311,7 +335,13 @@ def test_build_systems_dry_run_with_dict_input(monkeypatch, tmp_path):
 
     assert len(results) == 1
     assert results[0]["simulation_type"] == "mixedbox"
-    assert results[0]["parametrization"] == "cgenff"
+    assert results[0]["parametrization"] == "charmm"
+    assert results[0]["parametrization_components"] == {
+        "protein": None,
+        "small_molecules": "cgenff",
+        "water": "tip3p",
+        "ions": "charmm36",
+    }
     assert results[0]["hash"]  # hash should be computed
 
 
@@ -340,7 +370,7 @@ def test_build_systems_with_dict_input(monkeypatch, tmp_path):
 
     input_dict = {
         "simulation_type": "mixedbox",
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "engine": "gromacs",
         "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
     }

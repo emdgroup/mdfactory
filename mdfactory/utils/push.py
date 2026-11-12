@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import yaml
 from loguru import logger
 from pydantic import ValidationError
@@ -16,7 +15,7 @@ from ..analysis.constants import (
     SimulationStatus,
 )
 from ..models.input import BuildInput
-from ..prepare import df_to_build_input_models
+from ..prepare import load_build_input_csv
 from .data_manager import PLACEHOLDER_HASH
 from .db_operations import (
     init_csv_tables,
@@ -121,10 +120,9 @@ def load_models_from_csv(csv_path: Path) -> tuple[list[BuildInput], dict[int, st
     tuple[list[BuildInput], dict[int, str]]
         Tuple of (models, errors) where errors is a dict mapping row indices to error messages
     """
-    df = pd.read_csv(csv_path)
-    # Remove 'unnamed' CSV columns
-    df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
-    models, errors = df_to_build_input_models(df)
+    # Same loader as prepare-build/build, so relative protein PDB paths resolve
+    # identically and the hashes match the built folders.
+    _, models, errors = load_build_input_csv(csv_path)
     return models, errors
 
 
@@ -393,7 +391,7 @@ def get_placeholder_record() -> dict[str, Any]:
     return {
         "hash": PLACEHOLDER_HASH,
         "engine": "gromacs",
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "simulation_type": "mixedbox",
         "input_data": "{}",
         "input_data_type": "BuildInput",

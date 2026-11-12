@@ -1,0 +1,28 @@
+# Multi-chain protein in protein_mixedbox: all chains are merged into ONE
+# molecule (`merge_all: true`, no `chains` list), which is what the packing and
+# compression stages need. Water-only box with a fixed size.
+simulation_type: protein_mixedbox
+engine: gromacs
+parametrization:
+  family: amber
+  protein: amber14sb
+  water_model: tip3p
+
+system:
+  protein:
+    resname: INS
+    count: 1
+    pdb_path: ../proteinbox/1zni.pdb
+    ignore_hydrogens: true
+    merge_all: true
+  species:
+    - smiles: O
+      resname: SOL
+      concentration: 53.0
+  sizing:
+    type: fixed_box
+    box_size: 80.0
+  padding: 12.0
+  ionization:
+    neutralize: true
+    concentration: 0.15

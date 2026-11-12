@@ -19,7 +19,13 @@ from mdfactory.models.composition import (
     distribute_counts,
 )
 from mdfactory.models.input import BuildInput
-from mdfactory.models.species import LipidSpecies, SingleMoleculeSpecies, Species
+from mdfactory.models.species import (
+    LipidSpecies,
+    SingleMoleculeSpecies,
+    SolutionSpecies,
+    Species,
+)
+from mdfactory.utils.setup_utilities import native_atom_names
 from mdfactory.utils.utilities import working_directory
 
 
@@ -190,6 +196,7 @@ def test_generate_input_model_from_dict():
     inp = BuildInput(
         engine="gromacs",
         simulation_type="mixedbox",
+        parametrization="charmm",
         system=comp,
     )
     print(inp)
@@ -226,6 +233,7 @@ def test_generate_input_model_from_dict():
         inp = BuildInput(
             engine="gromacs",
             simulation_type="bilayer",
+            parametrization="charmm",
             system=comp,
         )
 
@@ -241,6 +249,7 @@ def test_ionization_can_be_explicitly_disabled(disabled):
 def test_disabled_ionization_build_input_round_trip():
     input_data = {
         "simulation_type": "mixedbox",
+        "parametrization": "openff",
         "system": {
             "species": [{"smiles": "O", "count": 10, "resname": "SOL"}],
             "ionization": False,
@@ -267,7 +276,6 @@ def test_ionization_defaults_when_omitted():
 
 def test_parameter_set_dump(tmp_path):
     from mdfactory.models.parametrization import (  # noqa: PLC0415
-        CgenffConfig,
         GromacsSingleMoleculeParameterSet,
     )
 
@@ -281,8 +289,9 @@ def test_parameter_set_dump(tmp_path):
         prm = GromacsSingleMoleculeParameterSet(
             moleculetype="1234ABCD",
             smiles="CC",
-            parametrization="cgenff",
-            parametrization_config=CgenffConfig(),
+            component="small_molecule",
+            forcefield="cgenff",
+            topology_merge="cgenff",
             itp=itp,
             parameter_itp=prm,
             forcefield_itp=ff,
@@ -298,7 +307,6 @@ def test_parameter_set_dump(tmp_path):
 
 def test_gmx_parameter_model(tmp_path):
     from mdfactory.models.parametrization import (  # noqa: PLC0415
-        CgenffConfig,
         GromacsSingleMoleculeParameterSet,
     )
 
@@ -309,8 +317,9 @@ def test_gmx_parameter_model(tmp_path):
             prm = GromacsSingleMoleculeParameterSet(
                 moleculetype="1234ABCD",
                 smiles="CC",
-                parametrization="cgenff",
-                parametrization_config=CgenffConfig(),
+                component="small_molecule",
+                forcefield="cgenff",
+                topology_merge="cgenff",
                 itp=itp,
             )
             del prm
@@ -499,3 +508,22 @@ def test_shell_composition_counts_sum_correctly():
     assert abs(ratios[0] - 0.33) < 0.05
     assert abs(ratios[1] - 0.33) < 0.05
     assert abs(ratios[2] - 0.34) < 0.05
+
+
+class TestNativeSpecies:
+    """Water and monatomic ions share one naming table."""
+
+    @pytest.mark.parametrize(
+        ("smiles", "resname", "atom_names"),
+        [("O", "SOL", 3), ("[Na+]", "NA", 1), ("[Cl-]", "CL", 1)],
+    )
+    def test_table_drives_validation_and_atom_names(self, smiles, resname, atom_names):
+        SolutionSpecies(smiles=smiles, resname=resname, count=1)
+        with pytest.raises(ValueError, match="must use resname"):
+            SolutionSpecies(smiles=smiles, resname="XXX", count=1)
+        assert len(native_atom_names(smiles)) == atom_names
+
+    def test_only_ions_are_ions(self):
+        assert SingleMoleculeSpecies(smiles="[Na+]", count=1, resname="NA").is_ion
+        assert not SingleMoleculeSpecies(smiles="O", count=1, resname="SOL").is_ion
+        assert not SingleMoleculeSpecies(smiles="CCO", count=1, resname="ETH").is_ion

@@ -1,0 +1,10 @@
+# Settings for `mdfactory apply-settings`: re-render the mdp files of existing
+# builds without rebuilding them.
+#
+#   mdfactory apply-settings apply_longer_production.yaml runs/ --dry-run
+#   mdfactory apply-settings apply_longer_production.yaml runs/
+#
+# Refused for a directory if the temperature or pressure would change, or if a
+# changed stage already has outputs.
+production:
+  length: 500.0   # ns

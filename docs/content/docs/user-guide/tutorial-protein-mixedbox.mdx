@@ -1,0 +1,428 @@
+---
+title: "Tutorial: Protein in a Co-solvent Box"
+description: End-to-end walkthrough for proteinbox and protein_mixedbox systems, from a PDB file through a SLURM campaign with SimulationSettings to analysis
+---
+
+This tutorial takes **hen egg-white lysozyme (PDB 1AKI)** from a PDB file to a finished,
+analysed simulation campaign. It covers the two protein system types, the open-source Amber
+force-field route, the `SimulationSettings` run protocol and a SLURM executor config:
+
+1. choose between `proteinbox` and `protein_mixedbox`
+2. build a solvated protein (`proteinbox`)
+3. build a protein in a water/ethanol mixture (`protein_mixedbox`)
+4. describe the run protocol with `simulation_settings`
+5. prepare a four-system campaign from a CSV
+6. configure SLURM, build and simulate
+7. analyse, and adjust the protocol afterwards if needed
+
+Every file used here is in [`examples/`](https://github.com/emdgroup/mdfactory/tree/main/examples),
+which also has a [`pipeline/`](https://github.com/emdgroup/mdfactory/tree/main/examples/pipeline)
+directory with the complete campaign.
+
+<Callout type="info" title="Prerequisites">
+- The `amber` route (used here) needs **GROMACS 2026 or later** and no CGenFF license. The pixi
+  environments `gmx` (CPU) and `gmx-cuda` (CUDA, linux-64) provide it; see
+  [Installation](/docs/installation).
+- The `charmm` route (CHARMM36m + CGenFF for small molecules) works with older GROMACS, but
+  needs a SILCSBIO/CGenFF installation for any non-water, non-ion species. Differences are
+  noted along the way.
+</Callout>
+
+## Which system type?
+
+| | `proteinbox` | `protein_mixedbox` |
+|---|---|---|
+| Solvent | Pure water, cubic box with `padding` around the protein | Water plus any SMILES co-solutes and ions, in a box of fixed size or fixed density |
+| Sizing | `padding` (Å) | `sizing: fixed_box` (edge in Å) or `sizing: count_density` (target g/cm³) |
+| Species | None besides the protein | `species`, by `count` or molar `concentration` |
+| Ions | Neutralize + salt | Neutralize + salt, and/or packed ion species |
+| Use for | Plain protein MD | Co-solvent, crowding or small-molecule-in-solution studies |
+
+Both take the protein from a PDB file, prepare it with PDBFixer and `pdb2gmx`, relax it with
+the protein restrained, and validate the final system with `grompp` before the build ends.
+
+## Get the structure
+
+PDB files are not tracked in the repository:
+
+```bash
+bash examples/fetch_pdbs.sh     # writes examples/proteinbox/1aki.pdb and 1zni.pdb
+```
+
+## 1. Set up the environment
+
+<Tabs items={['Amber (open source)', 'CHARMM36m + CGenFF']}>
+<Tab value="Amber (open source)">
+
+```bash
+pixi install -e gmx            # CPU; use `-e gmx-cuda` on GPU nodes
+pixi run -e gmx gmx --version  # GROMACS version: 2026.x
+```
+
+Run the following commands as `pixi run -e gmx mdfactory ...`, or start a shell with
+`pixi shell -e gmx`. If you manage GROMACS differently, point mdfactory at the binary in
+`config.ini` (`mdfactory config edit`):
+
+```ini
+[gromacs]
+GMX_PATH = /path/to/gmx
+```
+
+</Tab>
+<Tab value="CHARMM36m + CGenFF">
+
+```bash
+mdfactory config init     # answer the GROMACS prompts; accept the CHARMM36m download
+```
+
+The wizard stores `[gromacs] GMX_PATH` and `FORCEFIELD_DIR` and downloads the CHARMM36m
+GROMACS force field (checksum-pinned) into the force-field directory. Small molecules need
+`[cgenff] SILCSBIODIR` to point to a SILCSBIO installation.
+
+</Tab>
+</Tabs>
+
+mdfactory checks the GROMACS version twice: when the protein is prepared at build time, and
+again on the compute node before the first `grompp` of `simulate`. An `amber14sb` system with an
+older `gmx` fails early with an error that points to the pixi environments.
+
+## 2. A solvated protein: `proteinbox`
+
+```yaml title="examples/proteinbox/lysozyme_amber14sb.yaml"
+simulation_type: proteinbox
+engine: gromacs
+parametrization:
+  family: amber
+  protein: amber14sb
+  water_model: tip3p
+
+system:
+  protein:
+    resname: LYZ
+    count: 1
+    pdb_path: ./1aki.pdb
+    ignore_hydrogens: true
+    chains: [A]
+    disulfide_bonds:
+      - [CYS6, CYS127]
+      - [CYS30, CYS115]
+      - [CYS64, CYS80]
+      - [CYS76, CYS94]
+    protonation_states:
+      HIS15: HIE
+  padding: 12.0
+  ionization:
+    neutralize: true
+    concentration: 0.15
+```
+
+The pieces:
+
+- **`parametrization`** picks one force-field *family* for the whole system: `amber`
+  (ff14SB protein, TIP3P, Joung-Cheatham ions, OpenFF Sage for small molecules) or `charmm`
+  (CHARMM36m, CGenFF). See [Parametrization](/docs/user-guide/parametrization).
+- **`protein.pdb_path`** is resolved relative to the YAML file (or the CSV).
+- **`chains`** lists the chains to keep. Each becomes a `Protein_chain_<ID>` molecule in the topology.
+- **`disulfide_bonds`** and **`protonation_states`** are passed on to `pdb2gmx`.
+- **`padding`** is the minimum distance (Å) between the protein and the box edge.
+- **`ionization`** neutralizes the protein charge and adds salt at the given molarity.
+
+Build it locally:
+
+```bash
+pixi run -e gmx mdfactory build examples/proteinbox/lysozyme_amber14sb.yaml --output runs_pb
+```
+
+The output directory contains one `<hash>/` per system with:
+
+- `system.pdb` and `topology.top` (plus the `amber14sb.ff` directory and generated `.itp` files)
+- `em.mdp`, `nvt.mdp`, `npt.mdp`, `md.mdp`, rendered from the run protocol
+- `<hash>.yaml`, the record of the input with its resolved simulation settings
+
+A multi-chain protein works the same way: `examples/proteinbox/insulin_amber14sb.yaml` lists
+`chains: [A, B, C, D]`.
+
+## 3. Protein in 1 M ethanol: `protein_mixedbox`
+
+```yaml title="examples/protein_mixedbox/lysozyme_amber_fixed_box.yaml (excerpt)"
+simulation_type: protein_mixedbox
+engine: gromacs
+parametrization:
+  family: amber
+  protein: amber14sb
+  small_molecules:
+    forcefield: openff-2.2.0.offxml
+    charge_method: openff-gnn-am1bcc-0.1.0-rc.3.pt
+  water_model: tip3p
+
+system:
+  protein: { ... }              # as above
+  species:
+    - smiles: O
+      resname: SOL
+      concentration: 53.0
+    - smiles: CCO
+      resname: ETH
+      concentration: 1.0
+  sizing:
+    type: fixed_box
+    box_size: 72.0
+  padding: 12.0
+  concentration_volume_basis: protein_excluded
+  partial_specific_volume: 0.73
+  relax_steps: 10000
+  ionization:
+    neutralize: true
+    concentration: 0.15
+```
+
+What is new compared to `proteinbox`:
+
+- **Water is an explicit species** (`smiles: O`, `resname: SOL`). Water, `[Na+]` (`NA`) and
+  `[Cl-]` (`CL`) take their parameters from the protein force field; every other species is
+  parametrized with the family's small-molecule force field.
+- **Species amounts** are either a `count` or a molar `concentration`, never a `fraction`.
+  Concentrations are resolved against a volume basis (`concentration_volume_basis`):
+  `protein_excluded` (default) subtracts the protein volume, estimated from its mass and
+  `partial_specific_volume` (mL/g); `box` uses the whole box.
+- **Sizing** is `fixed_box` (cubic edge in Å; at least the protein extent plus 2 × `padding`)
+  or `count_density`. With `count_density` every species needs a `count`, and the box edge
+  follows from the total mass and `target_density`:
+
+  ```yaml
+  sizing:
+    type: count_density
+    target_density: 1.0
+  ```
+
+- **Build procedure**: the solution is packed around the protein in a dilute box, then
+  compressed with OpenMM to the target volume with the protein's internal geometry restrained.
+  The result is re-imaged, ionized, relaxed with the protein restrained (`relax_steps`) and
+  validated with `grompp`. The compression is far faster on a GPU than on CPUs.
+- **Ions**: `ionization` neutralizes and adds salt on top of any packed ion species. To set the
+  ionic strength with packed ions instead, give `[Na+]`/`[Cl-]` species and use
+  `concentration: 0` (`examples/protein_mixedbox/lysozyme_amber_packed_ions.yaml`).
+- **Multi-chain proteins** use `merge_all: true` and no `chains` list, so that all chains
+  become one molecule (`examples/protein_mixedbox/insulin_amber_merged.yaml`).
+
+Build it, and inspect what was requested versus what was achieved:
+
+```bash
+pixi run -e gmx-cuda mdfactory build examples/protein_mixedbox/lysozyme_amber_fixed_box.yaml \
+    --output runs_pmb
+cat runs_pmb/*/build_metadata.json
+```
+
+`build_metadata.json` records, per species, the requested count or concentration, the resolved
+and final molecule counts and the achieved molarity, together with the requested and final box
+volume.
+
+<Callout type="info" title="CHARMM variant">
+`examples/protein_mixedbox/lysozyme_fixed_box.yaml` is the same system with
+`parametrization: {family: charmm, protein: charmm36m}`: ethanol is parametrized with CGenFF
+and water is 55 M. The `amber` example uses 53 M, because 55 M + 1 M over-fills the box for
+TIP3P with Sage.
+</Callout>
+
+## 4. The run protocol: `SimulationSettings`
+
+The build also generates the four GROMACS run files. Their content is set by
+`simulation_settings` (all fields optional; see
+[Simulation Settings](/docs/user-guide/simulation-settings) for the full reference). For
+protein systems the generated protocol thermostats `Protein` and `Non-Protein` separately,
+couples the pressure with Berendsen (NPT) and Parrinello-Rahman (production), and uses the
+nonbonded settings of the family (Sage settings for `amber`).
+
+```yaml
+simulation_settings:
+  temperature: 310.0        # K,  part of the system identity (hash)
+  production:
+    length: 50.0            # ns, not part of the hash
+    output_interval: 20.0   # ps
+  gromacs_overrides:
+    npt: {pcoupl: C-rescale}
+```
+
+Only **temperature and pressure** are part of the identity. A system simulated at 300 K and at
+310 K is two systems (two hashes, two directories); a 50 ns and a 500 ns production run are one
+system.
+
+There are three places to set it. They combine as *row > protocol file > defaults*:
+
+| Where | Example |
+|---|---|
+| Inline in the build YAML | `examples/pipeline/lysozyme_ethanol_amber.yaml` |
+| Dotted CSV columns | `simulation_settings.temperature`, `simulation_settings.production.length`, `simulation_settings.gromacs_overrides.npt.pcoupl` |
+| A protocol file passed to `build` / `prepare-build` | `--simulation-settings examples/pipeline/protocol.yaml` |
+
+## 5. A campaign from a CSV
+
+`examples/pipeline/systems.csv` has four rows: 0.5 M and 1 M ethanol at 300 K and 310 K.
+The first row, abbreviated:
+
+```csv
+simulation_type,parametrization.family,parametrization.protein,...,system.protein.resname,system.protein.pdb_path,system.protein.chains,system.protein.disulfide_bonds,system.protein.protonation_states.HIS15,system.species.SOL.concentration,system.species.ETH.smiles,system.species.ETH.concentration,system.sizing.type,system.sizing.box_size,...,simulation_settings.temperature,simulation_settings.production.length
+protein_mixedbox,amber,amber14sb,...,LYZ,../proteinbox/1aki.pdb,A,CYS6-CYS127;CYS30-CYS115;...,HIE,53.0,CCO,0.5,fixed_box,72.0,...,300,
+```
+
+Column conventions (see [CSV Format](/docs/user-guide/csv-format)):
+
+- species columns are `system.species.<RESNAME>.{smiles,count,concentration}`
+- lists use `;` (`chains` as `A;B`, `disulfide_bonds` as `CYS6-CYS127;CYS30-CYS115`)
+- one column per protonation state: `system.protein.protonation_states.HIS15`
+- `pdb_path` is relative to the CSV; blank optional cells fall back to the protocol file or the
+  default (`simulation_settings.production.length` is blank above, so the protocol file applies)
+
+The shared protocol takes care of what the rows leave open:
+
+```yaml title="examples/pipeline/protocol.yaml"
+production:
+  length: 50.0
+  output_interval: 20.0
+nvt:
+  length: 200.0
+npt:
+  length: 500.0
+gromacs_overrides:
+  npt:
+    pcoupl: C-rescale
+```
+
+Validate before spending any compute, and prepare the run directories:
+
+```bash
+mdfactory check-csv examples/pipeline/systems.csv
+mdfactory prepare-build examples/pipeline/systems.csv runs_pipeline \
+    --simulation-settings examples/pipeline/protocol.yaml
+```
+
+`prepare-build` creates one directory per row with its resolved `<hash>.yaml` (look at the
+`simulation_settings:` block to see exactly what will be rendered) and a summary
+`systems.yaml`. Rows with the same hash are rejected, also when they differ only in
+non-identity settings.
+
+## 6. SLURM: build and simulate
+
+All heavy work is submitted as SLURM jobs by Parsl; your terminal (or one small controller job)
+only coordinates. The executor config is one YAML file, used for both `build` and `simulate`:
+
+```yaml title="examples/pipeline/slurm_gpu.yaml"
+provider: slurm
+account: my-account
+partition: gpu
+walltime: "12:00:00"
+nodes: 1
+cpus_per_node: 16
+gres: "gpu:1"
+mem: "32G"
+
+environment:
+  extra_init: >-
+    export CONDA_OVERRIDE_CUDA=12.9;
+    eval "$(pixi shell-hook --as-is --manifest-path /path/to/mdfactory/pyproject.toml -e gmx-cuda)";
+    gmx --version | grep -E "GROMACS version|GPU support"
+
+max_workers_per_node: 1
+max_blocks: 4
+available_accelerators: 1
+retries: 2
+max_rescue: 3
+gmx_binary: auto
+```
+
+Things specific to this setup:
+
+- **GROMACS >= 2026 on the workers.** Cluster modules rarely provide it, so the workers
+  activate the pixi `gmx-cuda` environment through `environment.extra_init`. The wizard's
+  `pixi_manifest` option always activates pixi's `default` environment, so use `extra_init` for
+  `gmx` / `gmx-cuda`.
+- **Builds use the GPU too.** The `protein_mixedbox` compression is an OpenMM simulation.
+- **`max_blocks`** caps how many SLURM allocations (and so how many systems at a time) Parsl holds.
+- **`stage_overrides`** (not used here) can give single stages different `cpus_per_node` or `gres`.
+- `mdfactory config slurm` writes such a file interactively; `mdfactory config cluster` lists
+  accounts, partitions and GPUs. See [Running on HPC](/docs/user-guide/running-on-hpc) for all fields.
+
+Run the pipeline:
+
+```bash
+MDF="pixi run -e gmx-cuda mdfactory"
+
+$MDF build examples/pipeline/systems.csv --output runs_pipeline \
+    --simulation-settings examples/pipeline/protocol.yaml \
+    --slurm examples/pipeline/slurm_gpu.yaml
+
+$MDF simulate runs_pipeline --slurm examples/pipeline/slurm_gpu.yaml --dry-run   # plan only
+$MDF simulate runs_pipeline --slurm examples/pipeline/slurm_gpu.yaml
+```
+
+`simulate` runs EM → NVT → NPT → Production per system. Repeating the command resumes from
+checkpoints. Parsl retries infrastructure failures (`retries`), and physics failures in
+EM/NVT/NPT are rescued with a smaller step (`max_rescue`).
+
+<Callout type="warn" title="Use the same environment for the controller">
+The process that runs `mdfactory ... --slurm` is the Parsl controller. Run it from the same
+pixi environment as the workers (`-e gmx-cuda` above). With a different Python environment,
+Parsl version mismatches between controller and workers can break the run.
+</Callout>
+
+To run the controller as a batch job as well, submit the wrapper script, which performs
+`check-csv`, build, simulate and analysis in sequence:
+
+```bash
+sbatch examples/pipeline/run_pipeline.sh
+
+# smoke test with a short protocol
+PROTOCOL=examples/simulation_settings/protocol_short_test.yaml \
+    sbatch examples/pipeline/run_pipeline.sh
+```
+
+## 7. Analysis
+
+Protein systems register the `system_chemistry` analysis (species, counts and achieved
+concentrations; no trajectory needed) and the `last_frame_pdb` artifact (which needs the finished
+production trajectory). `systems.yaml` is the summary YAML that `build` writes:
+
+```bash
+$MDF analysis run runs_pipeline/systems.yaml --analysis system_chemistry
+$MDF analysis artifacts run runs_pipeline/systems.yaml --artifact last_frame_pdb
+$MDF analysis info runs_pipeline/systems.yaml
+```
+
+For `protein_mixedbox`, the chemistry table adds the columns `concentration`, `resolved_count`,
+`final_count` and `achieved_concentration`, read from `build_metadata.json`. To push systems and
+results into a database and pull them back, continue as in the
+[mixed-box campaign tutorial](/docs/user-guide/tutorial-mixedbox-campaign#6-initialize-the-sqlite-sync-tables).
+
+## 8. Changing the protocol afterwards
+
+The hash does not depend on the production length, so a longer run is a protocol change, not a
+new system. Re-render the mdp files of builds whose affected stages have no outputs yet:
+
+```bash
+$MDF apply-settings examples/simulation_settings/apply_longer_production.yaml runs_pipeline --dry-run
+$MDF apply-settings examples/simulation_settings/apply_longer_production.yaml runs_pipeline
+```
+
+Temperature and pressure changes are refused (they would be new systems), as are directories
+whose affected stages already have outputs.
+
+## Troubleshooting
+
+- **A GROMACS 2026 requirement error**: the `gmx` on `PATH` (build) or on the worker (simulate)
+  is too old. Use the pixi `gmx` / `gmx-cuda` environment, and activate it in
+  `environment.extra_init` for SLURM workers.
+- **`pdb2gmx` fails for a multi-chain protein**: for `proteinbox`, `chains` must list all chains
+  of the structure; for `protein_mixedbox`, use `merge_all: true` and no `chains`.
+- **Box too small**: `box_size` must be at least the protein extent plus 2 × `padding`; the
+  error message reports the minimum.
+- **Net charge or grompp warnings**: with `neutralize: false` only the net-charge warning is
+  tolerated. See [Troubleshooting](/docs/user-guide/troubleshooting).
+
+## Next steps
+
+<Cards>
+  <Card title="Simulation Settings" href="/docs/user-guide/simulation-settings" />
+  <Card title="Parametrization" href="/docs/user-guide/parametrization" />
+  <Card title="Running on HPC" href="/docs/user-guide/running-on-hpc" />
+  <Card title="System Types" href="/docs/user-guide/system-types" />
+</Cards>

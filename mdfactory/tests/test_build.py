@@ -97,6 +97,19 @@ def test_ionize_solvated_system_adds_one_sided_counterions(total_charge, ion_res
     assert additional_species[0].count == ion_count
 
 
+def _assert_charmm_schedule(directory, dispcorr):
+    """Check that the build wrote all four mdps with the CHARMM nonbonded block."""
+    from mdfactory.orchestration.mdp import get_mdp_value, parse_mdp
+    from mdfactory.orchestration.stages import STAGE_REGISTRY
+
+    for spec in STAGE_REGISTRY:
+        parsed = parse_mdp(directory / spec.mdp_file)
+        assert get_mdp_value(parsed, "vdw_modifier") == "Force-switch"
+        assert get_mdp_value(parsed, "rvdw") == get_mdp_value(parsed, "rcoulomb") == "1.2"
+        assert get_mdp_value(parsed, "rvdw_switch") == "1.0"
+        assert get_mdp_value(parsed, "dispcorr") == dispcorr
+
+
 def test_build_mixedbox(tmp_path):
     spec = SingleMoleculeSpecies(smiles="O", fraction=0.9, resname="SOL")
     spec2 = SingleMoleculeSpecies(smiles="CO", fraction=0.1, resname="MET")
@@ -107,7 +120,7 @@ def test_build_mixedbox(tmp_path):
     inp = BuildInput(
         engine="gromacs",
         simulation_type="mixedbox",
-        parametrization="cgenff",
+        parametrization="charmm",
         system=comp,
     )
     with working_directory(tmp_path):
@@ -123,6 +136,7 @@ def test_build_mixedbox(tmp_path):
         assert n_ions == 2  # Neutralizing ions added
         assert n_sol == 358
         assert n_met == 40
+        _assert_charmm_schedule(tmp_path, dispcorr="EnerPres")
 
 
 def test_build_bilayer(tmp_path):
@@ -135,7 +149,7 @@ def test_build_bilayer(tmp_path):
     inp = BuildInput(
         engine="gromacs",
         simulation_type="bilayer",
-        parametrization="cgenff",
+        parametrization="charmm",
         system=comp,
     )
     with working_directory(tmp_path):
@@ -148,3 +162,4 @@ def test_build_bilayer(tmp_path):
         n_ions = sum(1 for res in residues if res.resname in ["NA", "CL"])
         assert n_ions == 6
         assert n_poc == 32
+        _assert_charmm_schedule(tmp_path, dispcorr="no")

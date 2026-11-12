@@ -93,6 +93,14 @@ MDFactory currently supports GROMACS workflows with OpenMM-assisted build steps.
 conda install -c conda-forge gromacs
 ```
 
+<Callout type="info" title="Amber protein route needs GROMACS 2026">
+The open-source `parametrization: amber` route for `proteinbox` and `protein_mixedbox` uses the
+`amber14sb.ff` force field that ships with **GROMACS 2026 or later**. Builds and simulations fail
+early with a clear error when an older `gmx` is found. The pixi workspace provides ready-made
+environments: `pixi run -e gmx ...` (CPU build, all platforms) and `pixi run -e gmx-cuda ...`
+(CUDA build, linux-64).
+</Callout>
+
 ### OpenMM
 
 ```bash
@@ -119,7 +127,7 @@ The interactive Foundry setup also expects the `fdt` command to be available on 
 
 ### CGenFF
 
-If you use `parametrization: cgenff`, configure the SilcsBio install path in your config file (typically `~/.config/mdfactory/config.ini`):
+If you use the `charmm` family with small molecules (CGenFF), configure the SilcsBio install path in your config file (typically `~/.config/mdfactory/config.ini`):
 
 ```ini
 [cgenff]

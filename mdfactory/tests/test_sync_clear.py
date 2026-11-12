@@ -16,7 +16,7 @@ def _run_record(hash_value: str) -> dict[str, object]:
     return {
         "hash": hash_value,
         "engine": "gromacs",
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "simulation_type": "mixedbox",
         "input_data": "{}",
         "input_data_type": "BuildInput",

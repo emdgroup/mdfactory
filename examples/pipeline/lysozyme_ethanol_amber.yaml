@@ -1,0 +1,52 @@
+# One protein_mixedbox system with its simulation settings inline: lysozyme in
+# 1 M aqueous ethanol, Amber ff14SB + OpenFF Sage + TIP3P, 310 K.
+# Build and run it on its own:
+#   mdfactory build lysozyme_ethanol_amber.yaml --output runs_single --slurm slurm_gpu.yaml
+simulation_type: protein_mixedbox
+engine: gromacs
+parametrization:
+  family: amber
+  protein: amber14sb
+  small_molecules:
+    forcefield: openff-2.2.0.offxml
+    charge_method: openff-gnn-am1bcc-0.1.0-rc.3.pt
+  water_model: tip3p
+
+system:
+  protein:
+    resname: LYZ
+    count: 1
+    pdb_path: ../proteinbox/1aki.pdb
+    ignore_hydrogens: true
+    chains: [A]
+    disulfide_bonds:
+      - [CYS6, CYS127]
+      - [CYS30, CYS115]
+      - [CYS64, CYS80]
+      - [CYS76, CYS94]
+    protonation_states:
+      HIS15: HIE
+  species:
+    - smiles: O
+      resname: SOL
+      concentration: 53.0
+    - smiles: CCO
+      resname: ETH
+      concentration: 1.0
+  sizing:
+    type: fixed_box
+    box_size: 72.0
+  padding: 12.0
+  concentration_volume_basis: protein_excluded
+  relax_steps: 10000
+  ionization:
+    neutralize: true
+    concentration: 0.15
+
+# Temperature and pressure are part of the build identity (hash); the rest
+# only shapes the generated em/nvt/npt/md.mdp files.
+simulation_settings:
+  temperature: 310.0
+  production:
+    length: 50.0           # ns
+    output_interval: 20.0  # ps

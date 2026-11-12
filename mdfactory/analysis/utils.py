@@ -2,12 +2,13 @@
 # ABOUTME: Provides simulation path scanning and species composition flattening
 """Shared analysis utilities for simulation discovery and metadata extraction."""
 
+import json
 from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
 
-from mdfactory.models.input import BuildInput
+from mdfactory.models.input import BuildInput, protein_anchor
 from mdfactory.utils.utilities import load_yaml_file
 
 from .constants import STATUS_ORDER
@@ -164,7 +165,7 @@ def flatten_species_composition(
 
 
 def flatten_system_parameters(build_input: BuildInput) -> dict[str, Any]:
-    """Flatten system-specific parameters (z_padding, target_density, etc.).
+    """Flatten system-specific parameters (z_padding, target_density, etc.) and the state point.
 
     Useful for analyses focusing on system configuration rather than composition.
 
@@ -182,7 +183,9 @@ def flatten_system_parameters(build_input: BuildInput) -> dict[str, Any]:
     flat = {
         "simulation_type": build_input.simulation_type,
         "engine": build_input.engine,
-        "parametrization": build_input.parametrization,
+        "parametrization": build_input.parametrization.family,
+        "temperature": build_input.simulation_settings.temperature,
+        "pressure": build_input.simulation_settings.pressure,
     }
 
     # Add system-specific parameters from metadata
@@ -340,17 +343,20 @@ def extract_all_species(build_input: BuildInput) -> dict[str, Any]:
         }
 
     result = {}
-    total_molecule_count = 0
+    counts = []
 
     for sp in species:
         resname = sp.resname
         result[f"{resname}_count"] = sp.count
         result[f"{resname}_fraction"] = sp.fraction
         result[f"{resname}_smiles"] = getattr(sp, "smiles", None)
-        total_molecule_count += sp.count
+        counts.append(sp.count)
 
     result["total_species_count"] = len(species)
-    result["total_molecule_count"] = total_molecule_count
+    # A concentration-based species has no count until build time, so the
+    # molecule total is unknown from the BuildInput alone; report None rather
+    # than crash when summing.
+    result["total_molecule_count"] = None if any(c is None for c in counts) else sum(counts)
 
     return result
 
@@ -402,6 +408,14 @@ def get_chemistry_extractor(
         raise ValueError(f"Unknown mode '{mode}'. Use 'all', 'lnp', or 'custom'.")
 
 
+def read_build_metadata(directory: str | Path | None) -> dict[str, Any] | None:
+    """Return the parsed ``build_metadata.json`` of a build directory, or None if absent."""
+    if directory is None:
+        return None
+    path = Path(directory) / "build_metadata.json"
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
 def system_chemistry(simulation, **kwargs) -> pd.DataFrame:
     """Extract species composition as a long-format DataFrame.
 
@@ -425,17 +439,47 @@ def system_chemistry(simulation, **kwargs) -> pd.DataFrame:
         - fraction: float - Mole fraction
         - simulation_type: str - e.g. "bilayer", "mixedbox"
 
+        For ``protein_mixedbox``, rows additionally contain requested
+        concentration, resolved/final counts, and achieved concentration.
+
     """
     build_input = simulation.build_input
+    build_metadata = read_build_metadata(getattr(simulation, "path", None))
+    achieved_species = (build_metadata or {}).get("species", [])
     rows = []
-    for sp in build_input.system.species:
+    if (anchor := protein_anchor(build_input)) is not None:
+        # List the protein as a species row to match proteinbox output; it
+        # consumes no achieved_species index.
         rows.append(
             {
-                "resname": sp.resname,
-                "smiles": getattr(sp, "smiles", None),
-                "count": sp.count,
-                "fraction": sp.fraction,
+                "resname": anchor["resname"],
+                "smiles": None,
+                "count": anchor["count"],
+                "fraction": anchor["fraction"],
                 "simulation_type": build_input.simulation_type,
+                "concentration": None,
+                "resolved_count": None,
+                "final_count": None,
+                "achieved_concentration": None,
             }
         )
+    for species_index, sp in enumerate(build_input.system.species):
+        achieved = achieved_species[species_index] if species_index < len(achieved_species) else {}
+        row = {
+            "resname": sp.resname,
+            "smiles": getattr(sp, "smiles", None),
+            "count": sp.count,
+            "fraction": sp.fraction,
+            "simulation_type": build_input.simulation_type,
+        }
+        if build_input.simulation_type == "protein_mixedbox":
+            row.update(
+                {
+                    "concentration": getattr(sp, "concentration", None),
+                    "resolved_count": achieved.get("resolved_count"),
+                    "final_count": achieved.get("final_count"),
+                    "achieved_concentration": achieved.get("achieved_concentration_molar"),
+                }
+            )
+        rows.append(row)
     return pd.DataFrame(rows)

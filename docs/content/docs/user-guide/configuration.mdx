@@ -168,14 +168,11 @@ Simulation YAML/CSV structure is documented here:
 
 ## Run schedules
 
-MDFactory uses `run_schedules.yaml` to define simulation protocols. This file specifies:
-
-- Minimization steps
-- Equilibration stages (NVT, NPT)
-- Production run length
-- Output frequencies
-
-Find templates in `config_templates/run_schedules.yaml`.
+The GROMACS run files (`em.mdp`, `nvt.mdp`, `npt.mdp`, `md.mdp`) are generated at build time from
+the build input and its simulation settings: temperature, pressure, timestep, stage lengths,
+output intervals and per-stage GROMACS overrides. The nonbonded settings follow the force-field
+family. Nothing in the configuration file controls them; see
+[Simulation Settings](/docs/user-guide/simulation-settings).
 
 ## Environment variables
 

@@ -34,7 +34,7 @@ Create a file called `system.yaml`:
 ```yaml
 engine: gromacs
 simulation_type: mixedbox
-parametrization: smirnoff
+parametrization: openff
 system:
   species:
     - smiles: "O"
@@ -116,6 +116,7 @@ After `mdfactory build`, the output directory typically contains:
 - `nvt.mdp`
 - `npt.mdp`
 - `md.mdp`
+- `<hash>.yaml` (the input with its resolved simulation settings)
 
 The first run also fills the configured parameter store so later builds can reuse previously parametrized molecules.
 
@@ -123,6 +124,8 @@ The first run also fills the configured parameter store so later builds can reus
 
 <Cards>
   <Card title="20-System Tutorial" href="/docs/user-guide/tutorial-mixedbox-campaign" />
+  <Card title="Protein Tutorial" href="/docs/user-guide/tutorial-protein-mixedbox" />
+  <Card title="Simulation Settings" href="/docs/user-guide/simulation-settings" />
   <Card title="Configuration" href="/docs/user-guide/configuration" />
   <Card title="Workflows" href="/docs/user-guide/workflows" />
   <Card title="Executing Analyses" href="/docs/user-guide/executing-analyses" />

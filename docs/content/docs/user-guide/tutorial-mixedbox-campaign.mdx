@@ -44,7 +44,7 @@ The example campaign holds these settings fixed:
 
 - `simulation_type: mixedbox`
 - `engine: gromacs`
-- `parametrization: smirnoff`
+- `parametrization: openff`
 - `system.total_count: 2000`
 - `system.target_density: 1.0`
 
@@ -63,11 +63,11 @@ First few rows:
 
 ```csv
 simulation_type,parametrization,engine,system.species.SOL.smiles,system.species.SOL.fraction,system.species.MEOH.smiles,system.species.MEOH.fraction,system.total_count,system.target_density
-mixedbox,smirnoff,gromacs,O,0.95,CO,0.05,2000,1.0
-mixedbox,smirnoff,gromacs,O,0.85,CO,0.15,2000,1.0
-mixedbox,smirnoff,gromacs,O,0.75,CO,0.25,2000,1.0
-mixedbox,smirnoff,gromacs,O,0.65,CO,0.35,2000,1.0
-mixedbox,smirnoff,gromacs,O,0.95,CCO,0.05,2000,1.0
+mixedbox,openff,gromacs,O,0.95,CO,0.05,2000,1.0
+mixedbox,openff,gromacs,O,0.85,CO,0.15,2000,1.0
+mixedbox,openff,gromacs,O,0.75,CO,0.25,2000,1.0
+mixedbox,openff,gromacs,O,0.65,CO,0.35,2000,1.0
+mixedbox,openff,gromacs,O,0.95,CCO,0.05,2000,1.0
 ```
 
 ## 1. Configure SQLite
@@ -374,6 +374,7 @@ For the broader code structure, see [Architecture](/docs/developer-guide/archite
 
 <Cards>
   <Card title="CSV Format" href="/docs/user-guide/csv-format" />
+  <Card title="Protein Tutorial" href="/docs/user-guide/tutorial-protein-mixedbox" />
   <Card title="Executing Analyses" href="/docs/user-guide/executing-analyses" />
   <Card title="Architecture" href="/docs/developer-guide/architecture" />
 </Cards>

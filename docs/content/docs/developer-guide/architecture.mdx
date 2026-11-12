@@ -48,6 +48,8 @@ flowchart LR
 - `mixedbox -> MixedBoxComposition`
 - `bilayer -> BilayerComposition`
 - `lnp -> LNPComposition`
+- `proteinbox -> ProteinBoxComposition`
+- `protein_mixedbox -> ProteinMixedBoxComposition`
 
 The current `engine` model field is restricted to `gromacs`.
 
@@ -60,6 +62,8 @@ DISPATCH_BUILD = {
     "mixedbox": build_mixedbox,
     "bilayer": build_bilayer,
     "lnp": build_lnp,
+    "proteinbox": build_proteinbox,
+    "protein_mixedbox": build_protein_mixedbox,
 }
 ```
 
@@ -69,9 +73,22 @@ Inside the build functions, parametrization and topology generation are dispatch
 
 The builders write simulation files directly into the working directory, including:
 
+- `<hash>.yaml`, the build input with its resolved simulation settings (written by `run_build_from_dict`)
 - `system.pdb`
 - `topology.top`
-- GROMACS `.mdp` files copied from the configured run schedule templates
+- GROMACS `.mdp` files rendered by `mdfactory.run_schedules.write_mdp_files` from the build input
+
+### Run schedules
+
+`BuildInput.simulation_settings` (`mdfactory/models/simulation_settings.py`) holds the physical
+run settings. `mdfactory/run_schedules/gromacs.py` renders each stage from plain dicts: a base per
+stage, the coupling overlay of the simulation type (`COUPLING`), the nonbonded overlay of the
+family's `nonbonded_scheme` (`NONBONDED`, `DISPCORR`), the settings converted to exact step counts,
+and the per-stage `gromacs_overrides`, applied last. There is no mdp object model; grompp validates
+the result. `BuildInput.hash` excludes every setting outside `SimulationSettings.IDENTITY_FIELDS`
+(temperature and pressure), and `mdfactory.run_schedules.apply_simulation_settings` re-renders
+existing build directories without changing their hash. The build path does not import
+`mdfactory.orchestration`; the file names match `StageSpec.mdp_file`, which a test checks.
 
 ## Analysis and artifact subsystem
 
@@ -180,15 +197,15 @@ graph TD
 
 - **`config.py`**: Pydantic models for local and SLURM execution. `ExecutorConfig` handles local runs; `SlurmExecutorConfig` adds SLURM-specific fields (account, partition, walltime, gres, per-stage overrides). Both serialize to/from YAML via `from_yaml()` and `model_dump()`.
 - **`session.py`**: `parsl_session()` context manager that owns the Parsl DataFlowKernel lifecycle. On exit it calls `parsl.clear()` and explicitly `scancel`s any lingering SLURM job IDs.
-- **`apps.py`**: Defines `get_build_app()` (python\_app for system building), `get_grompp_app()` and `get_mdrun_app()` (bash\_apps for GROMACS). Nearly all conditional logic (GPU, MPI, thread counts, restart flags) is resolved in Python before generating the bash script — the only permitted runtime branch is a small `if/elif/else/fi` block for binary detection when `gmx_binary` is set to `auto`.
-- **`stages.py`**: `STAGE_REGISTRY` declares the canonical pipeline (EM → NVT → NPT → Production) as `StageSpec` dataclasses. `run_stage()` is the single generic dispatch function for all stages.
+- **`apps.py`**: Defines `get_build_app()` (python\_app for system building), `get_grompp_app()` and `get_mdrun_app()` (bash\_apps for GROMACS). Nearly all conditional logic (GPU, MPI, thread counts, restart flags) is resolved in Python before generating the bash script — the only permitted runtime branches are a small `if/elif/else/fi` block for binary detection when `gmx_binary` is set to `auto`, and, in the grompp script only, a GROMACS version check that is emitted when the topology's force field needs a minimum GROMACS version (e.g. `amber14sb.ff` needs 2026).
+- **`stages.py`**: `STAGE_REGISTRY` declares the canonical pipeline (EM → NVT → NPT → Production) as `StageSpec` dataclasses. `run_stage()` is the single generic dispatch function for all stages; it derives the minimum GROMACS version from the simulation directory's `topology.top` and passes it to grompp.
 - **`build.py`** / **`simulate.py`**: Top-level entry points. `build_systems()` submits parallel build tasks; `run_simulations()` chains stages sequentially per simulation with checkpoint detection and trajectory validation.
 - **`tui.py`**: Interactive SLURM configuration wizard using `questionary`. Auto-discovers cluster hardware via `sinfo`/`sacctmgr` and persists the result as a reusable YAML file.
 
 ## Extension points
 
 - New simulation type: add the composition model, build function, and build dispatch entry.
-- New parametrization method: add the config model and parametrization dispatch entry.
+- New parametrization method: add a component model / family spec and a `DISPATCH_ENGINE_PARAMETRIZE` entry (see [Adding Parametrization Methods](/docs/developer-guide/adding-parametrization)).
 - New analysis or artifact: implement the function and register it in the relevant registry.
 - New sync backend: implement the `DataSource` contract and wire it through `DataManager`.
 

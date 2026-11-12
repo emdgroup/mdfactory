@@ -11,8 +11,57 @@ import pandas as pd
 import pytest
 import yaml
 
+from mdfactory.models.parametrization import PROTEIN_SIMULATION_TYPES
 from mdfactory.prepare import df_to_build_input_models
 from mdfactory.settings import Settings
+
+EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples"
+
+PROTEIN_TYPES = sorted(PROTEIN_SIMULATION_TYPES)
+
+#: Smallest valid mixedbox build specification: 100 waters.
+WATER = {
+    "simulation_type": "mixedbox",
+    "parametrization": "charmm",
+    "system": {"species": [{"smiles": "O", "count": 100, "resname": "SOL"}]},
+}
+
+
+def make_forcefield_dir(parent: Path, name: str, files) -> Path:
+    """Create a stub GROMACS force-field directory ``parent/name``.
+
+    Parameters
+    ----------
+    parent : Path
+        Directory that receives the force field.
+    name : str
+        Directory name, e.g. ``charmm36.ff``.
+    files : mapping or iterable of str
+        File name to its text, or just file names (written as ``; <name>``).
+    """
+    ff_dir = Path(parent) / name
+    ff_dir.mkdir()
+    contents = files if isinstance(files, dict) else {f: f"; {f}\n" for f in files}
+    for filename, text in contents.items():
+        (ff_dir / filename).write_text(text)
+    return ff_dir
+
+
+def default_settings_loader(db_type: str):
+    """Return a ``Settings._load_config`` replacement: defaults only, on one backend.
+
+    Parameters
+    ----------
+    db_type : str
+        Value of ``[database] TYPE`` (``sqlite`` or ``csv``).
+    """
+
+    def load_config(self):
+        for section, options in Settings._get_defaults().items():
+            self.config[section] = dict(options)
+        self.config["database"]["TYPE"] = db_type
+
+    return load_config
 
 
 def make_test_record(hash_value: str, status: str = "build", **overrides: Any) -> dict[str, str]:
@@ -35,7 +84,7 @@ def make_test_record(hash_value: str, status: str = "build", **overrides: Any) -
     record = {
         "hash": hash_value,
         "engine": "gromacs",
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "simulation_type": "mixedbox",
         "input_data": "{}",
         "input_data_type": "BuildInput",
@@ -58,7 +107,7 @@ def _sample_rows() -> list[dict[str, object]]:
         {
             "simulation_type": "mixedbox",
             "engine": "gromacs",
-            "parametrization": "cgenff",
+            "parametrization": "charmm",
             "system.total_count": 1000,
             "system.species.ABC.smiles": "CCC",
             "system.species.ABC.fraction": 0.4,
@@ -68,7 +117,7 @@ def _sample_rows() -> list[dict[str, object]]:
         {
             "simulation_type": "mixedbox",
             "engine": "gromacs",
-            "parametrization": "cgenff",
+            "parametrization": "charmm",
             "system.total_count": 1500,
             "system.species.ABC.smiles": "CCC",
             "system.species.ABC.fraction": 0.5,
@@ -135,13 +184,8 @@ def temp_run_db(tmp_path, monkeypatch):
         return original_get_db_path(self, db_name, db_type)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
 
     # Initialize the database via the public init path
     from mdfactory.utils.push import init_systems_database
@@ -162,16 +206,56 @@ def temp_analysis_db(tmp_path, monkeypatch):
         return original_get_db_path(self, db_name, db_type)
 
     # Force sqlite backend
-    def patched_init(self):
-        for section, options in Settings.DEFAULT_CONFIG.items():
-            self.config[section] = dict(options)
-        self.config["database"]["TYPE"] = "sqlite"
-
     monkeypatch.setattr(Settings, "get_db_path", patched_get_db_path)
-    monkeypatch.setattr(Settings, "_load_config", patched_init)
+    monkeypatch.setattr(Settings, "_load_config", default_settings_loader("sqlite"))
 
     # Initialize the database
     from mdfactory.utils.push_analysis import init_analysis_database
 
     init_analysis_database()
     return db_path
+
+
+@pytest.fixture()
+def protein_pdb(tmp_path) -> Path:
+    """One-atom ALA PDB so ProteinSpecies has an existing (unvalidated) pdb_path."""
+    path = tmp_path / "test.pdb"
+    path.write_text("ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00\n")
+    return path
+
+
+def protein_input_data(
+    sim_type: str,
+    pdb: Path,
+    *,
+    protein: dict[str, Any] | None = None,
+    **top_level: Any,
+) -> dict[str, Any]:
+    """Return minimal valid BuildInput data for a protein simulation type.
+
+    Parameters
+    ----------
+    sim_type : str
+        ``"proteinbox"`` or ``"protein_mixedbox"``.
+    pdb : Path
+        Path to an existing PDB file.
+    protein : dict, optional
+        Overrides merged into the ``system.protein`` mapping.
+    **top_level
+        Overrides replacing top-level keys (e.g. ``parametrization="amber"``).
+        The parametrization defaults to the ``charmm`` family.
+    """
+    system: dict[str, Any] = {
+        "protein": {"resname": "LYZ", "pdb_path": str(pdb), **(protein or {})},
+        "padding": 12.0,
+    }
+    if sim_type == "protein_mixedbox":
+        system["species"] = [{"smiles": "O", "resname": "SOL", "count": 10}]
+        system["sizing"] = {"type": "fixed_box", "box_size": 72.0}
+    data: dict[str, Any] = {
+        "simulation_type": sim_type,
+        "parametrization": "charmm",
+        "system": system,
+    }
+    data.update(top_level)
+    return data

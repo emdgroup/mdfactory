@@ -12,6 +12,7 @@ import pytest
 from mdfactory.analysis.artifacts import ARTIFACT_REGISTRY
 from mdfactory.analysis.simulation import ANALYSIS_REGISTRY, Simulation
 from mdfactory.models.input import BuildInput
+from mdfactory.models.parametrization import CharmmParametrization
 
 
 @pytest.fixture
@@ -31,7 +32,7 @@ def mock_build_input_bilayer():
     mock.hash = "ABC123"
     mock.simulation_type = "bilayer"
     mock.engine = "gromacs"
-    mock.parametrization = "cgenff"
+    mock.parametrization = CharmmParametrization().resolve("bilayer")
 
     # Mock system with species
     mock.system = Mock()
@@ -64,7 +65,7 @@ def mock_build_input_bilayer():
         "hash": "ABC123",
         "simulation_type": "bilayer",
         "engine": "gromacs",
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "total_count": 600,
         "species_composition": [
             {"resname": "ILN", "count": 150, "fraction": 0.25},
@@ -88,7 +89,7 @@ def mock_build_input_mixedbox():
     mock.hash = "DEF456"
     mock.simulation_type = "mixedbox"
     mock.engine = "gromacs"
-    mock.parametrization = "cgenff"
+    mock.parametrization = CharmmParametrization().resolve("mixedbox")
 
     # Mock system
     mock.system = Mock()
@@ -115,7 +116,7 @@ def mock_build_input_mixedbox():
         "hash": "DEF456",
         "simulation_type": "mixedbox",
         "engine": "gromacs",
-        "parametrization": "cgenff",
+        "parametrization": "charmm",
         "total_count": 1000,
         "species_composition": [
             {"resname": "MOL1", "count": 500, "fraction": 0.5},
@@ -201,7 +202,7 @@ def test_metadata_property_bilayer(temp_sim_dir, mock_build_input_bilayer):
     assert metadata["hash"] == "ABC123"
     assert metadata["simulation_type"] == "bilayer"
     assert metadata["engine"] == "gromacs"
-    assert metadata["parametrization"] == "cgenff"
+    assert metadata["parametrization"] == "charmm"
     assert metadata["total_count"] == 600
     assert len(metadata["species_composition"]) == 2
     assert metadata["species_composition"][0]["resname"] == "ILN"
@@ -704,7 +705,5 @@ def test_analysis_registry_has_mixedbox_analyses():
 
 def test_artifact_registry_has_defaults():
     """Test ARTIFACT_REGISTRY includes expected artifact entries."""
-    assert "bilayer" in ARTIFACT_REGISTRY
-    assert "mixedbox" in ARTIFACT_REGISTRY
-    assert "last_frame_pdb" in ARTIFACT_REGISTRY["bilayer"]
-    assert "last_frame_pdb" in ARTIFACT_REGISTRY["mixedbox"]
+    for sim_type in ("bilayer", "mixedbox", "proteinbox", "protein_mixedbox"):
+        assert "last_frame_pdb" in ARTIFACT_REGISTRY[sim_type]

@@ -1,0 +1,27 @@
+# Open-source route: Amber ff14SB (amber14sb.ff, GROMACS >= 2026) + TIP3P and
+# Joung-Cheatham ions. No CGenFF/SILCSBIO installation is needed.
+simulation_type: proteinbox
+engine: gromacs
+parametrization:
+  family: amber
+  protein: amber14sb
+  water_model: tip3p
+
+system:
+  protein:
+    resname: LYZ
+    count: 1
+    pdb_path: ./1aki.pdb
+    ignore_hydrogens: true
+    chains: [A]
+    disulfide_bonds:
+      - [CYS6, CYS127]
+      - [CYS30, CYS115]
+      - [CYS64, CYS80]
+      - [CYS76, CYS94]
+    protonation_states:
+      HIS15: HIE
+  padding: 12.0
+  ionization:
+    neutralize: true
+    concentration: 0.15

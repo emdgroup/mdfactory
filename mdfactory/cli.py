@@ -29,11 +29,17 @@ from .analysis.submit import (
     submit_artifacts_slurm,
 )
 from .analysis.utils import get_chemistry_extractor
-from .prepare import df_to_build_input_models
+from .models.input import check_unique_hashes, write_build_record
+from .models.simulation_settings import load_simulation_settings
+from .prepare import (
+    apply_simulation_settings_file,
+    load_build_input_csv,
+    resolve_protein_pdb_path,
+)
 from .utils.data_manager import check_run_exists
 from .utils.push import push_systems
 from .utils.utilities import working_directory
-from .workflows import run_build_from_dict, run_build_from_file
+from .workflows import run_build_from_dict
 
 if TYPE_CHECKING:
     from .orchestration import ExecutorConfig
@@ -42,8 +48,44 @@ if TYPE_CHECKING:
 app = App(name="MDFactory", version=__version__)
 
 
+SimulationSettingsOption = Annotated[
+    Path | None,
+    Parameter(
+        help=(
+            "YAML file with simulation settings (temperature, pressure, stage lengths, "
+            "GROMACS overrides) applied to every system; an input's own "
+            "simulation_settings take precedence."
+        )
+    ),
+]
+
+
+def _load_settings_option(path: Path | None) -> dict | None:
+    """Load the ``--simulation-settings`` file, exiting with an error if it is invalid."""
+    if path is None:
+        return None
+    try:
+        return load_simulation_settings(path)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        logger.error(f"Invalid simulation settings file {path}: {exc}")
+        sys.exit(1)
+
+
+def _check_unique_or_exit(models: list, labels: list[str]) -> None:
+    """Exit with an error if two inputs share a hash."""
+    try:
+        check_unique_hashes(models, labels)
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
+
 @app.command(group="Build")
-def prepare_build(input: Path, output: Path = Path(".")):
+def prepare_build(
+    input: Path,
+    output: Path = Path("."),
+    simulation_settings: SimulationSettingsOption = None,
+):
     """Prepare YAML files for system build from a CSV data frame.
 
     Parameters
@@ -52,11 +94,15 @@ def prepare_build(input: Path, output: Path = Path(".")):
         Path to the CSV file with the compositions
     output : Path, optional
         Output directory, by default Path(".")
+    simulation_settings : Path, optional
+        Simulation settings YAML applied to every row; the rows'
+        ``simulation_settings.*`` columns take precedence.
 
     """
     input = input.resolve()
     output = output.resolve()
     output.mkdir(exist_ok=True)
+    settings = _load_settings_option(simulation_settings)
 
     logger.info(f"Building YAML files from CSV {input} and output directory: {output}.")
 
@@ -70,7 +116,7 @@ def prepare_build(input: Path, output: Path = Path(".")):
         )
         shutil.copy(yml_build_path, yml_bak)
 
-    df, models, errors = df_models_from_input_csv(input)
+    df, models, errors = load_build_input_csv(input, settings)
     for m in models:
         if check_run_exists(m):
             raise ValueError("This system has already been built and is in the database:")
@@ -79,6 +125,7 @@ def prepare_build(input: Path, output: Path = Path(".")):
         for k, v in errors.items():
             logger.error(f"\t Row {k} -- {v}")
         sys.exit(1)
+    _check_unique_or_exit(models, [f"row {i}" for i in df.index])
 
     logger.info("Successfully created PyDantic models for all rows.")
     df["model"] = models
@@ -87,14 +134,6 @@ def prepare_build(input: Path, output: Path = Path(".")):
     logger.info("Created DataFrame for systems:\n{}", df)
 
     _prepare_system_directories(models, input, output, exist_ok=False)
-
-
-def df_models_from_input_csv(input):
-    df = pd.read_csv(input)
-    # remove 'unnamed' CSV columns
-    df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
-    models, errors = df_to_build_input_models(df)
-    return df, models, errors
 
 
 def _prepare_system_directories(
@@ -127,10 +166,7 @@ def _prepare_system_directories(
     for model in models:
         build_dir = output / model.hash
         build_dir.mkdir(parents=True, exist_ok=exist_ok)
-        yml_path = build_dir / f"{model.hash}.yaml"
-        if not yml_path.exists():
-            with open(yml_path, "w") as f:
-                yaml.safe_dump(model.model_dump(), f)
+        write_build_record(model, build_dir)
         dirs.append(str(build_dir.resolve()))
 
     summary_path = output / f"{input_path.stem}.yaml"
@@ -235,6 +271,7 @@ def build_system(
     dry_run: Annotated[
         bool, Parameter(help="Print what would be built without executing.")
     ] = False,
+    simulation_settings: SimulationSettingsOption = None,
 ):
     """Build MD system(s) from YAML, CSV, or summary input.
 
@@ -255,11 +292,16 @@ def build_system(
         interactive configuration wizard.
     dry_run : bool, optional
         Print what would be built without executing.
+    simulation_settings : Path, optional
+        Simulation settings YAML applied to every system; an input's own
+        ``simulation_settings`` take precedence. Not accepted for summary
+        YAMLs, whose systems were prepared with their settings.
 
     """
     input = input.resolve()
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    settings = _load_settings_option(simulation_settings)
 
     # Resolve --slurm flag: "tui" launches the interactive wizard,
     # anything else is treated as a path to a YAML config file.
@@ -269,9 +311,11 @@ def build_system(
     suffix = input.suffix.lower()
 
     if suffix == ".csv":
-        _build_from_csv(input, output, config=config, dry_run=dry_run)
+        _build_from_csv(input, output, config=config, dry_run=dry_run, simulation_settings=settings)
     elif suffix in (".yaml", ".yml"):
-        _build_from_yaml(input, output, config=config, dry_run=dry_run)
+        _build_from_yaml(
+            input, output, config=config, dry_run=dry_run, simulation_settings=settings
+        )
     else:
         logger.error(f"Unsupported input file format: {suffix}. Use .csv, .yaml, or .yml.")
         sys.exit(1)
@@ -283,14 +327,16 @@ def _build_from_csv(
     *,
     config: "ExecutorConfig | Path | None" = None,
     dry_run: bool = False,
+    simulation_settings: dict | None = None,
 ):
     """Handle CSV input for the build command."""
-    df, models, errors = df_models_from_input_csv(input)
+    df, models, errors = load_build_input_csv(input, simulation_settings)
     if errors:
         logger.error("Errors building models from CSV:")
         for k, v in errors.items():
             logger.error(f"  Row {k}: {v}")
         sys.exit(1)
+    _check_unique_or_exit(models, [f"row {i}" for i in df.index])
 
     if dry_run:
         from mdfactory.orchestration import build_systems
@@ -326,6 +372,7 @@ def _build_from_yaml(
     *,
     config: "ExecutorConfig | Path | None" = None,
     dry_run: bool = False,
+    simulation_settings: dict | None = None,
 ):
     """Handle YAML input for the build command."""
     with open(input) as f:
@@ -337,12 +384,23 @@ def _build_from_yaml(
 
     if "system_directory" in data:
         # Summary YAML -- dispatch builds for prepared systems
+        if simulation_settings is not None:
+            logger.error(
+                "--simulation-settings does not apply to a summary YAML: its systems were "
+                "prepared with their settings. Pass the file to prepare-build, or change "
+                "the settings of prepared directories with 'mdfactory apply-settings'."
+            )
+            sys.exit(1)
         _build_from_summary_yaml(data, output, config=config, dry_run=dry_run)
     else:
         # Single build YAML
         from mdfactory.models.input import BuildInput
 
-        model = BuildInput(**data)
+        # Resolve a relative protein pdb_path against the YAML's directory before
+        # hashing, so the Parsl worker (which runs inside output/<hash>/) finds the
+        # PDB and the build directory is named after the model that is built.
+        resolve_protein_pdb_path(data, Path(input).parent)
+        model = BuildInput(**apply_simulation_settings_file(data, simulation_settings))
 
         if config is not None or dry_run:
             from mdfactory.orchestration import build_systems
@@ -355,7 +413,7 @@ def _build_from_yaml(
             build_dir = output / model.hash
             logger.info(f"Building {model.hash} ({model.simulation_type}) -> {build_dir}")
             with working_directory(build_dir, create=True):
-                run_build_from_file(input)
+                run_build_from_dict(model)
             logger.info(f"Output: {output}")
             logger.info("Next step — run simulations:")
             logger.info(f"  mdfactory simulate {output}")
@@ -794,6 +852,67 @@ def _report_benchmark_result(result: "BenchmarkResult") -> None:
     )
 
 
+@app.command(name="apply-settings", group="Build")
+def apply_settings(
+    settings: Annotated[Path, Parameter(help="Simulation settings YAML to apply")],
+    source: Annotated[Path, Parameter(help="Build directory, output directory or summary YAML")],
+    dry_run: Annotated[bool, Parameter(help="Report changes without writing files")] = False,
+):
+    """Re-render the mdp files of existing builds with new simulation settings.
+
+    The settings are merged over each directory's recorded settings
+    (``<hash>.yaml``). Temperature and pressure cannot change (they define the
+    system), and stages that already have outputs are not rewritten: a
+    directory where such a stage would change is refused.
+
+    Examples
+    --------
+    Lengthen the production run of systems that have not run it yet::
+
+        mdfactory apply-settings longer.yaml output_dir/
+
+    Parameters
+    ----------
+    settings : Path
+        Simulation settings YAML (the content of a ``simulation_settings:`` section).
+    source : Path
+        A build directory, a directory of build directories, or a summary YAML.
+    dry_run : bool, optional
+        Report what would change without writing anything.
+
+    """
+    from .run_schedules import apply_simulation_settings
+
+    statuses = ("updated", "unchanged", "refused")
+    mapping = _load_settings_option(settings)
+    try:
+        sim_paths = _resolve_sim_paths_for_simulate(source.resolve())
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
+    updates = apply_simulation_settings(sim_paths, mapping, dry_run=dry_run)
+    prefix = "[dry-run] " if dry_run else ""
+    for update in updates:
+        name = update.directory.name
+        if update.status == "refused":
+            logger.error(f"{prefix}{name}: refused: {update.reason}")
+        elif update.status == "unchanged":
+            logger.info(f"{prefix}{name}: unchanged")
+        else:
+            stages = ", ".join(update.changed_stages) or "none"
+            files = ", ".join(path.name for path in update.written)
+            verb = "would write" if dry_run else "wrote"
+            logger.info(f"{prefix}{name}: changed stages: {stages}; {verb} {files}")
+    counts = {status: sum(u.status == status for u in updates) for status in statuses}
+    logger.info(
+        f"{prefix}{len(updates)} build(s): {counts['updated']} updated, "
+        f"{counts['unchanged']} unchanged, {counts['refused']} refused."
+    )
+    if counts["refused"]:
+        sys.exit(1)
+
+
 @app.command(name="clean")
 def clean(parameters: bool = True, database: bool = True):
     import shutil
@@ -856,7 +975,7 @@ def check_csv(input: Path):
 
     """
     input = input.resolve()
-    _, models, errors = df_models_from_input_csv(input)
+    _, models, errors = load_build_input_csv(input)
     if errors:
         logger.error("Error occured in building models from CSV data.")
         for k, v in errors.items():
@@ -1055,7 +1174,7 @@ def sync_pull_systems(
         str | None, Parameter(help="Filter by simulation type (mixedbox/bilayer).")
     ] = None,
     parametrization: Annotated[
-        str | None, Parameter(help="Filter by parametrization (cgenff/smirnoff).")
+        str | None, Parameter(help="Filter by force-field family (charmm/amber/openff).")
     ] = None,
     engine: Annotated[str | None, Parameter(help="Filter by engine (e.g., gromacs).")] = None,
     output: Annotated[
@@ -1075,7 +1194,7 @@ def sync_pull_systems(
     simulation_type : str, optional
         Filter by simulation type (mixedbox, bilayer)
     parametrization : str, optional
-        Filter by parametrization (cgenff, smirnoff)
+        Filter by force-field family (charmm, amber, openff)
     engine : str, optional
         Filter by engine (gromacs)
     output : Path, optional

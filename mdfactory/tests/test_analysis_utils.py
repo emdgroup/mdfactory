@@ -13,9 +13,13 @@ from mdfactory.analysis.bilayer.utils import run_per_frame_analysis, trajectory_
 from mdfactory.analysis.utils import (
     STATUS_ORDER,
     discover_simulations,
+    extract_all_species,
     flatten_species_composition,
     flatten_system_parameters,
 )
+from mdfactory.models.parametrization import OpenFFParametrization
+from mdfactory.models.simulation_settings import SimulationSettings
+from mdfactory.models.species import SolutionSpecies
 
 
 @pytest.fixture
@@ -176,20 +180,50 @@ def test_flatten_species_composition() -> None:
     assert result["sys_WAT_fraction"] == 0.5
 
 
+@pytest.mark.parametrize(
+    ("sol_kwargs", "expected_sol", "expected_total"),
+    [
+        # A concentration-based species has no count, so the total is None, not a crash.
+        ({"concentration": 55.0}, None, None),
+        # When every species has a count, the total is their sum.
+        ({"count": 10000}, 10000, 10200),
+    ],
+)
+def test_extract_all_species_total_molecule_count(sol_kwargs, expected_sol, expected_total) -> None:
+    species = [
+        SolutionSpecies(smiles="O", resname="SOL", **sol_kwargs),
+        SolutionSpecies(smiles="CCO", resname="ETH", count=200),
+    ]
+    build_input = SimpleNamespace(
+        simulation_type="protein_mixedbox",
+        system=SimpleNamespace(species=species),
+    )
+
+    result = extract_all_species(build_input)
+
+    assert result["SOL_count"] == expected_sol
+    assert result["ETH_count"] == 200
+    assert result["total_species_count"] == 2
+    assert result["total_molecule_count"] == expected_total
+
+
 def test_flatten_system_parameters() -> None:
     """Test flatten_system_parameters merges system_specific metadata."""
     build_input = SimpleNamespace(
         simulation_type="mixedbox",
         engine="gromacs",
-        parametrization="cgenff",
+        parametrization=OpenFFParametrization().resolve("mixedbox"),
+        simulation_settings=SimulationSettings(temperature=310.0),
         metadata={"system_specific": {"z_padding": 10.0, "target_density": 1.0}},
     )
 
     result = flatten_system_parameters(build_input)
 
+    assert result["temperature"] == 310.0
+    assert result["pressure"] == 1.0
     assert result["simulation_type"] == "mixedbox"
     assert result["engine"] == "gromacs"
-    assert result["parametrization"] == "cgenff"
+    assert result["parametrization"] == "openff"
     assert result["z_padding"] == 10.0
     assert result["target_density"] == 1.0
 

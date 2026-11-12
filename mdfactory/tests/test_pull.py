@@ -89,14 +89,14 @@ def test_pull_systems_filter_by_parametrization(temp_run_db):
     dm = DataManager("RUN_DATABASE")
     dm.delete_data({})
 
-    dm.save_data(_record("HASH1", parametrization="cgenff"))
-    dm.save_data(_record("HASH2", parametrization="smirnoff"))
+    dm.save_data(_record("HASH1", parametrization="charmm"))
+    dm.save_data(_record("HASH2", parametrization="openff"))
 
-    df = pull_systems(parametrization="smirnoff")
+    df = pull_systems(parametrization="openff")
 
     assert len(df) == 1
     assert df.iloc[0]["hash"] == "HASH2"
-    assert df.iloc[0]["parametrization"] == "smirnoff"
+    assert df.iloc[0]["parametrization"] == "openff"
 
 
 def test_pull_systems_filter_by_engine(temp_run_db):
@@ -323,3 +323,33 @@ def test_cli_pull_systems_combined_filters(temp_run_db, capsys):
     captured = capsys.readouterr()
     assert "1 simulation" in captured.out
     assert "HASH1" in captured.out
+
+
+def test_check_run_exists_matches_on_family_name(temp_run_db):
+    """check_run_exists queries the parametrization column with the family name."""
+    from mdfactory.models.input import BuildInput
+    from mdfactory.utils.data_manager import check_run_exists
+
+    dm = DataManager("RUN_DATABASE")
+    dm.delete_data({})
+    inp = BuildInput(
+        simulation_type="mixedbox",
+        parametrization={"family": "openff", "water_model": "tip3p"},
+        system={"species": [{"smiles": "O", "resname": "SOL", "count": 10}]},
+    )
+    assert not check_run_exists(inp)
+
+    dm.save_data(_record(inp.hash, parametrization="charmm"))
+    assert not check_run_exists(inp)
+
+    dm.delete_data({})
+    dm.save_data(_record(inp.hash, parametrization="openff"))
+    assert check_run_exists(inp)
+    assert inp.to_data_row()["parametrization"] == "openff"
+
+
+def test_placeholder_record_uses_valid_family():
+    from mdfactory.models.parametrization import FAMILY_SPECS
+    from mdfactory.utils.push import get_placeholder_record
+
+    assert get_placeholder_record()["parametrization"] in FAMILY_SPECS

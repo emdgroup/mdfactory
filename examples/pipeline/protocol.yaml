@@ -1,0 +1,14 @@
+# Shared protocol for every system in systems.csv (--simulation-settings).
+# Rows of systems.csv set their own temperature (identity) and leave
+# `simulation_settings.production.length` blank, so the 50 ns here applies.
+# Precedence: row > this file > defaults.
+production:
+  length: 50.0           # ns
+  output_interval: 20.0  # ps (2500 frames)
+nvt:
+  length: 200.0          # ps
+npt:
+  length: 500.0          # ps
+gromacs_overrides:
+  npt:
+    pcoupl: C-rescale

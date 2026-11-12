@@ -936,7 +936,7 @@ def check_run_exists(build_model: BuildInput) -> bool:
     conditions = {
         "hash": build_model.hash,
         "engine": build_model.engine,
-        "parametrization": build_model.parametrization,
+        "parametrization": build_model.parametrization.family,
         "simulation_type": build_model.simulation_type,
     }
     dm = DataManager("RUN_DATABASE")

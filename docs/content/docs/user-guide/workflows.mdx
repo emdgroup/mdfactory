@@ -35,7 +35,7 @@ mdfactory build systems.csv --output results --slurm slurm_executor.yaml
 What it does:
 
 1. Runs `mdfactory prepare-build` internally (CSV → per-hash YAML + summary YAML).
-2. Builds each hash directory using the appropriate builder (mixedbox, bilayer, LNP).
+2. Builds each hash directory using the appropriate builder (mixedbox, bilayer, LNP, proteinbox, protein_mixedbox).
 3. With `--slurm`, builds run as parallel Parsl `python_app` tasks on allocated nodes.
 
 The summary YAML filename is derived from the CSV stem. For example, `systems.csv` produces `results/systems.yaml`.
@@ -59,6 +59,11 @@ mdfactory simulate results/ --slurm tui
 2. **NVT** — NVT equilibration using `nvt.mdp`
 3. **NPT** — NPT equilibration using `npt.mdp`
 4. **Production** — production run using `md.mdp`
+
+The build generates these files from the input's
+[simulation settings](/docs/user-guide/simulation-settings) (temperature, pressure, stage lengths,
+output intervals, GROMACS overrides). To change them for systems that are already built, use
+`mdfactory apply-settings`.
 
 ### Stage selection
 
