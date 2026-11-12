@@ -156,7 +156,7 @@ class ResourceHints(NamedTuple):
     gmx_binary: str  # "auto" | "gmx" | "gmx_mpi"
 
 
-def extract_resource_hints(stage_config: Any) -> ResourceHints:
+def _extract_resource_hints(stage_config: Any) -> ResourceHints:
     """Extract mdrun resource hints from a stage-specific executor config.
 
     Parameters
@@ -241,7 +241,7 @@ def run_stage(
 
     """
     work_dir = str(sim_dir.resolve())
-    hints = extract_resource_hints(stage_config)
+    hints = _extract_resource_hints(stage_config)
 
     if restart_from_cpt:
         # TPR exists from the interrupted run — skip grompp, resume mdrun.

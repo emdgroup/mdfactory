@@ -11,7 +11,8 @@ slurm_config
     ``BaseSlurmConfig`` provides 3-tier autodiscovery for account and partition.
     ``SlurmConfig`` is the submitit backend configuration.
 benchmark
-    Scalability benchmark sweep — short GROMACS trials across resource configs.
+    CPU scalability benchmark — short GROMACS trials per core count, judged
+    against the 75% parallel-efficiency rule of thumb.
 """
 
 from mdfactory.performance import cluster

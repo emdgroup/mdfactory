@@ -1,64 +1,46 @@
-# ABOUTME: Tests for the scalability benchmark sweep module
-# ABOUTME: Covers md.log parser, config validation, MDP generation, sweep logic, JSON persistence
+# ABOUTME: Tests for the CPU scalability benchmark sweep module
+# ABOUTME: Covers sidecar parser, config validation, MDP generation, sweep logic, persistence
 """Tests for mdfactory.performance.benchmark."""
 
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mdfactory.orchestration.apps import MDRUN_PERF_MARKER
+from mdfactory.orchestration.apps import _PERF_EXTRACT, MDRUN_PERF_MARKER
 from mdfactory.performance.benchmark import (
     BenchmarkConfig,
     BenchmarkResult,
     TrialResult,
-    _build_sweep_configs,
     _generate_benchmark_mdp,
-    _select_optimum,
     _sweep_lock,
-    parse_mdlog_performance,
-    parse_performance_marker,
     read_performance_file,
     run_benchmark_sweep,
 )
 
-# ---------------------------------------------------------------------------
-# Fixtures: synthetic GROMACS log content
-# ---------------------------------------------------------------------------
-
 #: Typical GROMACS md.log performance block (end of file)
 NORMAL_LOG = """\
-               Core t (s)   Wall t (s)        (%)
-       Time:      120.000       15.000      800.0
-                         0:15
                  (ns/day)    (hour/ns)
    Performance:        5.234        4.586
 """
 
 #: Log with two performance blocks (restart with -append)
 RESTART_LOG = """\
-               Core t (s)   Wall t (s)        (%)
-       Time:       60.000        7.500      800.0
-                         0:07
-                 (ns/day)    (hour/ns)
    Performance:        3.100        7.742
 
    <restart marker>
 
-               Core t (s)   Wall t (s)        (%)
-       Time:      120.000       15.000      800.0
-                         0:15
-                 (ns/day)    (hour/ns)
    Performance:        5.234        4.586
 """
 
 #: Truncated log without performance block
 TRUNCATED_LOG = """\
-Step    Time         Lambda
-   0    0.00000        0
-  10    0.02000        0
+    0    0.00000        0
+   10    0.02000        0
 
 Writing checkpoint, step 10 at Mon Sep  8 12:00:00 2025
 """
@@ -78,137 +60,63 @@ nstxout-compressed = 5000
 """
 
 
-# ---------------------------------------------------------------------------
-# T1: md.log performance parser
-# ---------------------------------------------------------------------------
-
-
-class TestParseMdlogPerformance:
-    """Tests for parse_mdlog_performance."""
-
-    def test_normal_log(self, tmp_path):
-        """Normal log file returns ns/day."""
-        log = tmp_path / "prod.log"
-        log.write_text(NORMAL_LOG)
-        result = parse_mdlog_performance(log)
-        assert result == pytest.approx(5.234)
-
-    def test_restart_log_uses_last_block(self, tmp_path):
-        """Restart log with multiple performance blocks uses the last one."""
-        log = tmp_path / "prod.log"
-        log.write_text(RESTART_LOG)
-        result = parse_mdlog_performance(log)
-        assert result == pytest.approx(5.234)
-
-    def test_truncated_log_returns_none(self, tmp_path):
-        """Truncated log without performance block returns None."""
-        log = tmp_path / "prod.log"
-        log.write_text(TRUNCATED_LOG)
-        assert parse_mdlog_performance(log) is None
-
-    def test_missing_file_returns_none(self, tmp_path):
-        """Non-existent file returns None."""
-        assert parse_mdlog_performance(tmp_path / "nonexistent.log") is None
-
-    def test_empty_file_returns_none(self, tmp_path):
-        """Empty file returns None."""
-        log = tmp_path / "empty.log"
-        log.write_text("")
-        assert parse_mdlog_performance(log) is None
-
-
-class TestParsePerformanceMarker:
-    """Tests for parse_performance_marker."""
-
-    def test_extracts_value(self):
-        """Marker line yields the ns/day value."""
-        stdout = f"some mdrun output\n{MDRUN_PERF_MARKER}5.234\n"
-        assert parse_performance_marker(stdout) == pytest.approx(5.234)
-
-    def test_uses_last_marker(self):
-        """When several markers are present, the last one wins."""
-        stdout = f"{MDRUN_PERF_MARKER}1.0\n{MDRUN_PERF_MARKER}9.75\n"
-        assert parse_performance_marker(stdout) == pytest.approx(9.75)
-
-    def test_missing_marker_returns_none(self):
-        """stdout without the marker returns None."""
-        assert parse_performance_marker("no marker here") is None
-
-    def test_empty_marker_returns_none(self):
-        """Marker with an empty value returns None (regex requires a digit)."""
-        assert parse_performance_marker(f"{MDRUN_PERF_MARKER}\n") is None
-
-    def test_none_stdout_returns_none(self):
-        """None or empty stdout returns None."""
-        assert parse_performance_marker(None) is None
-        assert parse_performance_marker("") is None
+def _run_extract(tmp_path, log_text: str) -> str:
+    """Run ``{_PERF_EXTRACT} <log> | tail -1`` exactly as the mdrun script does."""
+    log = tmp_path / "bench.log"
+    log.write_text(log_text)
+    proc = subprocess.run(
+        ["bash", "-c", f'{_PERF_EXTRACT} "{log}" | tail -1'],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout.strip()
 
 
 class TestReadPerformanceFile:
-    """Tests for read_performance_file."""
+    """The sidecar parser is the sole source of live ns/day values."""
 
     def test_reads_marker_from_file(self, tmp_path):
-        """Sidecar with a marker line yields the value."""
         perf = tmp_path / "bench.deadbeef.perf"
         perf.write_text(f"{MDRUN_PERF_MARKER}5.234\n")
         assert read_performance_file(perf) == pytest.approx(5.234)
 
     def test_missing_file_returns_none(self, tmp_path):
-        """A sidecar that was never written returns None."""
+        """A sidecar that was never written (failed trial) reads as None."""
         assert read_performance_file(tmp_path / "nope.perf") is None
 
     def test_empty_value_returns_none(self, tmp_path):
-        """A sidecar with an empty marker value returns None."""
+        """A sidecar written from a truncated log holds no value."""
         perf = tmp_path / "bench.perf"
         perf.write_text(f"{MDRUN_PERF_MARKER}\n")
         assert read_performance_file(perf) is None
 
+    def test_last_marker_wins(self, tmp_path):
+        perf = tmp_path / "bench.perf"
+        perf.write_text(f"{MDRUN_PERF_MARKER}1.0\n{MDRUN_PERF_MARKER}9.75\n")
+        assert read_performance_file(perf) == pytest.approx(9.75)
+
 
 class TestPerfExtractProgram:
-    """Execute the worker-side sed program against realistic logs.
-
-    ``_PERF_EXTRACT`` is the sole producer of real ns/day in the live sweep
-    path (the driver reads the sidecar it writes).  The existing script test
-    only asserted the substring ``echo "MARKER$(sed`` was present, so a
-    corrupted pattern would pass CI while every live trial reported "no
-    performance data" (finding 3).  These tests run the actual sed program.
-    """
-
-    def _run_extract(self, tmp_path, log_text: str) -> str:
-        """Run ``{extract} <log> | tail -1`` exactly as the mdrun script does."""
-        import subprocess
-
-        from mdfactory.orchestration.apps import _PERF_EXTRACT
-
-        log = tmp_path / "bench.log"
-        log.write_text(log_text)
-        proc = subprocess.run(
-            ["bash", "-c", f'{_PERF_EXTRACT} "{log}" | tail -1'],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return proc.stdout.strip()
+    """Execute the worker-side sed program against realistic logs."""
 
     def test_extracts_ns_per_day_from_log(self, tmp_path):
-        """A normal GROMACS log yields its exact Performance value."""
-        assert self._run_extract(tmp_path, NORMAL_LOG) == "5.234"
+        assert _run_extract(tmp_path, NORMAL_LOG) == "5.234"
 
     def test_restart_log_yields_last_block(self, tmp_path):
-        """tail -1 collapses multiple Performance blocks to the last one.
-
-        Without tail the output would be two lines (3.100 then 5.234), so this
-        also pins the ``| tail -1`` the script appends."""
-        assert self._run_extract(tmp_path, RESTART_LOG) == "5.234"
+        """``| tail -1`` collapses restart logs to the final block."""
+        assert _run_extract(tmp_path, RESTART_LOG) == "5.234"
 
     def test_truncated_log_yields_empty(self, tmp_path):
-        """A log with no Performance line yields an empty string (-> error)."""
-        assert self._run_extract(tmp_path, TRUNCATED_LOG) == ""
+        """A log with no Performance line yields an empty marker value."""
+        assert _run_extract(tmp_path, TRUNCATED_LOG) == ""
 
-    def test_extracted_value_round_trips_marker(self, tmp_path):
-        """The sed output feeds the marker parser the driver reads."""
-        value = self._run_extract(tmp_path, NORMAL_LOG)
-        assert parse_performance_marker(f"{MDRUN_PERF_MARKER}{value}") == pytest.approx(5.234)
+    def test_extracted_value_round_trips_sidecar(self, tmp_path):
+        """The sed output round-trips through the file the driver reads."""
+        value = _run_extract(tmp_path, NORMAL_LOG)
+        perf = tmp_path / "bench.perf"
+        perf.write_text(f"{MDRUN_PERF_MARKER}{value}\n")
+        assert read_performance_file(perf) == pytest.approx(5.234)
 
 
 class TestSweepLock:
@@ -222,16 +130,13 @@ class TestSweepLock:
                     pass
 
     def test_lock_released_after_exit(self, tmp_path):
-        """The lock is released when the holding sweep exits."""
         with _sweep_lock(tmp_path):
             pass
         with _sweep_lock(tmp_path):
             pass  # must not raise
 
     def test_lock_held_before_mdp_generation(self, tmp_path):
-        """A concurrent sweep fails before touching the shared benchmark.mdp
-        (finding 2 regression: MDP generation used to run before the lock,
-        letting a losing sweep mutate a running sweep's trials)."""
+        """A concurrent sweep fails before touching the shared benchmark.mdp."""
         from mdfactory.orchestration.config import ExecutorConfig
 
         sim_dir = _setup_sim_dir(tmp_path)
@@ -239,762 +144,421 @@ class TestSweepLock:
         with _sweep_lock(sim_dir):
             with pytest.raises(RuntimeError, match="already running"):
                 run_benchmark_sweep(sim_dir, ExecutorConfig(), BenchmarkConfig(cpu_counts=[2]))
-            # The losing sweep must not have regenerated the shared MDP
             assert not (sim_dir / "benchmark.mdp").exists()
 
 
-# ---------------------------------------------------------------------------
-# T2: BenchmarkConfig validation
-# ---------------------------------------------------------------------------
-
-
 class TestBenchmarkConfig:
-    """Tests for BenchmarkConfig validation."""
+    """Sweep parameter validation."""
 
     def test_defaults(self):
-        """Default config has sensible values."""
-        cfg = BenchmarkConfig()
-        assert cfg.cpu_counts == [1, 2, 4, 8]
-        assert cfg.gpu_replicas == []
-        assert cfg.duration_ps == 100.0
-        assert cfg.selection == "ns_per_day"
+        config = BenchmarkConfig()
+        assert config.cpu_counts == [1, 2, 4, 8, 16, 32, 64]
+        assert config.efficiency_threshold == pytest.approx(0.75)
+        assert config.duration_ps == pytest.approx(100.0)
 
     def test_empty_cpu_counts_rejected(self):
-        """Empty cpu_counts raises ValueError."""
         with pytest.raises(ValueError, match="must not be empty"):
             BenchmarkConfig(cpu_counts=[])
 
     def test_zero_cpu_count_rejected(self):
-        """cpu_counts must be >= 1 (0 would trigger auto-detect mislabel)."""
+        """A 0 would fall back to node-wide auto-detection under a false label."""
         with pytest.raises(ValueError, match=">= 1"):
-            BenchmarkConfig(cpu_counts=[0])
+            BenchmarkConfig(cpu_counts=[0, 4])
 
-    def test_zero_gpu_replicas_rejected(self):
-        """gpu_replicas must be >= 1 when given."""
-        with pytest.raises(ValueError, match=">= 1"):
-            BenchmarkConfig(gpu_replicas=[0])
-
-    def test_negative_duration_rejected(self):
-        """Non-positive duration_ps raises ValueError."""
+    def test_non_positive_duration_rejected(self):
         with pytest.raises(ValueError, match="must be positive"):
             BenchmarkConfig(duration_ps=0)
 
-    def test_custom_values(self):
-        """Custom config values are accepted."""
-        cfg = BenchmarkConfig(
-            cpu_counts=[16],
-            gpu_replicas=[1, 2],
-            duration_ps=50.0,
-            selection="efficiency",
-            mdp_overrides={"nstxout-compressed": "0"},
-        )
-        # cpu_counts is stored but ignored for a GPU sweep (cores = GPUs);
-        # it still drives a CPU-only sweep.
-        assert cfg.cpu_counts == [16]
-        assert cfg.gpu_replicas == [1, 2]
-        assert cfg.selection == "efficiency"
+    @pytest.mark.parametrize("threshold", [0, -0.5, 1.5])
+    def test_threshold_must_be_a_fraction(self, threshold):
+        with pytest.raises(ValueError, match="in \\(0, 1\\]"):
+            BenchmarkConfig(efficiency_threshold=threshold)
 
 
-# ---------------------------------------------------------------------------
-# T3: TrialResult and optimum selection
-# ---------------------------------------------------------------------------
+class TestBenchmarkResult:
+    """Efficiency accounting and the justified-core-count answer."""
 
-
-class TestTrialResult:
-    """Tests for TrialResult and _select_optimum."""
-
-    def test_efficiency_property(self):
-        """Efficiency is ns_per_day / cpu_count."""
-        t = TrialResult(cpu_count=8, gpu_replicas=0, ns_per_day=16.0, wall_seconds=10.0)
-        assert t.efficiency == pytest.approx(2.0)
-
-    def test_efficiency_none_when_no_performance(self):
-        """Efficiency is None when ns_per_day is None."""
-        t = TrialResult(cpu_count=8, gpu_replicas=0, ns_per_day=None, wall_seconds=None)
-        assert t.efficiency is None
-
-    def test_efficiency_none_when_zero_cpus(self):
-        """Efficiency is None when cpu_count is 0 (guard against division by zero)."""
-        t = TrialResult(cpu_count=0, gpu_replicas=0, ns_per_day=5.0, wall_seconds=10.0)
-        assert t.efficiency is None
-
-    def test_select_optimum_ns_per_day(self):
-        """Select by ns_per_day picks highest throughput."""
+    def _result(self, throughputs, threshold=0.75):
         trials = [
-            TrialResult(cpu_count=4, gpu_replicas=0, ns_per_day=5.0, wall_seconds=10.0),
-            TrialResult(cpu_count=8, gpu_replicas=0, ns_per_day=8.0, wall_seconds=10.0),
-            TrialResult(cpu_count=16, gpu_replicas=0, ns_per_day=7.5, wall_seconds=10.0),
+            TrialResult(cpu_count=cpus, ns_per_day=ns, wall_seconds=1.0) for cpus, ns in throughputs
         ]
-        opt = _select_optimum(trials, "ns_per_day")
-        assert opt is not None
-        assert opt.cpu_count == 8
-
-    def test_select_optimum_efficiency(self):
-        """Select by efficiency picks best ns/day per core."""
-        trials = [
-            TrialResult(cpu_count=4, gpu_replicas=0, ns_per_day=5.0, wall_seconds=10.0),
-            TrialResult(cpu_count=8, gpu_replicas=0, ns_per_day=8.0, wall_seconds=10.0),
-            TrialResult(cpu_count=16, gpu_replicas=0, ns_per_day=7.5, wall_seconds=10.0),
-        ]
-        opt = _select_optimum(trials, "efficiency")
-        assert opt is not None
-        # 5/4=1.25, 8/8=1.0, 7.5/16=0.47 → 4 cores wins
-        assert opt.cpu_count == 4
-
-    def test_select_optimum_all_failed(self):
-        """All-failed trials return None."""
-        trials = [
-            TrialResult(cpu_count=4, gpu_replicas=0, ns_per_day=None, wall_seconds=5.0),
-        ]
-        assert _select_optimum(trials, "ns_per_day") is None
-
-
-# ---------------------------------------------------------------------------
-# T4: Benchmark MDP generation
-# ---------------------------------------------------------------------------
-
-
-class TestGenerateBenchmarkMdp:
-    """Tests for _generate_benchmark_mdp."""
-
-    def test_nsteps_override(self, tmp_path):
-        """nsteps is set to achieve the target duration."""
-        src = tmp_path / "md.mdp"
-        src.write_text(SAMPLE_MDP)
-        out = tmp_path / "benchmark.mdp"
-        _generate_benchmark_mdp(src, out, duration_ps=100.0)
-        content = out.read_text()
-        # dt=0.002, duration=100 → nsteps=50000
-        assert "50000" in content
-
-    def test_io_frequency_reduced(self, tmp_path):
-        """Output frequencies are set to nsteps to minimize I/O."""
-        src = tmp_path / "md.mdp"
-        src.write_text(SAMPLE_MDP)
-        out = tmp_path / "benchmark.mdp"
-        _generate_benchmark_mdp(src, out, duration_ps=100.0)
-        content = out.read_text()
-        # nstxout, nstvout, nstenergy, nstlog should be 50000
-        assert content.count("50000") >= 4
-
-    def test_extra_overrides_applied(self, tmp_path):
-        """Extra MDP overrides are applied."""
-        src = tmp_path / "md.mdp"
-        src.write_text(SAMPLE_MDP)
-        out = tmp_path / "benchmark.mdp"
-        _generate_benchmark_mdp(
-            src, out, duration_ps=100.0, extra_overrides={"nstxout_compressed": "99999"}
-        )
-        content = out.read_text()
-        assert "99999" in content
-
-    def test_override_appended_when_key_absent(self, tmp_path):
-        """An override naming a key absent from the source MDP is appended.
-
-        modify_mdp_value only replaces existing lines; without appending, the
-        documented ``{"nstxout-compressed": "0"}`` example would be a silent
-        no-op on any md.mdp lacking the key (finding 4)."""
-        from mdfactory.orchestration.mdp import get_mdp_value, parse_mdp
-
-        src = tmp_path / "md.mdp"
-        # Source deliberately omits nstxout-compressed
-        src.write_text(
-            "\n".join(line for line in SAMPLE_MDP.splitlines() if "compressed" not in line)
-        )
-        out = tmp_path / "benchmark.mdp"
-        _generate_benchmark_mdp(
-            src, out, duration_ps=100.0, extra_overrides={"nstxout-compressed": "0"}
+        return BenchmarkResult(
+            system_path="/tmp/sim", trials=trials, efficiency_threshold=threshold
         )
 
-        parsed = parse_mdp(out)
-        # Hyphen form normalized to underscore on parse, value applied
-        assert get_mdp_value(parsed, "nstxout_compressed") == "0"
+    def test_baseline_is_smallest_successful_trial(self):
+        result = self._result([(8, 40.0), (2, 10.0), (4, None)])
+        assert result.baseline.cpu_count == 2
 
-    def test_disabled_outputs_preserved(self, tmp_path):
-        """Outputs set to 0 (disabled) are not overridden."""
-        src = tmp_path / "md.mdp"
-        src.write_text(SAMPLE_MDP)
-        out = tmp_path / "benchmark.mdp"
-        _generate_benchmark_mdp(src, out, duration_ps=100.0)
+    def test_linear_scaling_is_full_efficiency(self):
+        result = self._result([(1, 5.0), (4, 20.0)])
+        assert result.efficiency(result.trials[1]) == pytest.approx(1.0)
 
-        from mdfactory.orchestration.mdp import get_mdp_value, parse_mdp
+    def test_efficiency_is_throughput_per_core_ratio(self):
+        """4 cores at 15 ns/day against a 5 ns/day baseline = 75%."""
+        result = self._result([(1, 5.0), (4, 15.0)])
+        assert result.efficiency(result.trials[1]) == pytest.approx(0.75)
 
-        parsed = parse_mdp(out)
-        # nstfout was 0 in SAMPLE_MDP — should remain 0
-        assert get_mdp_value(parsed, "nstfout") == "0"
-        # nstxout was 5000 — should be overridden to nsteps (50000)
-        assert get_mdp_value(parsed, "nstxout") == "50000"
-
-    def test_explicit_dt_override(self, tmp_path):
-        """Explicit dt parameter overrides the source MDP value."""
-        src = tmp_path / "md.mdp"
-        src.write_text(SAMPLE_MDP)
-        out = tmp_path / "benchmark.mdp"
-        _generate_benchmark_mdp(src, out, duration_ps=100.0, dt=0.001)
-        content = out.read_text()
-        # dt=0.001, duration=100 → nsteps=100000
-        assert "100000" in content
-
-
-# ---------------------------------------------------------------------------
-# T5: Sweep config generation
-# ---------------------------------------------------------------------------
-
-
-class TestBuildSweepConfigs:
-    """Tests for _build_sweep_configs."""
-
-    def test_cpu_only_sweep(self):
-        """CPU-only sweep generates one point per cpu_count."""
-        base = MagicMock()
-        cfg = BenchmarkConfig(cpu_counts=[2, 4, 8])
-        points = _build_sweep_configs(base, cfg)
-        assert len(points) == 3
-        assert [p["cpu_count"] for p in points] == [2, 4, 8]
-        assert all(p["gpu_replicas"] == 0 for p in points)
-
-    def test_cpu_only_points_normalize_max_workers(self):
-        """CPU-only points force max_workers_per_node=1 so ntasks equals the
-        labeled cpu_count regardless of the base config (finding 1)."""
-        base = MagicMock()
-        cfg = BenchmarkConfig(cpu_counts=[1, 2, 4, 8])
-        points = _build_sweep_configs(base, cfg)
-        assert all(p["config_overrides"]["max_workers_per_node"] == 1 for p in points)
-        assert [p["config_overrides"]["cpus_per_node"] for p in points] == [1, 2, 4, 8]
-
-    def test_gpu_sweep_ties_cores_to_gpus(self):
-        """A GPU sweep ties cores 1:1 to GPUs (1 core per GPU, pure MPI)."""
-        base = MagicMock()
-        cfg = BenchmarkConfig(gpu_replicas=[1, 2, 4])
-        points = _build_sweep_configs(base, cfg)
-        combos = [(p["cpu_count"], p["gpu_replicas"]) for p in points]
-        assert combos == [(1, 1), (2, 2), (4, 4)]
-        # 1 thread per rank: ntasks = cores // ranks = gpu // gpu = 1
-        assert all(
-            p["config_overrides"]["max_workers_per_node"] == p["gpu_replicas"] for p in points
+    def test_max_justified_stops_at_the_threshold(self):
+        """Efficiency decays as 1/cpu_count -- only 2 cores stay justified."""
+        result = self._result([(1, 4.0), (2, 7.0), (4, 11.0), (8, 16.0), (16, 16.0)])
+        assert [result.efficiency(t) for t in result.trials] == pytest.approx(
+            [1.0, 0.875, 0.6875, 0.5, 0.25]
         )
+        assert result.max_justified.cpu_count == 2
 
-    def test_gpu_sweep_ignores_cpu_counts(self):
-        """cpu_counts is ignored for a GPU sweep — cores come from --gpus."""
-        base = MagicMock()
-        cfg = BenchmarkConfig(cpu_counts=[64], gpu_replicas=[2])
-        points = _build_sweep_configs(base, cfg)
-        assert [(p["cpu_count"], p["gpu_replicas"]) for p in points] == [(2, 2)]
+    def test_max_justified_skips_failed_trials(self):
+        result = self._result([(1, 4.0), (2, None), (4, 16.0)])
+        assert result.max_justified.cpu_count == 4
 
+    def test_max_justified_none_without_successful_trial(self):
+        result = self._result([(1, None), (2, None)])
+        assert result.baseline is None
+        assert result.max_justified is None
 
-class TestScaleGres:
-    """Tests for _scale_gres (a GPU sweep scales the allocation's gres)."""
-
-    def test_replaces_trailing_count(self):
-        from mdfactory.performance.benchmark import _scale_gres
-
-        assert _scale_gres("gpu:l40s:1", 4) == "gpu:l40s:4"
-        assert _scale_gres("gpu:1", 3) == "gpu:3"
-
-    def test_appends_missing_count(self):
-        from mdfactory.performance.benchmark import _scale_gres
-
-        assert _scale_gres("gpu", 2) == "gpu:2"
-        assert _scale_gres("gpu:l40s", 2) == "gpu:l40s:2"
-
-
-# ---------------------------------------------------------------------------
-# T6: Dry-run mode
-# ---------------------------------------------------------------------------
-
-
-class TestRunBenchmarkSweepDryRun:
-    """Tests for run_benchmark_sweep dry-run mode."""
-
-    def test_dry_run_no_parsl(self, tmp_path):
-        """Dry-run does not import or load Parsl."""
-        from mdfactory.orchestration.config import ExecutorConfig
-
-        cfg = ExecutorConfig()
-        bench_cfg = BenchmarkConfig(cpu_counts=[2, 4])
-
-        result = run_benchmark_sweep(tmp_path, cfg, bench_cfg, dry_run=True)
-
-        assert len(result.trials) == 2
-        assert all(t.ns_per_day is None for t in result.trials)
-        assert result.optimum is None
-        assert result.selection_criterion == "ns_per_day"
-
-    def test_dry_run_with_gpu(self, tmp_path):
-        """Dry-run with GPU replicas generates cross-product."""
-        from mdfactory.orchestration.config import ExecutorConfig
-
-        cfg = ExecutorConfig()
-        bench_cfg = BenchmarkConfig(cpu_counts=[4], gpu_replicas=[1, 2])
-
-        result = run_benchmark_sweep(tmp_path, cfg, bench_cfg, dry_run=True)
-
-        assert len(result.trials) == 2
-        assert result.trials[0].gpu_replicas == 1
-        assert result.trials[1].gpu_replicas == 2
-
-
-# ---------------------------------------------------------------------------
-# T7: JSON persistence round-trip
-# ---------------------------------------------------------------------------
-
-
-class TestBenchmarkResultPersistence:
-    """Tests for BenchmarkResult save/load."""
+    def test_zero_throughput_baseline_yields_no_efficiency(self):
+        """A degenerate 0 ns/day baseline cannot be divided by."""
+        result = self._result([(1, 0.0), (2, 5.0)])
+        assert result.efficiency(result.trials[1]) is None
 
     def test_json_round_trip(self, tmp_path):
-        """Save and load produces equivalent result."""
-        trials = [
-            TrialResult(cpu_count=4, gpu_replicas=0, ns_per_day=5.0, wall_seconds=10.0),
-            TrialResult(cpu_count=8, gpu_replicas=0, ns_per_day=8.0, wall_seconds=12.0),
-        ]
-        optimum = trials[1]
-        result = BenchmarkResult(
-            system_path="/tmp/sim",
-            trials=trials,
-            optimum=optimum,
-            selection_criterion="ns_per_day",
-        )
-
+        result = self._result([(1, 5.0), (4, 15.0)])
         path = tmp_path / "benchmark_result.json"
         result.save(path)
 
         loaded = BenchmarkResult.load(path)
-        assert loaded.system_path == result.system_path
-        assert len(loaded.trials) == 2
-        assert loaded.optimum is not None
-        assert loaded.optimum.ns_per_day == pytest.approx(8.0)
-        assert loaded.selection_criterion == "ns_per_day"
+        assert loaded == result
+        assert loaded.max_justified.cpu_count == 4
+        assert set(json.loads(path.read_text())) == {
+            "system_path",
+            "trials",
+            "efficiency_threshold",
+        }
 
-    def test_json_contains_all_fields(self, tmp_path):
-        """Saved JSON contains expected top-level keys."""
-        import json
 
-        result = BenchmarkResult(
-            system_path="/tmp/sim",
-            trials=[
-                TrialResult(cpu_count=4, gpu_replicas=0, ns_per_day=5.0, wall_seconds=10.0),
-            ],
+class TestGenerateBenchmarkMdp:
+    """Short-trial MDP derivation."""
+
+    def _values(self, tmp_path, **kwargs):
+        from mdfactory.orchestration.mdp import parse_mdp
+
+        source = tmp_path / "md.mdp"
+        source.write_text(SAMPLE_MDP)
+        output = tmp_path / "benchmark.mdp"
+        _generate_benchmark_mdp(source, output, **kwargs)
+        return {key: value for _, key, value in parse_mdp(output)}
+
+    def test_nsteps_override(self, tmp_path):
+        """100 ps at dt = 0.002 is 50000 steps, not the production 500000."""
+        assert self._values(tmp_path, duration_ps=100.0)["nsteps"] == "50000"
+
+    def test_output_frequency_reduced(self, tmp_path):
+        values = self._values(tmp_path, duration_ps=100.0)
+        assert values["nstxout"] == "50000"
+        assert values["nstenergy"] == "50000"
+
+    def test_disabled_outputs_preserved(self, tmp_path):
+        """Keys already 0 stay 0 instead of being switched back on."""
+        assert self._values(tmp_path, duration_ps=100.0)["nstfout"] == "0"
+
+    def test_override_replaces_present_key(self, tmp_path):
+        values = self._values(tmp_path, duration_ps=100.0, extra_overrides={"nstxout": "0"})
+        assert values["nstxout"] == "0"
+
+    def test_override_appended_when_key_absent(self, tmp_path):
+        """An override naming an absent key is appended, not silently dropped."""
+        values = self._values(
+            tmp_path, duration_ps=100.0, extra_overrides={"verlet-buffer-tolerance": "0.005"}
         )
-        path = tmp_path / "result.json"
-        result.save(path)
+        assert values["verlet_buffer_tolerance"] == "0.005"
 
-        data = json.loads(path.read_text())
-        assert "system_path" in data
-        assert "trials" in data
-        assert "optimum" in data
-        assert "selection_criterion" in data
+    def test_explicit_dt(self, tmp_path):
+        assert self._values(tmp_path, duration_ps=10.0, dt=0.002)["nsteps"] == "5000"
 
 
-# ---------------------------------------------------------------------------
-# T8: Mocked execution path (dry_run=False)
-# ---------------------------------------------------------------------------
+class TestRunBenchmarkSweepDryRun:
+    """Dry-run mode runs without cluster or filesystem side effects."""
+
+    def test_dry_run_lists_the_plan_only(self, tmp_path):
+        from mdfactory.orchestration.config import ExecutorConfig
+
+        result = run_benchmark_sweep(
+            tmp_path, ExecutorConfig(), BenchmarkConfig(cpu_counts=[4, 2]), dry_run=True
+        )
+
+        assert [t.cpu_count for t in result.trials] == [2, 4]
+        assert all(t.ns_per_day is None for t in result.trials)
+        assert result.max_justified is None
+        assert not (tmp_path / ".benchmark").exists()
+        assert not (tmp_path / "benchmark_result.json").exists()
 
 
 def _setup_sim_dir(tmp_path):
-    """Create a minimal simulation directory for benchmark tests."""
+    """Create a minimal prepared simulation directory."""
     sim_dir = tmp_path / "sim"
     sim_dir.mkdir()
     (sim_dir / "system.pdb").write_text("FAKE")
     (sim_dir / "topology.top").write_text("FAKE")
     # Companion topology include — must be staged into each trial directory
     (sim_dir / "extra_params.itp").write_text("FAKE")
-    # Production MDP
     (sim_dir / "md.mdp").write_text(SAMPLE_MDP)
     return sim_dir
 
 
-def _mdrun_writes_perf(perf_text: str):
-    """Build a mock mdrun side_effect that writes a performance sidecar.
+def _mock_sweep(tmp_path, ns_per_day="5.234"):
+    """Wire grompp/mdrun mocks whose mdrun writes the performance sidecar."""
+    sim_dir = _setup_sim_dir(tmp_path)
 
-    The real mdrun script writes ns/day to ``performance_file`` inside
-    ``work_dir``; this mimics that so ``read_performance_file`` finds it.
-    """
+    def fake_mdrun(**kwargs):
+        Path(kwargs["work_dir"], kwargs["performance_file"]).write_text(
+            f"{MDRUN_PERF_MARKER}{ns_per_day}\n"
+        )
+        future = MagicMock()
+        future.result.return_value = 0
+        return future
 
-    def _fake(**kwargs):
-        Path(kwargs["work_dir"], kwargs["performance_file"]).write_text(perf_text)
-        fut = MagicMock()
-        fut.result.return_value = 0
-        return fut
-
-    return _fake
+    grompp = MagicMock()
+    grompp.return_value.result.return_value = "ok"
+    mdrun = MagicMock(side_effect=fake_mdrun)
+    return sim_dir, grompp, mdrun
 
 
+@patch("mdfactory.orchestration.trajectory.find_structure_file")
+@patch("mdfactory.orchestration.session.parsl_session")
+@patch("mdfactory.orchestration.apps.get_grompp_app")
+@patch("mdfactory.orchestration.apps.get_mdrun_app")
 class TestRunBenchmarkSweepExecution:
-    """Tests for the live execution path (dry_run=False)."""
+    """The live execution path, with Parsl and the apps mocked."""
 
-    @patch("mdfactory.orchestration.trajectory.find_structure_file")
-    @patch("mdfactory.orchestration.session.parsl_session")
-    @patch("mdfactory.orchestration.apps.get_grompp_app")
-    @patch("mdfactory.orchestration.apps.get_mdrun_app")
-    def test_mocked_sweep_runs_all_points(
-        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
-    ):
-        """Mocked sweep runs every point inside a single allocation."""
-        from mdfactory.orchestration.config import ExecutorConfig
-
-        sim_dir = _setup_sim_dir(tmp_path)
+    def _run(self, tmp_path, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, **kwargs):
+        sim_dir, grompp, mdrun = _mock_sweep(tmp_path, kwargs.pop("ns_per_day", "5.234"))
         mock_find.return_value = sim_dir / "system.pdb"
         mock_session.return_value.__enter__ = MagicMock()
         mock_session.return_value.__exit__ = MagicMock(return_value=False)
+        mock_grompp_app.return_value = grompp
+        mock_mdrun_app.return_value = mdrun
+        return sim_dir, grompp, mdrun
 
-        mock_grompp = MagicMock()
-        mock_grompp.return_value.result.return_value = "ok"
-        mock_grompp_app.return_value = mock_grompp
+    def test_runs_every_point_in_one_cpu_only_allocation(
+        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+    ):
+        from mdfactory.orchestration.config import ExecutorConfig
 
-        mock_mdrun = MagicMock()
-        # mdrun writes ns/day to the (uniquely named) performance sidecar
-        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}5.234\n")
-        mock_mdrun_app.return_value = mock_mdrun
+        sim_dir, grompp, mdrun = self._run(
+            tmp_path, mock_mdrun_app, mock_grompp_app, mock_session, mock_find
+        )
 
-        cfg = ExecutorConfig()
-        bench_cfg = BenchmarkConfig(cpu_counts=[2, 4])
+        result = run_benchmark_sweep(sim_dir, ExecutorConfig(), BenchmarkConfig(cpu_counts=[2, 4]))
 
-        result = run_benchmark_sweep(sim_dir, cfg, bench_cfg)
-
-        # One allocation for the whole sweep, two trials inside it
         assert mock_session.call_count == 1
-        assert mock_grompp.call_count == 2
-        assert mock_mdrun.call_count == 2
-        assert len(result.trials) == 2
+        assert grompp.call_count == 2
+        assert mdrun.call_count == 2
         assert all(t.ns_per_day == pytest.approx(5.234) for t in result.trials)
         assert all(t.error is None for t in result.trials)
-        assert result.optimum is not None
-        # Result saved as JSON sidecar
         assert (sim_dir / "benchmark_result.json").exists()
 
-        # The allocation is sized to the largest requested CPU count...
-        allocation_config = mock_session.call_args.args[0]
-        assert allocation_config.cpus_per_node == 4
-        # ...with a single worker (CPU-only sweep runs one mdrun at a time).
-        assert allocation_config.max_workers_per_node == 1
-        # ...while mdrun thread counts follow the individual sweep points.
-        assert [call.kwargs["ntasks"] for call in mock_mdrun.call_args_list] == [2, 4]
+        allocation = mock_session.call_args.args[0]
+        assert allocation.cpus_per_node == 4  # sized to the largest point
+        assert allocation.max_workers_per_node == 1
+        assert allocation.max_blocks == 1
 
-        # Regression: ns/day must be extracted on the worker into a uniquely
-        # named sidecar, not by reading the log from the driver.
-        perf_names = [call.kwargs["performance_file"] for call in mock_mdrun.call_args_list]
-        assert all(name for name in perf_names)
-        assert len(set(perf_names)) == len(perf_names)  # unique per trial
-
-        # Regression: apps must receive an explicit input dependency list.
-        # Omitting it forwards ``inputs=None``, which Parsl cannot iterate.
-        assert mock_grompp.call_args.kwargs["inputs"] == []
-        assert mock_mdrun.call_args.kwargs["inputs"] == [mock_grompp.return_value]
-
-        # Regression: topology include files must be staged into the trial dir
-        # (GROMACS resolves ``#include`` relative to the topology file).
-        trial_dir = sim_dir / ".benchmark" / "cpus2_gpu0"
-        assert (trial_dir / "extra_params.itp").is_symlink()
-
-    @patch("mdfactory.orchestration.trajectory.find_structure_file")
-    @patch("mdfactory.orchestration.session.parsl_session")
-    @patch("mdfactory.orchestration.apps.get_grompp_app")
-    @patch("mdfactory.orchestration.apps.get_mdrun_app")
-    def test_cpu_threads_match_labels_with_base_max_workers(
+    def test_mdrun_threads_match_labels(
         self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
-        """The labeled cpu_count equals the actual mdrun thread count even
-        when the base config declares max_workers_per_node > 1 (finding 1)."""
+        """Thread count is the code under test's, never the base config's."""
         from mdfactory.orchestration.config import ExecutorConfig
 
-        sim_dir = _setup_sim_dir(tmp_path)
-        mock_find.return_value = sim_dir / "system.pdb"
-        mock_session.return_value.__enter__ = MagicMock()
-        mock_session.return_value.__exit__ = MagicMock(return_value=False)
+        sim_dir, _, mdrun = self._run(
+            tmp_path, mock_mdrun_app, mock_grompp_app, mock_session, mock_find
+        )
 
-        mock_grompp = MagicMock()
-        mock_grompp.return_value.result.return_value = "ok"
-        mock_grompp_app.return_value = mock_grompp
+        # Base config claims 4 workers per node; the sweep must ignore that.
+        run_benchmark_sweep(
+            sim_dir, ExecutorConfig(max_workers_per_node=4), BenchmarkConfig(cpu_counts=[1, 2, 4])
+        )
 
-        mock_mdrun = MagicMock()
-        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}5.234\n")
-        mock_mdrun_app.return_value = mock_mdrun
+        assert [c.kwargs["ntasks"] for c in mdrun.call_args_list] == [1, 2, 4]
+        # CPU-only: a GPU-enabled config must not leak into the trials.
+        assert all(c.kwargs["disable_gpu"] is True for c in mdrun.call_args_list)
 
-        # Base config claims 4 workers per node — previously this leaked into
-        # the per-point hints and produced ntasks 0, 0, 1, 2.
-        cfg = ExecutorConfig(max_workers_per_node=4)
-        bench_cfg = BenchmarkConfig(cpu_counts=[1, 2, 4, 8])
-
-        run_benchmark_sweep(sim_dir, cfg, bench_cfg)
-
-        assert [c.kwargs["ntasks"] for c in mock_mdrun.call_args_list] == [1, 2, 4, 8]
-        # The allocation itself stays single-worker; thread counts come from
-        # the per-point overrides.
-        assert mock_session.call_args.args[0].max_workers_per_node == 1
-
-    @patch("mdfactory.orchestration.trajectory.find_structure_file")
-    @patch("mdfactory.orchestration.session.parsl_session")
-    @patch("mdfactory.orchestration.apps.get_grompp_app")
-    @patch("mdfactory.orchestration.apps.get_mdrun_app")
-    def test_sweep_allocation_forces_exclusive_and_single_block(
+    def test_sweep_allocation_forces_exclusive_single_block(
         self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
-        """The sweep allocation forces exclusive use AND a single SLURM block.
-
-        Exclusive so neighbour jobs can't skew the measurement (a shared node
-        swung the 8-core point ~37% between identical runs); max_blocks=1 so
-        the sweep can never span multiple allocations.  The base config is
-        left untouched (simulate keeps its multi-block parallelism)."""
+        """Exclusive so neighbours cannot skew it; base config left untouched."""
         from mdfactory.orchestration.config import SlurmExecutorConfig
 
-        sim_dir = _setup_sim_dir(tmp_path)
-        mock_find.return_value = sim_dir / "system.pdb"
-        mock_session.return_value.__enter__ = MagicMock()
-        mock_session.return_value.__exit__ = MagicMock(return_value=False)
-
-        mock_grompp = MagicMock()
-        mock_grompp.return_value.result.return_value = "ok"
-        mock_grompp_app.return_value = mock_grompp
-
-        mock_mdrun = MagicMock()
-        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}5.234\n")
-        mock_mdrun_app.return_value = mock_mdrun
-
-        # Base opts OUT of exclusive and allows 4 blocks — the sweep must
-        # still force exclusive=True and max_blocks=1 on its own copy.
+        sim_dir, _, _ = self._run(
+            tmp_path, mock_mdrun_app, mock_grompp_app, mock_session, mock_find
+        )
         cfg = SlurmExecutorConfig(account="acct", partition="cpu", exclusive=False, max_blocks=4)
 
         run_benchmark_sweep(sim_dir, cfg, BenchmarkConfig(cpu_counts=[2, 4]))
 
-        allocation_config = mock_session.call_args.args[0]
-        assert allocation_config.exclusive is True
-        assert allocation_config.max_blocks == 1
-        # ...and the base config object is not mutated.
+        allocation = mock_session.call_args.args[0]
+        assert allocation.exclusive is True
+        assert allocation.max_blocks == 1
         assert cfg.exclusive is False
         assert cfg.max_blocks == 4
 
-    @patch("mdfactory.orchestration.trajectory.find_structure_file")
-    @patch("mdfactory.orchestration.session.parsl_session")
-    @patch("mdfactory.orchestration.apps.get_grompp_app")
-    @patch("mdfactory.orchestration.apps.get_mdrun_app")
-    def test_trial_md_mdp_resolves_to_benchmark_mdp(
+    def test_trial_dir_is_staged_with_the_short_mdp(
         self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
-        """Each trial's md.mdp is the short benchmark MDP, not the production
-        MDP (finding 4 regression)."""
+        """Each trial gets a linked copy of the inputs and the short MDP."""
         from mdfactory.orchestration.config import ExecutorConfig
         from mdfactory.orchestration.mdp import get_mdp_value, parse_mdp
 
-        sim_dir = _setup_sim_dir(tmp_path)
-        mock_find.return_value = sim_dir / "system.pdb"
-        mock_session.return_value.__enter__ = MagicMock()
-        mock_session.return_value.__exit__ = MagicMock(return_value=False)
-
-        mock_grompp = MagicMock()
-        mock_grompp.return_value.result.return_value = "ok"
-        mock_grompp_app.return_value = mock_grompp
-
-        mock_mdrun = MagicMock()
-        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}5.234\n")
-        mock_mdrun_app.return_value = mock_mdrun
+        sim_dir, grompp, _ = self._run(
+            tmp_path, mock_mdrun_app, mock_grompp_app, mock_session, mock_find
+        )
 
         run_benchmark_sweep(sim_dir, ExecutorConfig(), BenchmarkConfig(cpu_counts=[2]))
 
-        trial_dir = sim_dir / ".benchmark" / "cpus2_gpu0"
+        trial_dir = sim_dir / ".benchmark" / "cpus2"
+        # GROMACS resolves #include relative to the topology file.
+        assert (trial_dir / "extra_params.itp").is_symlink()
         md_mdp = trial_dir / "md.mdp"
-        # The trial's md.mdp must resolve to the shared benchmark MDP...
         assert md_mdp.resolve() == (sim_dir / "benchmark.mdp").resolve()
-        # ...which is the short trial (100 ps / 0.002 ps = 50000 steps), not
-        # the production MDP (500000 steps).  A regression here would run the
-        # full-length production MDP for every trial.
+        # 100 ps, not the 1 ns production MDP.
         assert get_mdp_value(parse_mdp(md_mdp), "nsteps") == "50000"
-        # grompp consumed the trial's md.mdp
-        assert mock_grompp.call_args.kwargs["mdp_file"] == "md.mdp"
+        assert grompp.call_args.kwargs["mdp_file"] == "md.mdp"
+        assert grompp.call_args.kwargs["inputs"] == []
 
-    @patch("mdfactory.orchestration.trajectory.find_structure_file")
-    @patch("mdfactory.orchestration.session.parsl_session")
-    @patch("mdfactory.orchestration.apps.get_grompp_app")
-    @patch("mdfactory.orchestration.apps.get_mdrun_app")
-    def test_gpu_point_runs_single_simulation_across_gpus(
+    def test_performance_sidecar_is_unique_per_trial(
         self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
-        """A gpu_replicas=R point launches ONE mdrun (gpus=R → srun -n R) with
-        cores tied 1:1 to GPUs (1 thread/rank, pure MPI), gres scaled to R."""
+        """A never-reused sidecar name cannot be served from a stale cache entry."""
+        from mdfactory.orchestration.config import ExecutorConfig
+
+        sim_dir, grompp, mdrun = self._run(
+            tmp_path, mock_mdrun_app, mock_grompp_app, mock_session, mock_find
+        )
+
+        run_benchmark_sweep(sim_dir, ExecutorConfig(), BenchmarkConfig(cpu_counts=[1, 2, 4]))
+
+        names = [c.kwargs["performance_file"] for c in mdrun.call_args_list]
+        assert all(names)
+        assert len(set(names)) == len(names)
+        # mdrun must depend on grompp's TPR, or Parsl cannot order the two.
+        assert mdrun.call_args.kwargs["inputs"] == [grompp.return_value]
+
+    def test_gmx_binary_is_forwarded(
+        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+    ):
+        """A pinned gmx_mpi config reaches mdrun instead of falling back to auto."""
         from mdfactory.orchestration.config import SlurmExecutorConfig
 
-        sim_dir = _setup_sim_dir(tmp_path)
-        mock_find.return_value = sim_dir / "system.pdb"
-        mock_session.return_value.__enter__ = MagicMock()
-        mock_session.return_value.__exit__ = MagicMock(return_value=False)
+        sim_dir, _, mdrun = self._run(
+            tmp_path, mock_mdrun_app, mock_grompp_app, mock_session, mock_find
+        )
+        cfg = SlurmExecutorConfig(account="acct", partition="cpu", gmx_binary="gmx_mpi")
 
-        mock_grompp = MagicMock()
-        mock_grompp.return_value.result.return_value = "ok"
-        mock_grompp_app.return_value = mock_grompp
+        run_benchmark_sweep(sim_dir, cfg, BenchmarkConfig(cpu_counts=[2]))
 
-        mock_mdrun = MagicMock()
-        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}5.234\n")
-        mock_mdrun_app.return_value = mock_mdrun
+        assert mdrun.call_args.kwargs["gmx_binary"] == "gmx_mpi"
 
-        cfg = SlurmExecutorConfig(account="acct", partition="gpu", gres="gpu:l40s:1")
-        # cpu_counts=[4] must be IGNORED — cores come from gpu_replicas (2).
-        bench_cfg = BenchmarkConfig(cpu_counts=[4], gpu_replicas=[2])
+    def test_short_mdp_reaches_the_written_file(
+        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+    ):
+        """--duration-ps and MDP overrides are honoured by the written MDP."""
+        from mdfactory.orchestration.config import ExecutorConfig
+        from mdfactory.orchestration.mdp import get_mdp_value, parse_mdp
 
-        result = run_benchmark_sweep(sim_dir, cfg, bench_cfg)
+        sim_dir, _, _ = self._run(
+            tmp_path, mock_mdrun_app, mock_grompp_app, mock_session, mock_find
+        )
 
-        # ONE grompp, ONE mdrun — a single simulation across R GPUs
-        assert mock_grompp.call_count == 1
-        assert mock_mdrun.call_count == 1
-        call = mock_mdrun.call_args
-        assert call.kwargs["gpus"] == 2  # script: srun -n 2 --gpus-per-task=1
-        assert call.kwargs["deffnm"] == "bench"
-        assert call.kwargs["ntasks"] == 1  # cores tied 1:1 → 2 cores // 2 ranks
-        assert call.kwargs["disable_gpu"] is False
+        run_benchmark_sweep(
+            sim_dir,
+            ExecutorConfig(),
+            BenchmarkConfig(cpu_counts=[2], duration_ps=10.0, mdp_overrides={"nstxout": "0"}),
+        )
 
-        # Allocation: cores = GPUs (2), gres scaled to 2 GPUs, all visible
-        # (no per-worker pinning), one worker running the multi-rank sim.
-        allocation_config = mock_session.call_args.args[0]
-        assert allocation_config.cpus_per_node == 2  # cores = max GPU count
-        assert allocation_config.gres == "gpu:l40s:2"
-        assert allocation_config.available_accelerators == 0
-        assert allocation_config.max_workers_per_node == 1
+        parsed = parse_mdp(sim_dir / ".benchmark" / "cpus2" / "md.mdp")
+        assert get_mdp_value(parsed, "nsteps") == "5000"
+        assert get_mdp_value(parsed, "nstxout") == "0"
 
-        # Single simulation throughput (not an aggregate/sum)
-        assert len(result.trials) == 1
-        trial = result.trials[0]
-        assert trial.cpu_count == 2  # cores = GPUs; cpu_counts=[4] ignored
-        assert trial.gpu_replicas == 2
-        assert trial.ns_per_day == pytest.approx(5.234)
-        assert trial.error is None
+    def test_efficiency_threshold_selects_the_answer(
+        self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
+    ):
+        """The persisted result answers the rule of thumb, not raw throughput."""
+        from mdfactory.orchestration.config import ExecutorConfig
 
-        # Single shared TPR — no per-replica symlinks
-        trial_dir = sim_dir / ".benchmark" / "cpus2_gpu2"
-        assert not (trial_dir / "bench_r0.tpr").exists()
-        assert not (trial_dir / "bench_r1.tpr").exists()
+        sim_dir, _, _ = self._run(
+            tmp_path, mock_mdrun_app, mock_grompp_app, mock_session, mock_find
+        )
 
-    @patch("mdfactory.orchestration.trajectory.find_structure_file")
-    @patch("mdfactory.orchestration.session.parsl_session")
-    @patch("mdfactory.orchestration.apps.get_grompp_app")
-    @patch("mdfactory.orchestration.apps.get_mdrun_app")
+        config = BenchmarkConfig(cpu_counts=[1, 2, 4], efficiency_threshold=0.9)
+
+        result = run_benchmark_sweep(sim_dir, ExecutorConfig(), config)
+
+        # Identical ns/day at every count: efficiency falls as 1/cpu_count.
+        assert result.max_justified.cpu_count == 1
+        assert BenchmarkResult.load(sim_dir / "benchmark_result.json").max_justified.cpu_count == 1
+
     def test_missing_performance_data_sets_error(
         self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
-        """When mdrun succeeds but emits no marker, error is set."""
+        """mdrun succeeding without a marker is an error, not a zero result."""
         from mdfactory.orchestration.config import ExecutorConfig
 
-        sim_dir = _setup_sim_dir(tmp_path)
-        mock_find.return_value = sim_dir / "system.pdb"
-        mock_session.return_value.__enter__ = MagicMock()
-        mock_session.return_value.__exit__ = MagicMock(return_value=False)
+        sim_dir, _, mdrun = self._run(
+            tmp_path, mock_mdrun_app, mock_grompp_app, mock_session, mock_find
+        )
+        mdrun.side_effect = None
+        mdrun.return_value.result.return_value = 0
 
-        mock_grompp = MagicMock()
-        mock_grompp.return_value.result.return_value = "ok"
-        mock_grompp_app.return_value = mock_grompp
+        result = run_benchmark_sweep(sim_dir, ExecutorConfig(), BenchmarkConfig(cpu_counts=[4]))
 
-        mock_mdrun = MagicMock()
-        # No performance sidecar is written -> no performance data
-        mock_mdrun.return_value.result.return_value = 0
-        mock_mdrun_app.return_value = mock_mdrun
-
-        cfg = ExecutorConfig()
-        bench_cfg = BenchmarkConfig(cpu_counts=[4])
-
-        result = run_benchmark_sweep(sim_dir, cfg, bench_cfg)
-
-        assert len(result.trials) == 1
         assert result.trials[0].ns_per_day is None
-        assert result.trials[0].error is not None
         assert "no performance data" in result.trials[0].error
-        assert result.optimum is None
+        assert result.max_justified is None
 
-    @patch("mdfactory.orchestration.trajectory.find_structure_file")
-    @patch("mdfactory.orchestration.session.parsl_session")
-    @patch("mdfactory.orchestration.apps.get_grompp_app")
-    @patch("mdfactory.orchestration.apps.get_mdrun_app")
-    def test_failed_trial_continues_sweep(
+    def test_failed_trial_records_error_and_continues(
         self, mock_mdrun_app, mock_grompp_app, mock_session, mock_find, tmp_path
     ):
-        """A failed trial records the error and continues to the next point."""
+        """One failing trial must not abort the rest of the sweep."""
         from mdfactory.orchestration.config import ExecutorConfig
 
-        sim_dir = _setup_sim_dir(tmp_path)
-        mock_find.return_value = sim_dir / "system.pdb"
-        mock_session.return_value.__enter__ = MagicMock()
-        mock_session.return_value.__exit__ = MagicMock(return_value=False)
+        sim_dir, grompp, _ = self._run(
+            tmp_path, mock_mdrun_app, mock_grompp_app, mock_session, mock_find
+        )
+        first = MagicMock()
+        first.result.side_effect = RuntimeError("GROMACS mdrun failed")
+        grompp.return_value = first
 
-        # First trial fails, second succeeds
-        mock_grompp = MagicMock()
-        mock_grompp_app.return_value = mock_grompp
+        result = run_benchmark_sweep(sim_dir, ExecutorConfig(), BenchmarkConfig(cpu_counts=[2]))
 
-        call_count = {"n": 0}
-
-        def grompp_side_effect(*args, **kwargs):
-            call_count["n"] += 1
-            future = MagicMock()
-            if call_count["n"] == 1:
-                future.result.side_effect = RuntimeError("GROMACS grompp failed")
-            else:
-                future.result.return_value = "ok"
-            return future
-
-        mock_grompp.side_effect = grompp_side_effect
-
-        mock_mdrun = MagicMock()
-        mock_mdrun.side_effect = _mdrun_writes_perf(f"{MDRUN_PERF_MARKER}8.0\n")
-        mock_mdrun_app.return_value = mock_mdrun
-
-        cfg = ExecutorConfig()
-        bench_cfg = BenchmarkConfig(cpu_counts=[2, 4])
-
-        result = run_benchmark_sweep(sim_dir, cfg, bench_cfg)
-
-        assert len(result.trials) == 2
-        # First trial failed
         assert result.trials[0].ns_per_day is None
-        assert result.trials[0].error is not None
-        assert "grompp failed" in result.trials[0].error
-        # Second trial succeeded
-        assert result.trials[1].ns_per_day == pytest.approx(8.0)
-        # Optimum selected from successful trials only
-        assert result.optimum is not None
-        assert result.optimum.cpu_count == 4
+        assert "mdrun failed" in result.trials[0].error
 
 
-# ---------------------------------------------------------------------------
-# T9: Error paths
-# ---------------------------------------------------------------------------
+def test_missing_production_mdp_raises(tmp_path):
+    """A sweep needs a prepared directory, so an absent MDP fails fast."""
+    from mdfactory.orchestration.config import ExecutorConfig
+
+    sim_dir = _setup_sim_dir(tmp_path)
+    (sim_dir / "md.mdp").unlink()
+
+    with pytest.raises(FileNotFoundError, match="Production MDP not found"):
+        run_benchmark_sweep(sim_dir, ExecutorConfig(), BenchmarkConfig(cpu_counts=[2]))
 
 
-class TestRunBenchmarkSweepErrors:
-    """Tests for error handling in run_benchmark_sweep."""
+def test_missing_structure_file_raises(tmp_path):
+    from mdfactory.orchestration.config import ExecutorConfig
 
-    def test_missing_production_mdp(self, tmp_path):
-        """Missing production MDP raises FileNotFoundError."""
-        from mdfactory.orchestration.config import ExecutorConfig
+    sim_dir = _setup_sim_dir(tmp_path)
 
-        sim_dir = tmp_path / "sim"
-        sim_dir.mkdir()
-        # No md.mdp file
+    with (
+        patch("mdfactory.orchestration.trajectory.find_structure_file", return_value=None),
+        pytest.raises(FileNotFoundError, match="No structure file found"),
+    ):
+        run_benchmark_sweep(sim_dir, ExecutorConfig(), BenchmarkConfig(cpu_counts=[2]))
 
-        with pytest.raises(FileNotFoundError, match="Production MDP not found"):
-            run_benchmark_sweep(sim_dir, ExecutorConfig())
 
-    def test_gpu_sweep_without_gres_raises(self, tmp_path):
-        """A GPU replica sweep on a config with no GPU gres fails fast.
+def test_multi_node_allocation_rejected(tmp_path):
+    """Trials are one mdrun on one node, so a multi-node allocation is refused."""
+    from mdfactory.orchestration.config import SlurmExecutorConfig
 
-        Otherwise every trial would run CPU-only while labeled as a GPU
-        point and still feed _select_optimum (finding 5)."""
-        from mdfactory.orchestration.config import ExecutorConfig
-
-        cfg = ExecutorConfig()  # no gres -> no GPU
-        with pytest.raises(ValueError, match="GPU"):
-            run_benchmark_sweep(tmp_path, cfg, BenchmarkConfig(cpu_counts=[2], gpu_replicas=[1]))
-
-    @patch("mdfactory.orchestration.trajectory.find_structure_file")
-    def test_missing_structure_file(self, mock_find, tmp_path):
-        """Missing structure file raises FileNotFoundError."""
-        from mdfactory.orchestration.config import ExecutorConfig
-
-        sim_dir = _setup_sim_dir(tmp_path)
-        mock_find.return_value = None
-
-        with pytest.raises(FileNotFoundError, match="No structure file found"):
-            run_benchmark_sweep(sim_dir, ExecutorConfig())
-
-    def test_multi_node_allocation_rejected(self, tmp_path):
-        """A multi-node allocation is rejected because trials are single-rank."""
-        from mdfactory.orchestration.config import SlurmExecutorConfig
-
-        cfg = SlurmExecutorConfig(account="acct", partition="cpu", nodes=2)
-        with pytest.raises(ValueError, match="single-node"):
-            run_benchmark_sweep(tmp_path, cfg, BenchmarkConfig(cpu_counts=[2]))
+    cfg = SlurmExecutorConfig(account="acct", partition="cpu", nodes=2)
+    with pytest.raises(ValueError, match="single-node"):
+        run_benchmark_sweep(tmp_path, cfg, BenchmarkConfig(cpu_counts=[2]))

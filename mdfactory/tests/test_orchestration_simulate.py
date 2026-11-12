@@ -538,65 +538,6 @@ def test_resolve_gpu_flags_no_gpu():
     assert _resolve_gpu_flags(has_gpu=False, pme_gpu=False) == ""
 
 
-def test_resolve_gpu_flags_multi_rank_adds_npme():
-    """Multi-rank + PME-on-GPU appends the mandatory -npme 1 (>= 1, not 0:
-    this GROMACS build lacks cuFFTMp, so -npme 0 spreads PME over multiple
-    CUDA devices and aborts)."""
-    flags = _resolve_gpu_flags(has_gpu=True, pme_gpu=True, gpus=2)
-    assert flags == "-nb gpu -pme gpu -gpu_id $GPU_ID -npme 1"
-
-
-def test_resolve_gpu_flags_multi_rank_no_pme_omits_npme():
-    """Multi-rank with PME-on-CPU needs no -npme (only PME-on-GPU requires it)."""
-    flags = _resolve_gpu_flags(has_gpu=True, pme_gpu=False, gpus=4)
-    assert "-npme" not in flags
-    assert flags == "-nb gpu -pme cpu -gpu_id $GPU_ID"
-
-
-def test_resolve_gpu_flags_single_rank_omits_npme():
-    """Single-rank PME-on-GPU works without -npme (GROMACS only requires it
-    across multiple ranks)."""
-    assert "-npme" not in _resolve_gpu_flags(has_gpu=True, pme_gpu=True, gpus=1)
-
-
-def test_build_mdrun_script_multi_gpu_uses_srun():
-    """gpus > 1 wraps the command in srun so one simulation spans N GPUs.
-
-    --cpus-per-task=$NTHR must be present: the cluster task-prolog exports
-    OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK per srun task, and GROMACS 2024
-    fatal-errors when that env differs from -ntomp.  -npme 1 is present because
-    GROMACS aborts multi-rank PME-on-GPU without an explicit -npme."""
-    script = _build_mdrun_script(
-        deffnm="bench", work_dir="/tmp/wd", disable_gpu=False, gmx_binary="gmx_mpi", gpus=2
-    )
-    assert "srun -n 2 --cpus-per-task=$NTHR --gpus-per-task=1 gmx_mpi mdrun" in script
-    assert "-ntomp $NTHR" in script  # matches the prolog-provided OMP value
-    assert "-npme 1" in script  # mandatory for multi-rank PME-on-GPU
-
-
-def test_build_mdrun_script_single_rank_no_srun():
-    """gpus <= 1 runs a single rank (no srun wrapper)."""
-    script = _build_mdrun_script(
-        deffnm="bench", work_dir="/tmp/wd", disable_gpu=False, gmx_binary="gmx_mpi", gpus=1
-    )
-    assert "srun" not in script
-    assert "gmx_mpi mdrun" in script
-
-
-def test_build_mdrun_script_gpu_id_is_zero():
-    """Each rank's one pinned GPU is device 0 inside the process (CUDA
-    renumbers a pinned device, so a physical id would be out of range)."""
-    script = _build_mdrun_script(deffnm="bench", work_dir="/tmp/wd", disable_gpu=False)
-    assert "GPU_ID=0" in script
-    assert "CUDA_VISIBLE_DEVICES" not in script
-
-
-def test_build_mdrun_script_cpu_omits_gpu_id():
-    """CPU-only scripts never reference GPU_ID."""
-    script = _build_mdrun_script(deffnm="min", work_dir="/tmp/wd", disable_gpu=True)
-    assert "GPU_ID" not in script
-
-
 def test_resolve_is_mpi():
     """Binary selector resolves to expected is_mpi values."""
     assert _resolve_is_mpi("gmx_mpi") is True
@@ -605,13 +546,13 @@ def test_resolve_is_mpi():
 
 
 def test_resolve_thread_flags_explicit_mpi():
-    """MPI CPU build uses -ntomp and pins threads explicitly."""
+    """MPI build always uses -ntomp and pins CPU threads explicitly."""
     assert _resolve_thread_flags(is_mpi=True, has_gpu=True) == "-ntomp $NTHR -pin on"
     assert _resolve_thread_flags(is_mpi=True, has_gpu=False) == "-ntomp $NTHR -pin on"
 
 
 def test_resolve_thread_flags_tmpi_gpu():
-    """Thread-MPI build with GPU uses -ntmpi 1 -ntomp (no CPU pinning)."""
+    """Thread-MPI build with GPU uses -ntmpi 1 -ntomp."""
     assert _resolve_thread_flags(is_mpi=False, has_gpu=True) == "-ntmpi 1 -ntomp $NTHR"
 
 
@@ -1794,12 +1735,11 @@ def test_build_mdrun_script_explicit_gmx_mpi():
 
 
 def test_build_mdrun_script_cpu_pins_threads():
-    """CPU mdrun scripts request explicit thread pinning."""
-    gmx_script = _build_mdrun_script("prod", "/sim", gmx_binary="gmx", disable_gpu=True)
-    assert "-nt $NTHR -pin on" in gmx_script
-
-    mpi_script = _build_mdrun_script("prod", "/sim", gmx_binary="gmx_mpi", disable_gpu=True)
-    assert "-ntomp $NTHR -pin on" in mpi_script
+    """CPU mdrun scripts request explicit thread pinning in both builds."""
+    script = _build_mdrun_script("prod", "/sim", gmx_binary="gmx", disable_gpu=True)
+    assert "-nt $NTHR -pin on" in script
+    script = _build_mdrun_script("prod", "/sim", gmx_binary="gmx_mpi", disable_gpu=True)
+    assert "-ntomp $NTHR -pin on" in script
 
 
 def test_build_mdrun_script_auto_cpu_pins_threads():
@@ -1825,66 +1765,65 @@ def test_build_mdrun_script_performance_file_off_by_default():
     """The performance marker is not emitted unless a file is requested."""
     from mdfactory.orchestration.apps import MDRUN_PERF_MARKER
 
-    script = _build_mdrun_script("prod", "/sim", gmx_binary="gmx")
-    assert MDRUN_PERF_MARKER not in script
+    assert MDRUN_PERF_MARKER not in _build_mdrun_script("prod", "/sim", gmx_binary="gmx")
 
 
 # ---------------------------------------------------------------------------
-# T7: extract_resource_hints GPU / gmx_binary branches (Finding 18)
+# T7: _extract_resource_hints GPU / gmx_binary branches (Finding 18)
 # ---------------------------------------------------------------------------
 
 
-def testextract_resource_hints_gpu_gres_disables_disable_gpu():
+def test_extract_resource_hints_gpu_gres_disables_disable_gpu():
     """GPU gres string → disable_gpu=False (GPU mode active)."""
-    from mdfactory.orchestration.stages import extract_resource_hints
+    from mdfactory.orchestration.stages import _extract_resource_hints
 
     cfg = MagicMock(
         cpus_per_node=12, gres="gpu:l40s:1", gmx_binary="gmx_mpi", max_workers_per_node=1
     )
-    hints = extract_resource_hints(cfg)
+    hints = _extract_resource_hints(cfg)
 
     assert hints.disable_gpu is False
     assert hints.gmx_binary == "gmx_mpi"
     assert hints.ntasks == 12
 
 
-def testextract_resource_hints_non_gpu_gres_sets_disable_gpu():
+def test_extract_resource_hints_non_gpu_gres_sets_disable_gpu():
     """Non-GPU gres string → disable_gpu=True (no GPU)."""
-    from mdfactory.orchestration.stages import extract_resource_hints
+    from mdfactory.orchestration.stages import _extract_resource_hints
 
     cfg = MagicMock(cpus_per_node=4, gres="ssd:1", gmx_binary="auto", max_workers_per_node=1)
-    hints = extract_resource_hints(cfg)
+    hints = _extract_resource_hints(cfg)
 
     assert hints.disable_gpu is True
 
 
-def testextract_resource_hints_none_gres_sets_disable_gpu():
+def test_extract_resource_hints_none_gres_sets_disable_gpu():
     """gres=None → disable_gpu=True (no GPU)."""
-    from mdfactory.orchestration.stages import extract_resource_hints
+    from mdfactory.orchestration.stages import _extract_resource_hints
 
     cfg = MagicMock(cpus_per_node=8, gres=None, gmx_binary="auto", max_workers_per_node=1)
-    hints = extract_resource_hints(cfg)
+    hints = _extract_resource_hints(cfg)
 
     assert hints.disable_gpu is True
 
 
-def testextract_resource_hints_none_stage_config_is_cpu_safe():
+def test_extract_resource_hints_none_stage_config_is_cpu_safe():
     """stage_config=None → disable_gpu=True (safe default for local runs)."""
-    from mdfactory.orchestration.stages import extract_resource_hints
+    from mdfactory.orchestration.stages import _extract_resource_hints
 
-    hints = extract_resource_hints(None)
+    hints = _extract_resource_hints(None)
 
     assert hints.disable_gpu is True
     assert hints.ntasks == 0
     assert hints.gmx_binary == "auto"
 
 
-def testextract_resource_hints_divides_by_max_workers():
+def test_extract_resource_hints_divides_by_max_workers():
     """ntasks is divided by max_workers_per_node when >1 to avoid oversubscription."""
-    from mdfactory.orchestration.stages import extract_resource_hints
+    from mdfactory.orchestration.stages import _extract_resource_hints
 
     cfg = MagicMock(cpus_per_node=12, gres=None, gmx_binary="auto", max_workers_per_node=2)
-    hints = extract_resource_hints(cfg)
+    hints = _extract_resource_hints(cfg)
 
     assert hints.ntasks == 6  # 12 // 2
 

@@ -753,14 +753,7 @@ def benchmark(
     cpus: Annotated[
         list[int] | None,
         Parameter(
-            help="CPU counts to sweep (default: 1 2 4 8). CPU-only; ignored when --gpus is set.",
-            consume_multiple=True,
-        ),
-    ] = None,
-    gpus: Annotated[
-        list[int] | None,
-        Parameter(
-            help="GPU counts to sweep; one core + one MPI rank per GPU (pure MPI).",
+            help="CPU counts to sweep (default: 1 2 4 8 16 32 64).",
             consume_multiple=True,
         ),
     ] = None,
@@ -768,35 +761,37 @@ def benchmark(
         float,
         Parameter(help="Duration of each benchmark trial in ps (default: 100)."),
     ] = 100.0,
-    selection: Annotated[
-        Literal["ns_per_day", "efficiency"],
-        Parameter(help="Criterion for choosing the optimum configuration."),
-    ] = "ns_per_day",
+    efficiency: Annotated[
+        float,
+        Parameter(
+            help="Minimum parallel efficiency a CPU count must reach (default: 0.75).",
+        ),
+    ] = 0.75,
     dry_run: Annotated[
         bool,
         Parameter(help="Print the sweep plan without submitting any work."),
     ] = False,
 ):
-    """Benchmark resource configurations to find the optimal deployment.
+    """Find the highest CPU count justified by the 75% efficiency rule of thumb.
 
-    Runs short GROMACS production trials across a sweep of CPU counts (or, for
-    a GPU scalability study, increasing GPU counts with cores tied 1:1 — one
-    simulation spanning more GPUs), parses throughput from each trial's
-    log, and writes a ``benchmark_result.json`` sidecar next to the system with
-    the selected optimum.
+    Runs short, CPU-only GROMACS production trials at increasing thread counts
+    inside one exclusive allocation, reports each point's parallel efficiency
+    relative to the smallest swept count, and names the highest count that
+    still reaches ``--efficiency``.  GPU scaling is out of scope.
 
     A SLURM executor is required: every trial is submitted to the cluster, so
     no heavy work runs on the submitting node.
 
     Examples
     --------
-    CPU sweep::
+    Sweep the default core counts::
 
-        mdfactory benchmark output_dir/abc123 --slurm slurm_cpu.yaml --cpus 1 2 4 8
+        mdfactory benchmark output_dir/abc123 --slurm slurm_cpu.yaml
 
-    Optimize throughput per core::
+    Demand 80% efficiency from 200 ps trials::
 
-        mdfactory benchmark output_dir/abc123 --slurm slurm_cpu.yaml --selection efficiency
+        mdfactory benchmark output_dir/abc123 --slurm slurm_cpu.yaml \
+            --cpus 1 2 4 8 16 --duration-ps 200 --efficiency 0.8
 
     Dry-run preview (no submission)::
 
@@ -810,20 +805,18 @@ def benchmark(
         logger.error(str(exc))
         sys.exit(1)
 
-    config = _resolve_slurm_flag(slurm, stages=())
-    executor_config = _load_executor_config(config)
+    executor_config = _load_executor_config(_resolve_slurm_flag(slurm, stages=()))
 
-    from mdfactory.performance.benchmark import BenchmarkConfig, run_benchmark_sweep
+    from mdfactory.performance.benchmark import (
+        DEFAULT_CPU_COUNTS,
+        BenchmarkConfig,
+        run_benchmark_sweep,
+    )
 
-    # A GPU sweep ties cores 1:1 to GPUs (one core/MPI rank per GPU, 1 thread
-    # each — pure MPI, no OpenMP hybrid), so the core count comes from --gpus
-    # and --cpus applies only to a CPU-only sweep.
-    benchmark_cpu_counts = list(gpus) if gpus else (cpus or [1, 2, 4, 8])
     benchmark_config = BenchmarkConfig(
-        cpu_counts=benchmark_cpu_counts,
-        gpu_replicas=gpus or [],
+        cpu_counts=list(cpus or DEFAULT_CPU_COUNTS),
         duration_ps=duration_ps,
-        selection=selection,
+        efficiency_threshold=efficiency,
     )
 
     for sim_path in sim_paths:
@@ -833,22 +826,24 @@ def benchmark(
 
 
 def _report_benchmark_result(result: "BenchmarkResult") -> None:
-    """Log the outcomes of a benchmark sweep and its selected optimum."""
+    """Log each trial's parallel efficiency and the highest justified CPU count."""
     for trial in result.trials:
         ns_per_day = f"{trial.ns_per_day:.3f}" if trial.ns_per_day is not None else "N/A"
-        logger.info(
-            f"  cpus={trial.cpu_count} gpu_replicas={trial.gpu_replicas}: {ns_per_day} ns/day"
-            + (f" ({trial.error})" if trial.error else "")
-        )
+        efficiency = result.efficiency(trial)
+        line = f"  cpus={trial.cpu_count}: {ns_per_day} ns/day"
+        if efficiency is not None:
+            line += f", {efficiency:.0%} efficiency"
+        logger.info(line + (f" ({trial.error})" if trial.error else ""))
 
-    if result.optimum is None:
-        logger.warning(f"No successful trial for {result.system_path}")
+    best = result.max_justified
+    if best is None:
+        logger.warning(f"No CPU count reached the efficiency threshold for {result.system_path}")
         return
 
-    opt = result.optimum
     logger.info(
-        f"Optimum ({result.selection_criterion}): cpus={opt.cpu_count}, "
-        f"gpu_replicas={opt.gpu_replicas} -> {opt.ns_per_day:.3f} ns/day"
+        f"Highest justified CPU count: {best.cpu_count} "
+        f"({result.efficiency(best):.0%} efficiency, "
+        f"threshold {result.efficiency_threshold:.0%})"
     )
 
 
