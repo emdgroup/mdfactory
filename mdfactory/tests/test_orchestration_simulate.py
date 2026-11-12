@@ -546,9 +546,9 @@ def test_resolve_is_mpi():
 
 
 def test_resolve_thread_flags_explicit_mpi():
-    """MPI build always uses -ntomp regardless of GPU mode."""
-    assert _resolve_thread_flags(is_mpi=True, has_gpu=True) == "-ntomp $NTHR"
-    assert _resolve_thread_flags(is_mpi=True, has_gpu=False) == "-ntomp $NTHR"
+    """MPI build always uses -ntomp and pins CPU threads explicitly."""
+    assert _resolve_thread_flags(is_mpi=True, has_gpu=True) == "-ntomp $NTHR -pin on"
+    assert _resolve_thread_flags(is_mpi=True, has_gpu=False) == "-ntomp $NTHR -pin on"
 
 
 def test_resolve_thread_flags_tmpi_gpu():
@@ -557,8 +557,8 @@ def test_resolve_thread_flags_tmpi_gpu():
 
 
 def test_resolve_thread_flags_tmpi_cpu():
-    """Thread-MPI build without GPU uses -nt (all-thread count)."""
-    assert _resolve_thread_flags(is_mpi=False, has_gpu=False) == "-nt $NTHR"
+    """Thread-MPI CPU build uses -nt and pins threads explicitly."""
+    assert _resolve_thread_flags(is_mpi=False, has_gpu=False) == "-nt $NTHR -pin on"
 
 
 def test_resolve_thread_flags_auto():
@@ -1732,6 +1732,40 @@ def test_build_mdrun_script_explicit_gmx_mpi():
     script = _build_mdrun_script("prod", "/sim", gmx_binary="gmx_mpi")
     assert "command -v gmx" not in script
     assert "gmx_mpi mdrun" in script
+
+
+def test_build_mdrun_script_cpu_pins_threads():
+    """CPU mdrun scripts request explicit thread pinning in both builds."""
+    script = _build_mdrun_script("prod", "/sim", gmx_binary="gmx", disable_gpu=True)
+    assert "-nt $NTHR -pin on" in script
+    script = _build_mdrun_script("prod", "/sim", gmx_binary="gmx_mpi", disable_gpu=True)
+    assert "-ntomp $NTHR -pin on" in script
+
+
+def test_build_mdrun_script_auto_cpu_pins_threads():
+    """Auto CPU mode pins in both detected binary branches."""
+    script = _build_mdrun_script("prod", "/sim", gmx_binary="auto", disable_gpu=True)
+    assert "-nt $NTHR -pin on" in script
+    assert "-ntomp $NTHR -pin on" in script
+
+
+def test_build_mdrun_script_performance_file_writes_marker():
+    """performance_file writes the on-worker ns/day marker to that file."""
+    from mdfactory.orchestration.apps import MDRUN_PERF_MARKER
+
+    script = _build_mdrun_script(
+        "bench", "/sim", gmx_binary="gmx", performance_file="bench.abc.perf"
+    )
+    assert f'echo "{MDRUN_PERF_MARKER}$(sed' in script
+    assert "> bench.abc.perf" in script
+    assert "bench.log" in script
+
+
+def test_build_mdrun_script_performance_file_off_by_default():
+    """The performance marker is not emitted unless a file is requested."""
+    from mdfactory.orchestration.apps import MDRUN_PERF_MARKER
+
+    assert MDRUN_PERF_MARKER not in _build_mdrun_script("prod", "/sim", gmx_binary="gmx")
 
 
 # ---------------------------------------------------------------------------

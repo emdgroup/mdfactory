@@ -43,6 +43,7 @@ from .workflows import run_build_from_dict
 
 if TYPE_CHECKING:
     from .orchestration import ExecutorConfig
+    from .performance.benchmark import BenchmarkResult
 
 app = App(name="MDFactory", version=__version__)
 
@@ -737,6 +738,113 @@ def _report_simulation_results(results: list[dict]):
     for r in results:
         if r.get("status") == "failed":
             logger.error(f"  {r.get('hash', 'unknown')}: {r.get('error', 'unknown error')}")
+
+
+@app.command(name="benchmark", group="Simulation")
+def benchmark(
+    source: Annotated[
+        Path,
+        Parameter(help="Prepared simulation directory or summary YAML to benchmark."),
+    ],
+    slurm: Annotated[
+        str,
+        Parameter(help="SLURM executor config YAML or 'tui' for interactive setup."),
+    ],
+    cpus: Annotated[
+        list[int] | None,
+        Parameter(
+            help="CPU counts to sweep (default: 1 2 4 8 16 32 64).",
+            consume_multiple=True,
+        ),
+    ] = None,
+    duration_ps: Annotated[
+        float,
+        Parameter(help="Duration of each benchmark trial in ps (default: 100)."),
+    ] = 100.0,
+    efficiency: Annotated[
+        float,
+        Parameter(
+            help="Minimum parallel efficiency a CPU count must reach (default: 0.75).",
+        ),
+    ] = 0.75,
+    dry_run: Annotated[
+        bool,
+        Parameter(help="Print the sweep plan without submitting any work."),
+    ] = False,
+):
+    """Find the highest CPU count justified by the 75% efficiency rule of thumb.
+
+    Runs short, CPU-only GROMACS production trials at increasing thread counts
+    inside one exclusive allocation, reports each point's parallel efficiency
+    relative to the smallest swept count, and names the highest count that
+    still reaches ``--efficiency``.  GPU scaling is out of scope.
+
+    A SLURM executor is required: every trial is submitted to the cluster, so
+    no heavy work runs on the submitting node.
+
+    Examples
+    --------
+    Sweep the default core counts::
+
+        mdfactory benchmark output_dir/abc123 --slurm slurm_cpu.yaml
+
+    Demand 80% efficiency from 200 ps trials::
+
+        mdfactory benchmark output_dir/abc123 --slurm slurm_cpu.yaml \
+            --cpus 1 2 4 8 16 --duration-ps 200 --efficiency 0.8
+
+    Dry-run preview (no submission)::
+
+        mdfactory benchmark output_dir/abc123 --slurm slurm_cpu.yaml --dry-run
+
+    """
+    source = source.resolve()
+    try:
+        sim_paths = _resolve_sim_paths_for_simulate(source)
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
+    executor_config = _load_executor_config(_resolve_slurm_flag(slurm, stages=()))
+
+    from mdfactory.performance.benchmark import (
+        DEFAULT_CPU_COUNTS,
+        BenchmarkConfig,
+        run_benchmark_sweep,
+    )
+
+    benchmark_config = BenchmarkConfig(
+        cpu_counts=list(cpus or DEFAULT_CPU_COUNTS),
+        duration_ps=duration_ps,
+        efficiency_threshold=efficiency,
+    )
+
+    for sim_path in sim_paths:
+        logger.info(f"Benchmarking {sim_path}")
+        result = run_benchmark_sweep(sim_path, executor_config, benchmark_config, dry_run=dry_run)
+        _report_benchmark_result(result)
+
+
+def _report_benchmark_result(result: "BenchmarkResult") -> None:
+    """Log each trial's parallel efficiency and the highest justified CPU count."""
+    for trial in result.trials:
+        ns_per_day = f"{trial.ns_per_day:.3f}" if trial.ns_per_day is not None else "N/A"
+        efficiency = result.efficiency(trial)
+        line = f"  cpus={trial.cpu_count}: {ns_per_day} ns/day"
+        if efficiency is not None:
+            line += f", {efficiency:.0%} efficiency"
+        logger.info(line + (f" ({trial.error})" if trial.error else ""))
+
+    best = result.max_justified
+    if best is None:
+        logger.warning(f"No CPU count reached the efficiency threshold for {result.system_path}")
+        return
+
+    logger.info(
+        f"Highest justified CPU count: {best.cpu_count} "
+        f"({result.efficiency(best):.0%} efficiency, "
+        f"threshold {result.efficiency_threshold:.0%})"
+    )
 
 
 @app.command(name="apply-settings", group="Build")
