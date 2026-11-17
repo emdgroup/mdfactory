@@ -2,10 +2,12 @@
 # ABOUTME: Drive run_staged_compression with fake simulations; no OpenMM context is created
 """Tests for staged box compression and NaN retry in ``openmm_utils``."""
 
+import numpy as np
 import openmm as mm
 import pytest
 from openmm import unit
 
+from mdfactory.simulation import openmm_utils
 from mdfactory.simulation.openmm_utils import (
     COMPRESSION_STAGE_FRACTIONS,
     _is_nan_failure,
@@ -40,10 +42,13 @@ class World:
 class FakeSimulation:
     """Shrinks the cubic box a little on every ``step`` call."""
 
-    def __init__(self, world, edge=INITIAL_VOLUME ** (1 / 3)):
+    def __init__(self, world, edge=INITIAL_VOLUME ** (1 / 3), integrator=None, topology=None):
         self.world = world
         self.edge = edge
         self.context = self
+        self.integrator = integrator
+        self.topology = topology
+        self.reporters = []
 
     def getState(self, getPositions=False):
         return self
@@ -123,10 +128,10 @@ def test_stages_already_passed_are_skipped():
     assert world.minimize_calls == 0
 
 
-def _step_calls_to_finish_first_stage():
-    """Step calls the unperturbed fake needs to reach the first stage's density."""
+def _step_calls_to_reach(fraction):
+    """Step calls the unperturbed fake needs to reach *fraction* of the target density."""
     edge = INITIAL_VOLUME ** (1 / 3)
-    threshold = (TARGET_VOLUME / COMPRESSION_STAGE_FRACTIONS[0]) ** (1 / 3)
+    threshold = (TARGET_VOLUME / fraction) ** (1 / 3)
     calls = 0
     while edge > threshold:
         edge *= 0.98
@@ -139,7 +144,8 @@ def test_nan_retries_from_checkpoint_with_halved_dt(message):
     # Fail on the first step of the second stage: the checkpoint is the box left by
     # the first stage's minimization, not the starting box.
     world = World(
-        fail_on_step_calls={_step_calls_to_finish_first_stage() + 1}, fail_message=message
+        fail_on_step_calls={_step_calls_to_reach(COMPRESSION_STAGE_FRACTIONS[0]) + 1},
+        fail_message=message,
     )
     _, _, _, converged = _run(world)
     assert converged
@@ -171,11 +177,110 @@ def test_non_nan_openmm_errors_are_not_retried():
     assert world.made_dts == []
 
 
-def test_step_budget_is_shared_and_unconverged_runs_stop_early():
+def test_unconverged_run_stops_in_the_first_unfinished_stage():
     world = World()
     _, densities, steps, converged = _run(world, steps=100)
     assert not converged
     assert steps <= 100
     assert densities[-1] < TARGET_DENSITY
-    # It stopped in the first unfinished stage instead of starting the next.
-    assert world.minimize_calls <= 1
+    # It stopped in the first stage instead of starting the next.
+    assert world.minimize_calls == 0
+
+
+def test_step_budget_is_shared_across_stages_and_the_last_stage_can_fall_short():
+    # The budget finishes the first two stages but runs out two checks before the
+    # target. Were each stage given the full budget, the last one would converge.
+    calls = _step_calls_to_reach(COMPRESSION_STAGE_FRACTIONS[-1]) - 2
+    world = World()
+    _, densities, steps, converged = _run(world, steps=25 * calls)
+    assert not converged
+    assert steps == 25 * calls
+    assert world.step_calls == calls
+    assert densities[-1] < TARGET_DENSITY
+    # Both inter-stage minimizations ran; none after the unfinished last stage.
+    assert world.minimize_calls == len(COMPRESSION_STAGE_FRACTIONS) - 1
+
+
+class FakeTopology:
+    def getPeriodicBoxVectors(self):
+        return None
+
+
+@pytest.mark.parametrize("message", NAN_MESSAGES)
+def test_compress_box_retries_with_one_restraint_and_hands_the_new_simulation_on(
+    message, monkeypatch, tmp_path
+):
+    """Drive compress_box through a NaN retry with OpenMM's file and simulation I/O faked."""
+    monkeypatch.chdir(tmp_path)
+    world = World(fail_on_step_calls={1}, fail_message=message)
+    gro = type("Gro", (), {"topology": FakeTopology(), "positions": [mm.Vec3(0, 0, 0)] * 2})()
+    system = mm.System()
+    for _ in range(2):
+        system.addParticle(MASS.value_in_unit(unit.dalton) / 2)
+    simulations = []
+    restraint_calls = []
+    finished = []
+    exported = []
+
+    class FakePDBFile:
+        def __new__(cls, path):
+            return gro
+
+        @staticmethod
+        def writeFile(*args, **kwargs):
+            pass
+
+    class FakeTopFile:
+        def __init__(self, path, periodicBoxVectors=None):
+            self.topology = gro.topology
+
+        def createSystem(self, **kwargs):
+            return system
+
+    def fake_simulation(topology, system_, integrator):
+        sim = FakeSimulation(world, integrator=integrator, topology=topology)
+        simulations.append(sim)
+        return sim
+
+    monkeypatch.setattr(openmm_utils.app, "PDBFile", FakePDBFile)
+    monkeypatch.setattr(openmm_utils.app, "GromacsTopFile", FakeTopFile)
+    monkeypatch.setattr(openmm_utils.app, "Simulation", fake_simulation)
+    monkeypatch.setattr(openmm_utils.app, "PDBReporter", lambda *a, **k: object())
+    monkeypatch.setattr(openmm_utils, "_state_data_reporter", lambda target: object())
+    monkeypatch.setattr(
+        openmm_utils,
+        "_add_protein_rmsd_restraint",
+        lambda *args: restraint_calls.append(args),
+    )
+    monkeypatch.setattr(
+        openmm_utils, "finish_compression", lambda context, *a, **k: finished.append(context)
+    )
+    monkeypatch.setattr(
+        openmm_utils,
+        "_universe_from_simulation",
+        lambda simulation, u, stem: exported.append(simulation) or "universe",
+    )
+
+    result = openmm_utils.compress_box(
+        None,
+        "in.pdb",
+        "in.top",
+        target_volume=TARGET_VOLUME * 1000.0,  # Å^3
+        protein_indices=[0, 1],
+        dt=0.004,
+        max_nan_retries=1,
+    )
+
+    assert result == "universe"
+    # The restraint reference is captured once from the input positions, not per attempt.
+    assert len(restraint_calls) == 1
+    assert restraint_calls[0][1] is gro.positions
+    # A retry builds a second simulation at half the requested time step.
+    assert len(simulations) == 2
+    step_sizes = [
+        sim.integrator.getStepSize().value_in_unit(unit.picoseconds) for sim in simulations
+    ]
+    assert np.allclose(step_sizes, [0.004, 0.002])
+    # The result comes from the replacement simulation, not the one that hit NaN.
+    assert finished == [simulations[1].context]
+    assert exported == [simulations[1]]
