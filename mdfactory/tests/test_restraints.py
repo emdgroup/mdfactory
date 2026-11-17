@@ -2,22 +2,34 @@
 # ABOUTME: Covers index mapping per layout, itp text, include insertion and the error paths
 """Tests for :mod:`mdfactory.setup.restraints` (no GROMACS needed)."""
 
+import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
-from mdfactory.models.species import PositionRestraint
+from mdfactory.models.species import ComDistanceRestraint, PositionRestraint
 from mdfactory.setup.restraints import (
-    apply_position_restraints,
+    apply_restraints,
+    format_index_groups,
     format_position_restraints,
     insert_restraint_includes,
+    measure_com_distance,
+    read_com_restraints,
     read_protein_moleculetypes,
+    reference_distance,
+    write_com_restraint_files,
 )
 from mdfactory.utils.topology_utilities import iter_topology_entries
 
 from .conftest import PDB2GMX_RESIDUES, write_pdb2gmx_output
 
 CHAIN_A = PDB2GMX_RESIDUES[:2]
+
+
+def _apply(params, restraints, cleaned):
+    """Apply *restraints* and return the updated parameter set."""
+    return apply_restraints(params, restraints, cleaned)[0]
 
 
 def _harmonic(name="core", selection="name CA", k=500.0):
@@ -57,9 +69,7 @@ def _restrained_labels(itp: Path, moleculetype_file: Path) -> list[tuple[int, st
 
 def test_single_chain_maps_selection_to_moleculetype_atoms(tmp_path):
     params, cleaned = write_pdb2gmx_output(tmp_path, "single", CHAIN_A)
-    result = apply_position_restraints(
-        params, [_harmonic(selection="resid 2 and name CA CB")], cleaned
-    )
+    result = _apply(params, [_harmonic(selection="resid 2 and name CA CB")], cleaned)
 
     itp = params.topology_file.parent / "posre_core_Protein_chain_A.itp"
     assert result.topology_include_files == [*params.topology_include_files, itp]
@@ -73,7 +83,7 @@ def test_unmerged_chains_restrain_only_the_selected_chain(tmp_path):
     chain_a_before = (out / "topol_Protein_chain_A.itp").read_text()
 
     restraint = _harmonic(selection="chainID B and resid 1 and not name H*")
-    result = apply_position_restraints(params, [restraint], cleaned)
+    result = _apply(params, [restraint], cleaned)
 
     itp = out / "posre_core_Protein_chain_B.itp"
     assert [p.name for p in result.topology_include_files][-1] == itp.name
@@ -87,7 +97,7 @@ def test_unmerged_chains_restrain_only_the_selected_chain(tmp_path):
 def test_unmerged_chains_split_a_selection_across_moleculetypes(tmp_path):
     params, cleaned = write_pdb2gmx_output(tmp_path, "chains")
     out = params.topology_file.parent
-    apply_position_restraints(params, [_harmonic(selection="resid 1 and name CA")], cleaned)
+    _apply(params, [_harmonic(selection="resid 1 and name CA")], cleaned)
     for chain, resname in (("A", "GLY"), ("B", "SER")):
         itp = out / f"posre_core_Protein_chain_{chain}.itp"
         assert _restrained_labels(itp, out / f"topol_Protein_chain_{chain}.itp") == [
@@ -98,7 +108,7 @@ def test_unmerged_chains_split_a_selection_across_moleculetypes(tmp_path):
 def test_merged_chains_use_input_chain_ids_and_resids(tmp_path):
     """merge_all: one moleculetype; resids come from the input even if the gro renumbers."""
     params, cleaned = write_pdb2gmx_output(tmp_path, "single", gro_resids=[1, 2, 3, 4])
-    apply_position_restraints(params, [_harmonic(selection="chainID B and resid 2")], cleaned)
+    _apply(params, [_harmonic(selection="chainID B and resid 2")], cleaned)
 
     itp = params.topology_file.parent / "posre_core_Protein_chain_A.itp"
     labels = _restrained_labels(itp, params.topology_file)
@@ -119,7 +129,8 @@ def test_read_protein_moleculetypes_in_molecules_order(tmp_path):
 def test_no_restraints_leaves_output_untouched(tmp_path):
     params, cleaned = write_pdb2gmx_output(tmp_path, "single")
     before = params.topology_file.read_text()
-    assert apply_position_restraints(params, [], cleaned) is params
+    result, com_groups = apply_restraints(params, [], cleaned)
+    assert result is params and com_groups == {}
     assert params.topology_file.read_text() == before
 
 
@@ -155,9 +166,7 @@ def _ifdef_blocks(path: Path) -> list[tuple[str, str]]:
 
 def test_includes_follow_pdb2gmx_block_in_topology(tmp_path):
     params, cleaned = write_pdb2gmx_output(tmp_path, "single")
-    apply_position_restraints(
-        params, [_harmonic(), _flat_bottom(selection="chainID A and name C")], cleaned
-    )
+    _apply(params, [_harmonic(), _flat_bottom(selection="chainID A and name C")], cleaned)
     assert _ifdef_blocks(params.topology_file) == [
         ("POSRES", "posre.itp"),
         ("POSRES_CORE", "posre_core_Protein_chain_A.itp"),
@@ -172,7 +181,7 @@ def test_includes_go_into_each_chain_itp(tmp_path):
     params, cleaned = write_pdb2gmx_output(tmp_path, "chains")
     out = params.topology_file.parent
     top_before = params.topology_file.read_text()
-    apply_position_restraints(params, [_harmonic(selection="name CA")], cleaned)
+    _apply(params, [_harmonic(selection="name CA")], cleaned)
     for chain in "AB":
         assert _ifdef_blocks(out / f"topol_Protein_chain_{chain}.itp") == [
             ("POSRES", f"posre_Protein_chain_{chain}.itp"),
@@ -201,7 +210,7 @@ def test_missing_posres_anchor_raises(tmp_path):
 def test_bad_selection_raises(tmp_path, selection, match):
     params, cleaned = write_pdb2gmx_output(tmp_path, "chains")
     with pytest.raises(ValueError, match=match):
-        apply_position_restraints(params, [_harmonic(selection=selection)], cleaned)
+        _apply(params, [_harmonic(selection=selection)], cleaned)
 
 
 def test_atom_name_mismatch_raises(tmp_path):
@@ -209,7 +218,7 @@ def test_atom_name_mismatch_raises(tmp_path):
     gro = params.structure_file.read_text().replace("  OXT", "  OT2", 1)
     params.structure_file.write_text(gro)
     with pytest.raises(ValueError, match="'OT2' in the pdb2gmx structure but 'OXT'"):
-        apply_position_restraints(params, [_harmonic()], cleaned)
+        _apply(params, [_harmonic()], cleaned)
 
 
 def test_residue_count_mismatch_raises(tmp_path):
@@ -217,7 +226,7 @@ def test_residue_count_mismatch_raises(tmp_path):
     lines = cleaned.read_text().splitlines(keepends=True)
     cleaned.write_text("".join(line for line in lines if line[21:26] != "B   2"))
     with pytest.raises(ValueError, match="has 4 residues but .* has 3"):
-        apply_position_restraints(params, [_harmonic()], cleaned)
+        _apply(params, [_harmonic()], cleaned)
 
 
 # --- the builders copy the restraint files ------------------------------------------------
@@ -227,7 +236,7 @@ def test_proteinbox_copy_takes_the_restraint_itps(tmp_path):
     from mdfactory.build import _copy_protein_topology
 
     params, cleaned = write_pdb2gmx_output(tmp_path, "chains")
-    params = apply_position_restraints(params, [_harmonic(selection="chainID B")], cleaned)
+    params = _apply(params, [_harmonic(selection="chainID B")], cleaned)
     dest = tmp_path / "build"
     dest.mkdir()
     _copy_protein_topology(params, dest, "topology.top")
@@ -244,7 +253,7 @@ def test_protein_mixedbox_composite_topology_includes_restraints(tmp_path):
     from mdfactory.models.species import SolutionSpecies
 
     params, cleaned = write_pdb2gmx_output(tmp_path, "single")
-    params = apply_position_restraints(params, [_harmonic(), _flat_bottom()], cleaned)
+    params = _apply(params, [_harmonic(), _flat_bottom()], cleaned)
     ff_dir = tmp_path / "amber14sb.ff"
     ff_dir.mkdir()
     dest = tmp_path / "build"
@@ -262,3 +271,145 @@ def test_protein_mixedbox_composite_topology_includes_restraints(tmp_path):
         text.index(f'#include "posre_{n}_Protein_chain_A.itp"') for n in ("core", "loop")
     )
     assert text.index("[ atoms ]") < first < last < text.index("tip3p.itp")
+
+
+# --- COM-distance restraints ----------------------------------------------------------------
+
+
+def _com(name="dimer", selections=("chainID A", "chainID B"), **kwargs):
+    return ComDistanceRestraint(
+        name=name, type="com_distance", selections=selections, k=kwargs.pop("k", 1000.0), **kwargs
+    )
+
+
+def test_com_groups_resolve_chain_qualified_selections(tmp_path):
+    params, cleaned = write_pdb2gmx_output(tmp_path, "chains")
+    before = params.topology_file.read_text()
+    result, groups = apply_restraints(params, [_com()], cleaned)
+    first, second = groups["dimer"]
+    n_a = sum(len(atoms) for chain, _, _, atoms in PDB2GMX_RESIDUES if chain == "A")
+    assert first.tolist() == list(range(n_a))
+    assert second.tolist() == list(range(n_a, n_a + 13))
+    # COM restraints write no itp and leave the topology alone.
+    assert result is params and params.topology_file.read_text() == before
+
+
+@pytest.mark.parametrize(
+    ("selections", "match"),
+    [
+        (("chainID A", "resid 1"), "share 5 atoms"),
+        (("chainID A", "chainID C"), "matches no protein atom"),
+    ],
+)
+def test_bad_com_groups_raise(tmp_path, selections, match):
+    params, cleaned = write_pdb2gmx_output(tmp_path, "chains")
+    with pytest.raises(ValueError, match=match):
+        apply_restraints(params, [_com(selections=selections)], cleaned)
+
+
+def test_measure_com_distance_is_mass_weighted_and_minimum_image():
+    positions = np.array([[0.0, 0, 0], [3.0, 0, 0], [19.0, 0, 0]])
+    masses = np.array([1.0, 2.0, 5.0])
+    groups = (np.array([0, 1]), np.array([2]))
+    # COM of the first group is at x = 2 Å, closest to atom 2 (1-based).
+    open_box = measure_com_distance(positions, masses, np.array([100.0] * 3 + [90.0] * 3), groups)
+    assert open_box.distance == pytest.approx(1.7)
+    assert open_box.pbcatoms == (2, 3)
+    periodic = measure_com_distance(positions, masses, np.array([20.0] * 3 + [90.0] * 3), groups)
+    assert periodic.distance == pytest.approx(0.3)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, 1.5),
+        ({"width": 0.2}, 1.7),
+        ({"distance": 1.0}, 1.0),
+        ({"distance": 1.0, "width": 0.5}, 1.5),
+    ],
+)
+def test_reference_distance(kwargs, expected):
+    assert reference_distance(_com(**kwargs), measured=1.5) == pytest.approx(expected)
+
+
+def test_index_groups_are_one_based_and_wrapped():
+    text = format_index_groups({"COM_X_1": np.arange(17), "COM_X_2": np.array([20])})
+    lines = text.splitlines()
+    assert lines[0] == "[ COM_X_1 ]"
+    assert lines[1].split() == [str(i) for i in range(1, 16)]
+    assert lines[2:] == ["16 17", "[ COM_X_2 ]", "21"]
+
+
+def _patch_make_ndx(monkeypatch, calls):
+    def fake_run_gmx(name, cmd, cwd, stdin, timeout):
+        calls.append((name, stdin))
+        Path(cmd[cmd.index("-o") + 1]).write_text("[ System ]\n1 2 3\n")
+
+    monkeypatch.setattr("mdfactory.setup.restraints._run_gmx", fake_run_gmx)
+    monkeypatch.setattr("mdfactory.setup.restraints.check_gmx_available", lambda: Path("gmx"))
+
+
+def test_write_com_restraint_files(tmp_path, monkeypatch):
+    import MDAnalysis as mda
+
+    calls = []
+    _patch_make_ndx(monkeypatch, calls)
+    params, cleaned = write_pdb2gmx_output(tmp_path, "chains")
+    restraints = [
+        _com(),
+        _com(name="tail", selections=("chainID A and resid 1", "name OXT"), width=0.1),
+    ]
+    _, groups = apply_restraints(params, restraints, cleaned)
+
+    index = write_com_restraint_files(
+        tmp_path, restraints, groups, params.structure_file, params.topology_file
+    )
+
+    assert calls == [("make_ndx", "q\n")]
+    text = index.read_text()
+    assert text.startswith("[ System ]")
+    headers = [line for line in text.splitlines() if line.startswith("[")]
+    assert headers == [
+        "[ System ]",
+        "[ COM_DIMER_1 ]",
+        "[ COM_DIMER_2 ]",
+        "[ COM_TAIL_1 ]",
+        "[ COM_TAIL_2 ]",
+    ]
+    entries = json.loads((tmp_path / "com_restraints.json").read_text())
+    assert entries["dimer"]["groups"] == ["COM_DIMER_1", "COM_DIMER_2"]
+    # Equal masses: the COMs are the plain centroids of the groups.
+    x = mda.Universe(str(params.structure_file)).atoms.positions
+    first, second = groups["dimer"]
+    expected = np.linalg.norm(x[first].mean(axis=0) - x[second].mean(axis=0)) / 10.0
+    assert entries["dimer"]["measured_distance"] == pytest.approx(expected, abs=1e-4)
+    for group, pbcatom in zip(groups["dimer"], entries["dimer"]["pbcatoms"]):
+        assert pbcatom - 1 in group
+
+
+def test_com_distance_beyond_half_the_box_raises(tmp_path, monkeypatch):
+    _patch_make_ndx(monkeypatch, [])
+    params, cleaned = write_pdb2gmx_output(tmp_path, "chains")
+    restraint = _com(distance=2.0, width=0.5)  # 2.5 nm in a 5 nm box
+    _, groups = apply_restraints(params, [restraint], cleaned)
+    with pytest.raises(ValueError, match="not below 0.49 x the shortest box edge"):
+        write_com_restraint_files(
+            tmp_path, [restraint], groups, params.structure_file, params.topology_file
+        )
+    assert not (tmp_path / "index.ndx").exists()
+
+
+def test_com_structure_must_start_with_the_protein(tmp_path, monkeypatch):
+    _patch_make_ndx(monkeypatch, [])
+    params, cleaned = write_pdb2gmx_output(tmp_path, "chains")
+    _, groups = apply_restraints(params, [_com()], cleaned)
+    params.structure_file.write_text(params.structure_file.read_text().replace("  OXT", "  OT2"))
+    with pytest.raises(ValueError, match="'OT2' in the protein of"):
+        write_com_restraint_files(
+            tmp_path, [_com()], groups, params.structure_file, params.topology_file
+        )
+
+
+def test_read_com_restraints_requires_the_build_file(tmp_path):
+    with pytest.raises(FileNotFoundError, match="rebuild the system"):
+        read_com_restraints(tmp_path)

@@ -64,7 +64,8 @@ def _parse_delimited_protein_fields(nested: dict) -> None:
     ("CYS6-CYS127;CYS30-CYS115"). ``protonation_states`` is expressed as nested
     dotted columns (system.protein.protonation_states.HIS15) and needs no parsing.
     ``restraints`` columns (system.protein.restraints.<NAME>.<property>) arrive as
-    ``{NAME: {property: value}}`` and become the list of restraint entries. Blank
+    ``{NAME: {property: value}}`` and become the list of restraint entries; the
+    ``selections`` of a COM-distance restraint are a ``;``-separated pair. Blank
     cells are already dropped, so a restraint whose cells are all blank is absent.
     """
     protein = nested.get("system", {}).get("protein")
@@ -80,7 +81,13 @@ def _parse_delimited_protein_fields(nested: dict) -> None:
                     f"Restraint column 'system.protein.restraints.{name}' needs a property, "
                     "e.g. 'system.protein.restraints.<NAME>.selection'."
                 )
-            entries.append({"name": name, **props})
+            entry = {"name": name, **props}
+            # A COM-distance restraint's two selections share one ";"-separated cell.
+            if isinstance(entry.get("selections"), str):
+                entry["selections"] = [
+                    part.strip() for part in entry["selections"].split(";") if part.strip()
+                ]
+            entries.append(entry)
         protein["restraints"] = entries
 
     chains = protein.get("chains")

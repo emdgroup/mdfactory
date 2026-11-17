@@ -530,6 +530,7 @@ def _build_grompp_script(
     cpt_file: str = "",
     maxwarn: int = 1,
     min_gmx_version: tuple[int, int] | None = None,
+    index_file: str = "",
 ) -> str:
     """Build the bash script for ``gmx grompp``.
 
@@ -558,6 +559,9 @@ def _build_grompp_script(
         needs, e.g. ``(2026, 0)``. When given, the script exits with an error
         before grompp if the detected binary is older. None (default) means no
         check, and the script is unchanged.
+    index_file : str, optional
+        Index file for ``-n`` (``index.ndx`` of a build with COM-distance
+        restraints). Empty (default) means grompp's default groups.
 
     Returns
     -------
@@ -566,6 +570,7 @@ def _build_grompp_script(
 
     """
     cpt_flag = f"-t {cpt_file}" if cpt_file else ""
+    index_flag = f"-n {index_file}" if index_file else ""
     version_check = _build_gmx_version_check(min_gmx_version) if min_gmx_version is not None else ""
 
     return f"""
@@ -579,7 +584,7 @@ def _build_grompp_script(
 
         # Run grompp with explicit error checking
         if ! $GMX_BIN grompp -f {mdp_file} -c {gro_file} -r {gro_file} -p {top_file} \\
-            -o {tpr_file} {cpt_flag} -maxwarn {maxwarn}; then
+            -o {tpr_file} {cpt_flag} {index_flag} -maxwarn {maxwarn}; then
             echo "ERROR: grompp failed for {tpr_file}" >&2
             echo "Check that input files ({mdp_file}, {gro_file}, {top_file}) are valid" >&2
             exit 1
@@ -715,6 +720,7 @@ def get_grompp_app():
         cpt_file: str = "",
         maxwarn: int = 1,
         min_gmx_version: tuple[int, int] | None = None,
+        index_file: str = "",
         stdout=None,
         stderr=None,
         inputs=None,
@@ -740,6 +746,8 @@ def get_grompp_app():
             Maximum number of warnings to allow.
         min_gmx_version : tuple of int, optional
             Minimum GROMACS version ``(year, minor)`` required by the topology.
+        index_file : str, optional
+            Index file for ``-n``; empty means grompp's default groups.
         stdout : str, optional
             File path for stdout.
         stderr : str, optional
@@ -762,6 +770,7 @@ def get_grompp_app():
             cpt_file,
             maxwarn,
             min_gmx_version,
+            index_file,
         )
 
     return run_grompp

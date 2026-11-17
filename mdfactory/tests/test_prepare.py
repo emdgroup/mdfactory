@@ -226,6 +226,21 @@ def test_csv_restraint_columns_per_row(tmp_path, protein_pdb):
     )
 
 
+def test_csv_com_restraint_selections_are_a_semicolon_pair(protein_pdb):
+    row = _proteinbox_row(
+        protein_pdb,
+        **{
+            "system.protein.restraints.dimer.type": "com_distance",
+            "system.protein.restraints.dimer.selections": "chainID A B ; chainID C D",
+            "system.protein.restraints.dimer.k": 500.0,
+            "system.protein.restraints.dimer.width": 0.2,
+        },
+    )
+    (dimer,) = BuildInput(**dict_to_nested_dict_with_species_prefix(row)).system.protein.restraints
+    assert dimer.selections == ("chainID A B", "chainID C D")
+    assert (dimer.k, dimer.width) == (500.0, 0.2)
+
+
 def test_csv_partial_restraint_is_a_row_error(protein_pdb):
     complete = _proteinbox_row(protein_pdb, **RESTRAINT_COLUMNS)
     partial = _proteinbox_row(protein_pdb, **{**RESTRAINT_COLUMNS, "system.protein.resname": "INS"})

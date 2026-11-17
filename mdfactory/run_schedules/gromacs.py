@@ -7,15 +7,15 @@ geometry, the force-field family's nonbonded scheme adds the nonbonded block,
 the :class:`~mdfactory.models.simulation_settings.SimulationSettings` add the
 state point, step counts and output intervals, and the per-stage GROMACS
 overrides are applied last. A protein's selection restraints then append their
-``-DPOSRES_<NAME>`` flags to the production ``define``. grompp is the validator
-of the result.
+``-DPOSRES_<NAME>`` flags to the production ``define`` and, for COM-distance
+restraints, the production pull block. grompp is the validator of the result.
 """
 
 from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from mdfactory import __version__
 from mdfactory.models.parametrization import PROTEIN_SIMULATION_TYPES
@@ -38,6 +38,10 @@ STAGE_FILES: dict[str, str] = {
     "npt": "npt.mdp",
     "production": "md.mdp",
 }
+
+#: Index file of a build with COM-distance restraints (default groups plus the
+#: pull groups). The stages pass it to grompp (``-n``) when it exists.
+INDEX_FILE = "index.ndx"
 
 #: Nonbonded block per scheme, identical in all four stages.
 #: charmm: CHARMM36/CGenFF force switch 1.0 -> 1.2 nm.
@@ -122,6 +126,7 @@ def render_stage(
     nonbonded_scheme: str,
     settings: SimulationSettings,
     restraint_macros: tuple[str, ...] = (),
+    pull_coordinates: tuple[PullCoordinate, ...] = (),
 ) -> dict[str, MdpValue | list[MdpValue]]:
     """Return the mdp parameters of one stage.
 
@@ -139,6 +144,10 @@ def render_stage(
         ``POSRES_<NAME>`` macros of the protein's selection restraints. The
         production ``define`` gets a ``-D<macro>`` flag for each, appended after
         the overrides, so a user ``define`` keeps them. Other stages ignore them.
+    pull_coordinates : tuple of PullCoordinate, optional
+        COM-distance restraints. The production stage gets their pull block,
+        after the overrides (the ``pull`` keys are build-owned while COM
+        restraints exist). Other stages ignore them.
 
     Returns
     -------
@@ -237,6 +246,9 @@ def render_stage(
     params = _apply_overrides(params, getattr(settings.gromacs_overrides, stage))
     if stage == "production" and restraint_macros:
         params = _append_defines(params, restraint_macros)
+    if stage == "production" and pull_coordinates:
+        interval = to_steps(settings.production.output_interval, timestep)
+        params = {**params, **_pull_block(pull_coordinates, interval)}
     return params
 
 
@@ -259,13 +271,90 @@ def _append_defines(params: dict[str, Any], macros: tuple[str, ...]) -> dict[str
     return {**params, key: " ".join([current, *flags] if current else flags)}
 
 
-def render_run_schedule(build_input: "BuildInput") -> dict[str, dict[str, Any]]:
+class PullCoordinate(NamedTuple):
+    """One COM-distance restraint as a GROMACS pull coordinate (geometry ``distance``)."""
+
+    #: Index group names of the two selections.
+    groups: tuple[str, str]
+    #: 1-based periodic reference atom of each group.
+    pbcatoms: tuple[int, int]
+    #: ``umbrella`` or ``flat-bottom``.
+    potential: str
+    #: Reference distance in nm (``pull-coord-init``).
+    init: float
+    #: Force constant in kJ mol^-1 nm^-2.
+    k: float
+
+
+def _pull_block(coordinates: tuple[PullCoordinate, ...], interval: int) -> dict[str, Any]:
+    """Return the pull-code mdp keys of the COM-distance restraints."""
+    block: dict[str, Any] = {
+        "pull": "yes",
+        "pull-ngroups": 2 * len(coordinates),
+        "pull-ncoords": len(coordinates),
+        "pull-pbc-ref-prev-step-com": "yes",
+        "pull-nstxout": interval,
+        "pull-nstfout": interval,
+    }
+    for i, coordinate in enumerate(coordinates):
+        for group, name, atom in zip(
+            (2 * i + 1, 2 * i + 2), coordinate.groups, coordinate.pbcatoms
+        ):
+            block[f"pull-group{group}-name"] = name
+            block[f"pull-group{group}-pbcatom"] = atom
+    for i, coordinate in enumerate(coordinates, 1):
+        block.update(
+            {
+                f"pull-coord{i}-type": coordinate.potential,
+                f"pull-coord{i}-geometry": "distance",
+                f"pull-coord{i}-groups": [2 * i - 1, 2 * i],
+                f"pull-coord{i}-dim": ["Y", "Y", "Y"],
+                f"pull-coord{i}-start": "no",
+                f"pull-coord{i}-init": coordinate.init,
+                f"pull-coord{i}-k": coordinate.k,
+            }
+        )
+    return block
+
+
+def _pull_coordinates(restraints, directory: Path) -> tuple[PullCoordinate, ...]:
+    """Return the pull coordinates of COM-distance restraints measured in *directory*."""
+    from mdfactory.setup.restraints import read_com_restraints, reference_distance
+
+    measured = read_com_restraints(directory)
+    coordinates = []
+    for restraint in restraints:
+        entry = measured.get(restraint.name)
+        if entry is None:
+            raise ValueError(
+                f"COM-distance restraint '{restraint.name}' is not in "
+                f"{directory}/com_restraints.json; rebuild the system."
+            )
+        coordinates.append(
+            PullCoordinate(
+                groups=tuple(entry["groups"]),
+                pbcatoms=tuple(entry["pbcatoms"]),
+                potential="umbrella" if restraint.width is None else "flat-bottom",
+                init=reference_distance(restraint, entry["measured_distance"]),
+                k=restraint.k,
+            )
+        )
+    return tuple(coordinates)
+
+
+def render_run_schedule(
+    build_input: "BuildInput", directory: Path | None = None
+) -> dict[str, dict[str, Any]]:
     """Return the mdp parameters of every stage of *build_input*.
 
     Parameters
     ----------
     build_input : BuildInput
         The build input; its simulation settings are resolved.
+    directory : Path, optional
+        Build directory (default: the working directory). Only read for
+        COM-distance restraints, whose measured distances it holds
+        (``com_restraints.json``).
 
     Returns
     -------
@@ -273,18 +362,22 @@ def render_run_schedule(build_input: "BuildInput") -> dict[str, dict[str, Any]]:
         Mapping of stage name to its mdp parameters.
 
     """
-    restraints = (
-        build_input.system.protein.restraints
-        if build_input.simulation_type in PROTEIN_SIMULATION_TYPES
-        else []
-    )
+    macros: tuple[str, ...] = ()
+    pull: tuple[PullCoordinate, ...] = ()
+    if build_input.simulation_type in PROTEIN_SIMULATION_TYPES:
+        protein = build_input.system.protein
+        macros = tuple(restraint.macro for restraint in protein.position_restraints)
+        if protein.com_restraints:
+            directory = Path.cwd() if directory is None else Path(directory)
+            pull = _pull_coordinates(protein.com_restraints, directory)
     return {
         stage: render_stage(
             stage,
             simulation_type=build_input.simulation_type,
             nonbonded_scheme=build_input.parametrization.nonbonded_scheme,
             settings=build_input.simulation_settings,
-            restraint_macros=tuple(restraint.macro for restraint in restraints),
+            restraint_macros=macros,
+            pull_coordinates=pull,
         )
         for stage in STAGES
     }
@@ -349,7 +442,7 @@ def write_mdp_files(
 
     """
     directory = Path.cwd() if directory is None else Path(directory)
-    schedule = render_run_schedule(build_input)
+    schedule = render_run_schedule(build_input, directory)
     written = {}
     for stage in stages:
         path = directory / STAGE_FILES[stage]

@@ -1,0 +1,39 @@
+# Insulin dimer (PDB 1ZNI, chains A-D; Amber ff14SB, GROMACS >= 2026) with selection-based
+# restraints in production. All chains number their residues from 1, so every selection
+# is qualified with chainID. NVT and NPT restrain every protein heavy atom (-DPOSRES) as usual.
+simulation_type: proteinbox
+engine: gromacs
+parametrization:
+  family: amber
+  protein: amber14sb
+  water_model: tip3p
+
+system:
+  protein:
+    resname: INS
+    count: 1
+    pdb_path: ./1zni.pdb
+    ignore_hydrogens: true
+    chains: [A, B, C, D]
+    restraints:
+      # Position restraint: anchor the C-alpha atoms of the A-chain helices.
+      - name: helices
+        selection: "chainID A C and name CA and resid 2:8 13:19"
+        k: 500.0 # kJ mol^-1 nm^-2
+      # COM distance (umbrella): keep the two insulin monomers (A+B, C+D) at the
+      # distance measured in the built system.
+      - name: dimer
+        type: com_distance
+        selections: ["chainID A B", "chainID C D"]
+        k: 1000.0 # kJ mol^-1 nm^-2
+      # COM distance (flat-bottom): chains A and B of the first monomer may move
+      # apart by up to 0.2 nm beyond their built distance before a force acts.
+      - name: monomer
+        type: com_distance
+        selections: ["chainID A", "chainID B"]
+        width: 0.2 # nm
+        k: 1000.0 # kJ mol^-1 nm^-2
+  padding: 12.0
+  ionization:
+    neutralize: true
+    concentration: 0.15

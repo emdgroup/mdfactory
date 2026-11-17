@@ -20,7 +20,7 @@ from .checkpoint import _detect_needed_stages_with_restart_info
 from .config import get_stage_config_or_none
 from .execution import _execute_stage_list, _validate_stage_prerequisites
 from .session import parsl_session
-from .stages import STAGE_BY_NAME, STAGE_REGISTRY
+from .stages import STAGE_BY_NAME, STAGE_REGISTRY, stage_index_file
 
 if TYPE_CHECKING:
     from .config import ExecutorConfig
@@ -393,6 +393,7 @@ def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[d
                         cpt_file=spec.prereq_cpt or "",
                         maxwarn=spec.maxwarn,
                         min_gmx_version=min_gmx_version,
+                        index_file=stage_index_file(Path(item["sim_dir"])),
                     )
                     _log_resolved_script(grompp_script, label="grompp")
 

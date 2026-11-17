@@ -110,7 +110,7 @@ def _update_directory(
     if updated.simulation_settings == current.simulation_settings:
         return SettingsUpdate(directory, "unchanged")
 
-    old, new = render_run_schedule(current), render_run_schedule(updated)
+    old, new = render_run_schedule(current, directory), render_run_schedule(updated, directory)
     changed = [stage for stage in STAGES if old[stage] != new[stage]]
     outputs = {stage: _stage_outputs(directory, stage) for stage in STAGES}
     blocked = {stage: outputs[stage] for stage in changed if outputs[stage]}

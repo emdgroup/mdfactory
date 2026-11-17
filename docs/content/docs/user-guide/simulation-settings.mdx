@@ -119,6 +119,8 @@ Keys that a typed setting or the build owns are rejected:
   `nstxtcout`);
 - from the build: the nonbonded block (`coulombtype`, `rcoulomb`, `vdwtype`, `rvdw`,
   `vdw-modifier`, `rvdw-switch`, `DispCorr`), `tc-grps`, `pcoupltype` and `compressibility`.
+- from a protein's [COM-distance restraints](/docs/user-guide/yaml-format#com-distance-restraints),
+  while it has any: every `pull*` key, in all stages.
 
 Everything else can be overridden, for example `pcoupl: C-rescale`, `tau-p`, `nstcalcenergy` or
 `define`. grompp validates the result when the stage runs (and, for protein systems, `em.mdp`
@@ -159,7 +161,9 @@ compressed coordinates only (no `.trr`) with `refcoord-scaling = com`.
 anchored at their positions at the start of the stage. For protein systems with
 [selection restraints](/docs/user-guide/yaml-format#position-restraints), production gets
 `define = -DPOSRES_<NAME> ...`, one flag per restraint, and no `-DPOSRES`. The flags are always
-appended after a production `define` override.
+appended after a production `define` override. COM-distance restraints add the `pull-*` block to production only,
+and every stage then runs `grompp -n index.ndx`, the index file with the pull groups that the
+build writes.
 
 <Callout type="info" title="Sage for lipids">
 OpenFF does not validate Sage for lipid bilayers. `openff` bilayer and LNP builds use the Sage

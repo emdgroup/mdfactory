@@ -207,6 +207,64 @@ class TestProteinSpecies:
         with pytest.raises(ValueError, match=match):
             ProteinSpecies(resname="LYZ", pdb_path=protein_pdb, restraints=[entry])
 
+    def test_com_distance_restraint(self, protein_pdb):
+        spec = ProteinSpecies(
+            resname="INS",
+            pdb_path=protein_pdb,
+            restraints=[
+                {"name": "core", "selection": "name CA", "k": 1000.0},
+                {
+                    "name": "dimer",
+                    "type": "com_distance",
+                    "selections": ["chainID A B", " chainID C D "],
+                    "k": 500.0,
+                    "width": 0.2,
+                },
+            ],
+        )
+        core, dimer = spec.restraints
+        assert spec.position_restraints == [core] and spec.com_restraints == [dimer]
+        assert dimer.selections == ("chainID A B", "chainID C D")
+        assert (dimer.width, dimer.distance) == (0.2, None)
+        assert dimer.group_names == ("COM_DIMER_1", "COM_DIMER_2")
+
+    @pytest.mark.parametrize(
+        ("restraint", "match"),
+        [
+            ({"selections": ["chainID A"]}, "selections.1\n  Field required"),
+            ({"selections": ["chainID A", "chainID B", "chainID C"]}, "at most 2 items"),
+            ({"selections": ["chainID A", ""]}, "at least 1 character"),
+            ({"width": 0.0}, "greater than 0"),
+            ({"distance": -1.0}, "greater than 0"),
+            ({"k": 0}, "greater than 0"),
+            ({"radius": 0.3}, "Extra inputs are not permitted"),
+            ({"selection": "name CA"}, "Extra inputs are not permitted"),
+        ],
+    )
+    def test_rejects_invalid_com_restraint(self, protein_pdb, restraint, match):
+        entry = {
+            "name": "dimer",
+            "type": "com_distance",
+            "selections": ["chainID A", "chainID B"],
+            "k": 500.0,
+            **restraint,
+        }
+        with pytest.raises(ValueError, match=match):
+            ProteinSpecies(resname="INS", pdb_path=protein_pdb, restraints=[entry])
+
+    def test_restraint_names_unique_across_kinds(self, protein_pdb):
+        entries = [
+            {"name": "dimer", "selection": "name CA", "k": 1000.0},
+            {
+                "name": "Dimer",
+                "type": "com_distance",
+                "selections": ["resid 1", "resid 2"],
+                "k": 1.0,
+            },
+        ]
+        with pytest.raises(ValueError, match="not unique"):
+            ProteinSpecies(resname="INS", pdb_path=protein_pdb, restraints=entries)
+
     def test_rejects_restraint_names_equal_ignoring_case(self, protein_pdb):
         entries = [
             {"name": "core", "selection": "name CA", "k": 1000.0},
@@ -330,6 +388,24 @@ class TestProteinInput:
             )
         )
         assert len({plain.hash, restrained.hash, softer.hash}) == 3
+
+    @pytest.mark.parametrize("stage", ["production", "nvt"])
+    def test_pull_overrides_rejected_with_com_restraints(self, sim_type, protein_pdb, stage):
+        com = {
+            "name": "dimer",
+            "type": "com_distance",
+            "selections": ["resid 1:5", "resid 10:15"],
+            "k": 500.0,
+        }
+        overrides = {"simulation_settings": {"gromacs_overrides": {stage: {"Pull_nstxout": 10}}}}
+        with pytest.raises(ValueError, match="pull-code keys"):
+            BuildInput(
+                **protein_input_data(
+                    sim_type, protein_pdb, protein={"restraints": [com]}, **overrides
+                )
+            )
+        # Without a COM restraint the pull keys stay free.
+        BuildInput(**protein_input_data(sim_type, protein_pdb, **overrides))
 
     def test_merge_all_without_declared_chains_allowed(self, sim_type, protein_pdb):
         data = protein_input_data(
@@ -1144,9 +1220,9 @@ def test_prepare_protein_applies_restraints_to_pdb2gmx_output(tmp_path, monkeypa
 
     def fake_apply(params, restraints, reference_pdb):
         calls.append((params.topology_file.name, restraints, reference_pdb))
-        return "restrained"
+        return "restrained", {"groups": "resolved"}
 
-    monkeypatch.setattr("mdfactory.setup.restraints.apply_position_restraints", fake_apply)
+    monkeypatch.setattr("mdfactory.setup.restraints.apply_restraints", fake_apply)
     monkeypatch.chdir(tmp_path)
     species = ProteinSpecies(
         resname="LYZ",
@@ -1156,7 +1232,7 @@ def test_prepare_protein_applies_restraints_to_pdb2gmx_output(tmp_path, monkeypa
 
     result = _prepare_protein(species, CharmmParametrization().resolve("proteinbox"))
 
-    assert result == "restrained"
+    assert result == ("restrained", {"groups": "resolved"})
     assert calls == [("topol.top", species.restraints, Path("cleaned.pdb"))]
 
 

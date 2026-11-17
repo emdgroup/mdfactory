@@ -2,6 +2,7 @@
 # ABOUTME: Checks files, orchestration contract, settings propagation, nonbonded table, invariants
 """Tests for :mod:`mdfactory.run_schedules`."""
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +17,7 @@ from mdfactory.models.parametrization import (
     OpenFFParametrization,
 )
 from mdfactory.models.simulation_settings import STAGES, SimulationSettings
-from mdfactory.models.species import PositionRestraint
+from mdfactory.models.species import ComDistanceRestraint, PositionRestraint, ProteinSpecies
 from mdfactory.orchestration.mdp import apply_rescue_tier, get_mdp_value, parse_mdp
 from mdfactory.orchestration.simulate import _missing_build_files
 from mdfactory.orchestration.stages import STAGE_REGISTRY
@@ -50,7 +51,9 @@ def _inp(simulation_type, family=CharmmParametrization, restraints=(), **setting
         simulation_type=simulation_type,
         parametrization=family().resolve(simulation_type),
         simulation_settings=SimulationSettings(**settings).resolve(simulation_type),
-        system=SimpleNamespace(protein=SimpleNamespace(restraints=list(restraints))),
+        system=SimpleNamespace(
+            protein=ProteinSpecies(resname="LYZ", pdb_path="lyz.pdb", restraints=list(restraints))
+        ),
     )
 
 
@@ -367,6 +370,87 @@ def test_restraint_flags_follow_a_user_define(tmp_path, key):
     assert values["define"].split() == ["-DFLEXIBLE", "-DPOSRES_CORE", "-DPOSRES_LOOP"]
     assert stages["nvt"]["define"] == "-DPOSRES_X"
     assert stages["npt"]["define"] == "-DPOSRES"
+
+
+COM = [
+    ComDistanceRestraint(
+        name="dimer", type="com_distance", selections=("chainID A", "chainID B"), k=500.0
+    ),
+    ComDistanceRestraint(
+        name="tail",
+        type="com_distance",
+        selections=("chainID A and resid 1", "chainID B and resid 30"),
+        k=800.0,
+        width=0.25,
+        distance=1.0,
+    ),
+]
+MEASURED = {
+    "dimer": {
+        "groups": ["COM_DIMER_1", "COM_DIMER_2"],
+        "pbcatoms": [12, 340],
+        "measured_distance": 2.1,
+    },
+    "tail": {
+        "groups": ["COM_TAIL_1", "COM_TAIL_2"],
+        "pbcatoms": [3, 400],
+        "measured_distance": 1.4,
+    },
+}
+
+
+def _measured(directory):
+    directory.mkdir(exist_ok=True)
+    (directory / "com_restraints.json").write_text(json.dumps(MEASURED))
+    return directory
+
+
+@pytest.mark.parametrize("simulation_type", PROTEIN_TYPES)
+def test_com_restraints_add_the_pull_block_to_production(tmp_path, simulation_type):
+    restrained = _written(_measured(tmp_path / "r"), simulation_type, restraints=COM)
+    (tmp_path / "p").mkdir()
+    plain = _written(tmp_path / "p", simulation_type)
+    for stage in ("minimization", "nvt", "npt"):
+        assert restrained[stage] == plain[stage], stage
+    pull = {k: v for k, v in restrained["production"].items() if k not in plain["production"]}
+    assert pull == {
+        "pull": "yes",
+        "pull_ngroups": "4",
+        "pull_ncoords": "2",
+        "pull_pbc_ref_prev_step_com": "yes",
+        "pull_nstxout": "5000",
+        "pull_nstfout": "5000",
+        "pull_group1_name": "COM_DIMER_1",
+        "pull_group1_pbcatom": "12",
+        "pull_group2_name": "COM_DIMER_2",
+        "pull_group2_pbcatom": "340",
+        "pull_group3_name": "COM_TAIL_1",
+        "pull_group3_pbcatom": "3",
+        "pull_group4_name": "COM_TAIL_2",
+        "pull_group4_pbcatom": "400",
+        "pull_coord1_type": "umbrella",
+        "pull_coord1_geometry": "distance",
+        "pull_coord1_groups": "1 2",
+        "pull_coord1_dim": "Y Y Y",
+        "pull_coord1_start": "no",
+        "pull_coord1_init": "2.1",
+        "pull_coord1_k": "500.0",
+        "pull_coord2_type": "flat-bottom",
+        "pull_coord2_geometry": "distance",
+        "pull_coord2_groups": "3 4",
+        "pull_coord2_dim": "Y Y Y",
+        "pull_coord2_start": "no",
+        "pull_coord2_init": "1.25",  # explicit distance + width
+        "pull_coord2_k": "800.0",
+    }
+
+
+def test_com_restraints_need_the_build_measurement(tmp_path):
+    with pytest.raises(FileNotFoundError, match="com_restraints.json"):
+        write_mdp_files(_inp("proteinbox", restraints=COM), tmp_path)
+    (tmp_path / "com_restraints.json").write_text(json.dumps({"dimer": MEASURED["dimer"]}))
+    with pytest.raises(ValueError, match="'tail' is not in"):
+        write_mdp_files(_inp("proteinbox", restraints=COM), tmp_path)
 
 
 def test_restraints_ignored_for_non_protein_types(tmp_path):

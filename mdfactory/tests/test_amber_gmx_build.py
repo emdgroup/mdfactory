@@ -22,13 +22,18 @@ from mdfactory.models.parametrization import (
     OpenFFParametrization,
 )
 from mdfactory.models.simulation_settings import SimulationSettings
-from mdfactory.models.species import PositionRestraint, SingleMoleculeSpecies, SolutionSpecies
+from mdfactory.models.species import (
+    PositionRestraint,
+    ProteinSpecies,
+    SingleMoleculeSpecies,
+    SolutionSpecies,
+)
 from mdfactory.orchestration.stages import STAGE_REGISTRY
 from mdfactory.parametrize import NativeForceField, resolve_parametrizer
 from mdfactory.run_schedules import write_mdp_files
 from mdfactory.settings import settings
 from mdfactory.setup import protein
-from mdfactory.setup.restraints import apply_position_restraints
+from mdfactory.setup.restraints import apply_restraints
 from mdfactory.utils.setup_utilities import topology_atom_names
 
 # Lys1-Val2-Phe3 heavy atoms from PDB 1AKI (hen egg-white lysozyme).
@@ -82,12 +87,15 @@ pytestmark = pytest.mark.skipif(GMX is None, reason="needs GROMACS >= 2026")
 def _grompp_all_stages(build_dir: Path, structure: Path, topology: Path) -> None:
     """Run grompp on every generated stage within the stage's ``maxwarn``.
 
-    As in the orchestration, every stage gets ``-r`` equal to ``-c``; the stages
-    after EM start from the build structure, which is enough for grompp's checks.
+    As in the orchestration, every stage gets ``-r`` equal to ``-c`` and, when
+    the build wrote one, ``-n index.ndx``; the stages after EM start from the
+    build structure, which is enough for grompp's checks.
     """
+    index = ["-n", "index.ndx"] if (build_dir / "index.ndx").is_file() else []
     for spec in STAGE_REGISTRY:
         cmd = [str(GMX), "grompp", "-f", spec.mdp_file, "-c", str(structure), "-r", str(structure)]
         cmd += ["-p", str(topology), "-o", f"{spec.deffnm}.tpr", "-po", f"{spec.deffnm}_out.mdp"]
+        cmd += index
         cmd += ["-maxwarn", str(spec.maxwarn)]
         result = subprocess.run(cmd, cwd=build_dir, capture_output=True, text=True, check=False)
         assert result.returncode == 0, f"{spec.name}:\n{result.stdout}\n{result.stderr}"
@@ -139,7 +147,7 @@ def test_amber_sage_composite_topology_passes_grompp_build(tmp_path, monkeypatch
             k=800.0,
         ),
     ]
-    params = apply_position_restraints(params, restraints, pdb)
+    params, _ = apply_restraints(params, restraints, pdb)
     ff_name = protein.bundle_forcefield_into_topology(params.topology_file)
     assert ff_name == "amber14sb.ff"
     ff_dir = params.topology_file.parent / ff_name
@@ -182,7 +190,9 @@ def test_amber_sage_composite_topology_passes_grompp_build(tmp_path, monkeypatch
         simulation_type="protein_mixedbox",
         parametrization=spec,
         simulation_settings=SimulationSettings().resolve("protein_mixedbox"),
-        system=SimpleNamespace(protein=SimpleNamespace(restraints=restraints)),
+        system=SimpleNamespace(
+            protein=ProteinSpecies(resname="PEP", pdb_path=pdb, restraints=restraints)
+        ),
     )
     write_mdp_files(inp, build_dir)
     for itp in ("posre_backbone_Protein_chain_A.itp", "posre_tail_Protein_chain_A.itp"):
@@ -316,7 +326,7 @@ def test_chain_qualified_restraints_on_real_insulin_build(tmp_path, merge_all):
             k=1000.0,
         ),
     ]
-    params = apply_position_restraints(params, restraints, cleaned)
+    params, _ = apply_restraints(params, restraints, cleaned)
 
     out = params.topology_file.parent
     chain_b, chain_d = (
@@ -378,4 +388,34 @@ def test_restrained_proteinbox_example_build(tmp_path, monkeypatch):
         assert (tmp_path / f"posre_{name}_Protein_chain_A.itp").is_file()
     md = (tmp_path / "md.mdp").read_text()
     assert "-DPOSRES_HELICES -DPOSRES_LOOP" in md
+    _grompp_all_stages(tmp_path, tmp_path / "system.pdb", tmp_path / "topology.top")
+
+
+@needs_example_pdbs
+def test_com_restrained_insulin_example_build(tmp_path, monkeypatch):
+    """Position and COM-distance restraints build; every stage preprocesses with -n."""
+    import yaml
+
+    from mdfactory.build import build_proteinbox
+    from mdfactory.models.input import BuildInput
+    from mdfactory.orchestration.mdp import get_mdp_value, parse_mdp
+    from mdfactory.prepare import resolve_protein_pdb_path
+
+    data = yaml.safe_load((EXAMPLES / "insulin_restraints.yaml").read_text())
+    resolve_protein_pdb_path(data, EXAMPLES)
+    data["system"]["relax_steps"] = 200
+    inp = BuildInput(**data)
+    monkeypatch.chdir(tmp_path)
+
+    build_proteinbox(inp)
+
+    index = (tmp_path / "index.ndx").read_text()
+    for group in ("Protein", "non-Protein", "COM_DIMER_1", "COM_DIMER_2", "COM_MONOMER_1"):
+        assert f"[ {group} ]" in index
+    measured = json.loads((tmp_path / "com_restraints.json").read_text())
+    md = parse_mdp(tmp_path / "md.mdp")
+    assert get_mdp_value(md, "define") == "-DPOSRES_HELICES"
+    assert get_mdp_value(md, "pull_coord2_type") == "flat-bottom"
+    init = float(get_mdp_value(md, "pull_coord2_init"))
+    assert init == pytest.approx(measured["monomer"]["measured_distance"] + 0.2, abs=1e-6)
     _grompp_all_stages(tmp_path, tmp_path / "system.pdb", tmp_path / "topology.top")

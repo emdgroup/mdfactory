@@ -1093,6 +1093,7 @@ def validate_with_grompp(
     cwd: Path,
     allow_net_charge: bool = False,
     reference: Path | None = None,
+    index: Path | None = None,
 ) -> None:
     """Run gmx grompp as a validation check for topology/coordinate consistency.
 
@@ -1113,6 +1114,9 @@ def validate_with_grompp(
     reference : Path, optional
         Position-restraint reference structure passed as ``-r``, for an mdp
         that switches restraints on. Default is None (no ``-r``).
+    index : Path, optional
+        Index file passed as ``-n``, for an mdp that uses its groups (pull
+        groups). Default is None (grompp's default groups).
 
     Raises
     ------
@@ -1139,6 +1143,8 @@ def validate_with_grompp(
     ]
     if reference is not None:
         cmd += ["-r", str(reference)]
+    if index is not None:
+        cmd += ["-n", str(index)]
     # A single grompp call: gmx_mpi aborts through MPI on failure, which can take
     # down an enclosing srun step, so never rely on a failing first attempt.
     try:

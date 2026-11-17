@@ -178,7 +178,7 @@ to override individual components. See [Parametrization](/docs/user-guide/parame
 | `system.protein.protonation_states.<RESIDUE>` | string | One column per residue, e.g. `system.protein.protonation_states.HIS15` = `HIE` |
 | `system.protein.ignore_hydrogens` | bool | Ignore hydrogens in the input structure (default `true`) |
 | `system.protein.merge_all` | bool | Merge all chains into one molecule (default `false`) |
-| `system.protein.restraints.<NAME>.<property>` | any | One column per property of the restraint `<NAME>`: `selection`, `type`, `k`, `radius` |
+| `system.protein.restraints.<NAME>.<property>` | any | One column per property of the restraint `<NAME>`: `selection`, `type`, `k`, `radius`; for `com_distance`: `selections` (`;`-separated pair), `k`, `width`, `distance` |
 
 #### Position restraints
 
@@ -196,7 +196,13 @@ proteinbox,...,INS,1zni.pdb,A;B;C;D,chainID A C and name CA,500.0,chainID B D an
 ```
 
 The first row has no restraints. The second has a harmonic `anchor` (the default `type`) and a
-flat-bottom `tail`.
+flat-bottom `tail`. The example file also gives the second row a COM-distance restraint `dimer`,
+whose two selections share one cell, separated by `;`:
+
+```csv
+...,system.protein.restraints.dimer.type,system.protein.restraints.dimer.selections,system.protein.restraints.dimer.k,...
+...,com_distance,chainID A B;chainID C D,1000.0,...
+```
 
 ### Simulation settings (optional)
 

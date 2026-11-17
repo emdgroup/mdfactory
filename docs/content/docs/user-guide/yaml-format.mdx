@@ -361,7 +361,7 @@ See the [protein tutorial](/docs/user-guide/tutorial-protein-mixedbox) for a wal
 | `disulfide_bonds` | `[]` | Pairs of residues, e.g. `[[CYS6, CYS127]]`; chain-qualified (`A:CYS6`) is allowed |
 | `protonation_states` | `{}` | Residue to state, e.g. `HIS15: HIE`. CHARMM translates `HID/HIE/HIP/LYN` to `HSD/HSE/HSP/LSN` |
 | `ignore_hydrogens` | `true` | Passes `-ignh` to `pdb2gmx` |
-| `restraints` | `[]` | Selection-based position restraints for production, see [below](#position-restraints) |
+| `restraints` | `[]` | Selection-based position and COM-distance restraints for production, see [below](#position-restraints) |
 
 `pdb2gmx` needs GROMACS on `PATH` (or `[gromacs] GMX_PATH`), and `parametrization.protein:
 amber14sb` needs GROMACS 2026 or later.
@@ -445,6 +445,56 @@ flags combine with a `define` override. Restraints are part of the system and en
 `apply-settings` re-renders the mdp files only, so restraints cannot be added to an existing
 build.
 
+### COM-distance restraints
+
+A `com_distance` entry of the same `restraints` list restrains the distance between the centres
+of mass of two selections, for example two chains or subunits. Their relative arrangement is kept
+while their internal motion stays free. It also applies in production only.
+
+```yaml
+restraints:
+  - name: dimer
+    type: com_distance
+    selections: ["chainID A B", "chainID C D"]
+    k: 1000.0          # kJ mol^-1 nm^-2
+  - name: monomer
+    type: com_distance
+    selections: ["chainID A", "chainID B"]
+    width: 0.2         # nm
+    k: 1000.0
+```
+
+| Key | Default | Notes |
+|---|---|---|
+| `name` | – | Required, as for position restraints; names are unique across both kinds |
+| `type` | – | Required: `com_distance` |
+| `selections` | – | Required. Exactly two MDAnalysis selections, evaluated like a position restraint's `selection`. The two groups must not share atoms |
+| `k` | – | Required. Force constant on the COM distance in kJ mol⁻¹ nm⁻², greater than 0 |
+| `width` | – | Optional, nm. Makes the potential flat-bottom, see below |
+| `distance` | measured | Optional reference distance in nm. By default it is the distance measured in the built `system.pdb` |
+
+The build turns each entry into a GROMACS pull coordinate with `geometry = distance`. Centres of
+mass are mass-weighted and taken under periodic boundary conditions (minimum image):
+
+- without `width`: an umbrella (harmonic) potential around the reference distance;
+- with `width`: a flat-bottom potential with no force while the distance stays below reference +
+  `width`, and a harmonic force with constant `k` beyond it. The groups can come closer freely and
+  separate by at most `width` before a force acts.
+
+**What the build writes.** `index.ndx` holds the default groups of `gmx make_ndx` plus two groups
+per restraint, `COM_<NAME>_1` and `COM_<NAME>_2`. `com_restraints.json` records the groups, each
+group's periodic reference atom (the atom closest to its centre of mass) and the measured
+distance. The production mdp gets the `pull-*` block from these files, and every stage runs
+`grompp -n index.ndx`. While a COM-distance restraint exists, the `pull*` keys are owned by the
+build and rejected in `gromacs_overrides`.
+
+The pull distance (reference + `width`) must stay below 0.49 times the shortest box edge, the
+GROMACS limit for `geometry = distance`; otherwise the build fails. Increase `padding` for
+distant groups.
+
+`examples/proteinbox/insulin_restraints.yaml` combines a position restraint with an umbrella and a
+flat-bottom COM-distance restraint on the insulin dimer.
+
 ## Compounds used in docs YAML examples
 
 The YAML examples on this page use these repository compounds:
@@ -481,8 +531,10 @@ Spelling out a default does not change the hash, but any change of the system, t
 - Bilayer odd lipid counts when `monolayer: false`
 - `protein_mixedbox`: a species with both or neither of `count`/`concentration`, a `fraction`, or `merge_all` together with `chains`
 - A box that is smaller than the protein extent plus 2 × `padding`
-- A restraint with a `radius` and `type: harmonic`, or without one and `type: flat_bottom`; two
-  restraint names that differ only in case
+- A restraint with a `radius` and `type: harmonic`, or without one and `type: flat_bottom`; a
+  `com_distance` restraint without exactly two `selections`; two restraint names that differ
+  only in case
+- `pull*` keys in `gromacs_overrides` while a `com_distance` restraint exists
 - `parametrization` family that does not fit the system type (for example `amber` for `mixedbox`)
 - LNP `radius <= shell_thickness`
 

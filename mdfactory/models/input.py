@@ -19,7 +19,7 @@ from .composition import (
     ProteinMixedBoxComposition,
 )
 from .parametrization import PROTEIN_SIMULATION_TYPES, ParametrizationSpec, SimulationType
-from .simulation_settings import SimulationSettings
+from .simulation_settings import STAGES, SimulationSettings, normalize_mdp_key
 
 # Map system_type to the corresponding model class
 # TODO: StrEnum?
@@ -268,6 +268,28 @@ class BuildInput(BaseModel):
                 "protein.chains declares subunits to build as separate moleculetypes, but "
                 "system.protein.merge_all merges all chains into one. Set "
                 "merge_all=false to keep per-chain subunits, or drop protein.chains to merge."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def reject_pull_overrides_with_com_restraints(self) -> "BuildInput":
+        """Reject ``pull*`` overrides: COM-distance restraints own the pull code."""
+        if self.simulation_type not in PROTEIN_SIMULATION_TYPES:
+            return self
+        if not self.system.protein.com_restraints:
+            return self
+        overrides = self.simulation_settings.gromacs_overrides
+        owned = [
+            f"{stage}.{key}"
+            for stage in STAGES
+            for key in getattr(overrides, stage)
+            if normalize_mdp_key(key).startswith("pull")
+        ]
+        if owned:
+            raise ValueError(
+                f"gromacs_overrides {owned} set pull-code keys, which the protein's "
+                "COM-distance restraints own. Remove them, or express the restraint as a "
+                "com_distance entry of system.protein.restraints."
             )
         return self
 

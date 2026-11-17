@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from ..run_schedules.gromacs import STAGE_FILES
+from ..run_schedules.gromacs import INDEX_FILE, STAGE_FILES
 
 if TYPE_CHECKING:
     from parsl import AppFuture
@@ -183,6 +183,15 @@ def _extract_resource_hints(stage_config: Any) -> ResourceHints:
     return ResourceHints(ntasks=ntasks, disable_gpu=disable_gpu, gmx_binary=gmx_binary)
 
 
+def stage_index_file(sim_dir: Path) -> str:
+    """Return the index file the stages pass to grompp (``-n``), or ``""`` without one.
+
+    The build writes ``index.ndx`` only for COM-distance restraints; it holds the
+    default groups plus the pull groups.
+    """
+    return INDEX_FILE if (Path(sim_dir) / INDEX_FILE).is_file() else ""
+
+
 def run_stage(
     spec: StageSpec,
     sim_dir: Path,
@@ -272,6 +281,10 @@ def run_stage(
     min_gmx_version = min_gmx_version_for_topology(Path(sim_dir) / "topology.top")
     if min_gmx_version is not None:
         grompp_kwargs["min_gmx_version"] = min_gmx_version
+    # Builds with COM-distance restraints write an index file with the pull groups.
+    index_file = stage_index_file(sim_dir)
+    if index_file:
+        grompp_kwargs["index_file"] = index_file
 
     grompp_fut = grompp_app(**grompp_kwargs)
 

@@ -1593,6 +1593,31 @@ def test_run_stage_grompp_inputs(tmp_path, stage, gro_in, cpt_file):
     assert call_kwargs.get("cpt_file") == cpt_file
 
 
+@pytest.mark.parametrize("has_index", [False, True])
+def test_run_stage_passes_index_file_when_the_build_wrote_one(tmp_path, has_index):
+    """Builds with COM-distance restraints write index.ndx; every stage then passes -n."""
+    from mdfactory.orchestration.stages import STAGE_REGISTRY, run_stage
+
+    if has_index:
+        (tmp_path / "index.ndx").write_text("[ System ]\n1\n")
+    for spec in STAGE_REGISTRY:
+        grompp_app = MagicMock(return_value=MagicMock())
+        run_stage(spec, tmp_path, None, grompp_app, MagicMock(return_value=MagicMock()))
+        assert grompp_app.call_args[1].get("index_file") == ("index.ndx" if has_index else None)
+
+
+def test_build_grompp_script_index_flag():
+    from mdfactory.orchestration.apps import _build_grompp_script
+
+    with_index = _build_grompp_script(
+        "md.mdp", "npt.gro", "topology.top", "prod.tpr", "/sim", index_file="index.ndx"
+    )
+    assert " -n index.ndx " in with_index
+    assert " -n " not in _build_grompp_script(
+        "md.mdp", "npt.gro", "topology.top", "prod.tpr", "/sim"
+    )
+
+
 def test_stage_spec_has_no_separate_reference():
     """The -r reference is always the -c input; StageSpec has no field for another one."""
     from dataclasses import fields
