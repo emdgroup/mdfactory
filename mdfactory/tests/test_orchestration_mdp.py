@@ -118,7 +118,6 @@ class TestApplyRescueTier:
             cpt_file="min.cpt",
             prereq_cpt=None,
             traj_files=(),
-            ref_file=None,
             maxwarn=1,
             supports_pme_gpu=False,
         )
@@ -143,7 +142,6 @@ class TestApplyRescueTier:
             cpt_file="min.cpt",
             prereq_cpt=None,
             traj_files=(),
-            ref_file=None,
             maxwarn=1,
             supports_pme_gpu=False,
         )
@@ -166,7 +164,6 @@ class TestApplyRescueTier:
             cpt_file="nvt.cpt",
             prereq_cpt=None,
             traj_files=(),
-            ref_file="min.gro",
             maxwarn=1,
             supports_pme_gpu=True,
         )
@@ -198,7 +195,6 @@ class TestApplyRescueTier:
             cpt_file="min.cpt",
             prereq_cpt=None,
             traj_files=(),
-            ref_file=None,
             maxwarn=1,
             supports_pme_gpu=False,
         )

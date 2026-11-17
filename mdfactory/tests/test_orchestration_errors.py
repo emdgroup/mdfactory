@@ -108,7 +108,6 @@ class TestClassifyFailure:
             cpt_file="min.cpt",
             prereq_cpt=None,
             traj_files=(),
-            ref_file=None,
             maxwarn=1,
             supports_pme_gpu=False,
         )

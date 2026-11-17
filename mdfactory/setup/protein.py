@@ -1087,7 +1087,13 @@ def _grompp_warnings(output: str) -> list[str]:
 
 
 def validate_with_grompp(
-    topology: Path, structure: Path, mdp: Path, cwd: Path, allow_net_charge: bool = False
+    topology: Path,
+    structure: Path,
+    mdp: Path,
+    cwd: Path,
+    allow_net_charge: bool = False,
+    reference: Path | None = None,
+    index: Path | None = None,
 ) -> None:
     """Run gmx grompp as a validation check for topology/coordinate consistency.
 
@@ -1105,6 +1111,12 @@ def validate_with_grompp(
         Accept grompp's warning about Ewald electrostatics in a system with net
         charge, for builds that deliberately skip neutralization. Any other
         warning still fails validation. Default is False.
+    reference : Path, optional
+        Position-restraint reference structure passed as ``-r``, for an mdp
+        that switches restraints on. Default is None (no ``-r``).
+    index : Path, optional
+        Index file passed as ``-n``, for an mdp that uses its groups (pull
+        groups). Default is None (grompp's default groups).
 
     Raises
     ------
@@ -1129,6 +1141,10 @@ def validate_with_grompp(
         "-maxwarn",
         str(1 if allow_net_charge else 0),
     ]
+    if reference is not None:
+        cmd += ["-r", str(reference)]
+    if index is not None:
+        cmd += ["-n", str(index)]
     # A single grompp call: gmx_mpi aborts through MPI on failure, which can take
     # down an enclosing srun step, so never rely on a failing first attempt.
     try:

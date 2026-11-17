@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from ..run_schedules.gromacs import STAGE_FILES
+from ..run_schedules.gromacs import INDEX_FILE, STAGE_FILES
 
 if TYPE_CHECKING:
     from parsl import AppFuture
@@ -31,7 +31,8 @@ class StageSpec:
     mdp_file : str
         MDP parameter file name (e.g. ``"em.mdp"``).
     gro_in : str
-        Input structure file for ``gmx grompp -c`` (e.g. ``"system.pdb"``).
+        Input structure file for ``gmx grompp -c`` (e.g. ``"system.pdb"``),
+        also passed as the position-restraint reference ``-r``.
     gro_out : str
         Expected output ``.gro`` file; empty string when the stage writes a
         trajectory instead (Production stage).
@@ -46,9 +47,6 @@ class StageSpec:
     traj_files : tuple of str
         Accepted trajectory output files checked after mdrun — non-empty only
         for the Production stage: ``("prod.xtc", "prod.trr")``.
-    ref_file : str or None
-        Reference structure for ``gmx grompp -r`` (position restraints).
-        ``None`` when no position restraints are used.
     maxwarn : int
         Maximum grompp warnings to allow (``-maxwarn``).
     supports_pme_gpu : bool
@@ -66,7 +64,6 @@ class StageSpec:
     cpt_file: str
     prereq_cpt: "str | None"
     traj_files: "tuple[str, ...]"
-    ref_file: "str | None"
     maxwarn: int
     supports_pme_gpu: bool
 
@@ -83,7 +80,6 @@ STAGE_REGISTRY: list[StageSpec] = [
         cpt_file="min.cpt",
         prereq_cpt=None,
         traj_files=(),
-        ref_file=None,
         maxwarn=1,
         supports_pme_gpu=False,
     ),
@@ -97,7 +93,6 @@ STAGE_REGISTRY: list[StageSpec] = [
         cpt_file="nvt.cpt",
         prereq_cpt=None,
         traj_files=(),
-        ref_file="min.gro",
         maxwarn=1,
         supports_pme_gpu=True,
     ),
@@ -111,7 +106,6 @@ STAGE_REGISTRY: list[StageSpec] = [
         cpt_file="npt.cpt",
         prereq_cpt="nvt.cpt",
         traj_files=(),
-        ref_file="nvt.gro",
         maxwarn=2,
         supports_pme_gpu=True,
     ),
@@ -125,7 +119,6 @@ STAGE_REGISTRY: list[StageSpec] = [
         cpt_file="prod.cpt",
         prereq_cpt="npt.cpt",
         traj_files=("prod.xtc", "prod.trr"),
-        ref_file=None,
         maxwarn=2,
         supports_pme_gpu=True,
     ),
@@ -188,6 +181,15 @@ def _extract_resource_hints(stage_config: Any) -> ResourceHints:
     disable_gpu = gres is None or "gpu" not in str(gres).lower()
     gmx_binary = getattr(stage_config, "gmx_binary", "auto")
     return ResourceHints(ntasks=ntasks, disable_gpu=disable_gpu, gmx_binary=gmx_binary)
+
+
+def stage_index_file(sim_dir: Path) -> str:
+    """Return the index file the stages pass to grompp (``-n``), or ``""`` without one.
+
+    The build writes ``index.ndx`` only for COM-distance restraints; it holds the
+    default groups plus the pull groups.
+    """
+    return INDEX_FILE if (Path(sim_dir) / INDEX_FILE).is_file() else ""
 
 
 def run_stage(
@@ -270,8 +272,6 @@ def run_stage(
         "maxwarn": spec.maxwarn,
         "inputs": grompp_inputs,
     }
-    if spec.ref_file:
-        grompp_kwargs["ref_file"] = spec.ref_file
     if spec.prereq_cpt:
         grompp_kwargs["cpt_file"] = spec.prereq_cpt
     # Force fields that need a newer GROMACS (amber14sb) make grompp check the
@@ -281,6 +281,10 @@ def run_stage(
     min_gmx_version = min_gmx_version_for_topology(Path(sim_dir) / "topology.top")
     if min_gmx_version is not None:
         grompp_kwargs["min_gmx_version"] = min_gmx_version
+    # Builds with COM-distance restraints write an index file with the pull groups.
+    index_file = stage_index_file(sim_dir)
+    if index_file:
+        grompp_kwargs["index_file"] = index_file
 
     grompp_fut = grompp_app(**grompp_kwargs)
 

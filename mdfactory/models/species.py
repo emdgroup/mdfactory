@@ -7,9 +7,17 @@ import io
 import warnings
 from functools import cached_property
 from pathlib import Path
-from typing import Literal, NamedTuple, Optional
+from typing import Annotated, Literal, NamedTuple, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    StringConstraints,
+    Tag,
+    model_validator,
+)
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors
 
@@ -253,6 +261,137 @@ class LipidSpecies(SingleMoleculeSpecies):
     #     return u
 
 
+#: Restraint names whose ``POSRES_<NAME>`` macro pdb2gmx already uses.
+_RESERVED_RESTRAINT_NAMES = {"WATER"}
+
+#: Identifier of a restraint, unique within a protein (ignoring case).
+RestraintName = Annotated[
+    str,
+    Field(
+        pattern=r"^[A-Za-z][A-Za-z0-9_]*$",
+        description=(
+            "Identifier of the restraint, used for its file and group names. Unique "
+            "within a protein, ignoring case."
+        ),
+    ),
+]
+
+#: MDAnalysis selection evaluated on the pdb2gmx structure.
+Selection = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class PositionRestraint(BaseModel):
+    """A position restraint on the protein atoms matched by an MDAnalysis selection.
+
+    The build writes the restraint as a ``[ position_restraints ]`` include
+    guarded by ``#ifdef POSRES_<NAME>`` and adds ``-DPOSRES_<NAME>`` to the
+    production ``define``. The atoms are restrained to their positions in the
+    production starting structure.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: RestraintName
+    selection: Selection = Field(
+        ...,
+        description=(
+            "MDAnalysis selection of the restrained atoms, evaluated on the pdb2gmx "
+            "structure with the input chain IDs and residue numbers."
+        ),
+    )
+    type: Literal["harmonic", "flat_bottom"] = Field(
+        "harmonic",
+        description=(
+            "harmonic (GROMACS funct 1, isotropic) or flat_bottom (funct 2, a sphere "
+            "of the given radius)."
+        ),
+    )
+    k: float = Field(..., gt=0, description="Force constant in kJ mol^-1 nm^-2.")
+    radius: Optional[float] = Field(
+        None, gt=0, description="Flat-bottom sphere radius in nm (flat_bottom only)."
+    )
+
+    @model_validator(mode="after")
+    def check_radius_and_name(self) -> "PositionRestraint":
+        """Require ``radius`` for flat-bottom restraints only and reject reserved names."""
+        if self.type == "flat_bottom" and self.radius is None:
+            raise ValueError(f"Flat-bottom restraint '{self.name}' needs a 'radius' (nm).")
+        if self.type == "harmonic" and self.radius is not None:
+            raise ValueError(
+                f"Harmonic restraint '{self.name}' takes no 'radius'; "
+                "use type 'flat_bottom' for a flat-bottom sphere."
+            )
+        if self.name.upper() in _RESERVED_RESTRAINT_NAMES:
+            raise ValueError(
+                f"Restraint name '{self.name}' is reserved: pdb2gmx already defines "
+                f"POSRES_{self.name.upper()}."
+            )
+        return self
+
+    @property
+    def macro(self) -> str:
+        """Return the preprocessor macro that switches the restraint on."""
+        return f"POSRES_{self.name.upper()}"
+
+
+class ComDistanceRestraint(BaseModel):
+    """A restraint on the distance between the centres of mass of two atom selections.
+
+    The build writes both selections as index groups and adds a GROMACS pull
+    coordinate (``geometry = distance``) to the production stage: an umbrella
+    potential around the reference distance, or with ``width`` a flat-bottom
+    potential that only acts beyond reference + ``width``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: RestraintName
+    type: Literal["com_distance"]
+    selections: tuple[Selection, Selection] = Field(
+        ...,
+        description=(
+            "The two MDAnalysis selections whose centres of mass are restrained, "
+            "evaluated like a position restraint's selection."
+        ),
+    )
+    k: float = Field(
+        ..., gt=0, description="Force constant on the COM distance in kJ mol^-1 nm^-2."
+    )
+    width: Optional[float] = Field(
+        None,
+        gt=0,
+        description=(
+            "Flat-bottom width in nm: no force while the distance stays below the "
+            "reference distance + width. Omit for an umbrella (harmonic) potential."
+        ),
+    )
+    distance: Optional[float] = Field(
+        None,
+        gt=0,
+        description=(
+            "Reference distance in nm. Default: the distance measured in the built system."
+        ),
+    )
+
+    @property
+    def group_names(self) -> tuple[str, str]:
+        """Return the index group names of the two selections."""
+        return f"COM_{self.name.upper()}_1", f"COM_{self.name.upper()}_2"
+
+
+def _restraint_kind(value) -> str:
+    """Return the union tag of a restraint: ``com`` for COM distances, else ``position``."""
+    kind = value.get("type") if isinstance(value, dict) else getattr(value, "type", None)
+    return "com" if kind == "com_distance" else "position"
+
+
+#: One entry of ``ProteinSpecies.restraints``, told apart by ``type``.
+Restraint = Annotated[
+    Annotated[PositionRestraint, Tag("position")] | Annotated[ComDistanceRestraint, Tag("com")],
+    Discriminator(_restraint_kind),
+]
+
+
 class ProteinSpecies(Species):
     """Represent a protein species identified by a PDB structure file."""
 
@@ -295,6 +434,38 @@ class ProteinSpecies(Species):
     merge_all: bool = Field(
         False, description="Merge all chains into a single pdb2gmx moleculetype."
     )
+    restraints: list[Restraint] = Field(
+        default_factory=list,
+        description=(
+            "Selection-based restraints applied in the production stage: position "
+            "restraints (harmonic, flat_bottom) and COM-distance restraints "
+            "(com_distance). NVT and NPT keep pdb2gmx's heavy-atom restraints (-DPOSRES)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def check_unique_restraint_names(self) -> "ProteinSpecies":
+        """Reject restraints whose names differ only in case (they share file and group names)."""
+        seen: dict[str, str] = {}
+        for restraint in self.restraints:
+            previous = seen.get(restraint.name.upper())
+            if previous is not None:
+                raise ValueError(
+                    f"Restraint names '{previous}' and '{restraint.name}' are not unique "
+                    "(names are compared ignoring case)."
+                )
+            seen[restraint.name.upper()] = restraint.name
+        return self
+
+    @property
+    def position_restraints(self) -> list[PositionRestraint]:
+        """Return the harmonic and flat-bottom position restraints."""
+        return [r for r in self.restraints if isinstance(r, PositionRestraint)]
+
+    @property
+    def com_restraints(self) -> list[ComDistanceRestraint]:
+        """Return the COM-distance restraints."""
+        return [r for r in self.restraints if isinstance(r, ComDistanceRestraint)]
 
     @property
     def charge(self) -> int | None:

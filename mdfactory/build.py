@@ -748,7 +748,15 @@ def _prepare_protein(protein, spec):
     the chain/disulfide/protonation settings from the ``protein`` species. A
     force field that needs a minimum GROMACS version (amber14sb) is checked
     against the binary first, so an old GROMACS fails before any protein
-    preparation.
+    preparation. The protein's position restraints are written into the
+    pdb2gmx output, so every topology built from it includes them, and the
+    selections of its COM-distance restraints are resolved.
+
+    Returns
+    -------
+    tuple
+        The pdb2gmx parameter set and the resolved COM-distance groups
+        (:data:`~mdfactory.setup.restraints.ComGroups`).
     """
     from loguru import logger
 
@@ -758,6 +766,7 @@ def _prepare_protein(protein, spec):
         require_gmx_version,
         run_pdb2gmx,
     )
+    from .setup.restraints import apply_restraints
 
     gmx_bin = check_gmx_available()
     logger.info(f"Using GROMACS: {gmx_bin}")
@@ -776,7 +785,7 @@ def _prepare_protein(protein, spec):
         chains=protein.chains,
     )
     logger.info(f"pdb2gmx output: {params.structure_file}")
-    return params
+    return apply_restraints(params, protein.restraints, cleaned_pdb)
 
 
 def _copy_protein_topology(params, dest_dir: Path, topology_name: str) -> Path:
@@ -821,28 +830,46 @@ def _relax_protein_system(u, topology, itps, ff_dir_name, protein_indices, **rel
         )
 
 
-def _finalize_protein_build(inp, topology, extra_intermediates=()):
+def _finalize_protein_build(inp, topology, com_groups, extra_intermediates=()):
     """Write the run schedule, validate it with grompp, and drop build intermediates.
 
     The nonbonded block follows the family's nonbonded scheme, so Amber builds
-    get the Sage nonbonded settings. Cleanup only runs on success so a failed
-    build keeps its intermediates. ``solvated.pdb`` and ``relaxation/`` are left
-    in place, as in the bilayer build.
+    get the Sage nonbonded settings. COM-distance restraints are measured in
+    ``system.pdb`` first: their ``index.ndx`` and ``com_restraints.json`` feed
+    the production pull block. ``em.mdp`` is always validated; with restraints,
+    ``md.mdp`` (which switches them on) is validated too, with ``system.pdb`` as
+    the ``-r`` reference and the index file as ``-n``. Cleanup only runs on
+    success so a failed build keeps its intermediates. ``solvated.pdb`` and
+    ``relaxation/`` are left in place, as in the bilayer build.
     """
     from loguru import logger
 
     from .setup.protein import validate_with_grompp
+    from .setup.restraints import write_com_restraint_files
+
+    protein = inp.system.protein
+    structure = Path("system.pdb")
+    index = None
+    if protein.com_restraints:
+        index = write_com_restraint_files(
+            Path.cwd(), protein.com_restraints, com_groups, structure, topology
+        )
+        logger.info(f"COM-distance restraint groups written to {index.name}.")
 
     mdp_files = write_mdp_files(inp)
     logger.info("Run schedule written.")
 
-    validate_with_grompp(
+    validate = partial(
+        validate_with_grompp,
         topology,
-        Path("system.pdb"),
-        mdp_files["minimization"],
-        Path.cwd(),
+        structure,
+        cwd=Path.cwd(),
         allow_net_charge=not inp.system.ionization.neutralize,
+        index=index,
     )
+    validate(mdp_files["minimization"])
+    if protein.restraints:
+        validate(mdp_files["production"], reference=structure)
 
     for name in ("cleaned.pdb", "system_pre_relax.pdb", *extra_intermediates):
         Path(name).unlink(missing_ok=True)
@@ -860,7 +887,7 @@ def build_proteinbox(inp: BuildInput):
     if not isinstance(inp.system, ProteinBoxComposition):
         raise TypeError("System must specify a ProteinBoxComposition.")
 
-    params = _prepare_protein(inp.system.protein, inp.parametrization)
+    params, com_groups = _prepare_protein(inp.system.protein, inp.parametrization)
 
     # Center protein in a cubic box
     u = mda.Universe(str(params.structure_file))
@@ -897,7 +924,7 @@ def build_proteinbox(inp: BuildInput):
     u_relaxed.atoms.write("system.pdb")
     logger.info("Final system written to system.pdb")
 
-    _finalize_protein_build(inp, topology_dest.resolve())
+    _finalize_protein_build(inp, topology_dest.resolve(), com_groups)
     logger.info("Proteinbox build complete.")
 
 
@@ -1062,7 +1089,7 @@ def build_protein_mixedbox(inp: BuildInput):
     system = inp.system
     fixed_box = isinstance(system.sizing, FixedBoxSizing)
 
-    params = _prepare_protein(system.protein, inp.parametrization)
+    params, com_groups = _prepare_protein(system.protein, inp.parametrization)
 
     # Bundle the selected force field immediately. Native water/ion parameters
     # and small-molecule compatibility checks must use this exact directory
@@ -1277,5 +1304,7 @@ def build_protein_mixedbox(inp: BuildInput):
     Path("build_metadata.json").write_text(json.dumps(build_report, indent=2) + "\n")
     logger.info("Resolved counts and achieved concentrations written to build_metadata.json.")
 
-    _finalize_protein_build(inp, topology_dest, extra_intermediates=("topol_protein.top",))
+    _finalize_protein_build(
+        inp, topology_dest, com_groups, extra_intermediates=("topol_protein.top",)
+    )
     logger.info("Protein_mixedbox build complete.")

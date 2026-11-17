@@ -8,7 +8,11 @@ import pandas as pd
 import pytest
 
 from mdfactory.models.input import BuildInput
-from mdfactory.prepare import df_to_build_input_models, dict_to_nested_dict_with_species_prefix
+from mdfactory.prepare import (
+    df_to_build_input_models,
+    dict_to_nested_dict_with_species_prefix,
+    load_build_input_csv,
+)
 
 
 def test_row_to_nested_dict():
@@ -183,6 +187,73 @@ def test_df_to_models_allows_blank_optional_protein_fields(protein_pdb):
     assert models[1].system.protein.chains == ["A", "B"]
     assert models[1].system.protein.disulfide_bonds == []
     assert models[1].system.protein.protonation_states == {}
+
+
+RESTRAINT_COLUMNS = {
+    "system.protein.restraints.core.selection": "name CA",
+    "system.protein.restraints.core.k": 1000.0,
+    "system.protein.restraints.loop.selection": "chainID A and resid 5:8",
+    "system.protein.restraints.loop.type": "flat_bottom",
+    "system.protein.restraints.loop.radius": 0.3,
+    "system.protein.restraints.loop.k": 500.0,
+}
+
+
+def test_csv_restraint_columns_per_row(tmp_path, protein_pdb):
+    """Restraint columns become entries; a row with all of an entry's cells blank omits it."""
+    both = _proteinbox_row(protein_pdb, **RESTRAINT_COLUMNS)
+    core_only = _proteinbox_row(
+        protein_pdb,
+        **{"system.protein.resname": "INS"},
+        **{k: v for k, v in RESTRAINT_COLUMNS.items() if ".core." in k},
+    )
+    none = _proteinbox_row(protein_pdb, **{"system.protein.resname": "HEM"})
+    csv = tmp_path / "proteins.csv"
+    pd.DataFrame(data=[both, core_only, none]).to_csv(csv, index=False)
+
+    _, models, errors = load_build_input_csv(csv)
+
+    assert errors == {}
+    restraints = [m.system.protein.restraints for m in models]
+    assert [[r.name for r in entries] for entries in restraints] == [["core", "loop"], ["core"], []]
+    core, loop = restraints[0]
+    assert (core.selection, core.type, core.k, core.radius) == ("name CA", "harmonic", 1000.0, None)
+    assert (loop.selection, loop.type, loop.radius, loop.k) == (
+        "chainID A and resid 5:8",
+        "flat_bottom",
+        0.3,
+        500.0,
+    )
+
+
+def test_csv_com_restraint_selections_are_a_semicolon_pair(protein_pdb):
+    row = _proteinbox_row(
+        protein_pdb,
+        **{
+            "system.protein.restraints.dimer.type": "com_distance",
+            "system.protein.restraints.dimer.selections": "chainID A B ; chainID C D",
+            "system.protein.restraints.dimer.k": 500.0,
+            "system.protein.restraints.dimer.width": 0.2,
+        },
+    )
+    (dimer,) = BuildInput(**dict_to_nested_dict_with_species_prefix(row)).system.protein.restraints
+    assert dimer.selections == ("chainID A B", "chainID C D")
+    assert (dimer.k, dimer.width) == (500.0, 0.2)
+
+
+def test_csv_partial_restraint_is_a_row_error(protein_pdb):
+    complete = _proteinbox_row(protein_pdb, **RESTRAINT_COLUMNS)
+    partial = _proteinbox_row(protein_pdb, **{**RESTRAINT_COLUMNS, "system.protein.resname": "INS"})
+    partial["system.protein.restraints.loop.radius"] = None
+    models, errors = df_to_build_input_models(pd.DataFrame(data=[complete, partial]))
+    assert len(models) == 1
+    assert list(errors) == [1] and "needs a 'radius'" in errors[1]
+
+
+def test_csv_restraint_column_without_property_raises(protein_pdb):
+    row = _proteinbox_row(protein_pdb, **{"system.protein.restraints.core": "name CA"})
+    with pytest.raises(ValueError, match="needs a property"):
+        dict_to_nested_dict_with_species_prefix(row)
 
 
 def test_df_to_models_still_flags_missing_required_field(protein_pdb):

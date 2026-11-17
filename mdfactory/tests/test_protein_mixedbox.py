@@ -29,7 +29,7 @@ from mdfactory.models.composition import (
 from mdfactory.models.input import BuildInput
 from mdfactory.models.parametrization import AmberParametrization, CharmmParametrization
 from mdfactory.models.simulation_settings import SimulationSettings
-from mdfactory.models.species import ProteinSpecies, SolutionSpecies
+from mdfactory.models.species import PositionRestraint, ProteinSpecies, SolutionSpecies
 from mdfactory.parametrize import (
     NativeForceField,
     generate_gromacs_topology_with_protein,
@@ -1090,14 +1090,101 @@ class TestAmberExamplesAndSchedule:
             simulation_type="protein_mixedbox",
             parametrization=parametrization,
             simulation_settings=SimulationSettings().resolve("protein_mixedbox"),
-            system=SimpleNamespace(ionization=IonizationConfig()),
+            system=SimpleNamespace(
+                ionization=IonizationConfig(),
+                protein=ProteinSpecies(resname="LYZ", pdb_path="lyz.pdb"),
+            ),
         )
-        build._finalize_protein_build(inp, tmp_path / "topology.top")
+        build._finalize_protein_build(inp, tmp_path / "topology.top", {})
         for name in ("em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"):
             assert f"= {modifier}" in (tmp_path / name).read_text()
         # grompp validates the generated em.mdp unconditionally.
         assert len(calls) == 1
         assert Path(calls[0][0][2]).name == "em.mdp"
+        assert calls[0][1].get("reference") is None
+
+    @pytest.mark.parametrize("neutralize", [True, False])
+    def test_finalize_validates_restrained_production(self, tmp_path, monkeypatch, neutralize):
+        """With selection restraints, md.mdp is grompp-checked too, with system.pdb as -r."""
+        from mdfactory import build
+
+        monkeypatch.chdir(tmp_path)
+        calls = []
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.validate_with_grompp",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+        restraint = PositionRestraint(name="core", selection="name CA", k=1000.0)
+        inp = SimpleNamespace(
+            simulation_type="protein_mixedbox",
+            parametrization=AMBER_PROTEIN_MIXEDBOX,
+            simulation_settings=SimulationSettings().resolve("protein_mixedbox"),
+            system=SimpleNamespace(
+                ionization=IonizationConfig(neutralize=neutralize),
+                protein=ProteinSpecies(resname="LYZ", pdb_path="lyz.pdb", restraints=[restraint]),
+            ),
+        )
+        build._finalize_protein_build(inp, tmp_path / "topology.top", {})
+        assert [Path(args[2]).name for args, _ in calls] == ["em.mdp", "md.mdp"]
+        em_kwargs, md_kwargs = calls[0][1], calls[1][1]
+        assert em_kwargs.get("reference") is None
+        assert md_kwargs["reference"] == Path("system.pdb") == calls[1][0][1]
+        assert md_kwargs["allow_net_charge"] is (not neutralize)
+        assert "-DPOSRES_CORE" in (tmp_path / "md.mdp").read_text()
+
+    def test_finalize_writes_com_files_before_the_mdps(self, tmp_path, monkeypatch):
+        """COM restraints are measured first; both grompp checks then get the index file."""
+        import json
+
+        from mdfactory import build
+
+        monkeypatch.chdir(tmp_path)
+        events = []
+
+        def fake_write(directory, restraints, com_groups, structure, topology):
+            events.append(("measure", [r.name for r in restraints], com_groups, structure))
+            (Path(directory) / "com_restraints.json").write_text(
+                json.dumps(
+                    {
+                        "dimer": {
+                            "groups": ["G1", "G2"],
+                            "pbcatoms": [1, 9],
+                            "measured_distance": 2.0,
+                        }
+                    }
+                )
+            )
+            return Path(directory) / "index.ndx"
+
+        monkeypatch.setattr("mdfactory.setup.restraints.write_com_restraint_files", fake_write)
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.validate_with_grompp",
+            lambda *args, **kwargs: events.append(("grompp", Path(args[2]).name, kwargs)),
+        )
+        restraint = {
+            "name": "dimer",
+            "type": "com_distance",
+            "selections": ["resid 1:5", "resid 10:15"],
+            "k": 500.0,
+        }
+        inp = SimpleNamespace(
+            simulation_type="protein_mixedbox",
+            parametrization=AMBER_PROTEIN_MIXEDBOX,
+            simulation_settings=SimulationSettings().resolve("protein_mixedbox"),
+            system=SimpleNamespace(
+                ionization=IonizationConfig(),
+                protein=ProteinSpecies(resname="INS", pdb_path="ins.pdb", restraints=[restraint]),
+            ),
+        )
+        groups = {"dimer": ("first", "second")}
+        build._finalize_protein_build(inp, tmp_path / "topology.top", groups)
+
+        assert events[0] == ("measure", ["dimer"], groups, Path("system.pdb"))
+        assert [(e[1], e[2]["index"]) for e in events[1:]] == [
+            ("em.mdp", tmp_path / "index.ndx"),
+            ("md.mdp", tmp_path / "index.ndx"),
+        ]
+        assert "pull-coord1-init" in (tmp_path / "md.mdp").read_text()
 
 
 def test_read_include_layout_finds_anchors():

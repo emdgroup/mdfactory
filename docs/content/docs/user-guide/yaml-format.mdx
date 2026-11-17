@@ -361,9 +361,139 @@ See the [protein tutorial](/docs/user-guide/tutorial-protein-mixedbox) for a wal
 | `disulfide_bonds` | `[]` | Pairs of residues, e.g. `[[CYS6, CYS127]]`; chain-qualified (`A:CYS6`) is allowed |
 | `protonation_states` | `{}` | Residue to state, e.g. `HIS15: HIE`. CHARMM translates `HID/HIE/HIP/LYN` to `HSD/HSE/HSP/LSN` |
 | `ignore_hydrogens` | `true` | Passes `-ignh` to `pdb2gmx` |
+| `restraints` | `[]` | Selection-based position and COM-distance restraints for production, see [below](#position-restraints) |
 
 `pdb2gmx` needs GROMACS on `PATH` (or `[gromacs] GMX_PATH`), and `parametrization.protein:
 amber14sb` needs GROMACS 2026 or later.
+
+### Position restraints
+
+By default, NVT and NPT restrain every protein heavy atom (`define = -DPOSRES`, the `posre.itp`
+written by `pdb2gmx`) and production runs unrestrained. `restraints` adds restraints on a subset
+of protein atoms in **production only**. NVT and NPT are unchanged, and EM is never restrained.
+
+```yaml
+system:
+  protein:
+    resname: LYZ
+    pdb_path: ./1aki.pdb
+    chains: [A]
+    restraints:
+      - name: helices
+        selection: "name CA and resid 5:15 25:36 88:99"
+        type: harmonic
+        k: 1000.0        # kJ mol^-1 nm^-2
+      - name: loop
+        selection: "chainID A and resid 100:104 and not name H*"
+        type: flat_bottom
+        radius: 0.3      # nm
+        k: 1000.0        # kJ mol^-1 nm^-2
+```
+
+| Key | Default | Notes |
+|---|---|---|
+| `name` | – | Required. Letters, digits and `_`, starting with a letter. Unique within the protein, ignoring case. `water` is reserved (`pdb2gmx` already defines `POSRES_WATER`) |
+| `selection` | – | Required. [MDAnalysis selection](https://userguide.mdanalysis.org/stable/selections.html) of the restrained atoms |
+| `type` | `harmonic` | `harmonic` (GROMACS funct 1, the same `k` in x, y and z) or `flat_bottom` (funct 2, a sphere) |
+| `k` | – | Required. Force constant in kJ mol⁻¹ nm⁻², greater than 0 |
+| `radius` | – | Flat-bottom sphere radius in nm. Required for `flat_bottom`, rejected for `harmonic` |
+
+A flat-bottom restraint adds no force while an atom stays within `radius` of its reference
+position, and a harmonic force with constant `k` beyond it.
+
+**What a selection sees.** The selection is evaluated on the protein that `pdb2gmx` produced,
+before solvation:
+
+- atom names are the force field's, as `pdb2gmx` writes them. Hydrogens are added by `pdb2gmx`,
+  and terminal oxygens are `OXT` in Amber and `OT1`/`OT2` in CHARMM;
+- residue names are the input's, after any `protonation_states` rename (`HIE` in Amber, `HSE` in
+  CHARMM);
+- chain IDs (`chainID`) and residue numbers (`resid`, with insertion codes) are the input
+  structure's, transferred by residue order. In a multi-chain structure, chains often share
+  residue numbers, so qualify the selection with `chainID`. `segid` is not set.
+
+For an insulin dimer (PDB 1ZNI), where every chain numbers its residues from 1:
+
+```yaml
+restraints:
+  - name: anchor
+    selection: "chainID A C and name CA"
+    k: 500.0
+  - name: tail
+    selection: "chainID B D and resid 25:30 and not name H*"
+    type: flat_bottom
+    radius: 0.5
+    k: 1000.0
+```
+
+A selection that matches no atom, or is not valid MDAnalysis syntax, fails the build.
+
+**What the build writes.** For each restraint and each protein molecule it touches (one per
+chain, or one with `merge_all`), the build writes `posre_<name>_<molecule>.itp` and includes it in
+that molecule's topology, right after the `posre.itp` block of `pdb2gmx`:
+
+```text
+#ifdef POSRES_HELICES
+#include "posre_helices_Protein_chain_A.itp"
+#endif
+```
+
+The production `define` gets one `-DPOSRES_<NAME>` flag per restraint, and `grompp -r npt.gro`
+anchors the atoms at their positions in the production starting structure. See
+[Simulation settings](/docs/user-guide/simulation-settings#the-generated-protocol) for how the
+flags combine with a `define` override. Restraints are part of the system and enter the hash.
+`apply-settings` re-renders the mdp files only, so restraints cannot be added to an existing
+build.
+
+### COM-distance restraints
+
+A `com_distance` entry of the same `restraints` list restrains the distance between the centres
+of mass of two selections, for example two chains or subunits. Their relative arrangement is kept
+while their internal motion stays free. It also applies in production only.
+
+```yaml
+restraints:
+  - name: dimer
+    type: com_distance
+    selections: ["chainID A B", "chainID C D"]
+    k: 1000.0          # kJ mol^-1 nm^-2
+  - name: monomer
+    type: com_distance
+    selections: ["chainID A", "chainID B"]
+    width: 0.2         # nm
+    k: 1000.0
+```
+
+| Key | Default | Notes |
+|---|---|---|
+| `name` | – | Required, as for position restraints; names are unique across both kinds |
+| `type` | – | Required: `com_distance` |
+| `selections` | – | Required. Exactly two MDAnalysis selections, evaluated like a position restraint's `selection`. The two groups must not share atoms |
+| `k` | – | Required. Force constant on the COM distance in kJ mol⁻¹ nm⁻², greater than 0 |
+| `width` | – | Optional, nm. Makes the potential flat-bottom, see below |
+| `distance` | measured | Optional reference distance in nm. By default it is the distance measured in the built `system.pdb` |
+
+The build turns each entry into a GROMACS pull coordinate with `geometry = distance`. Centres of
+mass are mass-weighted and taken under periodic boundary conditions (minimum image):
+
+- without `width`: an umbrella (harmonic) potential around the reference distance;
+- with `width`: a flat-bottom potential with no force while the distance stays below reference +
+  `width`, and a harmonic force with constant `k` beyond it. The groups can come closer freely and
+  separate by at most `width` before a force acts.
+
+**What the build writes.** `index.ndx` holds the default groups of `gmx make_ndx` plus two groups
+per restraint, `COM_<NAME>_1` and `COM_<NAME>_2`. `com_restraints.json` records the groups, each
+group's periodic reference atom (the atom closest to its centre of mass) and the measured
+distance. The production mdp gets the `pull-*` block from these files, and every stage runs
+`grompp -n index.ndx`. While a COM-distance restraint exists, the `pull*` keys are owned by the
+build and rejected in `gromacs_overrides`.
+
+The pull distance (reference + `width`) must stay below 0.49 times the shortest box edge, the
+GROMACS limit for `geometry = distance`; otherwise the build fails. Increase `padding` for
+distant groups.
+
+`examples/proteinbox/insulin_restraints.yaml` combines a position restraint with an umbrella and a
+flat-bottom COM-distance restraint on the insulin dimer.
 
 ## Compounds used in docs YAML examples
 
@@ -401,6 +531,10 @@ Spelling out a default does not change the hash, but any change of the system, t
 - Bilayer odd lipid counts when `monolayer: false`
 - `protein_mixedbox`: a species with both or neither of `count`/`concentration`, a `fraction`, or `merge_all` together with `chains`
 - A box that is smaller than the protein extent plus 2 × `padding`
+- A restraint with a `radius` and `type: harmonic`, or without one and `type: flat_bottom`; a
+  `com_distance` restraint without exactly two `selections`; two restraint names that differ
+  only in case
+- `pull*` keys in `gromacs_overrides` while a `com_distance` restraint exists
 - `parametrization` family that does not fit the system type (for example `amber` for `mixedbox`)
 - LNP `radius <= shell_thickness`
 
