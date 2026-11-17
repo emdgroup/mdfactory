@@ -178,6 +178,25 @@ to override individual components. See [Parametrization](/docs/user-guide/parame
 | `system.protein.protonation_states.<RESIDUE>` | string | One column per residue, e.g. `system.protein.protonation_states.HIS15` = `HIE` |
 | `system.protein.ignore_hydrogens` | bool | Ignore hydrogens in the input structure (default `true`) |
 | `system.protein.merge_all` | bool | Merge all chains into one molecule (default `false`) |
+| `system.protein.restraints.<NAME>.<property>` | any | One column per property of the restraint `<NAME>`: `selection`, `type`, `k`, `radius` |
+
+#### Position restraints
+
+Each [position restraint](/docs/user-guide/yaml-format#position-restraints) is a group of columns
+named `system.protein.restraints.<NAME>.<property>`, like the `system.species.<RESNAME>.<property>`
+columns. A row whose cells of one restraint are all blank has no such restraint, so one table can
+mix restrained and unrestrained systems. A partly filled restraint, for example a `flat_bottom`
+restraint without `radius`, is an error for that row. From
+`examples/proteinbox/proteins_restraints_amber.csv` (some columns left out):
+
+```csv
+simulation_type,...,system.protein.resname,system.protein.pdb_path,system.protein.chains,system.protein.restraints.anchor.selection,system.protein.restraints.anchor.k,system.protein.restraints.tail.selection,system.protein.restraints.tail.type,system.protein.restraints.tail.radius,system.protein.restraints.tail.k,...
+proteinbox,...,LYZ,1aki.pdb,A,,,,,,,...
+proteinbox,...,INS,1zni.pdb,A;B;C;D,chainID A C and name CA,500.0,chainID B D and resid 25:30 and not name H*,flat_bottom,0.5,1000.0,...
+```
+
+The first row has no restraints. The second has a harmonic `anchor` (the default `type`) and a
+flat-bottom `tail`.
 
 ### Simulation settings (optional)
 

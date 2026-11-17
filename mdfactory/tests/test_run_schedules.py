@@ -16,6 +16,7 @@ from mdfactory.models.parametrization import (
     OpenFFParametrization,
 )
 from mdfactory.models.simulation_settings import STAGES, SimulationSettings
+from mdfactory.models.species import PositionRestraint
 from mdfactory.orchestration.mdp import apply_rescue_tier, get_mdp_value, parse_mdp
 from mdfactory.orchestration.simulate import _missing_build_files
 from mdfactory.orchestration.stages import STAGE_REGISTRY
@@ -44,11 +45,12 @@ COMBINATIONS = [
 ]
 
 
-def _inp(simulation_type, family=CharmmParametrization, **settings):
+def _inp(simulation_type, family=CharmmParametrization, restraints=(), **settings):
     return SimpleNamespace(
         simulation_type=simulation_type,
         parametrization=family().resolve(simulation_type),
         simulation_settings=SimulationSettings(**settings).resolve(simulation_type),
+        system=SimpleNamespace(protein=SimpleNamespace(restraints=list(restraints))),
     )
 
 
@@ -60,8 +62,8 @@ def _read(path: Path) -> dict[str, str]:
     return dict(pairs)
 
 
-def _written(tmp_path, simulation_type, family=CharmmParametrization, **settings):
-    files = write_mdp_files(_inp(simulation_type, family, **settings), tmp_path)
+def _written(tmp_path, simulation_type, family=CharmmParametrization, restraints=(), **settings):
+    files = write_mdp_files(_inp(simulation_type, family, restraints, **settings), tmp_path)
     return {stage: _read(path) for stage, path in files.items()}
 
 
@@ -329,6 +331,49 @@ def test_protein_schedules_reproduce_the_static_files(tmp_path, simulation_type,
         generated = {k: _tokens(v) for k, v in values.items() if k not in nonbonded | {"dispcorr"}}
         expected = {**PROTEIN_SCHEDULE[stage], **WRITTEN_AT_DEFAULT.get(stage, {})}
         assert generated == {k: _tokens(v) for k, v in expected.items()}, stage
+
+
+# --- selection restraints ---------------------------------------------------------------
+
+RESTRAINTS = [
+    PositionRestraint(name="core", selection="name CA", k=1000.0),
+    PositionRestraint(name="Loop", selection="resid 5", type="flat_bottom", radius=0.3, k=500.0),
+]
+
+
+@pytest.mark.parametrize("simulation_type", PROTEIN_TYPES)
+def test_restraints_switch_on_in_production_only(tmp_path, simulation_type):
+    (tmp_path / "r").mkdir()
+    (tmp_path / "p").mkdir()
+    restrained = _written(tmp_path / "r", simulation_type, restraints=RESTRAINTS)
+    plain = _written(tmp_path / "p", simulation_type)
+    assert restrained["production"]["define"].split() == ["-DPOSRES_CORE", "-DPOSRES_LOOP"]
+    for stage in ("minimization", "nvt", "npt"):
+        assert restrained[stage] == plain[stage], stage
+    assert {k: v for k, v in restrained["production"].items() if k != "define"} == plain[
+        "production"
+    ]
+
+
+@pytest.mark.parametrize("key", ["define", "DEFINE"])
+def test_restraint_flags_follow_a_user_define(tmp_path, key):
+    stages = _written(
+        tmp_path,
+        "proteinbox",
+        restraints=RESTRAINTS,
+        gromacs_overrides={"production": {key: "-DFLEXIBLE"}, "nvt": {"define": "-DPOSRES_X"}},
+    )
+    values = stages["production"]
+    assert values["define"].split() == ["-DFLEXIBLE", "-DPOSRES_CORE", "-DPOSRES_LOOP"]
+    assert stages["nvt"]["define"] == "-DPOSRES_X"
+    assert stages["npt"]["define"] == "-DPOSRES"
+
+
+def test_restraints_ignored_for_non_protein_types(tmp_path):
+    """Only protein builds carry restraints; other types never read system.protein."""
+    inp = _inp("mixedbox")
+    inp.system = SimpleNamespace(species=[])
+    assert "define" not in render_run_schedule(inp)["production"]
 
 
 def test_sage_scheme_matches_the_openff_force_fields(tmp_path):

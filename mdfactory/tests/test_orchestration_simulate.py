@@ -1569,62 +1569,37 @@ def test_run_simulations_propagates_stage_restarts(
 # ---------------------------------------------------------------------------
 
 
-def test_run_stage_nvt_passes_ref_file_to_grompp(tmp_path):
-    """NVT: run_stage calls grompp_app with ref_file=min.gro (position restraints)."""
+@pytest.mark.parametrize(
+    ("stage", "gro_in", "cpt_file"),
+    [
+        ("EM", "system.pdb", None),
+        ("NVT", "min.gro", None),
+        ("NPT", "nvt.gro", "nvt.cpt"),
+        ("Production", "npt.gro", "npt.cpt"),
+    ],
+)
+def test_run_stage_grompp_inputs(tmp_path, stage, gro_in, cpt_file):
+    """run_stage passes the stage's -c input (also the -r reference) and its -t checkpoint."""
     from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
 
     grompp_app = MagicMock(return_value=MagicMock())
     mdrun_app = MagicMock(return_value=MagicMock())
 
-    run_stage(STAGE_BY_NAME["NVT"], tmp_path, None, grompp_app, mdrun_app)
+    run_stage(STAGE_BY_NAME[stage], tmp_path, None, grompp_app, mdrun_app)
 
     call_kwargs = grompp_app.call_args[1]
-    assert call_kwargs["ref_file"] == "min.gro"
-    # NVT has no prereq_cpt; cpt_file kwarg should be absent
-    assert "cpt_file" not in call_kwargs
-
-
-def test_run_stage_npt_passes_ref_and_cpt_to_grompp(tmp_path):
-    """NPT: run_stage calls grompp_app with both ref_file=nvt.gro and cpt_file=nvt.cpt."""
-    from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
-
-    grompp_app = MagicMock(return_value=MagicMock())
-    mdrun_app = MagicMock(return_value=MagicMock())
-
-    run_stage(STAGE_BY_NAME["NPT"], tmp_path, None, grompp_app, mdrun_app)
-
-    call_kwargs = grompp_app.call_args[1]
-    assert call_kwargs["ref_file"] == "nvt.gro"
-    assert call_kwargs["cpt_file"] == "nvt.cpt"
-    assert call_kwargs["maxwarn"] == 2
-
-
-def test_run_stage_em_has_no_ref_or_cpt_flags(tmp_path):
-    """EM: run_stage calls grompp_app without ref_file or cpt_file (none specified in spec)."""
-    from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
-
-    grompp_app = MagicMock(return_value=MagicMock())
-    mdrun_app = MagicMock(return_value=MagicMock())
-
-    run_stage(STAGE_BY_NAME["EM"], tmp_path, None, grompp_app, mdrun_app)
-
-    call_kwargs = grompp_app.call_args[1]
+    assert call_kwargs["gro_file"] == gro_in
     assert "ref_file" not in call_kwargs
-    assert "cpt_file" not in call_kwargs
+    assert call_kwargs.get("cpt_file") == cpt_file
 
 
-def test_run_stage_production_has_cpt_but_no_ref(tmp_path):
-    """Production: run_stage calls grompp_app with cpt_file=npt.cpt but no ref_file."""
-    from mdfactory.orchestration.stages import STAGE_BY_NAME, run_stage
+def test_stage_spec_has_no_separate_reference():
+    """The -r reference is always the -c input; StageSpec has no field for another one."""
+    from dataclasses import fields
 
-    grompp_app = MagicMock(return_value=MagicMock())
-    mdrun_app = MagicMock(return_value=MagicMock())
+    from mdfactory.orchestration.stages import StageSpec
 
-    run_stage(STAGE_BY_NAME["Production"], tmp_path, None, grompp_app, mdrun_app)
-
-    call_kwargs = grompp_app.call_args[1]
-    assert "ref_file" not in call_kwargs
-    assert call_kwargs["cpt_file"] == "npt.cpt"
+    assert "ref_file" not in {f.name for f in fields(StageSpec)}
 
 
 # ---------------------------------------------------------------------------
@@ -1661,14 +1636,14 @@ def test_bash_result_to_dict_dict_passthrough():
 # ---------------------------------------------------------------------------
 
 
-def test_build_grompp_script_generates_ref_flag():
-    """_build_grompp_script emits -r flag when ref_file is provided."""
+@pytest.mark.parametrize("gro_file", ["system.pdb", "min.gro", "nvt.gro", "npt.gro"])
+def test_build_grompp_script_reference_is_the_input_structure(gro_file):
+    """_build_grompp_script always passes -r equal to -c."""
     from mdfactory.orchestration.apps import _build_grompp_script
 
-    script = _build_grompp_script(
-        "nvt.mdp", "min.gro", "topology.top", "nvt.tpr", "/sim", ref_file="min.gro"
-    )
-    assert "-r min.gro" in script
+    script = _build_grompp_script("x.mdp", gro_file, "topology.top", "x.tpr", "/sim")
+    assert f"-c {gro_file} -r {gro_file} " in script
+    assert script.count(" -r ") == 1
 
 
 def test_build_grompp_script_generates_cpt_flag():
@@ -1681,30 +1656,12 @@ def test_build_grompp_script_generates_cpt_flag():
     assert "-t nvt.cpt" in script
 
 
-def test_build_grompp_script_omits_flags_by_default():
-    """_build_grompp_script omits -r and -t when no ref_file / cpt_file given."""
+def test_build_grompp_script_omits_cpt_flag_by_default():
+    """_build_grompp_script omits -t when no cpt_file is given."""
     from mdfactory.orchestration.apps import _build_grompp_script
 
     script = _build_grompp_script("em.mdp", "system.pdb", "topology.top", "em.tpr", "/sim")
-    assert "-r " not in script
     assert "-t " not in script
-
-
-def test_build_grompp_script_can_emit_both_flags():
-    """_build_grompp_script emits both -r and -t when both are provided."""
-    from mdfactory.orchestration.apps import _build_grompp_script
-
-    script = _build_grompp_script(
-        "npt.mdp",
-        "nvt.gro",
-        "topology.top",
-        "npt.tpr",
-        "/sim",
-        ref_file="nvt.gro",
-        cpt_file="nvt.cpt",
-    )
-    assert "-r nvt.gro" in script
-    assert "-t nvt.cpt" in script
 
 
 # ---------------------------------------------------------------------------

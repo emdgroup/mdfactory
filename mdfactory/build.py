@@ -748,7 +748,8 @@ def _prepare_protein(protein, spec):
     the chain/disulfide/protonation settings from the ``protein`` species. A
     force field that needs a minimum GROMACS version (amber14sb) is checked
     against the binary first, so an old GROMACS fails before any protein
-    preparation.
+    preparation. The protein's selection restraints are written into the
+    pdb2gmx output, so every topology built from it includes them.
     """
     from loguru import logger
 
@@ -758,6 +759,7 @@ def _prepare_protein(protein, spec):
         require_gmx_version,
         run_pdb2gmx,
     )
+    from .setup.restraints import apply_position_restraints
 
     gmx_bin = check_gmx_available()
     logger.info(f"Using GROMACS: {gmx_bin}")
@@ -776,7 +778,7 @@ def _prepare_protein(protein, spec):
         chains=protein.chains,
     )
     logger.info(f"pdb2gmx output: {params.structure_file}")
-    return params
+    return apply_position_restraints(params, protein.restraints, cleaned_pdb)
 
 
 def _copy_protein_topology(params, dest_dir: Path, topology_name: str) -> Path:
@@ -825,9 +827,11 @@ def _finalize_protein_build(inp, topology, extra_intermediates=()):
     """Write the run schedule, validate it with grompp, and drop build intermediates.
 
     The nonbonded block follows the family's nonbonded scheme, so Amber builds
-    get the Sage nonbonded settings. Cleanup only runs on success so a failed
-    build keeps its intermediates. ``solvated.pdb`` and ``relaxation/`` are left
-    in place, as in the bilayer build.
+    get the Sage nonbonded settings. ``em.mdp`` is always validated; with
+    selection restraints, ``md.mdp`` (which switches them on) is validated too,
+    with ``system.pdb`` as the ``-r`` reference. Cleanup only runs on success so
+    a failed build keeps its intermediates. ``solvated.pdb`` and ``relaxation/``
+    are left in place, as in the bilayer build.
     """
     from loguru import logger
 
@@ -836,13 +840,17 @@ def _finalize_protein_build(inp, topology, extra_intermediates=()):
     mdp_files = write_mdp_files(inp)
     logger.info("Run schedule written.")
 
-    validate_with_grompp(
+    structure = Path("system.pdb")
+    validate = partial(
+        validate_with_grompp,
         topology,
-        Path("system.pdb"),
-        mdp_files["minimization"],
-        Path.cwd(),
+        structure,
+        cwd=Path.cwd(),
         allow_net_charge=not inp.system.ionization.neutralize,
     )
+    validate(mdp_files["minimization"])
+    if inp.system.protein.restraints:
+        validate(mdp_files["production"], reference=structure)
 
     for name in ("cleaned.pdb", "system_pre_relax.pdb", *extra_intermediates):
         Path(name).unlink(missing_ok=True)

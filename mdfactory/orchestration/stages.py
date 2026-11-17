@@ -31,7 +31,8 @@ class StageSpec:
     mdp_file : str
         MDP parameter file name (e.g. ``"em.mdp"``).
     gro_in : str
-        Input structure file for ``gmx grompp -c`` (e.g. ``"system.pdb"``).
+        Input structure file for ``gmx grompp -c`` (e.g. ``"system.pdb"``),
+        also passed as the position-restraint reference ``-r``.
     gro_out : str
         Expected output ``.gro`` file; empty string when the stage writes a
         trajectory instead (Production stage).
@@ -46,9 +47,6 @@ class StageSpec:
     traj_files : tuple of str
         Accepted trajectory output files checked after mdrun — non-empty only
         for the Production stage: ``("prod.xtc", "prod.trr")``.
-    ref_file : str or None
-        Reference structure for ``gmx grompp -r`` (position restraints).
-        ``None`` when no position restraints are used.
     maxwarn : int
         Maximum grompp warnings to allow (``-maxwarn``).
     supports_pme_gpu : bool
@@ -66,7 +64,6 @@ class StageSpec:
     cpt_file: str
     prereq_cpt: "str | None"
     traj_files: "tuple[str, ...]"
-    ref_file: "str | None"
     maxwarn: int
     supports_pme_gpu: bool
 
@@ -83,7 +80,6 @@ STAGE_REGISTRY: list[StageSpec] = [
         cpt_file="min.cpt",
         prereq_cpt=None,
         traj_files=(),
-        ref_file=None,
         maxwarn=1,
         supports_pme_gpu=False,
     ),
@@ -97,7 +93,6 @@ STAGE_REGISTRY: list[StageSpec] = [
         cpt_file="nvt.cpt",
         prereq_cpt=None,
         traj_files=(),
-        ref_file="min.gro",
         maxwarn=1,
         supports_pme_gpu=True,
     ),
@@ -111,7 +106,6 @@ STAGE_REGISTRY: list[StageSpec] = [
         cpt_file="npt.cpt",
         prereq_cpt="nvt.cpt",
         traj_files=(),
-        ref_file="nvt.gro",
         maxwarn=2,
         supports_pme_gpu=True,
     ),
@@ -125,7 +119,6 @@ STAGE_REGISTRY: list[StageSpec] = [
         cpt_file="prod.cpt",
         prereq_cpt="npt.cpt",
         traj_files=("prod.xtc", "prod.trr"),
-        ref_file=None,
         maxwarn=2,
         supports_pme_gpu=True,
     ),
@@ -270,8 +263,6 @@ def run_stage(
         "maxwarn": spec.maxwarn,
         "inputs": grompp_inputs,
     }
-    if spec.ref_file:
-        grompp_kwargs["ref_file"] = spec.ref_file
     if spec.prereq_cpt:
         grompp_kwargs["cpt_file"] = spec.prereq_cpt
     # Force fields that need a newer GROMACS (amber14sb) make grompp check the

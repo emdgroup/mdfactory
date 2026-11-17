@@ -259,3 +259,120 @@ def protein_input_data(
     }
     data.update(top_level)
     return data
+
+
+#: Residues of the synthetic pdb2gmx output: (chain, resid, resname, atom names).
+#: Both chains number their residues from 1, as in PDB 1ZNI.
+PDB2GMX_RESIDUES: tuple[tuple[str, int, str, tuple[str, ...]], ...] = (
+    ("A", 1, "GLY", ("N", "H1", "CA", "C", "O")),
+    ("A", 2, "ALA", ("N", "H", "CA", "CB", "C", "O", "OXT")),
+    ("B", 1, "SER", ("N", "H1", "CA", "CB", "OG", "C", "O")),
+    ("B", 2, "GLY", ("N", "H", "CA", "C", "O", "OXT")),
+)
+
+
+def _moleculetype_text(name: str, residues, posre: str) -> str:
+    lines = ["[ moleculetype ]", "; Name            nrexcl", f"{name}     3", "", "[ atoms ]"]
+    nr = 0
+    for resnr, (_, _, resname, atoms) in enumerate(residues, 1):
+        lines.append(f"; residue {resnr:3d} {resname} rtp {resname}  q 0.0")
+        for atom in atoms:
+            nr += 1
+            lines.append(
+                f"{nr:6d}  CT  {resnr:5d}  {resname:>5s}  {atom:>5s}  {nr:5d}  0.0  12.011"
+            )
+    lines += ["", "[ bonds ]", "    1     2     1", ""]
+    lines += ["; Include Position restraint file", "#ifdef POSRES", f'#include "{posre}"', "#endif"]
+    return "\n".join(lines) + "\n\n"
+
+
+def write_pdb2gmx_output(
+    directory: Path,
+    layout: str = "single",
+    residues=PDB2GMX_RESIDUES,
+    gro_resids=None,
+):
+    """Write a synthetic pdb2gmx output (and its input PDB) for restraint tests.
+
+    Parameters
+    ----------
+    directory : Path
+        Receives ``cleaned.pdb`` and the ``pdb2gmx_output`` directory.
+    layout : str
+        ``"single"``: one ``Protein_chain_A`` moleculetype in ``topol.top`` (a
+        single chain, or ``-merge all``). ``"chains"``: one
+        ``topol_Protein_chain_<ID>.itp`` per chain, as pdb2gmx writes them.
+    residues : tuple
+        ``(chain, resid, resname, atom names)`` per residue.
+    gro_resids : list of int, optional
+        Residue numbers written to ``processed.gro`` (default: the input ones).
+
+    Returns
+    -------
+    tuple
+        ``(GromacsProteinParameterSet, cleaned PDB path)``.
+
+    """
+    from mdfactory.models.parametrization import GromacsProteinParameterSet
+
+    directory = Path(directory)
+    out = directory / "pdb2gmx_output"
+    out.mkdir(parents=True)
+    gro_resids = gro_resids or [resid for _, resid, _, _ in residues]
+
+    pdb_lines, gro_lines = [], []
+    serial = 0
+    for (chain, resid, resname, atoms), gro_resid in zip(residues, gro_resids):
+        for atom in atoms:
+            serial += 1
+            x = 0.15 * serial
+            pdb_lines.append(
+                f"ATOM  {serial:5d} {atom:<4s} {resname:>3s} {chain:1s}{resid:4d}    "
+                f"{x * 10:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00\n"
+            )
+            gro_lines.append(
+                f"{gro_resid:5d}{resname:<5s}{atom:>5s}{serial:5d}{x:8.3f}{0.0:8.3f}{0.0:8.3f}\n"
+            )
+    cleaned = directory / "cleaned.pdb"
+    cleaned.write_text("".join(pdb_lines) + "END\n")
+    structure = out / "processed.gro"
+    structure.write_text(f"protein\n{serial:5d}\n" + "".join(gro_lines) + "   5.0   5.0   5.0\n")
+
+    header = '#include "amber14sb.ff/forcefield.itp"\n\n'
+    footer = (
+        '#include "amber14sb.ff/tip3p.itp"\n\n'
+        "#ifdef POSRES_WATER\n[ position_restraints ]\n   1    1  1000  1000  1000\n#endif\n\n"
+        "[ system ]\nProtein\n\n[ molecules ]\n; Compound        #mols\n"
+    )
+    includes = []
+    if layout == "single":
+        body = _moleculetype_text("Protein_chain_A", residues, "posre.itp")
+        (out / "posre.itp").write_text("[ position_restraints ]\n")
+        includes.append(out / "posre.itp")
+        molecules = "Protein_chain_A     1\n"
+    elif layout == "chains":
+        chains = list(dict.fromkeys(chain for chain, _, _, _ in residues))
+        body, molecules = "", ""
+        for chain in chains:
+            name = f"Protein_chain_{chain}"
+            chain_residues = [r for r in residues if r[0] == chain]
+            (out / f"topol_{name}.itp").write_text(
+                _moleculetype_text(name, chain_residues, f"posre_{name}.itp")
+            )
+            (out / f"posre_{name}.itp").write_text("[ position_restraints ]\n")
+            body += f'#include "topol_{name}.itp"\n'
+            molecules += f"{name}     1\n"
+        includes += [out / f"topol_Protein_chain_{chain}.itp" for chain in chains]
+        includes += [out / f"posre_Protein_chain_{chain}.itp" for chain in chains]
+        body += "\n"
+    else:
+        raise ValueError(f"Unknown layout {layout!r}.")
+    topology = out / "topol.top"
+    topology.write_text(header + body + footer + molecules)
+    params = GromacsProteinParameterSet(
+        topology_file=topology,
+        structure_file=structure,
+        topology_include_files=includes,
+        total_charge=0,
+    )
+    return params, cleaned

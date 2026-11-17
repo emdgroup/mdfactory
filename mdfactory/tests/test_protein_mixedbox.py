@@ -29,7 +29,7 @@ from mdfactory.models.composition import (
 from mdfactory.models.input import BuildInput
 from mdfactory.models.parametrization import AmberParametrization, CharmmParametrization
 from mdfactory.models.simulation_settings import SimulationSettings
-from mdfactory.models.species import ProteinSpecies, SolutionSpecies
+from mdfactory.models.species import PositionRestraint, ProteinSpecies, SolutionSpecies
 from mdfactory.parametrize import (
     NativeForceField,
     generate_gromacs_topology_with_protein,
@@ -1090,7 +1090,9 @@ class TestAmberExamplesAndSchedule:
             simulation_type="protein_mixedbox",
             parametrization=parametrization,
             simulation_settings=SimulationSettings().resolve("protein_mixedbox"),
-            system=SimpleNamespace(ionization=IonizationConfig()),
+            system=SimpleNamespace(
+                ionization=IonizationConfig(), protein=SimpleNamespace(restraints=[])
+            ),
         )
         build._finalize_protein_build(inp, tmp_path / "topology.top")
         for name in ("em.mdp", "nvt.mdp", "npt.mdp", "md.mdp"):
@@ -1098,6 +1100,36 @@ class TestAmberExamplesAndSchedule:
         # grompp validates the generated em.mdp unconditionally.
         assert len(calls) == 1
         assert Path(calls[0][0][2]).name == "em.mdp"
+        assert calls[0][1].get("reference") is None
+
+    @pytest.mark.parametrize("neutralize", [True, False])
+    def test_finalize_validates_restrained_production(self, tmp_path, monkeypatch, neutralize):
+        """With selection restraints, md.mdp is grompp-checked too, with system.pdb as -r."""
+        from mdfactory import build
+
+        monkeypatch.chdir(tmp_path)
+        calls = []
+        monkeypatch.setattr(
+            "mdfactory.setup.protein.validate_with_grompp",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+        restraint = PositionRestraint(name="core", selection="name CA", k=1000.0)
+        inp = SimpleNamespace(
+            simulation_type="protein_mixedbox",
+            parametrization=AMBER_PROTEIN_MIXEDBOX,
+            simulation_settings=SimulationSettings().resolve("protein_mixedbox"),
+            system=SimpleNamespace(
+                ionization=IonizationConfig(neutralize=neutralize),
+                protein=SimpleNamespace(restraints=[restraint]),
+            ),
+        )
+        build._finalize_protein_build(inp, tmp_path / "topology.top")
+        assert [Path(args[2]).name for args, _ in calls] == ["em.mdp", "md.mdp"]
+        em_kwargs, md_kwargs = calls[0][1], calls[1][1]
+        assert em_kwargs.get("reference") is None
+        assert md_kwargs["reference"] == Path("system.pdb") == calls[1][0][1]
+        assert md_kwargs["allow_net_charge"] is (not neutralize)
+        assert "-DPOSRES_CORE" in (tmp_path / "md.mdp").read_text()
 
 
 def test_read_include_layout_finds_anchors():

@@ -6,7 +6,9 @@ Each stage starts from a base dict. The simulation type adds the coupling
 geometry, the force-field family's nonbonded scheme adds the nonbonded block,
 the :class:`~mdfactory.models.simulation_settings.SimulationSettings` add the
 state point, step counts and output intervals, and the per-stage GROMACS
-overrides are applied last. grompp is the validator of the result.
+overrides are applied last. A protein's selection restraints then append their
+``-DPOSRES_<NAME>`` flags to the production ``define``. grompp is the validator
+of the result.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from mdfactory import __version__
+from mdfactory.models.parametrization import PROTEIN_SIMULATION_TYPES
 from mdfactory.models.simulation_settings import (
     STAGES,
     MdpValue,
@@ -118,6 +121,7 @@ def render_stage(
     simulation_type: str,
     nonbonded_scheme: str,
     settings: SimulationSettings,
+    restraint_macros: tuple[str, ...] = (),
 ) -> dict[str, MdpValue | list[MdpValue]]:
     """Return the mdp parameters of one stage.
 
@@ -131,6 +135,10 @@ def render_stage(
         The force-field family's nonbonded scheme (``charmm`` or ``sage``).
     settings : SimulationSettings
         Resolved simulation settings.
+    restraint_macros : tuple of str, optional
+        ``POSRES_<NAME>`` macros of the protein's selection restraints. The
+        production ``define`` gets a ``-D<macro>`` flag for each, appended after
+        the overrides, so a user ``define`` keeps them. Other stages ignore them.
 
     Returns
     -------
@@ -226,7 +234,10 @@ def render_stage(
         else:
             params["gen-vel"] = "no"
 
-    return _apply_overrides(params, getattr(settings.gromacs_overrides, stage))
+    params = _apply_overrides(params, getattr(settings.gromacs_overrides, stage))
+    if stage == "production" and restraint_macros:
+        params = _append_defines(params, restraint_macros)
+    return params
 
 
 def _apply_overrides(params: dict[str, Any], overrides: dict[str, MdpValue]) -> dict[str, Any]:
@@ -236,6 +247,16 @@ def _apply_overrides(params: dict[str, Any], overrides: dict[str, MdpValue]) -> 
     for key, value in overrides.items():
         result[existing.get(normalize_mdp_key(key), key)] = value
     return result
+
+
+def _append_defines(params: dict[str, Any], macros: tuple[str, ...]) -> dict[str, Any]:
+    """Append ``-D<macro>`` flags to ``define``; a missing ``define`` is added first."""
+    key = next((k for k in params if normalize_mdp_key(k) == "define"), None)
+    flags = [f"-D{macro}" for macro in macros]
+    if key is None:
+        return {"define": " ".join(flags), **params}
+    current = format_mdp_value(params[key]).strip()
+    return {**params, key: " ".join([current, *flags] if current else flags)}
 
 
 def render_run_schedule(build_input: "BuildInput") -> dict[str, dict[str, Any]]:
@@ -252,12 +273,18 @@ def render_run_schedule(build_input: "BuildInput") -> dict[str, dict[str, Any]]:
         Mapping of stage name to its mdp parameters.
 
     """
+    restraints = (
+        build_input.system.protein.restraints
+        if build_input.simulation_type in PROTEIN_SIMULATION_TYPES
+        else []
+    )
     return {
         stage: render_stage(
             stage,
             simulation_type=build_input.simulation_type,
             nonbonded_scheme=build_input.parametrization.nonbonded_scheme,
             settings=build_input.simulation_settings,
+            restraint_macros=tuple(restraint.macro for restraint in restraints),
         )
         for stage in STAGES
     }

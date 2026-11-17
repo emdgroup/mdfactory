@@ -527,7 +527,6 @@ def _build_grompp_script(
     top_file: str,
     tpr_file: str,
     work_dir: str,
-    ref_file: str = "",
     cpt_file: str = "",
     maxwarn: int = 1,
     min_gmx_version: tuple[int, int] | None = None,
@@ -542,15 +541,14 @@ def _build_grompp_script(
     mdp_file : str
         MDP parameter file (em.mdp, nvt.mdp, npt.mdp, md.mdp).
     gro_file : str
-        Input structure file (system.pdb, min.gro, etc).
+        Input structure file (system.pdb, min.gro, etc), also the
+        position-restraint reference (``-r``).
     top_file : str
         Topology file (topology.top).
     tpr_file : str
         Output TPR file (min.tpr, nvt.tpr, etc).
     work_dir : str
         Absolute path to simulation directory.
-    ref_file : str, optional
-        Reference structure for position restraints (-r flag).
     cpt_file : str, optional
         Checkpoint file for velocities (-t flag).
     maxwarn : int
@@ -567,7 +565,6 @@ def _build_grompp_script(
         Bash script to execute.
 
     """
-    ref_flag = f"-r {ref_file}" if ref_file else ""
     cpt_flag = f"-t {cpt_file}" if cpt_file else ""
     version_check = _build_gmx_version_check(min_gmx_version) if min_gmx_version is not None else ""
 
@@ -581,8 +578,8 @@ def _build_grompp_script(
         echo "GROMACS grompp: {mdp_file} -> {tpr_file} (using $GMX_BIN)" >&2
 
         # Run grompp with explicit error checking
-        if ! $GMX_BIN grompp -f {mdp_file} -c {gro_file} -p {top_file} -o {tpr_file} \\
-            {ref_flag} {cpt_flag} -maxwarn {maxwarn}; then
+        if ! $GMX_BIN grompp -f {mdp_file} -c {gro_file} -r {gro_file} -p {top_file} \\
+            -o {tpr_file} {cpt_flag} -maxwarn {maxwarn}; then
             echo "ERROR: grompp failed for {tpr_file}" >&2
             echo "Check that input files ({mdp_file}, {gro_file}, {top_file}) are valid" >&2
             exit 1
@@ -715,7 +712,6 @@ def get_grompp_app():
         top_file: str,
         tpr_file: str,
         work_dir: str,
-        ref_file: str = "",
         cpt_file: str = "",
         maxwarn: int = 1,
         min_gmx_version: tuple[int, int] | None = None,
@@ -730,15 +726,14 @@ def get_grompp_app():
         mdp_file : str
             MDP parameter file (em.mdp, nvt.mdp, npt.mdp, md.mdp).
         gro_file : str
-            Input structure file (system.pdb, min.gro, etc).
+            Input structure file (system.pdb, min.gro, etc), also the
+            position-restraint reference (``-r``).
         top_file : str
             Topology file (topology.top).
         tpr_file : str
             Output TPR file (min.tpr, nvt.tpr, etc).
         work_dir : str
             Absolute path to simulation directory.
-        ref_file : str, optional
-            Reference structure for position restraints (-r flag).
         cpt_file : str, optional
             Checkpoint file for velocities (-t flag).
         maxwarn : int
@@ -764,7 +759,6 @@ def get_grompp_app():
             top_file,
             tpr_file,
             work_dir,
-            ref_file,
             cpt_file,
             maxwarn,
             min_gmx_version,

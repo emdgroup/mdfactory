@@ -7,9 +7,9 @@ import io
 import warnings
 from functools import cached_property
 from pathlib import Path
-from typing import Literal, NamedTuple, Optional
+from typing import Annotated, Literal, NamedTuple, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors
 
@@ -253,6 +253,71 @@ class LipidSpecies(SingleMoleculeSpecies):
     #     return u
 
 
+#: Restraint names whose ``POSRES_<NAME>`` macro pdb2gmx already uses.
+_RESERVED_RESTRAINT_NAMES = {"WATER"}
+
+
+class PositionRestraint(BaseModel):
+    """A position restraint on the protein atoms matched by an MDAnalysis selection.
+
+    The build writes the restraint as a ``[ position_restraints ]`` include
+    guarded by ``#ifdef POSRES_<NAME>`` and adds ``-DPOSRES_<NAME>`` to the
+    production ``define``. The atoms are restrained to their positions in the
+    production starting structure.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        ...,
+        pattern=r"^[A-Za-z][A-Za-z0-9_]*$",
+        description=(
+            "Identifier of the restraint, used for its itp file and the POSRES_<NAME> "
+            "macro (upper-cased). Unique within a protein, ignoring case."
+        ),
+    )
+    selection: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] = Field(
+        ...,
+        description=(
+            "MDAnalysis selection of the restrained atoms, evaluated on the pdb2gmx "
+            "structure with the input chain IDs and residue numbers."
+        ),
+    )
+    type: Literal["harmonic", "flat_bottom"] = Field(
+        "harmonic",
+        description=(
+            "harmonic (GROMACS funct 1, isotropic) or flat_bottom (funct 2, a sphere "
+            "of the given radius)."
+        ),
+    )
+    k: float = Field(..., gt=0, description="Force constant in kJ mol^-1 nm^-2.")
+    radius: Optional[float] = Field(
+        None, gt=0, description="Flat-bottom sphere radius in nm (flat_bottom only)."
+    )
+
+    @model_validator(mode="after")
+    def check_radius_and_name(self) -> "PositionRestraint":
+        """Require ``radius`` for flat-bottom restraints only and reject reserved names."""
+        if self.type == "flat_bottom" and self.radius is None:
+            raise ValueError(f"Flat-bottom restraint '{self.name}' needs a 'radius' (nm).")
+        if self.type == "harmonic" and self.radius is not None:
+            raise ValueError(
+                f"Harmonic restraint '{self.name}' takes no 'radius'; "
+                "use type 'flat_bottom' for a flat-bottom sphere."
+            )
+        if self.name.upper() in _RESERVED_RESTRAINT_NAMES:
+            raise ValueError(
+                f"Restraint name '{self.name}' is reserved: pdb2gmx already defines "
+                f"POSRES_{self.name.upper()}."
+            )
+        return self
+
+    @property
+    def macro(self) -> str:
+        """Return the preprocessor macro that switches the restraint on."""
+        return f"POSRES_{self.name.upper()}"
+
+
 class ProteinSpecies(Species):
     """Represent a protein species identified by a PDB structure file."""
 
@@ -295,6 +360,27 @@ class ProteinSpecies(Species):
     merge_all: bool = Field(
         False, description="Merge all chains into a single pdb2gmx moleculetype."
     )
+    restraints: list[PositionRestraint] = Field(
+        default_factory=list,
+        description=(
+            "Selection-based position restraints applied in the production stage. "
+            "NVT and NPT keep pdb2gmx's heavy-atom restraints (-DPOSRES)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def check_unique_restraint_names(self) -> "ProteinSpecies":
+        """Reject restraints whose names differ only in case (they share a macro)."""
+        seen: dict[str, str] = {}
+        for restraint in self.restraints:
+            previous = seen.get(restraint.name.upper())
+            if previous is not None:
+                raise ValueError(
+                    f"Restraint names '{previous}' and '{restraint.name}' are not unique "
+                    "(names are compared ignoring case)."
+                )
+            seen[restraint.name.upper()] = restraint.name
+        return self
 
     @property
     def charge(self) -> int | None:

@@ -1,0 +1,41 @@
+# Lysozyme (Amber ff14SB, GROMACS >= 2026) with selection-based position restraints.
+# NVT and NPT restrain every protein heavy atom (-DPOSRES) as usual. Production
+# keeps only the restraints below, switched on with -DPOSRES_HELICES -DPOSRES_LOOP
+# and anchored to the production starting structure (grompp -r npt.gro).
+simulation_type: proteinbox
+engine: gromacs
+parametrization:
+  family: amber
+  protein: amber14sb
+  water_model: tip3p
+
+system:
+  protein:
+    resname: LYZ
+    count: 1
+    pdb_path: ./1aki.pdb
+    ignore_hydrogens: true
+    chains: [A]
+    disulfide_bonds:
+      - [CYS6, CYS127]
+      - [CYS30, CYS115]
+      - [CYS64, CYS80]
+      - [CYS76, CYS94]
+    protonation_states:
+      HIS15: HIE
+    restraints:
+      # Harmonic anchor on the C-alpha atoms of helices A, B and C.
+      - name: helices
+        selection: "name CA and resid 5:15 25:36 88:99"
+        type: harmonic
+        k: 1000.0 # kJ mol^-1 nm^-2
+      # Flat-bottom sphere: the loop heavy atoms move freely within 0.3 nm.
+      - name: loop
+        selection: "chainID A and resid 100:104 and not name H*"
+        type: flat_bottom
+        radius: 0.3 # nm
+        k: 1000.0 # kJ mol^-1 nm^-2
+  padding: 12.0
+  ionization:
+    neutralize: true
+    concentration: 0.15

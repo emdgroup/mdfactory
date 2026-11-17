@@ -122,7 +122,13 @@ Keys that a typed setting or the build owns are rejected:
 
 Everything else can be overridden, for example `pcoupl: C-rescale`, `tau-p`, `nstcalcenergy` or
 `define`. grompp validates the result when the stage runs (and, for protein systems, `em.mdp`
-already at build time).
+already at build time, and `md.mdp` too when the protein has
+[position restraints](/docs/user-guide/yaml-format#position-restraints)).
+
+A `define` override replaces the generated value, so an NVT or NPT `define` drops `-DPOSRES`. In
+production, the `-DPOSRES_<NAME>` flags of the protein's restraints are appended after the
+override: `production: {define: -DFLEXIBLE}` with a restraint `core` gives
+`define = -DFLEXIBLE -DPOSRES_CORE`.
 
 ## The generated protocol
 
@@ -147,6 +153,13 @@ already at build time).
 `4.5e-5` bar⁻¹; H-bond constraints with LINCS; Verlet neighbour search; PME order 4 with
 `fourierspacing = 0.16`; NVT generates velocities, NPT and production continue; production writes
 compressed coordinates only (no `.trr`) with `refcoord-scaling = com`.
+
+**Position restraints.** Every stage runs `grompp` with `-r` equal to its `-c` input (EM
+`system.pdb`, NVT `min.gro`, NPT `nvt.gro`, production `npt.gro`), so restrained atoms are
+anchored at their positions at the start of the stage. For protein systems with
+[selection restraints](/docs/user-guide/yaml-format#position-restraints), production gets
+`define = -DPOSRES_<NAME> ...`, one flag per restraint, and no `-DPOSRES`. The flags are always
+appended after a production `define` override.
 
 <Callout type="info" title="Sage for lipids">
 OpenFF does not validate Sage for lipid bilayers. `openff` bilayer and LNP builds use the Sage

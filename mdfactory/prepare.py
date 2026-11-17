@@ -28,6 +28,7 @@ OPTIONAL_FIELD_PREFIXES = (
     "system.protein.protonation_states",
     "system.protein.ignore_hydrogens",
     "system.protein.merge_all",
+    "system.protein.restraints.",
     "simulation_settings.",
 )
 
@@ -56,16 +57,31 @@ def _row_cells(row: pd.Series) -> dict[str, Any]:
 
 
 def _parse_delimited_protein_fields(nested: dict) -> None:
-    """Parse a proteinbox row's delimited list cells into lists in place.
+    """Parse a protein row's delimited list cells and restraint columns in place.
 
     ``chains`` is a ``;``-separated list of chain ids ("A;B"). ``disulfide_bonds``
     is a ``;``-separated list of ``RESNAME<id>-RESNAME<id>`` pairs
     ("CYS6-CYS127;CYS30-CYS115"). ``protonation_states`` is expressed as nested
     dotted columns (system.protein.protonation_states.HIS15) and needs no parsing.
+    ``restraints`` columns (system.protein.restraints.<NAME>.<property>) arrive as
+    ``{NAME: {property: value}}`` and become the list of restraint entries. Blank
+    cells are already dropped, so a restraint whose cells are all blank is absent.
     """
     protein = nested.get("system", {}).get("protein")
     if not isinstance(protein, dict):
         return
+
+    restraints = protein.get("restraints")
+    if isinstance(restraints, dict):
+        entries = []
+        for name, props in restraints.items():
+            if not isinstance(props, dict):
+                raise ValueError(
+                    f"Restraint column 'system.protein.restraints.{name}' needs a property, "
+                    "e.g. 'system.protein.restraints.<NAME>.selection'."
+                )
+            entries.append({"name": name, **props})
+        protein["restraints"] = entries
 
     chains = protein.get("chains")
     if isinstance(chains, str):

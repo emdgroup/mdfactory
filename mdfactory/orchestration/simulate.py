@@ -390,7 +390,6 @@ def _log_dry_run_plan(work_plan: list[dict], config: "ExecutorConfig") -> list[d
                         top_file="topology.top",
                         tpr_file=spec.tpr_file,
                         work_dir=work_dir,
-                        ref_file=spec.ref_file or "",
                         cpt_file=spec.prereq_cpt or "",
                         maxwarn=spec.maxwarn,
                         min_gmx_version=min_gmx_version,
