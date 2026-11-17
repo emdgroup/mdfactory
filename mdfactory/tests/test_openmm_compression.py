@@ -76,7 +76,7 @@ class FakeSimulation:
             raise mm.OpenMMException(self.world.fail_message)
         self.edge *= 0.98
 
-    def minimizeEnergy(self):
+    def minimizeEnergy(self, reporter=None):
         self.world.minimize_calls += 1
         if self.world.minimize_calls in self.world.fail_on_minimize:
             raise mm.OpenMMException(NAN_MESSAGES[0])
@@ -284,3 +284,31 @@ def test_compress_box_retries_with_one_restraint_and_hands_the_new_simulation_on
     # The result comes from the replacement simulation, not the one that hit NaN.
     assert finished == [simulations[1].context]
     assert exported == [simulations[1]]
+
+
+def test_minimization_progress_is_logged():
+    """A real (tiny) minimization calls the reporter, which logs energy through loguru."""
+    messages = []
+    sink_id = openmm_utils.logger.add(lambda message: messages.append(str(message)))
+    try:
+        system = mm.System()
+        force = mm.NonbondedForce()
+        rng = np.random.default_rng(0)
+        for _ in range(30):
+            system.addParticle(40.0)
+            force.addParticle(0.0, 0.3, 1.0)
+        system.addForce(force)
+        integrator = mm.VerletIntegrator(0.001)
+        context = mm.Context(system, integrator, mm.Platform.getPlatformByName("Reference"))
+        context.setPositions(rng.uniform(0.0, 0.5, size=(30, 3)))
+
+        simulation = type("Sim", (), {})()
+        simulation.minimizeEnergy = lambda reporter: mm.LocalEnergyMinimizer.minimize(
+            context, reporter=reporter
+        )
+        openmm_utils._minimize(simulation, log_interval=0.0)
+    finally:
+        openmm_utils.logger.remove(sink_id)
+
+    assert any("Minimization iteration" in m and "potential energy" in m for m in messages)
+    assert any("Minimization finished" in m for m in messages)

@@ -3,6 +3,7 @@
 """OpenMM simulation utilities for box compression and equilibration."""
 
 import sys
+import time
 
 import cycler
 import matplotlib.pyplot as plt
@@ -51,6 +52,33 @@ def _state_data_reporter(target):
         density=True,
         volume=True,
     )
+
+
+class _MinimizationProgress(mm.MinimizationReporter):
+    """Log the potential energy of a running minimization at most every *interval* seconds."""
+
+    def __init__(self, interval=30.0):
+        super().__init__()
+        self.interval = interval
+        self.last_log = time.monotonic()
+
+    def report(self, iteration, x, grad, args):
+        now = time.monotonic()
+        if now - self.last_log >= self.interval:
+            self.last_log = now
+            logger.info(
+                f"Minimization iteration {iteration}: "
+                f"potential energy = {args['system energy']:.6g} kJ/mol, "
+                f"max constraint error = {args['max constraint error']:.2g}"
+            )
+        return False
+
+
+def _minimize(simulation, log_interval=30.0):
+    """Minimize *simulation*, logging progress every *log_interval* seconds."""
+    logger.info("Minimizing energy...")
+    simulation.minimizeEnergy(reporter=_MinimizationProgress(log_interval))
+    logger.info("Minimization finished.")
 
 
 def _universe_from_simulation(simulation, u, stem, periodic=True):
@@ -481,7 +509,7 @@ def run_staged_compression(
                 simulation, mass, steps=steps - step, target_density=stage_density
             )
             if converged and not is_last:
-                simulation.minimizeEnergy()
+                _minimize(simulation)
         except mm.OpenMMException as exc:
             if not _is_nan_failure(exc):
                 raise
@@ -702,8 +730,7 @@ def compress_box(
     # return
 
     # Energy minimization
-    print("Minimizing energy...")
-    simulation.minimizeEnergy()
+    _minimize(simulation)
 
     minimized_positions = simulation.context.getState(getPositions=True).getPositions()
     app.PDBFile.writeFile(simulation.topology, minimized_positions, open("min.pdb", "w"))
