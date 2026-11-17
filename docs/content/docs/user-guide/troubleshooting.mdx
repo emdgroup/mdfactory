@@ -102,7 +102,9 @@ runs when the protein is prepared at build time, and again on the compute node b
 </Accordion>
 <Accordion title="Large systems fail during compression">
 
-The build code uses OpenMM-based compression or equilibration steps. For difficult systems, start with smaller molecule counts or a less aggressive target density and verify the input chemistry first.
+Mixed-box, LNP and protein mixed-box builds first pack the box at a fraction of the target density and then compress it with OpenMM. Compression runs in density stages (30%, 60% and 100% of the target), with an energy minimization between stages.
+
+If OpenMM reports NaN coordinates (`Particle coordinate is NaN` or `NaN encountered during RMSD force calculation`), the stage restarts from the last checkpoint with the time step halved, up to three times. The build log shows each retry. If the error persists after the retries, start with smaller molecule counts or a less aggressive target density and verify the input chemistry first.
 
 </Accordion>
 </Accordions>
