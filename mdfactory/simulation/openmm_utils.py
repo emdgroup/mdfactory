@@ -17,6 +17,11 @@ RESTRAINT_K = 1000.0
 # Largest relative density overshoot (target_volume / volume - 1) that
 # finish_compression corrects by rescaling; larger overshoots raise.
 OVERSHOOT_TOLERANCE = 0.15
+# Fractions of the target density at which compression pauses to minimize before
+# squeezing further; the last stage ends at the target itself.
+COMPRESSION_STAGE_FRACTIONS = (0.3, 0.6, 1.0)
+# Total NaN recoveries (each halves the time step) allowed per compression.
+MAX_NAN_RETRIES = 3
 
 
 def _add_protein_rmsd_restraint(system, positions, protein_indices):
@@ -374,6 +379,137 @@ def simulate_compression_until_density_reached(
     return densities, step, converged
 
 
+def _is_nan_failure(exc):
+    """Return True for OpenMM's NaN errors (``Particle coordinate is NaN`` and the
+    RMSD-force variant, which both mean the coordinates became non-finite)."""
+    return isinstance(exc, mm.OpenMMException) and "NaN" in str(exc)
+
+
+def _checkpoint(simulation):
+    """Capture positions and box vectors so a failed stage can be restarted."""
+    state = simulation.context.getState(getPositions=True)
+    return state.getPositions(), state.getPeriodicBoxVectors()
+
+
+def _restore(simulation, checkpoint):
+    """Put a checkpoint's box and positions into *simulation*'s context."""
+    positions, box = checkpoint
+    simulation.context.setPeriodicBoxVectors(*box)
+    simulation.context.setPositions(positions)
+
+
+def _current_density(simulation, mass):
+    """Instantaneous density of *simulation* in g/mL."""
+    box = simulation.context.getState().getPeriodicBoxVectors()
+    volume = box[0][0] * box[1][1] * box[2][2]
+    return (mass / volume).value_in_unit(unit.gram / unit.item / unit.milliliter)
+
+
+def run_staged_compression(
+    simulation,
+    make_simulation,
+    mass,
+    target_density,
+    steps,
+    dt,
+    max_nan_retries=MAX_NAN_RETRIES,
+    stage_fractions=COMPRESSION_STAGE_FRACTIONS,
+):
+    """Compress in density stages, minimizing between them and recovering from NaNs.
+
+    Each stage compresses to ``fraction * target_density`` with
+    :func:`simulate_compression_until_density_reached` (stages the system has
+    already passed are skipped) and, except for the last, ends with an energy
+    minimization whose result becomes the new checkpoint. When OpenMM reports NaN
+    coordinates during a stage or its minimization, the run restarts that stage
+    from the last checkpoint in a new simulation with the time step halved. The
+    step budget *steps* is shared by all stages; steps lost to a failed stage are
+    not counted.
+
+    Parameters
+    ----------
+    simulation : openmm.app.Simulation
+        Initialized (and minimized) simulation with a barostat.
+    make_simulation : callable
+        ``make_simulation(dt)`` returns a new simulation of the same system with
+        a time step of *dt* picoseconds. The caller restores the checkpoint.
+    mass : openmm.unit.Quantity
+        Total mass of the system.
+    target_density : float
+        Final density in g/mL.
+    steps : int
+        Maximum total number of MD steps.
+    dt : float
+        Initial time step in picoseconds.
+    max_nan_retries : int, optional
+        Total NaN recoveries allowed. Default is :data:`MAX_NAN_RETRIES`.
+    stage_fractions : sequence of float, optional
+        Target-density fractions of the stages. Default is
+        :data:`COMPRESSION_STAGE_FRACTIONS`.
+
+    Returns
+    -------
+    simulation : openmm.app.Simulation
+        The simulation holding the final state (a replacement after a retry).
+    densities : list of float
+        Recorded densities in g/mL over all stages.
+    step : int
+        Total number of steps executed in completed stages.
+    converged : bool
+        Whether the final target density was reached within *steps*.
+
+    Raises
+    ------
+    RuntimeError
+        If NaN coordinates persist after *max_nan_retries* recoveries.
+
+    """
+    densities = []
+    step = 0
+    retries = 0
+    checkpoint = _checkpoint(simulation)
+    stage = 0
+    n_stages = len(stage_fractions)
+    while stage < n_stages:
+        is_last = stage == n_stages - 1
+        stage_density = target_density * stage_fractions[stage]
+        if not is_last and _current_density(simulation, mass) >= stage_density:
+            stage += 1
+            continue
+        try:
+            stage_densities, stage_steps, converged = simulate_compression_until_density_reached(
+                simulation, mass, steps=steps - step, target_density=stage_density
+            )
+            if converged and not is_last:
+                simulation.minimizeEnergy()
+        except mm.OpenMMException as exc:
+            if not _is_nan_failure(exc):
+                raise
+            if retries >= max_nan_retries:
+                raise RuntimeError(
+                    f"Compression stage {stage + 1}/{n_stages} still produced NaN coordinates "
+                    f"after {retries} retries (time step reduced to {dt} ps): {exc}. "
+                    "Try a lower target density or a smaller system."
+                ) from exc
+            retries += 1
+            dt /= 2
+            logger.warning(
+                f"NaN during compression stage {stage + 1}/{n_stages} ({exc}); retrying from the "
+                f"last checkpoint with dt = {dt} ps (retry {retries}/{max_nan_retries})."
+            )
+            simulation = make_simulation(dt)
+            _restore(simulation, checkpoint)
+            continue
+        densities.extend(stage_densities)
+        step += stage_steps
+        if not converged:
+            return simulation, densities, step, False
+        if not is_last:
+            checkpoint = _checkpoint(simulation)
+        stage += 1
+    return simulation, densities, step, True
+
+
 def create_sphere(u, pdb, top, radius, steps: int = 100_000):
     """Compress a system into a sphere using a harmonic radial restraint.
 
@@ -454,14 +590,20 @@ def compress_box(
     target_volume=None,
     protein_indices=None,
     require_convergence=True,
+    dt=0.002,
+    max_nan_retries=MAX_NAN_RETRIES,
 ):
     """Compress a periodic box to a target density using high-pressure NPT.
 
     Apply a Monte Carlo barostat at elevated pressure, minimize, and run
     dynamics until the system density reaches *target_density* (or, when
-    *target_volume* is given, the equivalent density for that volume). When
-    *protein_indices* is given, their best-fit RMSD from the starting structure
-    is restrained through minimization and compression.
+    *target_volume* is given, the equivalent density for that volume). The
+    squeeze runs in density stages with a minimization between them, and a NaN
+    during a stage restarts it from the last checkpoint with half the time step
+    (see :func:`run_staged_compression`). When *protein_indices* is given, their
+    best-fit RMSD from the starting structure is restrained through minimization
+    and compression; the restraint reference stays the starting structure across
+    retries.
 
     At high pressure the box can sweep past the target between two checks.
     Any such overshoot is undone by expanding the box and molecule centers to
@@ -493,6 +635,12 @@ def compress_box(
         Raise when the target is not reached within *steps_compression*. When
         False, only warn and return the box as compressed so far (used for the
         LNP core, which cannot always reach its nominal density). Default is True.
+    dt : float, optional
+        Initial integration time step in picoseconds. Halved on each NaN
+        recovery. Default is 0.002.
+    max_nan_retries : int, optional
+        Total NaN recoveries allowed before raising. Default is
+        :data:`MAX_NAN_RETRIES`.
 
     Returns
     -------
@@ -505,8 +653,9 @@ def compress_box(
     ------
     RuntimeError
         If the requested density or volume is not reached (and
-        *require_convergence* is True), or compression overshoots its target
-        beyond :data:`OVERSHOOT_TOLERANCE`.
+        *require_convergence* is True), compression overshoots its target
+        beyond :data:`OVERSHOOT_TOLERANCE`, or NaN coordinates persist after
+        *max_nan_retries* recoveries.
 
     """
     # TODO: use proper logging
@@ -529,17 +678,17 @@ def compress_box(
     )
     system.addForce(barostat)
 
-    # Create integrator and simulation
-    integrator = mm.LangevinMiddleIntegrator(
-        300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picoseconds
-    )
+    def make_simulation(step_size):
+        integrator = mm.LangevinMiddleIntegrator(
+            300 * unit.kelvin, 1 / unit.picosecond, step_size * unit.picoseconds
+        )
+        sim = app.Simulation(top.topology, system, integrator)
+        sim.context.setPositions(gro.positions)
+        sim.reporters.append(app.PDBReporter("compress.pdb", reportInterval=5000))
+        sim.reporters.append(_state_data_reporter("data.txt"))
+        return sim
 
-    simulation = app.Simulation(top.topology, system, integrator)
-    simulation.context.setPositions(gro.positions)
-
-    simulation.reporters.append(app.PDBReporter("compress.pdb", reportInterval=5000))
-
-    simulation.reporters.append(_state_data_reporter("data.txt"))
+    simulation = make_simulation(dt)
 
     state = simulation.context.getState()
     box = state.getPeriodicBoxVectors()
@@ -570,8 +719,14 @@ def compress_box(
             totalMass / (target_density * unit.gram / unit.item / unit.milliliter)
         ).value_in_unit(unit.nanometer**3)
 
-    densities, completed_steps, converged = simulate_compression_until_density_reached(
-        simulation, mass=totalMass, steps=steps_compression, target_density=target_density
+    simulation, densities, completed_steps, converged = run_staged_compression(
+        simulation,
+        make_simulation,
+        mass=totalMass,
+        target_density=target_density,
+        steps=steps_compression,
+        dt=dt,
+        max_nan_retries=max_nan_retries,
     )
     final_density = f"{densities[-1]:.3f} g/mL" if densities else "nan"
 
