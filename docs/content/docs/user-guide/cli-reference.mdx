@@ -114,6 +114,34 @@ mdfactory simulate output_dir/ --clean --stages Production --slurm gpu.yaml
 mdfactory simulate output_dir/ --clean --dry-run
 ```
 
+### `mdfactory benchmark`
+
+Find the highest CPU count justified for a system by the 75% parallel-efficiency rule of thumb. GPU scaling is not covered.
+
+```bash
+mdfactory benchmark <source> --slurm <config.yaml> [options]
+```
+
+Short, CPU-only production trials run at increasing thread counts inside one exclusive allocation. Each point's parallel efficiency is its speedup over the smallest swept count divided by the core ratio; the reported answer is the highest count still at or above `--efficiency`.
+
+Options:
+
+- `--slurm` — SLURM config YAML or `'tui'` for interactive setup (required)
+- `--cpus` — core counts to sweep (default: `1 2 4 8 16 32 64`)
+- `--duration-ps` — length of each trial in ps (default: 100)
+- `--efficiency` — minimum parallel efficiency to count as justified (default: 0.75)
+- `--dry-run` — list the sweep plan without submitting anything
+
+Results are written to `.benchmark/` trial directories and `benchmark_result.json` next to the system.
+
+```bash
+# Default sweep at 75% efficiency
+mdfactory benchmark output_dir/abc123 --slurm cpu.yaml
+
+# Demand 80% efficiency from longer trials
+mdfactory benchmark output_dir/abc123 --slurm cpu.yaml --cpus 1 2 4 8 16 --duration-ps 200 --efficiency 0.8
+```
+
 ## Configuration commands
 
 ### `mdfactory config slurm`
